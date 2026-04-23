@@ -1,12 +1,16 @@
 {
-  "UserPromptSubmit": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "${CLAUDE_PLUGIN_ROOT}/hooks/mother-inject.sh"
-        }
-      ]
-    }
-  ]
+  "description": "Mother — surfaces queue events in the next user prompt",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/mother-inject.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
 }

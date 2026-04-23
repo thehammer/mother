@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# queue-inject.sh — UserPromptSubmit hook that surfaces queue state changes
+# mother-inject.sh — UserPromptSubmit hook that surfaces queue state changes
 # into Claude's context between user messages.
 #
 # Claude Code passes a JSON payload on stdin with at least `session_id`. We
@@ -29,8 +29,16 @@ payload=$(cat 2>/dev/null || true)
 session_id=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)
 [ -z "$session_id" ] && exit 0
 
-mother_cli="$MOTHER_BIN_DIR/mother"
-[ -x "$mother_cli" ] || exit 0
+# Resolve the CLI. When fired as a plugin hook, Claude Code sets
+# $CLAUDE_PLUGIN_ROOT. Fall back to $PATH so the hook also works when sourced
+# from legacy (pre-plugin) wiring or direct invocation.
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/bin/mother" ]; then
+    mother_cli="$CLAUDE_PLUGIN_ROOT/bin/mother"
+elif command -v mother >/dev/null 2>&1; then
+    mother_cli="$(command -v mother)"
+else
+    exit 0
+fi
 
 # Fetch deltas. The CLI returns a JSON array and advances the cursor.
 events=$("$mother_cli" events --since-cursor "$session_id" 2>/dev/null)

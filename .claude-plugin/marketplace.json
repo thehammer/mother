@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "thehammer-mother",
+  "description": "Mother — local background-work orchestrator for Claude Code",
+  "owner": {
+    "name": "Hammer",
+    "url": "https://github.com/thehammer"
+  },
+  "plugins": [
+    {
+      "name": "mother",
+      "description": "Background work for Claude Code. Propose a plan, Mother runs it in a worktree while you keep working.",
+      "author": {
+        "name": "Hammer",
+        "url": "https://github.com/thehammer"
+      },
+      "source": "./plugins/mother",
+      "version": "0.1.0",
+      "category": "productivity",
+      "tags": ["queue", "background", "automation", "tmux", "worktree"]
+    }
+  ]
+}
