@@ -17,13 +17,15 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 
 # mother-run-job — run a single queued job to completion.
 #
-# Invoked by `mother run --once` (phase 1). In phase 2 the daemon will call this
+# Invoked by `mother run --once` (phase 1). In phase 2 the daemon calls this
 # the same way. Responsibilities:
 #   - Resolve the target working directory (worktree or main dir).
 #   - Acquire a workspace lock if isolation=main-dir.
-#   - Spawn `claude --agent cody -p "$(cat <plan>)"` in a new tmux window at that
-#     cwd, tee'd to the job log.
+#   - Spawn `claude --agent cody -p "$(cat <plan>)"` as a headless background
+#     process (nohup + disown) at that cwd, tee'd to the job log. The pid is
+#     recorded on the job as `worker_pid`.
 #   - Poll a status-marker file; transition the job on exit.
+#   - On cancellation: SIGTERM the worker, wait 10s, then SIGKILL.
 #   - Parse the log for a PR URL and cost info (best-effort).
 #
 # Blocks until the job exits. Usage: mother-run-job <job-id>
@@ -102,15 +104,6 @@ case "$state" in
     *) echo "mother-run-job: job $id is $state, expected ready or running" >&2; exit 1 ;;
 esac
 
-# Must have a tmux server available to spawn the job window. The daemon
-# doesn't inherit a TMUX env var, but that's fine — we talk to the default
-# tmux socket by connecting rather than relying on $TMUX being set.
-if ! tmux list-sessions >/dev/null 2>&1; then
-    echo "mother-run-job: no tmux server available (start tmux first)" >&2
-    _transition failed "$(jq -nc --arg r "no_tmux" '{reason: $r}')"
-    exit 1
-fi
-
 isolation=$(jq -r .isolation  "$job_file")
 branch=$(jq -r .branch        "$job_file")
 repo_path=$(jq -r .repo_path  "$job_file")
@@ -141,16 +134,15 @@ else
     work_dir="$repo_path"
 fi
 
-# Record the tmux window + resolved work_dir on the job. If we were started
-# from `ready` (via `mother run --once`), also emit the running transition;
-# if the daemon pre-transitioned us, just record the window details.
-window="q:${id: -8}"
+# Record the resolved work_dir on the job. If we were started from `ready`
+# (via `mother run --once`), also emit the running transition; if the daemon
+# pre-transitioned us, just append a started event. The actual worker process
+# is spawned further down, after the wrapper script is written; the
+# `worker_pid` is recorded at that point.
 if [ "$state" = "ready" ]; then
-    _job_update ".tmux_window = \"$window\""
-    _transition running "$(jq -nc --arg w "$window" --arg d "$work_dir" '{tmux_window: $w, work_dir: $d}')"
+    _transition running "$(jq -nc --arg d "$work_dir" '{work_dir: $d}')"
 else
-    _job_update ".tmux_window = \"$window\""
-    _append_event "started" "$(jq -nc --arg w "$window" --arg d "$work_dir" '{tmux_window: $w, work_dir: $d}')"
+    _append_event "started" "$(jq -nc --arg d "$work_dir" '{work_dir: $d}')"
 fi
 
 # Spawn claude in a new tmux window. Use a wrapper script so we can capture
@@ -173,16 +165,26 @@ echo \$? > "$marker_file"
 WRAP
 chmod +x "$wrapper"
 
-tmux new-window -d -n "$window" -c "$work_dir" "bash '$wrapper'; echo; echo '(job $id finished — press any key to close)'; read -n1"
+nohup bash "$wrapper" >/dev/null 2>&1 &
+worker_pid=$!
+disown 2>/dev/null || true
+_job_update ".worker_pid = $worker_pid"
+_append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" '{pid: $pid}')"
 
 # Poll for the marker file.
 cancel_requested=0
 while [ ! -f "$marker_file" ]; do
     sleep 2
-    # Honor cancellation.
+    # Honor cancellation: TERM, grace period, then KILL.
     if [ "$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
         cancel_requested=1
-        tmux kill-window -t "$window" 2>/dev/null || true
+        kill -TERM "$worker_pid" 2>/dev/null || true
+        waited=0
+        while kill -0 "$worker_pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        kill -0 "$worker_pid" 2>/dev/null && kill -KILL "$worker_pid" 2>/dev/null || true
         break
     fi
 done

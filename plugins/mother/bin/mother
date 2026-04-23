@@ -120,7 +120,7 @@ cmd_add() {
             plan_path: $plan_path, log_path: $log_path,
             state: "queued", created_at: $created_at,
             started_at: null, finished_at: null,
-            pr_url: null, tmux_window: null, actual_cost_usd: null
+            pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null
         }')
     _atomic_write "$(_job_path "$id")" "$job_json"
     _append_event "$id" "queued" "$(jq -nc --arg title "$title" '{title: $title}')"
@@ -255,17 +255,19 @@ cmd_logs() {
 #
 # Show a live snapshot of what the worker is doing right now by parsing
 # Claude's per-session transcript file. Works for running and completed
-# jobs alike; for completed jobs it's a retrospective summary. See the
+# jobs alike; for completed jobs it's a retrospective summary. With --watch,
+# re-renders the snapshot every ~3s (useful as an fzf preview). See the
 # "Queue Worker Live Visibility" draft for the design rationale.
 
 cmd_peek() {
-    local id="${1:-}" format="text" tail_count=8
+    local id="${1:-}" format="text" tail_count=8 watch=0
     [ -n "$id" ] || _die "peek: <id> required"
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
             --format) format="$2"; shift 2 ;;
             --tail)   tail_count="$2"; shift 2 ;;
+            --watch)  watch=1; shift ;;
             *) _die "unknown flag for peek: $1" ;;
         esac
     done
@@ -305,10 +307,11 @@ cmd_peek() {
     [ -n "$transcript" ] && [ -f "$transcript" ] \
         || _die "peek: no transcript file in $project_dir"
 
-    PEEK_ID="$id" PEEK_STATE="$state" PEEK_TITLE="$title" \
-    PEEK_WORK_DIR="$work_dir" PEEK_TRANSCRIPT="$transcript" \
-    PEEK_FORMAT="$format" PEEK_TAIL="$tail_count" \
-        python3 - <<'PYEOF'
+    _peek_render() {
+        PEEK_ID="$id" PEEK_STATE="$state" PEEK_TITLE="$title" \
+        PEEK_WORK_DIR="$work_dir" PEEK_TRANSCRIPT="$transcript" \
+        PEEK_FORMAT="$format" PEEK_TAIL="$tail_count" \
+            python3 - <<'PYEOF'
 import json, os, sys, time
 from collections import Counter
 
@@ -431,6 +434,55 @@ else:
         for line in snippet.splitlines():
             print(f"  {line}")
 PYEOF
+    }
+
+    if [ "$watch" -eq 1 ]; then
+        # Stop cleanly if the parent (fzf preview) tears down the process.
+        trap 'exit 0' INT TERM
+        while :; do
+            clear
+            _peek_render
+            sleep 3
+        done
+    else
+        _peek_render
+    fi
+}
+
+# ---------- attach ----------
+
+# Opens a new tmux window that tails the job's log. Must be run from inside a
+# tmux session (otherwise there's nothing to spawn a window in). This is the
+# opt-in replacement for the old per-job tmux window: workers now run
+# headless, and attach is how you watch them live.
+cmd_attach() {
+    local id="${1:-}"
+    [ -n "$id" ] || _die "attach: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+    command -v tmux >/dev/null 2>&1 || _die "attach: tmux not available"
+    [ -n "${TMUX:-}" ] || _die "attach: must be run inside a tmux session"
+    local lp; lp=$(_log_path "$id")
+    [ -f "$lp" ] || _die "no log yet for $id"
+    local short="${id: -8}"
+    tmux new-window -n "q-attach:$short" "tail -f '$lp'"
+}
+
+# ---------- plan ----------
+
+# Show the plan file for a job. Pages via less when stdout is a tty so long
+# plans are navigable; cats otherwise so piping/grep keeps working. Bound to
+# ctrl-p in the switcher.
+cmd_plan() {
+    local id="${1:-}"
+    [ -n "$id" ] || _die "plan: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+    local plan_file; plan_file=$(_plan_path "$id")
+    [ -f "$plan_file" ] || _die "no plan file for $id"
+    if [ -t 1 ]; then
+        ${PAGER:-less} "$plan_file"
+    else
+        cat "$plan_file"
+    fi
 }
 
 # ---------- cancel ----------
@@ -867,7 +919,9 @@ Usage:
   mother list [--state STATE] [--repo REPO] [--format json|table]
   mother status ID [--format json|text]
   mother logs ID [--follow]
-  mother peek ID [--format json|text] [--tail N]
+  mother peek ID [--format json|text] [--tail N] [--watch]
+  mother attach ID
+  mother plan ID
   mother cancel ID
   mother retry ID
   mother events [--since-cursor SESSION_ID] [--since ISO_TS]
@@ -908,6 +962,8 @@ main() {
         status)  cmd_status "$@" ;;
         logs)    cmd_logs "$@" ;;
         peek)    cmd_peek "$@" ;;
+        attach)  cmd_attach "$@" ;;
+        plan)    cmd_plan "$@" ;;
         cancel)  cmd_cancel "$@" ;;
         retry)   cmd_retry "$@" ;;
         events)  cmd_events "$@" ;;

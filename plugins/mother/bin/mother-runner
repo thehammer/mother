@@ -23,9 +23,10 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 # tick. On SIGTERM/SIGINT, stops accepting new work and waits up to
 # MOTHER_SHUTDOWN_GRACE seconds for in-flight jobs before exiting.
 #
-# On startup, any jobs in `running` state whose tmux window is gone are
-# marked failed with reason=runner_died (crash recovery). Jobs whose tmux
-# windows are still alive are left alone (no re-adoption).
+# On startup, any jobs in `running` state whose worker pid is gone are marked
+# failed with reason=runner_died (crash recovery). Jobs whose worker is still
+# alive are left alone (no re-adoption). Legacy records without `worker_pid`
+# fall back to matching a recorded `tmux_window` against live tmux windows.
 #
 # Starts typically via `mother daemon start`. See also `mother daemon stop|status`.
 
@@ -123,34 +124,40 @@ _spawn_job() {
 # ---------- crash recovery ----------
 
 _recover_orphans() {
-    # If tmux isn't available, we can't safely tell living windows from dead
-    # ones. Be conservative: leave running jobs alone.
-    if ! command -v tmux >/dev/null 2>&1; then
-        _log "tmux not found — skipping orphan recovery"
-        return 0
+    # Primary check: `worker_pid` + `kill -0`. Falls back to a tmux-window
+    # match for legacy job records (created before the headless-worker
+    # migration) that recorded `tmux_window` instead of `worker_pid`.
+    local windows=""
+    if command -v tmux >/dev/null 2>&1; then
+        windows=$(tmux list-windows -a -F '#W' 2>/dev/null || echo "")
     fi
 
-    local windows
-    windows=$(tmux list-windows -a -F '#W' 2>/dev/null) || {
-        _log "tmux list-windows failed — skipping orphan recovery"
-        return 0
-    }
-
-    local f state window id
+    local f state pid window id
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state' "$f" 2>/dev/null) || continue
         [ "$state" = "running" ] || continue
-        window=$(jq -r '.tmux_window // ""' "$f")
         id=$(jq -r '.id' "$f")
-        if [ -z "$window" ]; then
-            # No window recorded at all — treat as orphaned.
-            _log "marking $id failed (runner_died, no tmux_window recorded)"
-            _job_transition "$id" failed '{"reason":"runner_died"}'
-            continue
-        fi
-        if ! grep -Fxq "$window" <<< "$windows"; then
-            _log "marking $id failed (runner_died, window $window gone)"
+        pid=$(jq -r '.worker_pid // empty' "$f")
+        window=$(jq -r '.tmux_window // ""' "$f")
+
+        if [ -n "$pid" ]; then
+            if ! kill -0 "$pid" 2>/dev/null; then
+                _log "marking $id failed (runner_died, pid $pid gone)"
+                _job_transition "$id" failed '{"reason":"runner_died"}'
+            fi
+        elif [ -n "$window" ]; then
+            # Legacy path: jobs recorded before the headless-worker migration.
+            if [ -z "$windows" ]; then
+                _log "skipping $id (legacy tmux_window record, no tmux available)"
+                continue
+            fi
+            if ! grep -Fxq "$window" <<< "$windows"; then
+                _log "marking $id failed (runner_died, window $window gone)"
+                _job_transition "$id" failed '{"reason":"runner_died"}'
+            fi
+        else
+            _log "marking $id failed (runner_died, no worker_pid or tmux_window recorded)"
             _job_transition "$id" failed '{"reason":"runner_died"}'
         fi
     done
@@ -206,7 +213,7 @@ _drain() {
     _reap_children
     local remaining; remaining=$(_count_running_children)
     if [ "$remaining" -gt 0 ]; then
-        _log "drain grace expired — $remaining child(ren) still running; exiting anyway (jobs continue in their tmux windows)"
+        _log "drain grace expired — $remaining child(ren) still running; exiting anyway (jobs continue as detached worker processes)"
     fi
 }
 

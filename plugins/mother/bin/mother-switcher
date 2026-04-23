@@ -9,7 +9,12 @@
 #   ctrl-x    → cancel a live job and reload the list
 #   ctrl-r    → retry a failed/cancelled job and reload the list
 #   ctrl-d    → archive a terminal-state job (immediate, regardless of age)
+#   ctrl-p    → show the job's plan file
 #   ctrl-q    → quit
+#
+# Rows are colored by state (succeeded/running/failed/cancelled/queued) and
+# carry an elapsed-duration column. The preview pane runs `mother peek --watch`
+# so the snapshot refreshes while the popup is open.
 #
 # Use absolute paths in fzf bindings so the popup works regardless of the
 # shell's $PATH inside the tmux popup.
@@ -28,6 +33,7 @@ done
 _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 : "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
 MOTHER_BIN="$MOTHER_BIN_DIR/mother"
+export MOTHER_BIN
 
 if ! command -v fzf >/dev/null 2>&1; then
     echo "mother-switcher: fzf is not installed or not on \$PATH" >&2
@@ -35,11 +41,53 @@ if ! command -v fzf >/dev/null 2>&1; then
     exit 1
 fi
 
-# Row source: one line per job, TAB-separated, id first so `{1}` refers to it.
+# Build one TAB-separated row per job:
+#   <id>\t<colored_state>\t<duration>\t<repo>\t<title>
 # `--with-nth 2..` hides the id from the fzf display but keeps it as {1}.
-rows_cmd="\"$MOTHER_BIN\" list --format json | jq -r '.[] | [.id, .state, .repo, .title] | @tsv'"
+# State is padded to 10 chars BEFORE wrapping in ANSI escapes so columns align
+# under `--ansi`. Duration is derived in jq from started_at/finished_at (now
+# for running jobs), right-padded to 6 chars.
+_format_rows() {
+    "$MOTHER_BIN" list --format json | jq -r '
+        def rpad(s; n): (s + (" " * n))[0:n];
+        def color_state(st):
+            (rpad(st; 10)) as $padded
+            | if   st == "succeeded" then "[38;5;114m" + $padded + "[0m"
+              elif st == "running"   then "[38;5;220m" + $padded + "[0m"
+              elif st == "failed"    then "[38;5;203m" + $padded + "[0m"
+              elif st == "cancelled" then "[38;5;245m" + $padded + "[0m"
+              elif st == "queued" or st == "ready" then
+                                          "[38;5;75m"  + $padded + "[0m"
+              else $padded end;
+            def fmt_dur(s):
+                if   s <  60   then (s | tostring) + "s"
+                elif s < 3600  then ((s / 60 | floor) | tostring) + "m"
+                elif s < 86400 then
+                    ((s / 3600 | floor) | tostring) + "h" +
+                    (((s % 3600) / 60 | floor) | tostring) + "m"
+                else ((s / 86400 | floor) | tostring) + "d"
+                end;
+        def duration:
+            (.started_at // null)  as $s
+            | (.finished_at // null) as $f
+            | if $s == null then ""
+              else
+                  ($s | fromdateiso8601) as $se
+                  | (if $f == null then now else ($f | fromdateiso8601) end) as $fe
+                  | fmt_dur(($fe - $se) | floor)
+              end;
+        .[] | [
+            .id,
+            color_state(.state),
+            rpad(duration; 6),
+            .repo,
+            .title
+        ] | @tsv
+    '
+}
+export -f _format_rows
 
-rows=$(eval "$rows_cmd")
+rows=$(_format_rows)
 
 if [ -z "$rows" ]; then
     echo "(no queued jobs)"
@@ -49,15 +97,19 @@ if [ -z "$rows" ]; then
     exit 0
 fi
 
+reload_cmd='bash -c _format_rows'
+
 printf '%s\n' "$rows" | fzf \
+    --ansi \
     --delimiter $'\t' \
     --with-nth '2..' \
-    --preview "\"$MOTHER_BIN\" peek {1}" \
+    --preview "\"$MOTHER_BIN\" peek --watch {1}" \
     --preview-window 'right:60%:wrap' \
-    --header 'enter: logs  ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-q: quit' \
+    --header 'enter: logs  ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-p: plan  ctrl-q: quit' \
     --bind "enter:execute(\"$MOTHER_BIN\" logs {1} --follow)" \
-    --bind "ctrl-x:execute-silent(\"$MOTHER_BIN\" cancel {1})+reload($rows_cmd)" \
-    --bind "ctrl-r:execute-silent(\"$MOTHER_BIN\" retry {1})+reload($rows_cmd)" \
-    --bind "ctrl-d:execute-silent(\"$MOTHER_BIN\" archive {1})+reload($rows_cmd)" \
+    --bind "ctrl-x:execute-silent(\"$MOTHER_BIN\" cancel {1})+reload($reload_cmd)" \
+    --bind "ctrl-r:execute-silent(\"$MOTHER_BIN\" retry {1})+reload($reload_cmd)" \
+    --bind "ctrl-d:execute-silent(\"$MOTHER_BIN\" archive {1})+reload($reload_cmd)" \
+    --bind "ctrl-p:execute(\"$MOTHER_BIN\" plan {1})" \
     --bind 'ctrl-q:abort' \
     >/dev/null
