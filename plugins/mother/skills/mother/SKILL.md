@@ -1,33 +1,34 @@
 ---
-name: queue
-description: Dispatch and monitor background implementation work via the local queue runner. Use when the user agrees on a plan to ship, asks "what's running?" or "what's queued?", wants to cancel or retry a job, or asks about PRs the queue has opened. Plans must be self-contained — invoke the `archie` agent first to produce one from the conversation before enqueueing.
+name: mother
+description: Dispatch and monitor background implementation work via Mother, a local background-work orchestrator. Use when the user agrees on a plan to ship, asks "what's running?" or "what's queued?", wants to cancel or retry a job, or asks about PRs Mother has opened. Plans must be self-contained — invoke the `archie` agent first to produce one from the conversation before enqueueing.
 ---
 
-# Queue — Background Work Dispatch
+# Mother — Background Work Dispatch
 
-Local queue for background Claude Code jobs. Plans run in worktrees (parallel) or
-in the main repo dir (serialized via existing workspace locks). Background sessions
-spawn via tmux, run `claude --agent cody -p "<plan>"`, and open PRs on completion.
+Local orchestrator for background Claude Code jobs. Plans run in worktrees
+(parallel) or in the main repo dir (serialized via workspace locks). Background
+sessions spawn as headless workers running `claude --agent cody -p "<plan>"` and
+open PRs on completion.
 
 State lives at `${MOTHER_ROOT:-$HOME/.mother}/` (plain JSON, gitignored). See
-`~/.claude/plans/queue-system.md` for the full design.
+the Mother plugin's `docs/design.md` for the full design.
 
 ## When to use this skill
 
 **Trigger — offer to queue work** when the user:
 - Agrees to ship a plan you've just converged on together
 - Says "let's implement this", "make it happen", "go build it", "ship it"
-- Has a Jira ticket with a clear, self-contained fix
+- Has a ticket (Jira, GitHub Issue, Linear, etc.) with a clear, self-contained fix
 
-**Trigger — report queue state** when the user asks:
+**Trigger — report Mother's state** when the user asks:
 - "What's running?" / "What's in flight?" / "What's queued?"
-- "What happened with that job?" / "Did CORE-XXXX's PR open?"
+- "What happened with that job?" / "Did TICKET-XXXX's PR open?"
 - "Cancel that" / "Retry it"
 
 ## The flow (proactive — PREFERENCES tells you to offer this)
 
 1. **Converge on intent** in conversation with the user.
-2. **Offer to queue.** ("Want me to queue this as a background job?")
+2. **Offer to queue.** ("Want me to have Mother run this as a background job?")
 3. **Invoke the `archie` agent** with a brief. Archie returns a full self-contained
    plan doc in the standard format.
 4. **Present the plan inline for review.** Show it in the conversation. Let the
@@ -38,33 +39,38 @@ State lives at `${MOTHER_ROOT:-$HOME/.mother}/` (plain JSON, gitignored). See
 
 ## CLI surface
 
-The `queue` command is always in PATH (`~/.claude/bin/queue`).
+The `mother` command is on PATH when the plugin is installed (via the plugin's
+`scripts/install.sh`, which symlinks into `~/.local/bin`).
 
 ```bash
 # Enqueue (returns job id on stdout)
-queue add --plan-file /tmp/plan.md \
-          --repo my-service \
-          --branch fix/TICKET-1234-slug \
-          --isolation worktree \
-          --max-cost 5
+mother add --plan-file /tmp/plan.md \
+           --repo my-service \
+           --branch fix/TICKET-1234-slug \
+           --isolation worktree \
+           --max-cost 5
 
-# List active jobs (omit --state to see non-terminal only)
-queue list
-queue list --state running
-queue list --format json   # for programmatic reads
+# List jobs (omit --state to see non-terminal only)
+mother list
+mother list --state running
+mother list --format json   # for programmatic reads
 
 # Full job + event history
-queue status <id>
-queue logs <id>
-queue logs <id> --follow
+mother status <id>
+mother peek <id>            # live snapshot of worker's transcript (running or done)
+mother logs <id>
+mother logs <id> --follow
 
 # Mutations
-queue cancel <id>
-queue retry <id>
+mother cancel <id>
+mother retry <id>
+
+# Attach to a running worker's log in a new tmux window (opt-in)
+mother attach <id>
 
 # Deltas for in-session awareness (the UserPromptSubmit hook uses this; you may
 # occasionally call it manually if the user asks "what's new?")
-queue events --since-cursor <session-id>
+mother events --since-cursor <session-id>
 ```
 
 ## Typical invocation pattern
@@ -77,20 +83,17 @@ cat > /tmp/plan-TICKET-1234.md <<'PLAN'
 <Archie's output pasted verbatim>
 PLAN
 
-# 2. Enqueue
-id=$(queue add --plan-file /tmp/plan-TICKET-1234.md \
-               --repo my-service \
-               --branch fix/TICKET-1234-slug \
-               --isolation worktree \
-               --max-cost 3)
+# 2. Enqueue — the daemon picks it up asynchronously
+id=$(mother add --plan-file /tmp/plan-TICKET-1234.md \
+                --repo my-service \
+                --branch fix/TICKET-1234-slug \
+                --isolation worktree \
+                --max-cost 3)
 echo "Queued: $id"
-
-# 3. Run it (phase 1 blocks the current session — this is expected for now)
-queue run --once
 ```
 
-In phase 2 once the daemon is live, step 3 goes away — `mother add` is enough,
-the daemon picks up the job asynchronously.
+Claude can keep working in the interactive session; state changes (succeeded,
+pr_opened, failed) surface via the UserPromptSubmit hook in the next turn.
 
 ## Useful details
 
@@ -101,9 +104,8 @@ the daemon picks up the job asynchronously.
 - **Always set `--max-cost`** unless the user explicitly says otherwise. A few
   dollars is plenty for most small fixes.
 - **Branch names** follow the project's convention: check the repo's
-  `CLAUDE.md`, `.claude/preferences/`, or recent `git log` for the established
-  pattern. Common shapes: `fix/TICKET-NNNN-slug`, `feature/TICKET-NNNN-slug`,
-  `<username>/<slug>`.
+  `CLAUDE.md` or recent `git log` for the established pattern. Common shapes:
+  `fix/TICKET-NNNN-slug`, `feature/TICKET-NNNN-slug`, `<username>/<slug>`.
 - **Base ref.** Defaults to `origin/main`. Some repos use `master` or a
   release branch. Archie is responsible for checking the repo's default and
   specifying correctly in the plan.
@@ -111,9 +113,9 @@ the daemon picks up the job asynchronously.
 ## Do not use this skill when
 
 - The work needs the user's **local Docker stack** for verification (seeded DB,
-  herd services, fixture data) — keep it interactive.
-- The work is **frontend / UI** that needs browser verification — cody in a
+  fixtures, per-developer services) — keep it interactive.
+- The work is **frontend / UI** that needs browser verification — Cody in a
   worktree has no browser.
-- The plan is **still taking shape** — wait until it's solid. Enqueueing a
-  half-formed plan wastes a cody session and the user's budget.
+- The plan is **still taking shape** — wait until it's solid. Dispatching a
+  half-formed plan wastes a Cody session and the user's budget.
 - The work is **one line** you could do inline in under 30 seconds.
