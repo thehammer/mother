@@ -67,9 +67,9 @@ _format_rows() {
                     (((s % 3600) / 60 | floor) | tostring) + "m"
                 else ((s / 86400 | floor) | tostring) + "d"
                 end;
-        # Mother's timestamps are microsecond-precision ISO-8601 (…%06dZ).
-        # jq's fromdateiso8601 only understands second-precision (…%SZ), so
-        # strip the fractional seconds before parsing.
+        # Mother timestamps are microsecond-precision ISO-8601 (trailing
+        # .NNNNNNZ). jqs fromdateiso8601 only understands second-precision,
+        # so strip the fractional seconds before parsing.
         def parse_ts: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
         def duration:
             (.started_at // null)  as $s
