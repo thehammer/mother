@@ -44,12 +44,17 @@ between you and your agents, and never runs without explicit consent.
 - `mother-runner` **daemon** — long-lived process that picks up queued jobs
   and spawns workers. Managed via launchd on macOS.
 - `mother-run-job` **worker spawner** — sets up the worktree, spawns
-  `claude --agent cody -p <plan>` as a headless background process, tees the
-  log, polls for completion.
+  `claude --agent "$MOTHER_WORKER_AGENT" -p <plan>` (default: `mother:cody`)
+  as a headless background process, tees the log, polls for completion.
 - `UserPromptSubmit` **hook** — surfaces state changes (succeeded, pr_opened,
   failed) in your next user message as a `<system-reminder>`.
-- Reference `archie` (planner) and `cody` (worker) **agents** — portable
-  defaults you can override with your own.
+- Reference `mother:archie` (planner) and `mother:cody` (worker)
+  **agents** — plugin-shipped defaults, namespaced under the plugin. Claude
+  Code exposes plugin-shipped agents as `<plugin>:<agent>`, so a fresh
+  install gives you `mother:archie` and `mother:cody`. If you already have
+  unprefixed `archie` / `cody` agents in `~/.claude/agents/`, Claude will
+  use those by name; set `MOTHER_WORKER_AGENT=cody` to have Mother dispatch
+  your personal `cody` instead of the plugin's.
 - `mother-switcher` **fzf popup** — bind to your tmux prefix (`prefix Space`);
   live preview, quick cancel/retry/archive/plan bindings.
 - Opt-in **statusline segment** — `source plugins/mother/statusline/segment.sh`

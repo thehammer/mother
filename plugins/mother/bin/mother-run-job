@@ -21,9 +21,11 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 # the same way. Responsibilities:
 #   - Resolve the target working directory (worktree or main dir).
 #   - Acquire a workspace lock if isolation=main-dir.
-#   - Spawn `claude --agent cody -p "$(cat <plan>)"` as a headless background
-#     process (nohup + disown) at that cwd, tee'd to the job log. The pid is
-#     recorded on the job as `worker_pid`.
+#   - Spawn `claude --agent <worker_agent> -p "$(cat <plan>)"` as a headless
+#     background process (nohup + disown) at that cwd, tee'd to the job log.
+#     The worker agent defaults to `mother:cody` (plugin-shipped, works
+#     out-of-the-box for fresh installs); override via MOTHER_WORKER_AGENT.
+#     The pid is recorded on the job as `worker_pid`.
 #   - Poll a status-marker file; transition the job on exit.
 #   - On cancellation: SIGTERM the worker, wait 10s, then SIGKILL.
 #   - Parse the log for a PR URL and cost info (best-effort).
@@ -145,8 +147,19 @@ else
     _append_event "started" "$(jq -nc --arg d "$work_dir" '{work_dir: $d}')"
 fi
 
-# Spawn claude in a new tmux window. Use a wrapper script so we can capture
-# exit status and keep quoting sane.
+# Spawn claude in a headless background process. Use a wrapper script so we
+# can capture exit status and keep quoting sane.
+#
+# Worker agent resolution: defaults to the plugin-shipped `mother:cody`
+# (Claude Code namespaces plugin-shipped agents with the plugin's name).
+# Users who have their own `cody` agent locally and prefer to use it can
+# override via the MOTHER_WORKER_AGENT env var:
+#
+#     MOTHER_WORKER_AGENT=cody mother daemon start
+#
+# Or permanently in the launchd plist's EnvironmentVariables block.
+worker_agent="${MOTHER_WORKER_AGENT:-mother:cody}"
+
 marker_file="$RUNNER_DIR/$id.exit"
 wrapper="$RUNNER_DIR/$id.wrap"
 cat > "$wrapper" <<WRAP
@@ -156,11 +169,12 @@ exec > >(tee -a "$log_path") 2>&1
 echo "=== mother job $id starting at \$(date) ==="
 echo "=== working dir: \$PWD ==="
 echo "=== branch:      $branch ==="
+echo "=== agent:       $worker_agent ==="
 echo
 # stream-json + verbose gives us a live per-event log (one JSON object per
 # line). \`mother logs --follow\` pretty-prints these via mother-stream-pretty;
 # the raw file stays authoritative and greppable.
-claude --agent cody -p "\$(cat "$plan_path")" --output-format stream-json --verbose
+claude --agent "$worker_agent" -p "\$(cat "$plan_path")" --output-format stream-json --verbose
 echo \$? > "$marker_file"
 WRAP
 chmod +x "$wrapper"

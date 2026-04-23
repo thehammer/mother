@@ -8,7 +8,7 @@ naturally in subsequent conversations.
 
 - Plans become background implementation work without leaving the interactive session.
 - No slash commands on the user's side. Dispatch happens via Bash tool calls from Claude.
-- Background sessions run locally — tmux + worktrees + `claude --agent cody`.
+- Background sessions run locally — tmux + worktrees + `claude --agent mother:cody`.
 - In-session awareness of queue state (completions, failures, PR URLs) surfaces via
   prompt-injection, not polling.
 - Architecture is executor-agnostic so a cloud executor can slot in later without
@@ -88,7 +88,7 @@ into `~/Library/LaunchAgents/`).
   - Main-dir jobs for a given repo serialize via `locks.sh` (`<repo>:workspace`).
 - Spawn executor:
   - **local-tmux** (v1): call `worktree_create` if isolation is worktree, open a new
-    tmux window at the target path, run `claude --agent cody -p "$PLAN"` with
+    tmux window at the target path, run `claude --agent mother:cody -p "$PLAN"` with
     `--max-cost` and `--output-format stream-json`, tee output to `logs/<id>.log`.
   - Parse the stream for known signals (PR URL created, cost updates, errors) and emit
     corresponding events.
@@ -218,7 +218,7 @@ Recommended block under Workflow Preferences in the user's personal prompt:
 > workflow tweaks, targeted refactors), proactively offer to queue it rather than
 > implementing inline.
 >
-> **Flow:** Invoke the `archie` agent to produce a plan. Present it inline for
+> **Flow:** Invoke the `mother:archie` agent to produce a plan. Present it inline for
 > review. Iterate with the user until approved. Then call `mother add`. Do NOT
 > enqueue without explicit user approval of the plan.
 >

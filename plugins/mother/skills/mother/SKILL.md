@@ -1,14 +1,14 @@
 ---
 name: mother
-description: Dispatch and monitor background implementation work via Mother, a local background-work orchestrator. Use when the user agrees on a plan to ship, asks "what's running?" or "what's queued?", wants to cancel or retry a job, or asks about PRs Mother has opened. Plans must be self-contained — invoke the `archie` agent first to produce one from the conversation before enqueueing.
+description: Dispatch and monitor background implementation work via Mother, a local background-work orchestrator. Use when the user agrees on a plan to ship, asks "what's running?" or "what's queued?", wants to cancel or retry a job, or asks about PRs Mother has opened. Plans must be self-contained — invoke the `mother:archie` agent first to produce one from the conversation before enqueueing. (If the user has their own unprefixed `archie` agent installed, that takes precedence.)
 ---
 
 # Mother — Background Work Dispatch
 
 Local orchestrator for background Claude Code jobs. Plans run in worktrees
 (parallel) or in the main repo dir (serialized via workspace locks). Background
-sessions spawn as headless workers running `claude --agent cody -p "<plan>"` and
-open PRs on completion.
+sessions spawn as headless workers running `claude --agent mother:cody -p "<plan>"`
+(or your own `cody` via `MOTHER_WORKER_AGENT`) and open PRs on completion.
 
 State lives at `${MOTHER_ROOT:-$HOME/.mother}/` (plain JSON, gitignored). See
 the Mother plugin's `docs/design.md` for the full design.
@@ -29,8 +29,9 @@ the Mother plugin's `docs/design.md` for the full design.
 
 1. **Converge on intent** in conversation with the user.
 2. **Offer to queue.** ("Want me to have Mother run this as a background job?")
-3. **Invoke the `archie` agent** with a brief. Archie returns a full self-contained
-   plan doc in the standard format.
+3. **Invoke the `mother:archie` agent** with a brief (the plugin-shipped
+   planner; use a bare `archie` if the user has their own local override).
+   Archie returns a full self-contained plan doc in the standard format.
 4. **Present the plan inline for review.** Show it in the conversation. Let the
    user iterate — edits, scope changes, splits, or scrap-and-restart. Re-invoke
    Archie with feedback if needed.
