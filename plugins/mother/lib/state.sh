@@ -1,7 +1,7 @@
-# mother/state.sh — shared state primitives for the queue CLI and daemon.
+# state.sh — shared state primitives for Mother's CLI and daemon.
 #
-# Sourced by the mother CLI and ~/.claude/bin/mother-runner. Do not
-# invoke directly.
+# Sourced by bin/mother and bin/mother-runner (siblings of this lib dir).
+# Do not invoke directly.
 #
 # All callers get the same constants and helpers so there's one source of
 # truth for the on-disk state layout. The caller owns shell options (we

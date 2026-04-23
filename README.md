@@ -2,9 +2,9 @@
 
 > *"Mother, may I?"*
 
-**Mother** is a local background-work orchestrator for Claude Code. You converge
-on a plan in conversation, ask Mother if she may, and she runs it in a worktree
-while you keep working.
+**Mother** is a local background-work orchestrator for [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview).
+You converge on a plan in conversation, Mother runs it in a git worktree while
+you keep working, and completion surfaces in your next message.
 
 Named for the ship's computer in *Alien* (`MU/TH/UR 6000`) and the children's
 permission game. Both are apt: Mother grants or denies permission, mediates
@@ -16,7 +16,7 @@ between you and your agents, and never runs without explicit consent.
   you ─── converge on a plan ─── Claude
                                    │
                                    ▼
-                        spawns Archie (planner)
+                        spawns archie (planner)
                                    │
                                    ▼
                       plan draft ──── you review
@@ -29,7 +29,7 @@ between you and your agents, and never runs without explicit consent.
                       │                  │
                       │  worktree        │
                       │     │            │
-                      │     └─ Cody ─── implements, opens PR
+                      │     └─ cody ─── implements, opens PR
                       └──────────────────┘
                                    │
                   PR opened ─── notification ─── next reply
@@ -37,52 +37,95 @@ between you and your agents, and never runs without explicit consent.
 
 ## What ships in this plugin
 
-- A **skill** (`mother`) that Claude reaches for naturally when you agree to ship a plan.
-- A **CLI** (`mother`) for adding, listing, peeking, cancelling, retrying jobs.
-- A **daemon** (`mother-runner`) that picks up queued jobs and spawns workers.
-- A **worker spawner** (`mother-run-job`) that sets up the worktree and runs Claude.
-- A **UserPromptSubmit hook** that surfaces job completions in your next message.
-- Reference **Archie** (planner) and **Cody** (worker) agents, customizable.
-- An **fzf-based tmux popup** (`mother-switcher`) bound to your tmux prefix for
-  glanceable status and quick actions.
-- An **opt-in statusline segment** showing running/queued counts.
+- `mother` **skill** — Claude's natural handle into the system. Triggers when
+  you agree to ship a plan, ask "what's running?", or want to cancel/retry.
+- `mother` **CLI** — `add`, `list`, `status`, `peek`, `logs`, `cancel`,
+  `retry`, `archive`, `plan`, `attach`, `daemon install|start|stop|status|uninstall`.
+- `mother-runner` **daemon** — long-lived process that picks up queued jobs
+  and spawns workers. Managed via launchd on macOS.
+- `mother-run-job` **worker spawner** — sets up the worktree, spawns
+  `claude --agent cody -p <plan>` as a headless background process, tees the
+  log, polls for completion.
+- `UserPromptSubmit` **hook** — surfaces state changes (succeeded, pr_opened,
+  failed) in your next user message as a `<system-reminder>`.
+- Reference `archie` (planner) and `cody` (worker) **agents** — portable
+  defaults you can override with your own.
+- `mother-switcher` **fzf popup** — bind to your tmux prefix (`prefix Space`);
+  live preview, quick cancel/retry/archive/plan bindings.
+- Opt-in **statusline segment** — `source plugins/mother/statusline/segment.sh`
+  and call `mother_segment` for a compact `Q ▶2 ⏸5` render.
 
 ## Requirements
 
-- macOS or Linux (tested on macOS)
-- `bash` 4+ (`/bin/bash` on macOS is old — install from brew if needed)
-- `jq`, `tmux`, `fzf`, `git`
-- `claude` CLI (Claude Code)
-- For the daemon on macOS: launchd (built-in). Linux: systemd user units.
+- macOS (launchd daemon) or Linux (systemd TODO — start manually for now)
+- `bash` 4+ (macOS `/bin/bash` is 3.2; `brew install bash` if needed)
+- `jq`, `tmux`, `fzf`, `git`, `python3` (for `mother peek`)
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) (`claude`) on PATH
 
 ## Install
-
-Planned: single-plugin marketplace you add to Claude Code.
 
 ```
 /plugin marketplace add thehammer/mother
 /plugin install mother
 ```
 
-Then one-shot bootstrap from the CLI:
+Then bootstrap the daemon and symlinks:
 
 ```
-mother doctor          # verify deps
-mother daemon install  # installs the launchd plist or systemd unit
+plugins/mother/scripts/install.sh   # symlinks bin/* into ~/.local/bin + runs doctor
+mother doctor                        # verify deps
+mother daemon install                # launchd plist on macOS
 mother daemon start
 ```
 
-## Status
+Optional:
 
-🚧 **Scratch / design phase.** This repo is a structural sketch being walked
-through interactively. Files here may be skeletons; the real ported content
-lives at `~/.claude/bin/queue*` and related paths on the author's machine.
+```
+# tmux popup
+echo 'bind Space display-popup -w 80% -h 80% -E "$HOME/.local/bin/mother-switcher"' >> ~/.tmux.conf
+tmux source-file ~/.tmux.conf
 
-## Design doc
+# statusline segment
+source "$PLUGIN_DIR/plugins/mother/statusline/segment.sh"
+# then include "$(mother_segment)" in your statusline renderer
+```
 
-See the original design: [`docs/design.md`](docs/design.md) (TODO: port from
-`~/.claude/plans/queue-system.md`).
+## Usage sketch
+
+```
+# 1. propose a plan (archie agent produces one, or write your own)
+# 2. review + approve
+# 3. queue it
+mother add \
+  --plan-file /tmp/my-plan.md \
+  --repo my-service \
+  --branch fix/TICKET-1234-slug \
+  --isolation worktree \
+  --max-cost 3
+
+# 4. keep working in your Claude session.
+#    mother runs the job headless; completion surfaces via the hook.
+
+# 5. peek / logs / manage
+mother list
+mother peek <id>
+mother logs <id> --follow
+mother cancel <id>
+```
+
+Or, from inside tmux: hit your bound key (default `prefix Space`) and use the
+switcher.
+
+## Works well with
+
+- **Redd** and **Marty** — optional companion agents for test-first and
+  refactor phases of red-green-refactor. Cody uses them when available.
+
+## Design
+
+See [`docs/design.md`](docs/design.md) for the full architecture: data model,
+event lifecycle, file layout, phased build.
 
 ## License
 
-TBD — MIT leaning.
+MIT — see [`LICENSE`](LICENSE).

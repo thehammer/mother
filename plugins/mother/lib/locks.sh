@@ -1,14 +1,18 @@
 #!/bin/bash
-# Resource Locking for Claude Code IDE
+# Resource locking for Mother
 # Prevents concurrent access to shared resources (tests, database, build)
 #
-# Lock files stored in ~/.claude/ide/locks/{lock_name}.lock
-# Each lock is a JSON file with holder info for debugging and stale detection
+# Lock files stored in ${MOTHER_ROOT}/locks/{lock_name}.lock
+# (default: ~/.mother/locks). Each lock is a JSON file with holder info
+# for debugging and stale detection.
 
-IDE_LOCKS_DIR="$HOME/.claude/ide/locks"
+: "${MOTHER_ROOT:=$HOME/.mother}"
+MOTHER_LOCKS_DIR="$MOTHER_ROOT/locks"
+# Back-compat alias: older callers may reference IDE_LOCKS_DIR.
+IDE_LOCKS_DIR="$MOTHER_LOCKS_DIR"
 
 # Ensure directory exists
-mkdir -p "$IDE_LOCKS_DIR" 2>/dev/null
+mkdir -p "$MOTHER_LOCKS_DIR" 2>/dev/null
 
 # Sanitize lock name for filesystem
 # Args: $1 = lock name (e.g., "project:tests")

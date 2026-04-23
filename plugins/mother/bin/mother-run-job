@@ -43,9 +43,9 @@ job_file="$JOBS_DIR/$id.json"
 [ -f "$job_file" ] || { echo "mother-run-job: no such job: $id" >&2; exit 1; }
 
 # shellcheck source=/dev/null
-source "$HOME/.claude/lib/core/worktree.sh"
+source "$MOTHER_LIB_DIR/worktree.sh"
 # shellcheck source=/dev/null
-source "$HOME/.claude/lib/core/locks.sh"
+source "$MOTHER_LIB_DIR/locks.sh"
 
 mother_cli="$MOTHER_BIN_DIR/mother"
 
@@ -117,7 +117,7 @@ work_dir=""
 if [ "$isolation" = "worktree" ]; then
     (cd "$repo_path" && git fetch --quiet origin "${base_ref#origin/}" 2>/dev/null || true)
     # Create the branch + worktree from base_ref.
-    wt_path=$(cd "$repo_path" && source "$HOME/.claude/lib/core/worktree.sh" && worktree_get_path "$branch")
+    wt_path=$(cd "$repo_path" && source "$MOTHER_LIB_DIR/worktree.sh" && worktree_get_path "$branch")
     if [ ! -d "$wt_path" ]; then
         (cd "$repo_path" && git worktree add -b "$branch" "$wt_path" "$base_ref") \
             || { _transition failed "$(jq -nc --arg r "worktree_create_failed" '{reason: $r}')"; exit 1; }
