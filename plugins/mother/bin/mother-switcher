@@ -107,7 +107,7 @@ printf '%s\n' "$rows" | fzf \
     --ansi \
     --delimiter $'\t' \
     --with-nth '2..' \
-    --preview "\"$MOTHER_BIN\" peek --watch {1}" \
+    --preview "\"$MOTHER_BIN\" peek {1} --watch" \
     --preview-window 'right:60%:wrap' \
     --header 'enter: logs  ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-p: plan  ctrl-q: quit' \
     --bind "enter:execute(\"$MOTHER_BIN\" logs {1} --follow)" \
