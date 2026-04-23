@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 
 # --- mother plugin path resolver (prepended during port) ---
-_MOTHER_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolves symlinks so the plugin works when installed via `ln -s` into a bin dir.
+_MOTHER_RAW="${BASH_SOURCE[0]}"
+while [ -L "$_MOTHER_RAW" ]; do
+    _link="$(readlink "$_MOTHER_RAW")"
+    case "$_link" in
+        /*) _MOTHER_RAW="$_link" ;;
+        *)  _MOTHER_RAW="$(dirname "$_MOTHER_RAW")/$_link" ;;
+    esac
+done
+_MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 : "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
 : "${MOTHER_LIB_DIR:=$_MOTHER_SELF/../lib}"
 # -----------------------------------------------------------

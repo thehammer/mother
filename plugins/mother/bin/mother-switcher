@@ -15,7 +15,16 @@
 
 set -u
 
-_MOTHER_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so this script works when invoked via `ln -s` in a bin dir.
+_MOTHER_RAW="${BASH_SOURCE[0]}"
+while [ -L "$_MOTHER_RAW" ]; do
+    _link="$(readlink "$_MOTHER_RAW")"
+    case "$_link" in
+        /*) _MOTHER_RAW="$_link" ;;
+        *)  _MOTHER_RAW="$(dirname "$_MOTHER_RAW")/$_link" ;;
+    esac
+done
+_MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 : "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
 MOTHER_BIN="$MOTHER_BIN_DIR/mother"
 
