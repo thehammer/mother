@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Mother daemon launchd agent for macOS.
+
+  Install:
+    cp com.thehammer.mother.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.thehammer.mother.plist
+
+  The `mother daemon install` subcommand automates this and substitutes
+  the absolute path to mother-runner based on the plugin install location.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.thehammer.mother</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- TODO: install.sh substitutes the absolute path to mother-runner here. -->
+    <string>__MOTHER_RUNNER_PATH__</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__MOTHER_STATE_DIR__/runner/runner.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__MOTHER_STATE_DIR__/runner/runner.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>__USER_HOME__</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

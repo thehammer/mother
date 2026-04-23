@@ -1,0 +1,12 @@
+{
+  "name": "mother",
+  "description": "Local background-work orchestrator for Claude Code. Propose a plan, Mother runs it in a worktree while you keep working.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Hammer",
+    "url": "https://github.com/thehammer"
+  },
+  "homepage": "https://github.com/thehammer/mother",
+  "license": "MIT",
+  "keywords": ["queue", "background", "worktree", "tmux", "automation"]
+}

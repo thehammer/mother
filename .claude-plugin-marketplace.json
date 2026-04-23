@@ -1,0 +1,17 @@
+{
+  "name": "thehammer-mother",
+  "description": "Mother — local background-work orchestrator for Claude Code",
+  "owner": {
+    "name": "Hammer",
+    "url": "https://github.com/thehammer"
+  },
+  "plugins": [
+    {
+      "name": "mother",
+      "source": "./plugins/mother",
+      "description": "Background work for Claude Code. Propose a plan, Mother runs it.",
+      "version": "0.1.0",
+      "tags": ["queue", "background", "automation", "tmux"]
+    }
+  ]
+}

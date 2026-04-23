@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# mother-switcher — fzf popup for browsing and acting on Mother jobs.
+#
+# Designed to be invoked from a tmux popup:
+#   bind Space display-popup -w 80% -h 80% -E "$HOME/.local/bin/mother-switcher"
+#
+# Bindings inside fzf:
+#   enter     → tail the job's log (queue logs --follow)
+#   ctrl-x    → cancel the job and reload the list
+#   ctrl-r    → retry the job and reload the list
+#   ctrl-q    → quit
+#
+# TODO (port): this file is a stub. The real implementation lives in the
+# uncommitted worktree at:
+#   /Users/hammer/.claude-feat-headless-workers-and-queue-switcher/bin/queue-switcher
+# Merge that change first, then port with the standard queue→mother rename.
+
+set -u
+
+_MOTHER_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
+
+command -v fzf >/dev/null 2>&1 || {
+    echo "mother-switcher: fzf not found — install with 'brew install fzf'" >&2
+    exit 1
+}
+
+# TODO: replicate the fzf invocation from the upstream queue-switcher once
+# the headless-workers branch is merged and ported here.
+echo "mother-switcher: not yet implemented in this plugin skeleton" >&2
+echo "See: /Users/hammer/.claude-feat-headless-workers-and-queue-switcher/bin/queue-switcher" >&2
+exit 2

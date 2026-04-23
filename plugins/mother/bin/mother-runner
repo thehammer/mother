@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+
+# --- mother plugin path resolver (prepended during port) ---
+_MOTHER_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
+: "${MOTHER_LIB_DIR:=$_MOTHER_SELF/../lib}"
+# -----------------------------------------------------------
+
+# mother-runner — long-lived daemon for the Claude Code background queue.
+#
+# Polls ${MOTHER_ROOT:-$HOME/.mother}/jobs every MOTHER_POLL_INTERVAL seconds. Promotes
+# queued → ready when dependencies are satisfied, and forks `mother-run-job`
+# children up to MOTHER_CONCURRENCY in parallel. Reaps exited children each
+# tick. On SIGTERM/SIGINT, stops accepting new work and waits up to
+# MOTHER_SHUTDOWN_GRACE seconds for in-flight jobs before exiting.
+#
+# On startup, any jobs in `running` state whose tmux window is gone are
+# marked failed with reason=runner_died (crash recovery). Jobs whose tmux
+# windows are still alive are left alone (no re-adoption).
+#
+# Starts typically via `mother daemon start`. See also `mother daemon stop|status`.
+
+set -u
+
+# shellcheck source=/dev/null
+source "$MOTHER_LIB_DIR/state.sh"
+
+MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
+MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
+MOTHER_SHUTDOWN_GRACE="${MOTHER_SHUTDOWN_GRACE:-30}"
+MOTHER_ARCHIVE_INTERVAL="${MOTHER_ARCHIVE_INTERVAL:-3600}"   # seconds between retention sweeps
+MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
+
+PIDFILE="$RUNNER_DIR/runner.pid"
+CHILDREN_DIR="$RUNNER_DIR/children"
+mkdir -p "$CHILDREN_DIR"
+
+SHUTDOWN=0
+
+# ---------- primitives ----------
+
+_log() {
+    printf '[%s] %s\n' "$(_iso_now)" "$*" >&2
+}
+
+_write_pidfile() {
+    local tmp="$PIDFILE.tmp.$$"
+    echo $$ > "$tmp" && mv "$tmp" "$PIDFILE"
+}
+
+_remove_pidfile() {
+    rm -f "$PIDFILE"
+}
+
+_on_signal() {
+    SHUTDOWN=1
+    _log "signal received — draining"
+}
+
+# ---------- child tracking ----------
+
+_track_child() {
+    local pid="$1" job_id="$2"
+    jq -nc --argjson pid "$pid" --arg job_id "$job_id" --arg started "$(_iso_now)" \
+        '{pid: $pid, job_id: $job_id, started_at: $started}' \
+        > "$CHILDREN_DIR/$pid.json"
+}
+
+_reap_children() {
+    # For each tracked child, remove its file if the pid is dead.
+    local f pid
+    for f in "$CHILDREN_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        pid=$(basename "$f" .json)
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$f"
+        fi
+    done
+}
+
+_count_running_children() {
+    find "$CHILDREN_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+# ---------- ready-job selection ----------
+
+_pick_next_ready() {
+    find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | while read -r f; do
+        jq -r 'select(.state == "ready") | .created_at + "\t" + .id' "$f"
+    done | sort | head -1 | cut -f2
+}
+
+# ---------- spawning ----------
+
+_spawn_job() {
+    local job_id="$1"
+
+    # Pre-transition ready → running so the next poll tick doesn't re-pick
+    # this job. mother-run-job tolerates both ready and running as starting
+    # states. If the fork fails, the job stays `running` with no tmux window;
+    # the next daemon restart's orphan recovery will mark it failed.
+    _job_transition "$job_id" running '{"spawned_by":"daemon"}'
+
+    # Detach via nohup + background + stdin/out/err redirection. mother-run-job
+    # tees its own log. macOS has no setsid, and nohup + disown is sufficient:
+    # signals to the daemon will not cascade once we disown the child.
+    nohup "$MOTHER_BIN_DIR/mother-run-job" "$job_id" </dev/null >/dev/null 2>&1 &
+    local pid=$!
+    disown 2>/dev/null || true
+    _track_child "$pid" "$job_id"
+    _log "spawned job $job_id as pid $pid"
+}
+
+# ---------- crash recovery ----------
+
+_recover_orphans() {
+    # If tmux isn't available, we can't safely tell living windows from dead
+    # ones. Be conservative: leave running jobs alone.
+    if ! command -v tmux >/dev/null 2>&1; then
+        _log "tmux not found — skipping orphan recovery"
+        return 0
+    fi
+
+    local windows
+    windows=$(tmux list-windows -a -F '#W' 2>/dev/null) || {
+        _log "tmux list-windows failed — skipping orphan recovery"
+        return 0
+    }
+
+    local f state window id
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        state=$(jq -r '.state' "$f" 2>/dev/null) || continue
+        [ "$state" = "running" ] || continue
+        window=$(jq -r '.tmux_window // ""' "$f")
+        id=$(jq -r '.id' "$f")
+        if [ -z "$window" ]; then
+            # No window recorded at all — treat as orphaned.
+            _log "marking $id failed (runner_died, no tmux_window recorded)"
+            _job_transition "$id" failed '{"reason":"runner_died"}'
+            continue
+        fi
+        if ! grep -Fxq "$window" <<< "$windows"; then
+            _log "marking $id failed (runner_died, window $window gone)"
+            _job_transition "$id" failed '{"reason":"runner_died"}'
+        fi
+    done
+}
+
+# ---------- main loop ----------
+
+_maybe_archive() {
+    # Run retention at most once per MOTHER_ARCHIVE_INTERVAL seconds, keyed off
+    # a timestamp file so it survives restarts.
+    local marker="$RUNNER_DIR/last-archive.ts"
+    local now last
+    now=$(date +%s)
+    last=0
+    [ -f "$marker" ] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    if [ $((now - last)) -ge "$MOTHER_ARCHIVE_INTERVAL" ]; then
+        _log "running archive sweep (older-than=${MOTHER_ARCHIVE_OLDER_THAN}d)"
+        "$MOTHER_BIN_DIR/mother" archive --older-than "$MOTHER_ARCHIVE_OLDER_THAN" 2>&1 | while read -r line; do _log "archive: $line"; done
+        echo "$now" > "$marker"
+    fi
+}
+
+_loop() {
+    while [ "$SHUTDOWN" -eq 0 ]; do
+        _reap_children
+        _promote_ready
+        while [ "$(_count_running_children)" -lt "$MOTHER_CONCURRENCY" ]; do
+            local next
+            next=$(_pick_next_ready)
+            [ -n "$next" ] || break
+            _spawn_job "$next"
+        done
+        _maybe_archive
+        # Sleep in short slices so signal handling is responsive.
+        local slept=0
+        while [ "$slept" -lt "$MOTHER_POLL_INTERVAL" ] && [ "$SHUTDOWN" -eq 0 ]; do
+            sleep 1
+            slept=$((slept + 1))
+        done
+    done
+}
+
+_drain() {
+    _log "drain: waiting up to ${MOTHER_SHUTDOWN_GRACE}s for ${MOTHER_CONCURRENCY} slots to clear"
+    local elapsed=0
+    while [ "$elapsed" -lt "$MOTHER_SHUTDOWN_GRACE" ]; do
+        _reap_children
+        local running; running=$(_count_running_children)
+        [ "$running" -eq 0 ] && { _log "drain complete"; return 0; }
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    _reap_children
+    local remaining; remaining=$(_count_running_children)
+    if [ "$remaining" -gt 0 ]; then
+        _log "drain grace expired — $remaining child(ren) still running; exiting anyway (jobs continue in their tmux windows)"
+    fi
+}
+
+# ---------- entrypoint ----------
+
+main() {
+    _write_pidfile
+    trap '_on_signal' TERM INT
+    _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
+    _recover_orphans
+    _loop
+    _drain
+    _remove_pidfile
+    _log "mother-runner exited"
+    exit 0
+}
+
+main "$@"

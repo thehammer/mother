@@ -1,0 +1,791 @@
+#!/usr/bin/env bash
+
+# --- mother plugin path resolver (prepended during port) ---
+_MOTHER_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
+: "${MOTHER_LIB_DIR:=$_MOTHER_SELF/../lib}"
+# -----------------------------------------------------------
+
+# mother — background work for Claude Code.
+#
+# Usage:
+#   mother add --plan-file <path> --repo <name> --branch <branch> [options]
+#   mother list [--state ...] [--repo ...] [--format json|table]
+#   mother status <id>
+#   mother logs <id> [--follow]
+#   mother peek <id> [--format json|text] [--tail N]
+#   mother cancel <id>
+#   mother retry <id>
+#   mother events [--since-cursor <session-id>] [--since <iso-ts>]
+#   mother drafts list|show <id>|rm <id>
+#   mother run [--once]
+#   mother help
+#
+# State lives under ${MOTHER_ROOT:-$HOME/.mother}/ (plain JSON files, gitignored).
+# See docs/design.md for the design.
+
+set -u
+
+# Shared state constants and primitives (used by both this CLI and mother-runner).
+# shellcheck source=/dev/null
+source "$MOTHER_LIB_DIR/state.sh"
+
+# ---------- CLI-only helpers ----------
+
+_gen_id() {
+    local ts rand
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    rand=$(hexdump -n 4 -e '/1 "%02x"' /dev/urandom)
+    echo "${ts}-${rand}"
+}
+
+_die() { echo "mother: $*" >&2; exit 1; }
+
+# ---------- add ----------
+
+cmd_add() {
+    local plan_file="" repo="" repo_path="" branch="" base_ref="origin/main"
+    local isolation="worktree" executor="local-tmux" max_cost="" depends_on=""
+    local format="text" title=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --plan-file)   plan_file="$2"; shift 2 ;;
+            --repo)        repo="$2"; shift 2 ;;
+            --repo-path)   repo_path="$2"; shift 2 ;;
+            --branch)      branch="$2"; shift 2 ;;
+            --base)        base_ref="$2"; shift 2 ;;
+            --isolation)   isolation="$2"; shift 2 ;;
+            --executor)    executor="$2"; shift 2 ;;
+            --max-cost)    max_cost="$2"; shift 2 ;;
+            --depends-on)  depends_on="$2"; shift 2 ;;
+            --title)       title="$2"; shift 2 ;;
+            --format)      format="$2"; shift 2 ;;
+            *) _die "unknown flag for add: $1" ;;
+        esac
+    done
+
+    [ -n "$plan_file" ] || _die "add: --plan-file required"
+    [ -f "$plan_file" ] || _die "add: plan file not found: $plan_file"
+    [ -n "$repo" ]      || _die "add: --repo required"
+    [ -n "$branch" ]    || _die "add: --branch required"
+
+    case "$isolation" in worktree|main-dir) ;; *) _die "isolation must be worktree or main-dir" ;; esac
+    case "$executor"  in local-tmux)        ;; *) _die "executor must be local-tmux (for now)" ;; esac
+
+    [ -z "$repo_path" ] && repo_path="$HOME/Code/$repo"
+    [ -d "$repo_path/.git" ] || _die "add: repo path is not a git repo: $repo_path"
+
+    [ -z "$title" ] && title=$(head -1 "$plan_file" | sed -E 's/^#+ *//;s/^[[:space:]]+//;s/[[:space:]]+$//')
+    [ -z "$title" ] && title="(untitled)"
+
+    local id deps_json job_json max_cost_json
+    id=$(_gen_id)
+    if [ -n "$depends_on" ]; then
+        deps_json=$(printf '%s' "$depends_on" | jq -Rc 'split(",") | map(select(length > 0))')
+    else
+        deps_json='[]'
+    fi
+    max_cost_json=$([ -n "$max_cost" ] && echo "$max_cost" || echo "null")
+
+    cp "$plan_file" "$(_plan_path "$id")"
+
+    job_json=$(jq -n \
+        --arg id "$id" \
+        --arg title "$title" \
+        --arg repo "$repo" \
+        --arg repo_path "$repo_path" \
+        --arg branch "$branch" \
+        --arg base_ref "$base_ref" \
+        --arg isolation "$isolation" \
+        --arg executor "$executor" \
+        --argjson deps "$deps_json" \
+        --argjson max_cost "$max_cost_json" \
+        --arg plan_path "$(_plan_path "$id")" \
+        --arg log_path "$(_log_path "$id")" \
+        --arg created_at "$(_iso_now)" \
+        '{
+            id: $id, title: $title, repo: $repo, repo_path: $repo_path,
+            branch: $branch, base_ref: $base_ref, isolation: $isolation,
+            executor: $executor, depends_on: $deps, max_cost_usd: $max_cost,
+            plan_path: $plan_path, log_path: $log_path,
+            state: "queued", created_at: $created_at,
+            started_at: null, finished_at: null,
+            pr_url: null, tmux_window: null, actual_cost_usd: null
+        }')
+    _atomic_write "$(_job_path "$id")" "$job_json"
+    _append_event "$id" "queued" "$(jq -nc --arg title "$title" '{title: $title}')"
+
+    if [ "$format" = "json" ]; then
+        jq -n --arg id "$id" '{id: $id}'
+    else
+        echo "$id"
+    fi
+}
+
+# ---------- list ----------
+
+cmd_list() {
+    local state_filter="" repo_filter="" format="table"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --state)  state_filter="$2"; shift 2 ;;
+            --repo)   repo_filter="$2"; shift 2 ;;
+            --format) format="$2"; shift 2 ;;
+            *) _die "unknown flag for list: $1" ;;
+        esac
+    done
+
+    local rows
+    rows=$(find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | sort | while read -r f; do
+        jq -c '.' "$f"
+    done | jq -cs --arg st "$state_filter" --arg repo "$repo_filter" '
+        map(select(
+            (($st | length == 0) or (.state == $st))
+            and (($repo | length == 0) or (.repo == $repo))
+        ))
+        | sort_by(.created_at)
+    ')
+
+    if [ "$format" = "json" ]; then
+        echo "$rows"
+    else
+        local count
+        count=$(echo "$rows" | jq 'length')
+        if [ "$count" = "0" ]; then
+            echo "(no jobs)"
+            return 0
+        fi
+        printf "%-28s  %-10s  %-18s  %-12s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "TITLE"
+        echo "$rows" | jq -r '.[] | [.id, .state, .repo, .isolation, .title] | @tsv' | \
+            while IFS=$'\t' read -r id st repo iso title; do
+                printf "%-28s  %-10s  %-18s  %-12s  %s\n" "$id" "$st" "$repo" "$iso" "$title"
+            done
+    fi
+}
+
+# ---------- status ----------
+
+cmd_status() {
+    local id="${1:-}" format="text"
+    [ -n "$id" ] || _die "status: <id> required"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --format) format="$2"; shift 2 ;;
+            *) _die "unknown flag for status: $1" ;;
+        esac
+    done
+    _job_exists "$id" || _die "no such job: $id"
+
+    if [ "$format" = "json" ]; then
+        jq -s '{job: .[0], events: .[1]}' \
+            "$(_job_path "$id")" \
+            <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
+    else
+        echo "=== job ==="
+        jq . "$(_job_path "$id")"
+        echo
+        echo "=== events ==="
+        if [ -f "$(_events_path "$id")" ]; then
+            jq -c . "$(_events_path "$id")"
+        else
+            echo "(no events)"
+        fi
+    fi
+}
+
+# ---------- logs ----------
+
+cmd_logs() {
+    local id="${1:-}" follow=0
+    [ -n "$id" ] || _die "logs: <id> required"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --follow|-f) follow=1; shift ;;
+            *) _die "unknown flag for logs: $1" ;;
+        esac
+    done
+    local lp; lp=$(_log_path "$id")
+    [ -f "$lp" ] || _die "no log yet for $id"
+    if [ "$follow" -eq 1 ]; then
+        tail -f "$lp"
+    else
+        cat "$lp"
+    fi
+}
+
+# ---------- peek ----------
+#
+# Show a live snapshot of what the worker is doing right now by parsing
+# Claude's per-session transcript file. Works for running and completed
+# jobs alike; for completed jobs it's a retrospective summary. See the
+# "Queue Worker Live Visibility" draft for the design rationale.
+
+cmd_peek() {
+    local id="${1:-}" format="text" tail_count=8
+    [ -n "$id" ] || _die "peek: <id> required"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --format) format="$2"; shift 2 ;;
+            --tail)   tail_count="$2"; shift 2 ;;
+            *) _die "unknown flag for peek: $1" ;;
+        esac
+    done
+    _job_exists "$id" || _die "no such job: $id"
+
+    local job_json work_dir state title
+    job_json=$(_job_path "$id")
+    work_dir=$(jq -r '.work_dir // empty' "$job_json")
+    # Fall back to the known worktree-naming convention if work_dir wasn't
+    # recorded on this job (older records didn't capture it explicitly).
+    if [ -z "$work_dir" ]; then
+        local repo_path branch
+        repo_path=$(jq -r '.repo_path // empty' "$job_json")
+        branch=$(jq -r '.branch // empty' "$job_json")
+        if [ -n "$repo_path" ] && [ -n "$branch" ]; then
+            work_dir="${repo_path}-$(echo "$branch" | tr '/' '-')"
+        fi
+    fi
+    state=$(jq -r '.state // "?"' "$job_json")
+    title=$(jq -r '.title // ""' "$job_json")
+
+    [ -n "$work_dir" ] || _die "peek: could not resolve work_dir for $id"
+
+    # Claude slugs a worktree path by replacing '/' with '-'.
+    local slug="${work_dir//\//-}"
+    local project_dir="$HOME/.claude/projects/$slug"
+    if [ ! -d "$project_dir" ]; then
+        _die "peek: no Claude project dir at $project_dir (worker may not have started yet)"
+    fi
+
+    # Newest .jsonl in the project dir is the active session.
+    local transcript
+    transcript=$(find "$project_dir" -maxdepth 1 -name '*.jsonl' -print0 2>/dev/null \
+        | xargs -0 ls -t 2>/dev/null | head -1)
+    [ -n "$transcript" ] && [ -f "$transcript" ] \
+        || _die "peek: no transcript file in $project_dir"
+
+    PEEK_ID="$id" PEEK_STATE="$state" PEEK_TITLE="$title" \
+    PEEK_WORK_DIR="$work_dir" PEEK_TRANSCRIPT="$transcript" \
+    PEEK_FORMAT="$format" PEEK_TAIL="$tail_count" \
+        python3 - <<'PYEOF'
+import json, os, sys, time
+from collections import Counter
+
+job_id     = os.environ["PEEK_ID"]
+state      = os.environ["PEEK_STATE"]
+title      = os.environ["PEEK_TITLE"]
+work_dir   = os.environ["PEEK_WORK_DIR"]
+path       = os.environ["PEEK_TRANSCRIPT"]
+fmt        = os.environ.get("PEEK_FORMAT", "text")
+tail_n     = int(os.environ.get("PEEK_TAIL", "8"))
+
+size_bytes = os.path.getsize(path)
+mtime      = os.path.getmtime(path)
+age_s      = max(0, int(time.time() - mtime))
+
+def fmt_size(n):
+    if n < 1024: return f"{n}B"
+    if n < 1024*1024: return f"{n/1024:.1f}KB"
+    return f"{n/1024/1024:.1f}MB"
+
+def fmt_age(s):
+    if s < 60: return f"{s}s ago"
+    if s < 3600: return f"{s//60}m{s%60:02d}s ago"
+    h, rem = divmod(s, 3600)
+    return f"{h}h{rem//60:02d}m ago"
+
+tool_counts = Counter()
+todos       = None
+tool_trail  = []   # rolling list of (tool_name, preview) — keep last tail_n
+last_text   = ""
+
+def brief(tool, inp):
+    if not isinstance(inp, dict):
+        return ""
+    for k in ("file_path", "path", "pattern", "command", "description"):
+        if k in inp and inp[k]:
+            v = str(inp[k])
+            # Collapse newlines, trim.
+            v = v.replace("\n", " ⏎ ")
+            return v[:110]
+    return ""
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message", {})
+            for c in msg.get("content", []):
+                ctype = c.get("type")
+                if ctype == "tool_use":
+                    name = c.get("name", "?")
+                    tool_counts[name] += 1
+                    tool_trail.append((name, brief(name, c.get("input", {}))))
+                    if len(tool_trail) > tail_n:
+                        tool_trail = tool_trail[-tail_n:]
+                    if name == "TodoWrite":
+                        todos = c.get("input", {}).get("todos", [])
+                elif ctype == "text":
+                    t = c.get("text", "").strip()
+                    if t:
+                        last_text = t
+except FileNotFoundError:
+    print(f"peek: transcript disappeared at {path}", file=sys.stderr)
+    sys.exit(1)
+
+if fmt == "json":
+    out = {
+        "id":          job_id,
+        "state":       state,
+        "title":       title,
+        "work_dir":    work_dir,
+        "transcript":  path,
+        "transcript_bytes": size_bytes,
+        "transcript_age_seconds": age_s,
+        "tool_counts": dict(tool_counts),
+        "todos":       todos or [],
+        "tool_trail":  [{"tool": n, "brief": b} for n, b in tool_trail],
+        "last_text":   last_text,
+    }
+    print(json.dumps(out, indent=2))
+else:
+    print(f"=== {job_id} ===")
+    if title:
+        print(f"Title:       {title}")
+    print(f"State:       {state}")
+    print(f"Work dir:    {work_dir}")
+    print(f"Transcript:  {path}")
+    print(f"             {fmt_size(size_bytes)}, updated {fmt_age(age_s)}")
+    print()
+    if todos:
+        print("Todos:")
+        icons = {"pending": "○", "in_progress": "▶", "completed": "✓", "cancelled": "✗"}
+        for t in todos:
+            icon = icons.get(t.get("status"), "?")
+            content = t.get("content", "")
+            print(f"  {icon} {content}")
+        print()
+    if tool_counts:
+        top = ", ".join(f"{n}: {c}" for n, c in tool_counts.most_common(8))
+        print(f"Tool counts: {top}")
+        print()
+    if tool_trail:
+        print(f"Recent tool calls (oldest → newest, last {len(tool_trail)}):")
+        for n, b in tool_trail:
+            label = f"[{n}]".ljust(14)
+            print(f"  {label}{b}")
+        print()
+    if last_text:
+        # Truncate very long last-text blocks so the peek stays glanceable.
+        snippet = last_text if len(last_text) <= 500 else last_text[:497] + "..."
+        print("Latest assistant text:")
+        for line in snippet.splitlines():
+            print(f"  {line}")
+PYEOF
+}
+
+# ---------- cancel ----------
+
+cmd_cancel() {
+    local id="${1:-}"
+    [ -n "$id" ] || _die "cancel: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+    local state; state=$(jq -r .state "$(_job_path "$id")")
+    case "$state" in
+        queued|ready)   _job_transition "$id" cancelled '{"reason":"user"}' ;;
+        running)        # Leave a cancel request; runner picks it up
+                        _job_update "$id" '.cancel_requested = true'
+                        _append_event "$id" "cancel_requested" '{}'
+                        echo "cancel requested; runner will stop on next tick"
+                        ;;
+        *) _die "cannot cancel job in state: $state" ;;
+    esac
+    echo "$id: $state -> cancelled"
+}
+
+# ---------- retry ----------
+
+cmd_retry() {
+    local id="${1:-}"
+    [ -n "$id" ] || _die "retry: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+    local state; state=$(jq -r .state "$(_job_path "$id")")
+    case "$state" in failed|cancelled) ;; *) _die "can only retry failed/cancelled jobs (state=$state)" ;; esac
+
+    local plan_file
+    plan_file=$(_plan_path "$id")
+    [ -f "$plan_file" ] || _die "plan not found for $id"
+
+    # Re-add using the original job's metadata
+    cmd_add \
+        --plan-file "$plan_file" \
+        --repo       "$(jq -r .repo       "$(_job_path "$id")")" \
+        --repo-path  "$(jq -r .repo_path  "$(_job_path "$id")")" \
+        --branch     "$(jq -r .branch     "$(_job_path "$id")")" \
+        --base       "$(jq -r .base_ref   "$(_job_path "$id")")" \
+        --isolation  "$(jq -r .isolation  "$(_job_path "$id")")" \
+        --executor   "$(jq -r .executor   "$(_job_path "$id")")" \
+        --title      "$(jq -r .title      "$(_job_path "$id")")"
+}
+
+# ---------- events (for the hook) ----------
+
+cmd_events() {
+    local session_id="" since_ts=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --since-cursor) session_id="$2"; shift 2 ;;
+            --since)        since_ts="$2";   shift 2 ;;
+            *) _die "unknown flag for events: $1" ;;
+        esac
+    done
+
+    # If session cursor provided, load its last-seen ts.
+    local cursor_file=""
+    if [ -n "$session_id" ]; then
+        cursor_file="$CURSORS_DIR/$session_id.json"
+        if [ -f "$cursor_file" ] && [ -z "$since_ts" ]; then
+            since_ts=$(jq -r '.last_seen // ""' "$cursor_file" 2>/dev/null || echo "")
+        fi
+    fi
+
+    # Aggregate all events across jobs, keeping job id and title alongside
+    local all
+    all=$(find "$EVENTS_DIR" -maxdepth 1 -name '*.jsonl' -type f 2>/dev/null | while read -r f; do
+        local jobid title
+        jobid=$(basename "$f" .jsonl)
+        # Skip derivative plan files (events ending in -plan are actually .md, not .jsonl — guard anyway)
+        [[ "$jobid" == *-plan ]] && continue
+        title=""
+        [ -f "$(_job_path "$jobid")" ] && title=$(jq -r '.title // ""' "$(_job_path "$jobid")" 2>/dev/null || echo "")
+        jq -c --arg jobid "$jobid" --arg title "$title" '. + {job_id: $jobid, title: $title}' "$f" 2>/dev/null
+    done | jq -cs --arg since "$since_ts" '
+        map(select(($since | length == 0) or (.ts > $since)))
+        | sort_by(.ts)
+    ')
+
+    echo "$all"
+
+    # Advance cursor to the newest event seen, if session_id given.
+    if [ -n "$session_id" ] && [ "$(echo "$all" | jq 'length')" -gt 0 ]; then
+        local max_ts
+        max_ts=$(echo "$all" | jq -r 'map(.ts) | max')
+        mkdir -p "$CURSORS_DIR"
+        _atomic_write "$cursor_file" "$(jq -n --arg ts "$max_ts" '{last_seen: $ts}')"
+    fi
+}
+
+# ---------- drafts ----------
+
+cmd_drafts() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        list)
+            find "$DRAFTS_DIR" -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort | while read -r f; do
+                local id title
+                id=$(basename "$f" .md)
+                title=$(head -1 "$f" | sed -E 's/^#+ *//')
+                printf "%-28s  %s\n" "$id" "$title"
+            done
+            ;;
+        save)
+            local plan_file="" id
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --plan-file) plan_file="$2"; shift 2 ;;
+                    *) _die "unknown flag for drafts save: $1" ;;
+                esac
+            done
+            [ -f "$plan_file" ] || _die "drafts save: --plan-file required"
+            id=$(_gen_id)
+            cp "$plan_file" "$(_draft_path "$id")"
+            echo "$id"
+            ;;
+        show)
+            local id="${1:-}"; [ -n "$id" ] || _die "drafts show: <id> required"
+            cat "$(_draft_path "$id")"
+            ;;
+        rm)
+            local id="${1:-}"; [ -n "$id" ] || _die "drafts rm: <id> required"
+            rm -f "$(_draft_path "$id")"
+            ;;
+        *) _die "unknown drafts subcommand: $sub (list|save|show|rm)" ;;
+    esac
+}
+
+# ---------- run ----------
+
+cmd_run() {
+    local once=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --once) once=1; shift ;;
+            *) _die "unknown flag for run: $1" ;;
+        esac
+    done
+    [ "$once" -eq 1 ] || _die "run: only --once is supported in phase 1 (daemon comes in phase 2)"
+
+    # Promote queued jobs whose deps are all in terminal state to ready.
+    _promote_ready
+
+    # Pick the oldest ready job.
+    local next
+    next=$(find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f | while read -r f; do
+        jq -r 'select(.state == "ready") | .created_at + "\t" + .id' "$f"
+    done | sort | head -1 | cut -f2)
+
+    if [ -z "$next" ]; then
+        echo "no ready jobs"
+        return 0
+    fi
+
+    "$MOTHER_BIN_DIR/mother-run-job" "$next"
+}
+
+# ---------- daemon ----------
+
+_daemon_pid_alive() {
+    local pid
+    [ -f "$RUNNER_DIR/runner.pid" ] || return 1
+    pid=$(cat "$RUNNER_DIR/runner.pid" 2>/dev/null) || return 1
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+_daemon_start() {
+    local foreground=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --foreground|-f) foreground=1; shift ;;
+            *) _die "unknown flag for daemon start: $1" ;;
+        esac
+    done
+
+    if _daemon_pid_alive; then
+        local pid; pid=$(cat "$RUNNER_DIR/runner.pid")
+        echo "already running (pid $pid)"
+        return 0
+    fi
+
+    # Clean up a stale pidfile if present.
+    [ -f "$RUNNER_DIR/runner.pid" ] && rm -f "$RUNNER_DIR/runner.pid"
+
+    if [ "$foreground" -eq 1 ]; then
+        exec "$MOTHER_BIN_DIR/mother-runner"
+    fi
+
+    nohup "$MOTHER_BIN_DIR/mother-runner" >> "$RUNNER_DIR/runner.log" 2>&1 &
+    disown 2>/dev/null || true
+
+    # Wait up to ~2s for the pidfile to appear.
+    local tries=0
+    while [ ! -f "$RUNNER_DIR/runner.pid" ] && [ "$tries" -lt 20 ]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+
+    if [ ! -f "$RUNNER_DIR/runner.pid" ]; then
+        _die "daemon failed to start (no pidfile after 2s; check $RUNNER_DIR/runner.log)"
+    fi
+    echo "started (pid $(cat "$RUNNER_DIR/runner.pid"))"
+}
+
+_daemon_stop() {
+    local pidfile="$RUNNER_DIR/runner.pid"
+    if [ ! -f "$pidfile" ]; then
+        echo "not running"
+        return 0
+    fi
+    local pid; pid=$(cat "$pidfile")
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "stale pidfile (pid $pid not alive) — removed"
+        rm -f "$pidfile"
+        return 0
+    fi
+
+    kill -TERM "$pid" 2>/dev/null || true
+    local elapsed=0
+    while kill -0 "$pid" 2>/dev/null && [ "$elapsed" -lt 30 ]; do
+        sleep 0.5
+        elapsed=$((elapsed + 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "SIGTERM ignored after 15s — escalating to SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        rm -f "$pidfile"
+        echo "killed (pid $pid)"
+    else
+        # Daemon cleans up its own pidfile on graceful exit.
+        [ -f "$pidfile" ] && rm -f "$pidfile"
+        echo "stopped (pid $pid)"
+    fi
+}
+
+_daemon_status() {
+    local pidfile="$RUNNER_DIR/runner.pid"
+    if [ ! -f "$pidfile" ]; then
+        echo "stopped"
+        return 0
+    fi
+    local pid; pid=$(cat "$pidfile")
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "stopped (stale pidfile)"
+        rm -f "$pidfile"
+        return 0
+    fi
+    local uptime
+    uptime=$(ps -o etime= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')
+    echo "running (pid $pid, uptime ${uptime:-unknown})"
+}
+
+# ---------- archive ----------
+
+# Move jobs in terminal states (succeeded/failed/cancelled) whose finished_at
+# is older than N days to archive/YYYY-MM/. Job file, events jsonl, plan md,
+# and the log (gzipped) all travel together.
+#
+# Usage: mother archive [--older-than DAYS] [--dry-run]
+cmd_archive() {
+    local older_than=30 dry_run=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --older-than) older_than="$2"; shift 2 ;;
+            --dry-run)    dry_run=1; shift ;;
+            *) _die "unknown flag for archive: $1" ;;
+        esac
+    done
+
+    # Cutoff timestamp: now - (older_than * 86400) seconds.
+    local cutoff_epoch
+    cutoff_epoch=$(( $(date +%s) - older_than * 86400 ))
+    local cutoff_iso
+    cutoff_iso=$(date -u -r "$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ)
+
+    local moved=0 skipped=0
+    local f state finished id year_month dest_dir
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        state=$(jq -r '.state // ""' "$f")
+        case "$state" in succeeded|failed|cancelled) ;; *) skipped=$((skipped + 1)); continue ;; esac
+
+        finished=$(jq -r '.finished_at // ""' "$f")
+        [ -n "$finished" ] || { skipped=$((skipped + 1)); continue; }
+
+        # String compare — both timestamps are ISO-8601 UTC.
+        if [ "$finished" \> "$cutoff_iso" ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        id=$(jq -r '.id' "$f")
+        year_month=$(printf '%s' "$finished" | cut -c1-7 | tr '-' '-')  # YYYY-MM
+        dest_dir="$ARCHIVE_DIR/$year_month"
+
+        if [ "$dry_run" -eq 1 ]; then
+            echo "[dry-run] would archive $id (finished $finished) → $dest_dir"
+            moved=$((moved + 1))
+            continue
+        fi
+
+        mkdir -p "$dest_dir"
+        mv "$f" "$dest_dir/$id.json" 2>/dev/null
+        [ -f "$EVENTS_DIR/$id.jsonl" ]    && mv "$EVENTS_DIR/$id.jsonl"    "$dest_dir/$id.events.jsonl"
+        [ -f "$EVENTS_DIR/$id-plan.md" ]  && mv "$EVENTS_DIR/$id-plan.md"  "$dest_dir/$id.plan.md"
+        if [ -f "$LOGS_DIR/$id.log" ]; then
+            gzip -c "$LOGS_DIR/$id.log" > "$dest_dir/$id.log.gz" && rm -f "$LOGS_DIR/$id.log"
+        fi
+        moved=$((moved + 1))
+    done
+
+    echo "archived: $moved, skipped: $skipped (cutoff: $cutoff_iso)"
+}
+
+cmd_daemon() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+    case "$sub" in
+        start)  _daemon_start "$@" ;;
+        stop)   _daemon_stop "$@" ;;
+        status) _daemon_status "$@" ;;
+        *) _die "unknown daemon subcommand: $sub (start|stop|status)" ;;
+    esac
+}
+
+# ---------- help ----------
+
+cmd_help() {
+    cat <<'EOF'
+mother — background work for Claude Code
+
+Usage:
+  mother add --plan-file PATH --repo NAME --branch BRANCH [options]
+  mother list [--state STATE] [--repo REPO] [--format json|table]
+  mother status ID [--format json|text]
+  mother logs ID [--follow]
+  mother peek ID [--format json|text] [--tail N]
+  mother cancel ID
+  mother retry ID
+  mother events [--since-cursor SESSION_ID] [--since ISO_TS]
+  mother drafts list | save --plan-file PATH | show ID | rm ID
+  mother daemon start [--foreground] | stop | status
+  mother archive [--older-than DAYS] [--dry-run]
+  mother run --once
+
+Add options:
+  --repo-path PATH     (default: ~/Code/<repo>)
+  --base REF           (default: origin/main)
+  --isolation worktree|main-dir   (default: worktree)
+  --executor local-tmux           (only option in phase 2)
+  --max-cost USD
+  --depends-on ID[,ID...]
+  --title TEXT         (default: first heading of plan file)
+  --format json|text   (default: text — prints job id only)
+
+Daemon env vars:
+  MOTHER_CONCURRENCY      (default: 2)   max parallel jobs
+  MOTHER_POLL_INTERVAL    (default: 2)   seconds between ticks
+  MOTHER_SHUTDOWN_GRACE   (default: 30)  seconds to wait for children on stop
+
+State flows: queued -> ready -> running -> succeeded | failed | cancelled
+
+See docs/design.md for the full design.
+EOF
+}
+
+# ---------- dispatch ----------
+
+main() {
+    local sub="${1:-help}"
+    shift || true
+    case "$sub" in
+        add)     cmd_add "$@" ;;
+        list)    cmd_list "$@" ;;
+        status)  cmd_status "$@" ;;
+        logs)    cmd_logs "$@" ;;
+        peek)    cmd_peek "$@" ;;
+        cancel)  cmd_cancel "$@" ;;
+        retry)   cmd_retry "$@" ;;
+        events)  cmd_events "$@" ;;
+        drafts)  cmd_drafts "$@" ;;
+        daemon)  cmd_daemon "$@" ;;
+        archive) cmd_archive "$@" ;;
+        run)     cmd_run "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *) _die "unknown subcommand: $sub (try: mother help)" ;;
+    esac
+}
+
+main "$@"

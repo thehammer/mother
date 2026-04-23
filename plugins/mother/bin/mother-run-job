@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+
+# --- mother plugin path resolver (prepended during port) ---
+_MOTHER_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
+: "${MOTHER_LIB_DIR:=$_MOTHER_SELF/../lib}"
+# -----------------------------------------------------------
+
+# mother-run-job — run a single queued job to completion.
+#
+# Invoked by `mother run --once` (phase 1). In phase 2 the daemon will call this
+# the same way. Responsibilities:
+#   - Resolve the target working directory (worktree or main dir).
+#   - Acquire a workspace lock if isolation=main-dir.
+#   - Spawn `claude --agent cody -p "$(cat <plan>)"` in a new tmux window at that
+#     cwd, tee'd to the job log.
+#   - Poll a status-marker file; transition the job on exit.
+#   - Parse the log for a PR URL and cost info (best-effort).
+#
+# Blocks until the job exits. Usage: mother-run-job <job-id>
+
+set -u
+
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_ROOT:-$HOME/.mother}}"
+JOBS_DIR="$MOTHER_ROOT/jobs"
+EVENTS_DIR="$MOTHER_ROOT/events"
+LOGS_DIR="$MOTHER_ROOT/logs"
+RUNNER_DIR="$MOTHER_ROOT/runner"
+
+id="${1:?usage: mother-run-job <id>}"
+job_file="$JOBS_DIR/$id.json"
+[ -f "$job_file" ] || { echo "mother-run-job: no such job: $id" >&2; exit 1; }
+
+# shellcheck source=/dev/null
+source "$HOME/.claude/lib/core/worktree.sh"
+# shellcheck source=/dev/null
+source "$HOME/.claude/lib/core/locks.sh"
+
+mother_cli="$MOTHER_BIN_DIR/mother"
+
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+_atomic_write() {
+    # NB: `path` collides with zsh's special array for PATH — use _target.
+    local _target="$1" content="$2" tmp="${1}.tmp.$$"
+    printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
+}
+_with_lock() {
+    local target="$1"; shift
+    local lockdir="${target}.lockdir"
+    local tries=0
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        sleep 0.05
+        tries=$((tries + 1))
+        [ "$tries" -gt 200 ] && { echo "mother-run-job: could not acquire lock for $target after 10s" >&2; return 1; }
+    done
+    "$@"
+    local rc=$?
+    rmdir "$lockdir" 2>/dev/null || true
+    return $rc
+}
+_append_line() { printf '%s\n' "$2" >> "$1"; }
+_append_event() {
+    local kind="$1" detail="${2:-}"
+    [ -z "$detail" ] && detail='{}'
+    local ev _eventpath
+    ev=$(jq -nc --arg ts "$(iso_now)" --arg kind "$kind" --argjson detail "$detail" \
+        '{ts: $ts, kind: $kind, detail: $detail}')
+    _eventpath="$EVENTS_DIR/$id.jsonl"
+    _with_lock "$_eventpath" _append_line "$_eventpath" "$ev"
+}
+_job_update() {
+    local filter="$1"
+    local merged; merged=$(jq "$filter" "$job_file") || return 1
+    _atomic_write "$job_file" "$merged"
+}
+_transition() {
+    local new="$1" detail="${2:-}"
+    [ -z "$detail" ] && detail='{}'
+    _job_update ".state = \"$new\""
+    case "$new" in
+        running)    _job_update ".started_at = \"$(iso_now)\"" ;;
+        succeeded|failed|cancelled)
+                    _job_update ".finished_at = \"$(iso_now)\"" ;;
+    esac
+    _append_event "$new" "$detail"
+}
+
+# Accept ready (invoked by `mother run --once`) or running (daemon already
+# pre-transitioned before forking us).
+state=$(jq -r .state "$job_file")
+case "$state" in
+    ready|running) ;;
+    *) echo "mother-run-job: job $id is $state, expected ready or running" >&2; exit 1 ;;
+esac
+
+# Must have a tmux server available to spawn the job window. The daemon
+# doesn't inherit a TMUX env var, but that's fine — we talk to the default
+# tmux socket by connecting rather than relying on $TMUX being set.
+if ! tmux list-sessions >/dev/null 2>&1; then
+    echo "mother-run-job: no tmux server available (start tmux first)" >&2
+    _transition failed "$(jq -nc --arg r "no_tmux" '{reason: $r}')"
+    exit 1
+fi
+
+isolation=$(jq -r .isolation  "$job_file")
+branch=$(jq -r .branch        "$job_file")
+repo_path=$(jq -r .repo_path  "$job_file")
+plan_path=$(jq -r .plan_path  "$job_file")
+log_path=$(jq -r .log_path    "$job_file")
+base_ref=$(jq -r .base_ref    "$job_file")
+repo=$(jq -r .repo            "$job_file")
+
+# Resolve working directory.
+work_dir=""
+if [ "$isolation" = "worktree" ]; then
+    (cd "$repo_path" && git fetch --quiet origin "${base_ref#origin/}" 2>/dev/null || true)
+    # Create the branch + worktree from base_ref.
+    wt_path=$(cd "$repo_path" && source "$HOME/.claude/lib/core/worktree.sh" && worktree_get_path "$branch")
+    if [ ! -d "$wt_path" ]; then
+        (cd "$repo_path" && git worktree add -b "$branch" "$wt_path" "$base_ref") \
+            || { _transition failed "$(jq -nc --arg r "worktree_create_failed" '{reason: $r}')"; exit 1; }
+    fi
+    work_dir="$wt_path"
+else
+    # main-dir: acquire workspace lock so concurrent main-dir jobs serialize.
+    lock_name="${repo}:workspace"
+    if ! lock_acquire "$lock_name" 0 >/dev/null 2>&1; then
+        echo "mother-run-job: could not acquire lock $lock_name (another main-dir job is running)" >&2
+        _transition failed "$(jq -nc --arg r "lock_busy" --arg lock "$lock_name" '{reason: $r, lock: $lock}')"
+        exit 1
+    fi
+    work_dir="$repo_path"
+fi
+
+# Record the tmux window + resolved work_dir on the job. If we were started
+# from `ready` (via `mother run --once`), also emit the running transition;
+# if the daemon pre-transitioned us, just record the window details.
+window="q:${id: -8}"
+if [ "$state" = "ready" ]; then
+    _job_update ".tmux_window = \"$window\""
+    _transition running "$(jq -nc --arg w "$window" --arg d "$work_dir" '{tmux_window: $w, work_dir: $d}')"
+else
+    _job_update ".tmux_window = \"$window\""
+    _append_event "started" "$(jq -nc --arg w "$window" --arg d "$work_dir" '{tmux_window: $w, work_dir: $d}')"
+fi
+
+# Spawn claude in a new tmux window. Use a wrapper script so we can capture
+# exit status and keep quoting sane.
+marker_file="$RUNNER_DIR/$id.exit"
+wrapper="$RUNNER_DIR/$id.wrap"
+cat > "$wrapper" <<WRAP
+#!/usr/bin/env bash
+cd "$work_dir"
+exec > >(tee -a "$log_path") 2>&1
+echo "=== mother job $id starting at \$(date) ==="
+echo "=== working dir: \$PWD ==="
+echo "=== branch:      $branch ==="
+echo
+claude --agent cody -p "\$(cat "$plan_path")"
+echo \$? > "$marker_file"
+WRAP
+chmod +x "$wrapper"
+
+tmux new-window -d -n "$window" -c "$work_dir" "bash '$wrapper'; echo; echo '(job $id finished — press any key to close)'; read -n1"
+
+# Poll for the marker file.
+cancel_requested=0
+while [ ! -f "$marker_file" ]; do
+    sleep 2
+    # Honor cancellation.
+    if [ "$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
+        cancel_requested=1
+        tmux kill-window -t "$window" 2>/dev/null || true
+        break
+    fi
+done
+
+exit_code=0
+[ -f "$marker_file" ] && exit_code=$(cat "$marker_file")
+
+# Best-effort: extract a PR URL from the log.
+pr_url=""
+if [ -f "$log_path" ]; then
+    pr_url=$(grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' "$log_path" | tail -1 || true)
+    if [ -n "$pr_url" ]; then
+        _job_update ".pr_url = \"$pr_url\""
+        _append_event "pr_opened" "$(jq -nc --arg url "$pr_url" '{url: $url}')"
+    fi
+fi
+
+# Release main-dir lock if we took one.
+if [ "$isolation" = "main-dir" ]; then
+    lock_release "${repo}:workspace" >/dev/null 2>&1 || true
+fi
+
+# Final transition.
+if [ "$cancel_requested" -eq 1 ]; then
+    _transition cancelled "$(jq -nc '{reason: "user"}')"
+elif [ "$exit_code" = "0" ]; then
+    _transition succeeded "$(jq -nc --arg pr "$pr_url" '{pr_url: $pr}')"
+else
+    _transition failed "$(jq -nc --argjson code "$exit_code" '{exit_code: $code}')"
+fi
+
+rm -f "$marker_file" "$wrapper"
+echo "job $id finished: $(jq -r .state "$job_file")"
