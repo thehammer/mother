@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Editor / swap files
+*.swp
+*.swo
+*~
+.#*
+\#*#
+
+# Logs
+*.log
+
+# Generated launchd plists during `mother daemon install` (source of truth stays in launchd/)
+/tmp/com.thehammer.mother.*.plist
+
+# Local runtime state (should never live in the repo)
+.mother/

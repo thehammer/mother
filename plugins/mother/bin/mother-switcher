@@ -1,32 +1,52 @@
 #!/usr/bin/env bash
-# mother-switcher — fzf popup for browsing and acting on Mother jobs.
+# mother-switcher — fzf popup for live Mother jobs.
 #
-# Designed to be invoked from a tmux popup:
+# Designed to be invoked from a tmux popup, e.g.:
 #   bind Space display-popup -w 80% -h 80% -E "$HOME/.local/bin/mother-switcher"
 #
 # Bindings inside fzf:
-#   enter     → tail the job's log (queue logs --follow)
+#   enter     → tail the job's log (mother logs --follow)
 #   ctrl-x    → cancel the job and reload the list
 #   ctrl-r    → retry the job and reload the list
 #   ctrl-q    → quit
 #
-# TODO (port): this file is a stub. The real implementation lives in the
-# uncommitted worktree at:
-#   /Users/hammer/.claude-feat-headless-workers-and-queue-switcher/bin/queue-switcher
-# Merge that change first, then port with the standard queue→mother rename.
+# Use absolute paths in fzf bindings so the popup works regardless of the
+# shell's $PATH inside the tmux popup.
 
 set -u
 
 _MOTHER_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
+MOTHER_BIN="$MOTHER_BIN_DIR/mother"
 
-command -v fzf >/dev/null 2>&1 || {
-    echo "mother-switcher: fzf not found — install with 'brew install fzf'" >&2
+if ! command -v fzf >/dev/null 2>&1; then
+    echo "mother-switcher: fzf is not installed or not on \$PATH" >&2
+    echo "install via: brew install fzf" >&2
     exit 1
-}
+fi
 
-# TODO: replicate the fzf invocation from the upstream queue-switcher once
-# the headless-workers branch is merged and ported here.
-echo "mother-switcher: not yet implemented in this plugin skeleton" >&2
-echo "See: /Users/hammer/.claude-feat-headless-workers-and-queue-switcher/bin/queue-switcher" >&2
-exit 2
+# Row source: one line per job, TAB-separated, id first so `{1}` refers to it.
+# `--with-nth 2..` hides the id from the fzf display but keeps it as {1}.
+rows_cmd="\"$MOTHER_BIN\" list --format json | jq -r '.[] | [.id, .state, .repo, .title] | @tsv'"
+
+rows=$(eval "$rows_cmd")
+
+if [ -z "$rows" ]; then
+    echo "(no queued jobs)"
+    echo
+    echo "press any key to close"
+    read -r -n1 _ || true
+    exit 0
+fi
+
+printf '%s\n' "$rows" | fzf \
+    --delimiter $'\t' \
+    --with-nth '2..' \
+    --preview "\"$MOTHER_BIN\" peek {1}" \
+    --preview-window 'right:60%:wrap' \
+    --header 'enter: logs  ctrl-x: cancel  ctrl-r: retry  ctrl-q: quit' \
+    --bind "enter:execute(\"$MOTHER_BIN\" logs {1} --follow)" \
+    --bind "ctrl-x:execute-silent(\"$MOTHER_BIN\" cancel {1})+reload($rows_cmd)" \
+    --bind "ctrl-r:execute-silent(\"$MOTHER_BIN\" retry {1})+reload($rows_cmd)" \
+    --bind 'ctrl-q:abort' \
+    >/dev/null
