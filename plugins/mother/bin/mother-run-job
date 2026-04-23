@@ -165,7 +165,10 @@ echo "=== mother job $id starting at \$(date) ==="
 echo "=== working dir: \$PWD ==="
 echo "=== branch:      $branch ==="
 echo
-claude --agent cody -p "\$(cat "$plan_path")"
+# stream-json + verbose gives us a live per-event log (one JSON object per
+# line). \`mother logs --follow\` pretty-prints these via mother-stream-pretty;
+# the raw file stays authoritative and greppable.
+claude --agent cody -p "\$(cat "$plan_path")" --output-format stream-json --verbose
 echo \$? > "$marker_file"
 WRAP
 chmod +x "$wrapper"

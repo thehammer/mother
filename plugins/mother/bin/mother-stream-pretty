@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+# mother-stream-pretty — render Claude Code stream-json events as compact, human-readable lines.
+#
+# Reads stream-json (one event per line) from stdin and emits one line per event
+# to stdout. Non-JSON lines pass through unchanged (so existing log headers like
+# "=== mother job ... ===" still show up). Designed for `mother logs --follow`
+# where you want to see what the worker is doing RIGHT NOW without parsing
+# raw JSON.
+
+import json
+import sys
+
+
+DIM   = "\033[2m"
+RESET = "\033[0m"
+CYAN  = "\033[38;5;75m"
+YELL  = "\033[38;5;220m"
+GRAY  = "\033[38;5;245m"
+RED   = "\033[38;5;203m"
+GREEN = "\033[38;5;114m"
+
+
+def fmt(label_color, label, body=""):
+    """Return a single formatted line: colored 12-char label + body."""
+    return f"{label_color}{label:<12}{RESET} {body}"
+
+
+def one_line(s, limit=120):
+    s = (s or "").replace("\n", " ⏎ ").strip()
+    if len(s) > limit:
+        s = s[: limit - 3] + "..."
+    return s
+
+
+def brief_tool_input(tool, inp):
+    if not isinstance(inp, dict):
+        return ""
+    for k in ("file_path", "path", "pattern", "command", "description", "query", "old_string"):
+        if k in inp and inp[k]:
+            return one_line(str(inp[k]))
+    return ""
+
+
+def handle(ev):
+    t = ev.get("type")
+    if t == "system":
+        sub = ev.get("subtype", "")
+        if sub == "init":
+            sid = ev.get("session_id", "")[-8:]
+            model = ev.get("model", "")
+            return fmt(GRAY, "[system]", f"init session={sid} model={model}")
+        return fmt(GRAY, "[system]", sub or "?")
+
+    if t == "assistant":
+        msg = ev.get("message", {})
+        for c in msg.get("content", []):
+            ctype = c.get("type")
+            if ctype == "tool_use":
+                name = c.get("name", "?")
+                b = brief_tool_input(name, c.get("input", {}))
+                return fmt(CYAN, f"[{name}]", b)
+            if ctype == "text":
+                text = (c.get("text") or "").strip()
+                if text:
+                    return fmt(YELL, "[text]", one_line(text))
+        return None  # assistant event with no content worth rendering
+
+    if t == "user":
+        msg = ev.get("message", {})
+        for c in msg.get("content", []):
+            if c.get("type") == "tool_result":
+                is_err = c.get("is_error", False)
+                content = c.get("content", "")
+                if isinstance(content, list):
+                    # stream-json represents multi-part results as a list
+                    content = " ".join(
+                        str(p.get("text", "")) for p in content if isinstance(p, dict)
+                    )
+                label_color = RED if is_err else GRAY
+                tag = "[result*]" if is_err else "[result]"
+                size = len(content) if isinstance(content, str) else 0
+                preview = one_line(content if isinstance(content, str) else "", 80)
+                return fmt(label_color, tag, f"{size}b — {preview}")
+        return None
+
+    if t == "result":
+        sub = ev.get("subtype", "")
+        cost = ev.get("total_cost_usd")
+        dur = ev.get("duration_ms")
+        extras = []
+        if cost is not None: extras.append(f"cost=${cost:.4f}")
+        if dur  is not None: extras.append(f"duration={dur/1000:.1f}s")
+        is_err = sub != "success"
+        label_color = RED if is_err else GREEN
+        return fmt(label_color, f"[{sub}]", " ".join(extras) or sub)
+
+    # Fallback: one-line raw type + keys
+    return fmt(GRAY, f"[{t}]", " ".join(ev.keys()))
+
+
+def main():
+    for line in sys.stdin:
+        stripped = line.rstrip("\n")
+        if not stripped.startswith("{"):
+            # Non-JSON passthrough (banners, exit markers, etc.)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            continue
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            continue
+        out = handle(ev)
+        if out is None:
+            continue
+        print(out, flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass

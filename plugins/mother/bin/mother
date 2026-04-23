@@ -207,21 +207,47 @@ cmd_status() {
 # ---------- logs ----------
 
 cmd_logs() {
-    local id="${1:-}" follow=0
+    local id="${1:-}" follow=0 raw=0
     [ -n "$id" ] || _die "logs: <id> required"
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
             --follow|-f) follow=1; shift ;;
+            --raw)       raw=1; shift ;;   # skip the pretty-printer
             *) _die "unknown flag for logs: $1" ;;
         esac
     done
     local lp; lp=$(_log_path "$id")
     [ -f "$lp" ] || _die "no log yet for $id"
+
+    # Resolve the pretty-printer. If missing (older install, broken symlink),
+    # fall back to raw output and note it.
+    local pretty="$MOTHER_BIN_DIR/mother-stream-pretty"
+    [ -x "$pretty" ] || raw=1
+
     if [ "$follow" -eq 1 ]; then
-        tail -f "$lp"
+        # Banner so the user knows how to exit the tail. ANSI-dim so it reads
+        # as chrome, not content. Written to stderr so piping the log doesn't
+        # pick up the banner.
+        {
+            printf '\033[2m'
+            printf '────────────────────────────────────────────────────────────\n'
+            printf '  mother logs — following %s\n' "$id"
+            printf '  press Ctrl-C to stop following and return\n'
+            printf '────────────────────────────────────────────────────────────\n'
+            printf '\033[0m'
+        } >&2
+        if [ "$raw" -eq 1 ]; then
+            tail -f "$lp"
+        else
+            tail -f "$lp" | "$pretty"
+        fi
     else
-        cat "$lp"
+        if [ "$raw" -eq 1 ]; then
+            cat "$lp"
+        else
+            "$pretty" < "$lp"
+        fi
     fi
 }
 
@@ -263,8 +289,10 @@ cmd_peek() {
 
     [ -n "$work_dir" ] || _die "peek: could not resolve work_dir for $id"
 
-    # Claude slugs a worktree path by replacing '/' with '-'.
+    # Claude slugs a worktree path by replacing '/' AND '.' with '-'
+    # (so /Users/x/.foo becomes -Users-x--foo, double-dash at the boundary).
     local slug="${work_dir//\//-}"
+    slug="${slug//./-}"
     local project_dir="$HOME/.claude/projects/$slug"
     if [ ! -d "$project_dir" ]; then
         _die "peek: no Claude project dir at $project_dir (worker may not have started yet)"
@@ -717,12 +745,69 @@ _daemon_uninstall() {
 
 # ---------- archive ----------
 
-# Move jobs in terminal states (succeeded/failed/cancelled) whose finished_at
-# is older than N days to archive/YYYY-MM/. Job file, events jsonl, plan md,
-# and the log (gzipped) all travel together.
+# Move a single terminal-state job from JOBS_DIR to archive/YYYY-MM/, taking
+# its events jsonl, plan md, and log (gzipped) along. Shared by both the bulk
+# sweep and the single-id form. Returns 0 if moved, 1 if skipped/not eligible.
+_archive_one() {
+    local id="$1" dry_run="${2:-0}"
+    local job_file="$JOBS_DIR/$id.json"
+    [ -f "$job_file" ] || { echo "archive: no such job: $id" >&2; return 1; }
+
+    local state finished year_month dest_dir
+    state=$(jq -r '.state // ""' "$job_file")
+    case "$state" in
+        succeeded|failed|cancelled) ;;
+        *) echo "archive: $id is $state, not a terminal state — skipping" >&2; return 1 ;;
+    esac
+
+    finished=$(jq -r '.finished_at // ""' "$job_file")
+    # If finished_at is missing (shouldn't normally happen), bucket under today.
+    [ -z "$finished" ] && finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    year_month=$(printf '%s' "$finished" | cut -c1-7)
+    dest_dir="$ARCHIVE_DIR/$year_month"
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "[dry-run] would archive $id (finished $finished) → $dest_dir"
+        return 0
+    fi
+
+    mkdir -p "$dest_dir"
+    mv "$job_file" "$dest_dir/$id.json" 2>/dev/null
+    [ -f "$EVENTS_DIR/$id.jsonl" ]    && mv "$EVENTS_DIR/$id.jsonl"    "$dest_dir/$id.events.jsonl"
+    [ -f "$EVENTS_DIR/$id-plan.md" ]  && mv "$EVENTS_DIR/$id-plan.md"  "$dest_dir/$id.plan.md"
+    if [ -f "$LOGS_DIR/$id.log" ]; then
+        gzip -c "$LOGS_DIR/$id.log" > "$dest_dir/$id.log.gz" && rm -f "$LOGS_DIR/$id.log"
+    fi
+    return 0
+}
+
+# Archive terminal-state jobs. Two modes:
+#   mother archive <id>                    — archive one specific job now
+#   mother archive [--older-than DAYS] [--dry-run]  — bulk sweep by age
 #
-# Usage: mother archive [--older-than DAYS] [--dry-run]
+# Single-id form intentionally ignores age — the user asked for it explicitly.
+# Useful from the fzf switcher's ctrl-d binding to clean up a failed job
+# without waiting 30 days.
 cmd_archive() {
+    # Detect single-id form: first arg is non-flag.
+    if [ $# -ge 1 ] && [ "${1#-}" = "$1" ]; then
+        local id="$1"; shift
+        local dry_run=0
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --dry-run) dry_run=1; shift ;;
+                *) _die "unknown flag for archive <id>: $1" ;;
+            esac
+        done
+        if _archive_one "$id" "$dry_run"; then
+            [ "$dry_run" -eq 1 ] || echo "archived: $id"
+        else
+            return 1
+        fi
+        return 0
+    fi
+
+    # Bulk sweep by age.
     local older_than=30 dry_run=0
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -732,48 +817,29 @@ cmd_archive() {
         esac
     done
 
-    # Cutoff timestamp: now - (older_than * 86400) seconds.
-    local cutoff_epoch
+    local cutoff_epoch cutoff_iso
     cutoff_epoch=$(( $(date +%s) - older_than * 86400 ))
-    local cutoff_iso
     cutoff_iso=$(date -u -r "$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ)
 
     local moved=0 skipped=0
-    local f state finished id year_month dest_dir
+    local f state finished id
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f")
         case "$state" in succeeded|failed|cancelled) ;; *) skipped=$((skipped + 1)); continue ;; esac
-
         finished=$(jq -r '.finished_at // ""' "$f")
         [ -n "$finished" ] || { skipped=$((skipped + 1)); continue; }
-
-        # String compare — both timestamps are ISO-8601 UTC.
         if [ "$finished" \> "$cutoff_iso" ]; then
             skipped=$((skipped + 1))
             continue
         fi
-
         id=$(jq -r '.id' "$f")
-        year_month=$(printf '%s' "$finished" | cut -c1-7 | tr '-' '-')  # YYYY-MM
-        dest_dir="$ARCHIVE_DIR/$year_month"
-
-        if [ "$dry_run" -eq 1 ]; then
-            echo "[dry-run] would archive $id (finished $finished) → $dest_dir"
+        if _archive_one "$id" "$dry_run"; then
             moved=$((moved + 1))
-            continue
+        else
+            skipped=$((skipped + 1))
         fi
-
-        mkdir -p "$dest_dir"
-        mv "$f" "$dest_dir/$id.json" 2>/dev/null
-        [ -f "$EVENTS_DIR/$id.jsonl" ]    && mv "$EVENTS_DIR/$id.jsonl"    "$dest_dir/$id.events.jsonl"
-        [ -f "$EVENTS_DIR/$id-plan.md" ]  && mv "$EVENTS_DIR/$id-plan.md"  "$dest_dir/$id.plan.md"
-        if [ -f "$LOGS_DIR/$id.log" ]; then
-            gzip -c "$LOGS_DIR/$id.log" > "$dest_dir/$id.log.gz" && rm -f "$LOGS_DIR/$id.log"
-        fi
-        moved=$((moved + 1))
     done
-
     echo "archived: $moved, skipped: $skipped (cutoff: $cutoff_iso)"
 }
 

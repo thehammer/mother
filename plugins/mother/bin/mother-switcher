@@ -6,8 +6,9 @@
 #
 # Bindings inside fzf:
 #   enter     → tail the job's log (mother logs --follow)
-#   ctrl-x    → cancel the job and reload the list
-#   ctrl-r    → retry the job and reload the list
+#   ctrl-x    → cancel a live job and reload the list
+#   ctrl-r    → retry a failed/cancelled job and reload the list
+#   ctrl-d    → archive a terminal-state job (immediate, regardless of age)
 #   ctrl-q    → quit
 #
 # Use absolute paths in fzf bindings so the popup works regardless of the
@@ -53,9 +54,10 @@ printf '%s\n' "$rows" | fzf \
     --with-nth '2..' \
     --preview "\"$MOTHER_BIN\" peek {1}" \
     --preview-window 'right:60%:wrap' \
-    --header 'enter: logs  ctrl-x: cancel  ctrl-r: retry  ctrl-q: quit' \
+    --header 'enter: logs  ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-q: quit' \
     --bind "enter:execute(\"$MOTHER_BIN\" logs {1} --follow)" \
     --bind "ctrl-x:execute-silent(\"$MOTHER_BIN\" cancel {1})+reload($rows_cmd)" \
     --bind "ctrl-r:execute-silent(\"$MOTHER_BIN\" retry {1})+reload($rows_cmd)" \
+    --bind "ctrl-d:execute-silent(\"$MOTHER_BIN\" archive {1})+reload($rows_cmd)" \
     --bind 'ctrl-q:abort' \
     >/dev/null
