@@ -39,8 +39,11 @@
 
   <key>EnvironmentVariables</key>
   <dict>
+    <!-- __USER_HOME__ is substituted by `mother daemon install`. We prepend
+         $HOME/.local/bin so `claude`, `mother`, and friends are found when
+         the daemon spawns worker processes via PATH. -->
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>__USER_HOME__/.local/bin:__USER_HOME__/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
 
   <key>WorkingDirectory</key>
