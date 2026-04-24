@@ -127,12 +127,25 @@ _recover_orphans() {
     # Primary check: `worker_pid` + `kill -0`. Falls back to a tmux-window
     # match for legacy job records (created before the headless-worker
     # migration) that recorded `tmux_window` instead of `worker_pid`.
+    #
+    # $1: grace_seconds (default 0). For jobs with no `worker_pid`, only
+    # act if `started_at` is older than this threshold — prevents racing
+    # with a live mother-run-job that hasn't persisted worker_pid yet.
+    # Startup passes 0 (aggressive); periodic calls from the loop pass a
+    # non-zero grace so healthy in-flight supervisors are left alone.
+    #
+    # Honors `cancel_requested`: when a zombie is reaped and the user had
+    # asked to cancel, transition to `cancelled` instead of `failed` so
+    # `mother cancel` is effective even when the supervisor is dead.
+    local grace="${1:-0}"
     local windows=""
     if command -v tmux >/dev/null 2>&1; then
         windows=$(tmux list-windows -a -F '#W' 2>/dev/null || echo "")
     fi
 
-    local f state pid window id
+    local now_epoch; now_epoch=$(date +%s)
+    local f state pid window id started_at started_at_sec started_epoch cancel_req
+    local terminal_state terminal_reason
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state' "$f" 2>/dev/null) || continue
@@ -140,11 +153,23 @@ _recover_orphans() {
         id=$(jq -r '.id' "$f")
         pid=$(jq -r '.worker_pid // empty' "$f")
         window=$(jq -r '.tmux_window // ""' "$f")
+        cancel_req=$(jq -r '.cancel_requested // false' "$f")
+
+        # Resolve the terminal state we'd transition to. If the user asked
+        # to cancel and the supervisor can't honor it (dead/absent pid),
+        # 'cancelled' is more truthful than 'failed: runner_died'.
+        if [ "$cancel_req" = "true" ]; then
+            terminal_state="cancelled"
+            terminal_reason='{"reason":"user"}'
+        else
+            terminal_state="failed"
+            terminal_reason='{"reason":"runner_died"}'
+        fi
 
         if [ -n "$pid" ]; then
             if ! kill -0 "$pid" 2>/dev/null; then
-                _log "marking $id failed (runner_died, pid $pid gone)"
-                _job_transition "$id" failed '{"reason":"runner_died"}'
+                _log "marking $id $terminal_state (pid $pid gone; cancel_requested=$cancel_req)"
+                _job_transition "$id" "$terminal_state" "$terminal_reason"
             fi
         elif [ -n "$window" ]; then
             # Legacy path: jobs recorded before the headless-worker migration.
@@ -153,15 +178,40 @@ _recover_orphans() {
                 continue
             fi
             if ! grep -Fxq "$window" <<< "$windows"; then
-                _log "marking $id failed (runner_died, window $window gone)"
-                _job_transition "$id" failed '{"reason":"runner_died"}'
+                _log "marking $id $terminal_state (window $window gone; cancel_requested=$cancel_req)"
+                _job_transition "$id" "$terminal_state" "$terminal_reason"
             fi
         else
-            _log "marking $id failed (runner_died, no worker_pid or tmux_window recorded)"
-            _job_transition "$id" failed '{"reason":"runner_died"}'
+            # No worker_pid AND no tmux_window. Supervisor either died before
+            # persisting worker_pid, or we're racing a fresh spawn. Apply the
+            # grace window: startup reaps immediately (grace=0), the periodic
+            # loop waits until started_at is older than grace_seconds.
+            if [ "$grace" -gt 0 ]; then
+                started_at=$(jq -r '.started_at // empty' "$f")
+                [ -n "$started_at" ] || continue
+                # Strip fractional seconds — started_at may be either
+                # `...SSZ` (from mother-run-job's iso_now) or `...SS.NNNNNNZ`
+                # (from state.sh's _iso_now), and date(1) only accepts the
+                # former with %S.
+                started_at_sec="${started_at%%.*}"
+                case "$started_at_sec" in *Z) ;; *) started_at_sec="${started_at_sec}Z" ;; esac
+                # ISO8601 → epoch (macOS date needs -j -f; GNU date needs -d).
+                started_epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$started_at_sec" +%s 2>/dev/null \
+                    || date -u -d "$started_at_sec" +%s 2>/dev/null || echo 0)
+                [ "$started_epoch" -eq 0 ] && continue
+                [ $((now_epoch - started_epoch)) -ge "$grace" ] || continue
+            fi
+            _log "marking $id $terminal_state (no worker_pid or tmux_window; cancel_requested=$cancel_req)"
+            _job_transition "$id" "$terminal_state" "$terminal_reason"
         fi
     done
 }
+
+# Grace (seconds) before the periodic reaper treats a `running` job with no
+# worker_pid as a zombie. Long enough to outlast any reasonable spawn path
+# (plan read + lock acquire + wrapper write + nohup fork), short enough that
+# users don't stare at a dead job for long.
+MOTHER_ORPHAN_GRACE="${MOTHER_ORPHAN_GRACE:-60}"
 
 # ---------- main loop ----------
 
@@ -183,6 +233,7 @@ _maybe_archive() {
 _loop() {
     while [ "$SHUTDOWN" -eq 0 ]; do
         _reap_children
+        _recover_orphans "$MOTHER_ORPHAN_GRACE"
         _promote_ready
         while [ "$(_count_running_children)" -lt "$MOTHER_CONCURRENCY" ]; do
             local next

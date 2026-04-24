@@ -98,6 +98,22 @@ _transition() {
     _append_event "$new" "$detail"
 }
 
+# Safety net: if we die before reaching a clean terminal transition (lock
+# acquisition failure under set -u, missing tool, killed by signal, etc.),
+# mark the job `failed: runner_died_early` so it doesn't linger as a zombie.
+# The trap is a no-op once the job has already been transitioned to a
+# terminal state — it only fires if the state is still `running` at exit.
+# Cleared explicitly at the end of a normal run.
+_runner_died_trap() {
+    local rc=$?
+    local cur; cur=$(jq -r '.state // empty' "$job_file" 2>/dev/null)
+    if [ "$cur" = "running" ]; then
+        _transition failed "$(jq -nc --argjson rc "$rc" \
+            '{reason: "runner_died_early", exit_code: $rc}')" 2>/dev/null || true
+    fi
+}
+trap _runner_died_trap EXIT
+
 # Accept ready (invoked by `mother run --once`) or running (daemon already
 # pre-transitioned before forking us).
 state=$(jq -r .state "$job_file")
@@ -235,4 +251,6 @@ else
 fi
 
 rm -f "$marker_file" "$wrapper"
+# Clean exit — disarm the runner_died_early safety net.
+trap - EXIT
 echo "job $id finished: $(jq -r .state "$job_file")"
