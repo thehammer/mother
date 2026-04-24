@@ -23,8 +23,10 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 #   - Acquire a workspace lock if isolation=main-dir.
 #   - Spawn `claude --agent <worker_agent> -p "$(cat <plan>)"` as a headless
 #     background process (nohup + disown) at that cwd, tee'd to the job log.
-#     The worker agent defaults to `mother:cody` (plugin-shipped, works
-#     out-of-the-box for fresh installs); override via MOTHER_WORKER_AGENT.
+#     The worker agent defaults to `cody` if the user has one in
+#     $work_dir/.claude/agents/ or ~/.claude/agents/ (so personal
+#     customizations win), falling back to the plugin-shipped `mother:cody`
+#     for fresh installs. Override either way via MOTHER_WORKER_AGENT.
 #     The pid is recorded on the job as `worker_pid`.
 #   - Poll a status-marker file; transition the job on exit.
 #   - On cancellation: SIGTERM the worker, wait 10s, then SIGKILL.
@@ -170,15 +172,23 @@ fi
 # Spawn claude in a headless background process. Use a wrapper script so we
 # can capture exit status and keep quoting sane.
 #
-# Worker agent resolution: defaults to the plugin-shipped `mother:cody`
-# (Claude Code namespaces plugin-shipped agents with the plugin's name).
-# Users who have their own `cody` agent locally and prefer to use it can
-# override via the MOTHER_WORKER_AGENT env var:
-#
-#     MOTHER_WORKER_AGENT=cody mother daemon start
-#
-# Or permanently in the launchd plist's EnvironmentVariables block.
-worker_agent="${MOTHER_WORKER_AGENT:-mother:cody}"
+# Worker agent resolution, in priority order:
+#   1. MOTHER_WORKER_AGENT, if set — honored absolutely. Permanent overrides
+#      belong in the launchd plist's EnvironmentVariables block.
+#   2. Plain `cody`, if the user has one in the project's
+#      $work_dir/.claude/agents/cody.md or their global
+#      ~/.claude/agents/cody.md — their personal customizations beat our
+#      shipped defaults.
+#   3. `mother:cody` — the plugin-shipped fallback that works out-of-the-box
+#      on fresh installs. Claude Code namespaces plugin-shipped agents with
+#      the plugin's name.
+if [ -n "${MOTHER_WORKER_AGENT:-}" ]; then
+    worker_agent="$MOTHER_WORKER_AGENT"
+elif [ -f "$work_dir/.claude/agents/cody.md" ] || [ -f "$HOME/.claude/agents/cody.md" ]; then
+    worker_agent="cody"
+else
+    worker_agent="mother:cody"
+fi
 
 # Generate a deterministic session ID and pass it to claude via --session-id
 # so the transcript filename is predictable. Without this, main-dir jobs

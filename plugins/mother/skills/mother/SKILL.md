@@ -7,8 +7,10 @@ description: Dispatch and monitor background implementation work via Mother, a l
 
 Local orchestrator for background Claude Code jobs. Plans run in worktrees
 (parallel) or in the main repo dir (serialized via workspace locks). Background
-sessions spawn as headless workers running `claude --agent mother:cody -p "<plan>"`
-(or your own `cody` via `MOTHER_WORKER_AGENT`) and open PRs on completion.
+sessions spawn as headless workers running `claude --agent cody -p "<plan>"` —
+preferring the user's own `cody` if they have one, falling back to the
+plugin-shipped `mother:cody` otherwise (override either with
+`MOTHER_WORKER_AGENT`) — and open PRs on completion.
 
 State lives at `${MOTHER_ROOT:-$HOME/.mother}/` (plain JSON, gitignored). See
 the Mother plugin's `docs/design.md` for the full design.
