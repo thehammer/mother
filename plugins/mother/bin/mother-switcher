@@ -89,7 +89,17 @@ _format_rows() {
         ] | @tsv
     '
 }
-export -f _format_rows
+
+# Self-invocation mode used by fzf's reload bindings. We can't rely on
+# `export -f` + `bash -c _format_rows` because macOS ships bash 3.2 as
+# /bin/bash and function exports aren't reliably visible to child `bash -c`
+# shells across that boundary — the reload then fails with
+# "Command failed: bash -c _format_rows". Re-exec'ing this script with
+# `--emit-rows` is shell-independent and always works.
+if [ "${1:-}" = "--emit-rows" ]; then
+    _format_rows
+    exit 0
+fi
 
 rows=$(_format_rows)
 
@@ -101,7 +111,8 @@ if [ -z "$rows" ]; then
     exit 0
 fi
 
-reload_cmd='bash -c _format_rows'
+_SWITCHER_SELF="$_MOTHER_SELF/$(basename "$_MOTHER_RAW")"
+reload_cmd="\"$_SWITCHER_SELF\" --emit-rows"
 
 printf '%s\n' "$rows" | fzf \
     --ansi \
