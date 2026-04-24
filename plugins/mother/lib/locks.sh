@@ -93,7 +93,7 @@ lock_acquire() {
             local session_id="${CLAUDE_SESSION_ID:-unknown}"
             local tmux_pane=""
             local tmux_window=""
-            [[ -n "$TMUX" ]] && {
+            [[ -n "${TMUX:-}" ]] && {
                 tmux_pane=$(tmux display-message -p '#{pane_id}')
                 tmux_window=$(tmux display-message -p '#{window_index}')
             }
