@@ -180,6 +180,20 @@ fi
 # Or permanently in the launchd plist's EnvironmentVariables block.
 worker_agent="${MOTHER_WORKER_AGENT:-mother:cody}"
 
+# Generate a deterministic session ID and pass it to claude via --session-id
+# so the transcript filename is predictable. Without this, main-dir jobs
+# sharing a work_dir all land in the same ~/.claude/projects/<slug>/ and
+# `mother peek` can't tell them apart — it falls back to newest-mtime,
+# which conflates sibling workers and any user's foreground Claude session
+# in the same directory.
+session_id=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')
+if [ -z "$session_id" ] && [ -r /proc/sys/kernel/random/uuid ]; then
+    session_id=$(cat /proc/sys/kernel/random/uuid)
+fi
+if [ -n "$session_id" ]; then
+    _job_update ".session_id = \"$session_id\""
+fi
+
 marker_file="$RUNNER_DIR/$id.exit"
 wrapper="$RUNNER_DIR/$id.wrap"
 cat > "$wrapper" <<WRAP
@@ -190,11 +204,12 @@ echo "=== mother job $id starting at \$(date) ==="
 echo "=== working dir: \$PWD ==="
 echo "=== branch:      $branch ==="
 echo "=== agent:       $worker_agent ==="
+echo "=== session-id:  $session_id ==="
 echo
 # stream-json + verbose gives us a live per-event log (one JSON object per
 # line). \`mother logs --follow\` pretty-prints these via mother-stream-pretty;
 # the raw file stays authoritative and greppable.
-claude --agent "$worker_agent" -p "\$(cat "$plan_path")" --output-format stream-json --verbose
+claude --agent "$worker_agent" --session-id "$session_id" -p "\$(cat "$plan_path")" --output-format stream-json --verbose
 echo \$? > "$marker_file"
 WRAP
 chmod +x "$wrapper"
@@ -203,7 +218,7 @@ nohup bash "$wrapper" >/dev/null 2>&1 &
 worker_pid=$!
 disown 2>/dev/null || true
 _job_update ".worker_pid = $worker_pid"
-_append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" '{pid: $pid}')"
+_append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" '{pid: $pid, session_id: $sid}')"
 
 # Poll for the marker file.
 cancel_requested=0

@@ -305,12 +305,23 @@ cmd_peek() {
         _die "peek: no Claude project dir at $project_dir (worker may not have started yet)"
     fi
 
-    # Newest .jsonl in the project dir is the active session.
-    local transcript
-    transcript=$(find "$project_dir" -maxdepth 1 -name '*.jsonl' -print0 2>/dev/null \
-        | xargs -0 ls -t 2>/dev/null | head -1)
-    [ -n "$transcript" ] && [ -f "$transcript" ] \
-        || _die "peek: no transcript file in $project_dir"
+    # Prefer the explicit session_id recorded on the job — this is the only
+    # way to reliably pick the right transcript when multiple workers (or a
+    # user's foreground Claude session) share the same project dir (typical
+    # for --isolation main-dir). Legacy jobs without session_id fall back to
+    # newest-mtime, which is the best we can do for them.
+    local transcript session_id
+    session_id=$(jq -r '.session_id // empty' "$job_json")
+    if [ -n "$session_id" ]; then
+        transcript="$project_dir/$session_id.jsonl"
+        [ -f "$transcript" ] \
+            || _die "peek: no transcript at $transcript (worker may not have started yet)"
+    else
+        transcript=$(find "$project_dir" -maxdepth 1 -name '*.jsonl' -print0 2>/dev/null \
+            | xargs -0 ls -t 2>/dev/null | head -1)
+        [ -n "$transcript" ] && [ -f "$transcript" ] \
+            || _die "peek: no transcript file in $project_dir"
+    fi
 
     _peek_render() {
         PEEK_ID="$id" PEEK_STATE="$state" PEEK_TITLE="$title" \
