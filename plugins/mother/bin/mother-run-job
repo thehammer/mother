@@ -136,6 +136,10 @@ else
     work_dir="$repo_path"
 fi
 
+# Persist resolved work_dir on the job JSON so peek (and similar consumers)
+# can read it without re-deriving from repo_path/branch/isolation.
+_job_update ".work_dir = \"$work_dir\""
+
 # Record the resolved work_dir on the job. If we were started from `ready`
 # (via `mother run --once`), also emit the running transition; if the daemon
 # pre-transitioned us, just append a started event. The actual worker process

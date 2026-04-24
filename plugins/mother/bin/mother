@@ -276,13 +276,18 @@ cmd_peek() {
     local job_json work_dir state title
     job_json=$(_job_path "$id")
     work_dir=$(jq -r '.work_dir // empty' "$job_json")
-    # Fall back to the known worktree-naming convention if work_dir wasn't
-    # recorded on this job (older records didn't capture it explicitly).
+    # Fall back to deriving from repo_path/branch/isolation if work_dir
+    # wasn't recorded (older records didn't capture it explicitly). main-dir
+    # jobs run in the shared checkout, so the work_dir is just repo_path —
+    # the worktree-style "${repo_path}-${branch}" path is wrong for them.
     if [ -z "$work_dir" ]; then
-        local repo_path branch
+        local repo_path branch isolation
         repo_path=$(jq -r '.repo_path // empty' "$job_json")
         branch=$(jq -r '.branch // empty' "$job_json")
-        if [ -n "$repo_path" ] && [ -n "$branch" ]; then
+        isolation=$(jq -r '.isolation // empty' "$job_json")
+        if [ "$isolation" = "main-dir" ] && [ -n "$repo_path" ]; then
+            work_dir="$repo_path"
+        elif [ -n "$repo_path" ] && [ -n "$branch" ]; then
             work_dir="${repo_path}-$(echo "$branch" | tr '/' '-')"
         fi
     fi
