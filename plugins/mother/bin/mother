@@ -44,7 +44,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 _gen_id() {
     local ts rand
     ts=$(date -u +%Y%m%dT%H%M%SZ)
-    rand=$(hexdump -n 4 -e '/1 "%02x"' /dev/urandom)
+    rand=$(od -vAn -N4 -tx1 /dev/urandom | tr -d ' \n')
+    [[ "$rand" =~ ^[0-9a-f]{8}$ ]] || _die "internal: _gen_id produced invalid suffix"
     echo "${ts}-${rand}"
 }
 
