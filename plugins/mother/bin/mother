@@ -25,6 +25,8 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 #   mother peek <id> [--format json|text] [--tail N]
 #   mother cancel <id>
 #   mother retry <id>
+#   mother await [<id>] --question "..."
+#   mother resume <id> "<answer>" | --from-file <path> | -
 #   mother events [--since-cursor <session-id>] [--since <iso-ts>]
 #   mother drafts list|show <id>|rm <id>
 #   mother run [--once]
@@ -294,6 +296,11 @@ cmd_peek() {
     fi
     state=$(jq -r '.state // "?"' "$job_json")
     title=$(jq -r '.title // ""' "$job_json")
+    # Surface the operator-relevant fields for awaiting jobs so the popup's
+    # peek pane shows the question without a separate `mother status` call.
+    local question paused_at
+    question=$(jq -r '.question // ""' "$job_json")
+    paused_at=$(jq -r '.paused_at // ""' "$job_json")
 
     [ -n "$work_dir" ] || _die "peek: could not resolve work_dir for $id"
 
@@ -328,6 +335,7 @@ cmd_peek() {
         PEEK_ID="$id" PEEK_STATE="$state" PEEK_TITLE="$title" \
         PEEK_WORK_DIR="$work_dir" PEEK_TRANSCRIPT="$transcript" \
         PEEK_FORMAT="$format" PEEK_TAIL="$tail_count" \
+        PEEK_QUESTION="$question" PEEK_PAUSED_AT="$paused_at" \
             python3 - <<'PYEOF'
 import json, os, sys, time
 from collections import Counter
@@ -339,6 +347,8 @@ work_dir   = os.environ["PEEK_WORK_DIR"]
 path       = os.environ["PEEK_TRANSCRIPT"]
 fmt        = os.environ.get("PEEK_FORMAT", "text")
 tail_n     = int(os.environ.get("PEEK_TAIL", "8"))
+question   = os.environ.get("PEEK_QUESTION", "")
+paused_at  = os.environ.get("PEEK_PAUSED_AT", "")
 
 size_bytes = os.path.getsize(path)
 mtime      = os.path.getmtime(path)
@@ -415,6 +425,8 @@ if fmt == "json":
         "todos":       todos or [],
         "tool_trail":  [{"tool": n, "brief": b} for n, b in tool_trail],
         "last_text":   last_text,
+        "question":    question or None,
+        "paused_at":   paused_at or None,
     }
     print(json.dumps(out, indent=2))
 else:
@@ -426,6 +438,17 @@ else:
     print(f"Transcript:  {path}")
     print(f"             {fmt_size(size_bytes)}, updated {fmt_age(age_s)}")
     print()
+    # Awaiting jobs need the question front-and-center — that's the whole
+    # reason the operator opened the popup.
+    if state == "awaiting" and question:
+        print("┌─ AWAITING INPUT ──────────────────────────────────────────")
+        for line in question.splitlines() or [""]:
+            print(f"│  {line}")
+        if paused_at:
+            print(f"│  (paused at {paused_at})")
+        print("└───────────────────────────────────────────────────────────")
+        print(f"Answer with:  mother resume {job_id} \"<your answer>\"")
+        print()
     if todos:
         print("Todos:")
         icons = {"pending": "○", "in_progress": "▶", "completed": "✓", "cancelled": "✗"}
@@ -511,6 +534,10 @@ cmd_cancel() {
     local state; state=$(jq -r .state "$(_job_path "$id")")
     case "$state" in
         queued|ready)   _job_transition "$id" cancelled '{"reason":"user"}' ;;
+        awaiting)       # No live worker to signal — the job paused itself and
+                        # the worker process already exited. Transition direct
+                        # to cancelled so it leaves the queue immediately.
+                        _job_transition "$id" cancelled '{"reason":"user_cancelled_awaiting"}' ;;
         running)        # Leave a cancel request; runner picks it up
                         _job_update "$id" '.cancel_requested = true'
                         _append_event "$id" "cancel_requested" '{}'
@@ -544,6 +571,134 @@ cmd_retry() {
         --isolation  "$(jq -r .isolation  "$(_job_path "$id")")" \
         --executor   "$(jq -r .executor   "$(_job_path "$id")")" \
         --title      "$(jq -r .title      "$(_job_path "$id")")"
+}
+
+# ---------- await ----------
+#
+# Worker-facing primitive. An agent inside a running job calls this when it
+# needs the operator's input to make progress. The CLI:
+#   - validates the job is in `running` state
+#   - records the question, paused_at, and clears any stale pending_answer
+#   - transitions state to `awaiting`
+#   - emits an `awaiting_input` event
+#   - prints guidance the agent will see in its tool-use stdout
+#
+# The agent's job is then to end its session cleanly; mother-run-job notices
+# the awaiting state when claude exits and refrains from a normal terminal
+# transition. The job sits in `awaiting` until the operator runs
+# `mother resume <id> "<answer>"`, which kicks a fresh worker that picks up
+# from the same worktree with the answer prepended to the original plan.
+#
+# Job id may be passed as a positional arg or via $MOTHER_JOB_ID — the
+# wrapper exports the latter so agents can call this without bookkeeping.
+
+cmd_await() {
+    local id="${MOTHER_JOB_ID:-}" question=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --question)   question="$2"; shift 2 ;;
+            --question=*) question="${1#*=}"; shift ;;
+            --) shift; break ;;
+            -*) _die "unknown flag for await: $1" ;;
+            *)
+                if [ -z "$id" ]; then id="$1"; shift
+                else _die "unexpected positional arg: $1"
+                fi ;;
+        esac
+    done
+    [ -n "$id" ]       || _die "await: <id> required (or set MOTHER_JOB_ID)"
+    [ -n "$question" ] || _die "await: --question required"
+    _job_exists "$id"  || _die "no such job: $id"
+
+    local state; state=$(jq -r .state "$(_job_path "$id")")
+    [ "$state" = "running" ] || _die "await: job is in state $state, expected running"
+
+    # Single atomic write: set question/paused_at/state and clear any stale
+    # pending_answer (so a resume after this pause must come from a fresh
+    # `mother resume` call, not a leftover from a previous cycle).
+    local job_file merged
+    job_file=$(_job_path "$id")
+    merged=$(jq --arg q "$question" --arg ts "$(_iso_now)" '
+        .question = $q
+        | .paused_at = $ts
+        | .pending_answer = null
+        | .state = "awaiting"
+    ' "$job_file") || _die "await: jq update failed"
+    _atomic_write "$job_file" "$merged"
+    _append_event "$id" "awaiting_input" \
+        "$(jq -nc --arg q "$question" '{question: $q}')"
+
+    cat <<EOF
+mother: question recorded for $id
+state: running -> awaiting
+
+The operator has been notified via the statusline. They will answer with:
+  mother resume $id "<answer>"
+
+A fresh worker will then be spawned in the same worktree (your in-progress
+changes and commits are preserved), with the answer prepended to the
+original plan. End your session now — emit a brief result event summarizing
+where you paused so the resumed worker has continuity.
+EOF
+}
+
+# ---------- resume ----------
+#
+# Operator-facing primitive. Provides an answer to an `awaiting` job and
+# kicks the daemon to spawn a fresh worker. The pending_answer field is
+# consumed by mother-run-job at spawn time, which constructs an augmented
+# plan including the original plan, the previous question, and this answer.
+#
+# Answer can come from the command line, from a file (`--from-file`), or
+# from stdin (`-`). All three flows write the same `pending_answer` field;
+# choose whichever is convenient for the answer's length / shape.
+
+cmd_resume() {
+    local id="" answer="" from_file="" from_stdin=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from-file)   from_file="$2"; shift 2 ;;
+            --from-file=*) from_file="${1#*=}"; shift ;;
+            -)             from_stdin=1; shift ;;
+            --) shift; break ;;
+            -*) _die "unknown flag for resume: $1" ;;
+            *)
+                if   [ -z "$id" ];     then id="$1"; shift
+                elif [ -z "$answer" ]; then answer="$1"; shift
+                else _die "unexpected positional arg: $1"
+                fi ;;
+        esac
+    done
+    [ -n "$id" ] || _die "resume: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+
+    if [ -n "$from_file" ]; then
+        [ -f "$from_file" ] || _die "resume: --from-file not found: $from_file"
+        answer=$(cat "$from_file")
+    elif [ "$from_stdin" -eq 1 ]; then
+        answer=$(cat)
+    fi
+    [ -n "$answer" ] || _die "resume: <answer> required (positional, --from-file, or '-' for stdin)"
+
+    local state; state=$(jq -r .state "$(_job_path "$id")")
+    [ "$state" = "awaiting" ] || _die "resume: job is in state $state, expected awaiting"
+
+    # Single atomic write: stash the answer, mark resumed_at, bump
+    # resume_count (defaulting from null on first resume), and transition
+    # straight to `ready` so the daemon's next promotion tick spawns a
+    # fresh worker without going through `queued`.
+    local job_file merged
+    job_file=$(_job_path "$id")
+    merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" '
+        .pending_answer = $a
+        | .resumed_at = $ts
+        | .resume_count = ((.resume_count // 0) + 1)
+        | .state = "ready"
+    ' "$job_file") || _die "resume: jq update failed"
+    _atomic_write "$job_file" "$merged"
+    _append_event "$id" "resumed" \
+        "$(jq -nc --arg a "$answer" '{answer: $a}')"
+    echo "$id: awaiting -> ready (worker will spawn on next daemon tick)"
 }
 
 # ---------- events (for the hook) ----------
@@ -941,6 +1096,8 @@ Usage:
   mother plan ID
   mother cancel ID
   mother retry ID
+  mother await [ID] --question TEXT      (worker-side: pause for operator input)
+  mother resume ID ANSWER | --from-file PATH | -    (operator-side: answer + resume)
   mother events [--since-cursor SESSION_ID] [--since ISO_TS]
   mother drafts list | save --plan-file PATH | show ID | rm ID
   mother daemon start [--foreground] | stop | status | install | uninstall
@@ -962,7 +1119,10 @@ Daemon env vars:
   MOTHER_POLL_INTERVAL    (default: 2)   seconds between ticks
   MOTHER_SHUTDOWN_GRACE   (default: 30)  seconds to wait for children on stop
 
-State flows: queued -> ready -> running -> succeeded | failed | cancelled
+State flows:
+  queued -> ready -> running -> succeeded | failed | cancelled
+  running -> awaiting -> ready -> running     (when a worker calls `await`,
+                                               then operator runs `resume`)
 
 See docs/design.md for the full design.
 EOF
@@ -983,6 +1143,8 @@ main() {
         plan)    cmd_plan "$@" ;;
         cancel)  cmd_cancel "$@" ;;
         retry)   cmd_retry "$@" ;;
+        await)   cmd_await "$@" ;;
+        resume)  cmd_resume "$@" ;;
         events)  cmd_events "$@" ;;
         drafts)  cmd_drafts "$@" ;;
         daemon)  cmd_daemon "$@" ;;

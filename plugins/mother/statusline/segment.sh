@@ -3,15 +3,18 @@
 #
 # Source this file from your own statusline.sh and call `mother_segment` at the
 # point in the line where you want the queue state to render. Writes a short
-# ANSI-coloured string like:  Q ▶2 ⏸5  (running, queued), with a trailing  !3
-# in red for any failures.
+# ANSI-coloured string like:  Q ▶2 ⏸5 ?1  (running, queued, awaiting),
+# with a trailing  !3 in red for any failures.
 #
 # Hidden entirely when all counts are zero.
 #
 # Cache:
 #   $MOTHER_STATUSLINE_CACHE (default: /tmp/.mother-statusline) — single line,
-#   colon-separated "RUNNING:QUEUED:FAILED" counts. TTL-based refresh in the
-#   background keeps the statusline fast.
+#   colon-separated "RUNNING:QUEUED:FAILED:AWAITING" counts. The awaiting
+#   field was added later and lives at the end so old caches written by an
+#   older version still parse: a missing fourth field defaults to zero, and
+#   a fresh refresh (TTL ~10s) overwrites the cache in the new format.
+#   TTL-based refresh in the background keeps the statusline fast.
 
 : "${MOTHER_STATUSLINE_CACHE:=/tmp/.mother-statusline}"
 : "${MOTHER_STATUSLINE_TTL:=10}"  # seconds
@@ -36,11 +39,12 @@ mother_statusline_refresh() {
             jq -r '.state' "$f" 2>/dev/null
         done \
         | awk '
-            /^running$/ { r++ }
-            /^queued$/  { q++ }
-            /^ready$/   { q++ }
-            /^failed$/  { fa++ }
-            END { printf "%d:%d:%d\n", r+0, q+0, fa+0 }
+            /^running$/  { r++ }
+            /^queued$/   { q++ }
+            /^ready$/    { q++ }
+            /^failed$/   { fa++ }
+            /^awaiting$/ { a++ }
+            END { printf "%d:%d:%d:%d\n", r+0, q+0, fa+0, a+0 }
         ')
 
     printf '%s\n' "$counts" > "$tmp" && mv "$tmp" "$cache"
@@ -64,12 +68,19 @@ mother_segment() {
         ( mother_statusline_refresh "$cache" >/dev/null 2>&1 ) &
     fi
 
-    local _mr _mq _mf
-    IFS=: read -r _mr _mq _mf < "$cache" 2>/dev/null || { _mr=0; _mq=0; _mf=0; }
-    : "${_mr:=0}" "${_mq:=0}" "${_mf:=0}"
+    local _mr _mq _mf _ma
+    # Read up to 4 fields. Old caches (3 fields, no awaiting) leave _ma empty,
+    # which the default below maps to 0 — correct until the next refresh
+    # overwrites the cache in the new format.
+    IFS=: read -r _mr _mq _mf _ma < "$cache" 2>/dev/null \
+        || { _mr=0; _mq=0; _mf=0; _ma=0; }
+    : "${_mr:=0}" "${_mq:=0}" "${_mf:=0}" "${_ma:=0}"
 
     # Only render if something non-zero.
-    if ! { [ "$_mr" -gt 0 ] 2>/dev/null || [ "$_mq" -gt 0 ] 2>/dev/null || [ "$_mf" -gt 0 ] 2>/dev/null; }; then
+    if ! { [ "$_mr" -gt 0 ] 2>/dev/null \
+        || [ "$_mq" -gt 0 ] 2>/dev/null \
+        || [ "$_mf" -gt 0 ] 2>/dev/null \
+        || [ "$_ma" -gt 0 ] 2>/dev/null; }; then
         return 0
     fi
 
@@ -77,6 +88,10 @@ mother_segment() {
     local out=" ${reset}Q"
     [ "$_mr" -gt 0 ] && out="${out} \033[38;5;220m▶${_mr}${reset}"  # yellow — running
     [ "$_mq" -gt 0 ] && out="${out} \033[38;5;75m⏸${_mq}${reset}"   # blue — queued/ready
+    # Awaiting jobs come BEFORE failures because they need operator action
+    # to make progress — surfacing them with a question-mark glyph in
+    # orange makes them stand out without crying wolf the way red would.
+    [ "$_ma" -gt 0 ] && out="${out} \033[38;5;208m?${_ma}${reset}"  # orange — awaiting input
     [ "$_mf" -gt 0 ] && out="${out} \033[38;5;203m!${_mf}${reset}"  # red — failed
     out="${out} "
 

@@ -204,17 +204,64 @@ if [ -n "$session_id" ]; then
     _job_update ".session_id = \"$session_id\""
 fi
 
+# Resume detection — if `mother resume` queued an answer for this job, build
+# an augmented plan that fronts the previous question + answer + worktree
+# state, with the original plan attached for reference. The wrapper passes
+# this augmented file to claude instead of the original. We don't try to
+# resume the previous claude session (no --resume in -p mode); instead the
+# new session gets the context it needs in its prompt, and the worktree
+# itself carries the in-progress changes from before the pause.
+resolved_plan_path="$plan_path"
+pending_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null || echo "")
+if [ -n "$pending_answer" ]; then
+    prev_question=$(jq -r '.question // empty' "$job_file" 2>/dev/null || echo "")
+    resume_plan="$RUNNER_DIR/$id.resume.md"
+    {
+        printf '# Resumed plan — operator answered your question\n\n'
+        printf 'A previous worker on this job paused itself with `mother await`.\n'
+        printf 'The operator has answered. Pick up from where the prior worker left off.\n\n'
+        printf '## The question you (or your predecessor) asked\n\n'
+        if [ -n "$prev_question" ]; then
+            printf '%s\n\n' "$prev_question"
+        else
+            printf '_(no question recorded — this should not happen; proceed with the answer below as guidance)_\n\n'
+        fi
+        printf "## The operator's answer\n\n"
+        printf '%s\n\n' "$pending_answer"
+        printf '## Worktree state at pause time\n\n'
+        printf 'Your work directory at `%s` retains all changes and commits from the\n' "$work_dir"
+        printf 'previous run — your branch is `%s`. Run `git status` and `git log --oneline`\n' "$branch"
+        printf 'before resuming so you orient yourself in the in-progress work.\n\n'
+        printf '## Original plan (for reference)\n\n'
+        cat "$plan_path"
+    } > "$resume_plan"
+    resolved_plan_path="$resume_plan"
+
+    # Consume the answer + question so the next spawn (if any) starts clean.
+    # Keep resumed_at / resume_count for the audit trail.
+    merged=$(jq '.pending_answer = null | .question = null' "$job_file") \
+        && _atomic_write "$job_file" "$merged"
+    _append_event "resumed_from_input" \
+        "$(jq -nc --arg q "$prev_question" --arg a "$pending_answer" --arg p "$resume_plan" \
+            '{question: $q, answer: $a, resume_plan: $p}')"
+fi
+
 marker_file="$RUNNER_DIR/$id.exit"
 wrapper="$RUNNER_DIR/$id.wrap"
 cat > "$wrapper" <<WRAP
 #!/usr/bin/env bash
 cd "$work_dir"
 exec > >(tee -a "$log_path") 2>&1
+# Export the job id so an in-worker agent can call \`mother await --question
+# "..."\` without bookkeeping. Without this, the agent has no clean way to
+# discover which job it belongs to.
+export MOTHER_JOB_ID="$id"
 echo "=== mother job $id starting at \$(date) ==="
 echo "=== working dir: \$PWD ==="
 echo "=== branch:      $branch ==="
 echo "=== agent:       $worker_agent ==="
 echo "=== session-id:  $session_id ==="
+echo "=== plan:        $resolved_plan_path ==="
 echo
 # stream-json + verbose gives us a live per-event log (one JSON object per
 # line). \`mother logs --follow\` pretty-prints these via mother-stream-pretty;
@@ -232,7 +279,7 @@ _forward_signal() {
     [ -n "\$claude_pid" ] && kill -TERM "\$claude_pid" 2>/dev/null || true
 }
 trap _forward_signal TERM INT
-claude --agent "$worker_agent" --session-id "$session_id" -p "\$(cat "$plan_path")" --output-format stream-json --verbose &
+claude --agent "$worker_agent" --session-id "$session_id" -p "\$(cat "$resolved_plan_path")" --output-format stream-json --verbose &
 claude_pid=\$!
 # wait may be interrupted by the trap (signal raises EINTR and bash returns
 # 128+sig); loop until claude is actually gone before recording its real
@@ -392,6 +439,23 @@ fi
 # Release main-dir lock if we took one.
 if [ "$isolation" = "main-dir" ]; then
     lock_release "${repo}:workspace" >/dev/null 2>&1 || true
+fi
+
+# If the worker called `mother await` and transitioned the job to
+# `awaiting` before exiting, respect that. The job is paused (not done) and
+# `mother resume` will spawn a fresh worker later — we just need to release
+# our own resources cleanly without touching state. The main-dir workspace
+# lock was already released above, so the resumed worker can re-acquire it.
+current_state=$(jq -r '.state' "$job_file" 2>/dev/null)
+if [ "$current_state" = "awaiting" ]; then
+    _append_event "worker_exited_paused" \
+        "$(jq -nc --arg pr "${pr_url:-}" '{pr_url: $pr}')"
+    rm -f "$marker_file" "$wrapper"
+    # The runner_died_early trap only fires while state == "running"; awaiting
+    # is safe by virtue of that, but disarm anyway for clarity.
+    trap - EXIT
+    echo "job $id paused (awaiting input)"
+    exit 0
 fi
 
 # Final transition.
