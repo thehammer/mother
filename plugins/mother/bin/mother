@@ -1119,6 +1119,13 @@ Daemon env vars:
   MOTHER_POLL_INTERVAL    (default: 2)   seconds between ticks
   MOTHER_SHUTDOWN_GRACE   (default: 30)  seconds to wait for children on stop
 
+Worker prompt env vars:
+  MOTHER_PREAMBLE_PATH    path to a markdown file prepended to every
+                          worker's prompt; teaches the agent how to
+                          pause via `mother await`. Defaults to the
+                          plugin's templates/preamble.md. Point at
+                          /dev/null (or a missing path) to disable.
+
 State flows:
   queued -> ready -> running -> succeeded | failed | cancelled
   running -> awaiting -> ready -> running     (when a worker calls `await`,

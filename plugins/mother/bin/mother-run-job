@@ -204,19 +204,38 @@ if [ -n "$session_id" ]; then
     _job_update ".session_id = \"$session_id\""
 fi
 
-# Resume detection — if `mother resume` queued an answer for this job, build
-# an augmented plan that fronts the previous question + answer + worktree
-# state, with the original plan attached for reference. The wrapper passes
-# this augmented file to claude instead of the original. We don't try to
-# resume the previous claude session (no --resume in -p mode); instead the
-# new session gets the context it needs in its prompt, and the worktree
-# itself carries the in-progress changes from before the pause.
-resolved_plan_path="$plan_path"
+# Compose the spawn-time prompt. The on-disk plan file stays the user's
+# authored content; everything Mother adds (the await/resume capability
+# preamble, plus any resume context from a previous pause cycle) is
+# layered in at spawn time and written to a single $RUNNER_DIR/$id.prompt.md
+# that becomes the prompt claude actually receives.
+#
+#   [preamble]              ← from $MOTHER_PREAMBLE_PATH or the shipped
+#                             template; tells the agent how to call
+#                             `mother await`. Empty / disabled by pointing
+#                             MOTHER_PREAMBLE_PATH at /dev/null or a
+#                             missing file.
+#   [resume context]        ← only on resume cycles: previous question,
+#                             operator's answer, worktree-state heads-up.
+#   [user's plan]           ← exact contents of $plan_path, untouched.
+#
+# We don't try to resume the previous claude session (no --resume in -p
+# mode); the augmented prompt + the worktree itself (which still carries
+# the in-progress changes from before the pause) are how continuity is
+# preserved.
+
+spawn_prompt="$RUNNER_DIR/$id.prompt.md"
+preamble_path="${MOTHER_PREAMBLE_PATH:-$MOTHER_LIB_DIR/../templates/preamble.md}"
 pending_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null || echo "")
-if [ -n "$pending_answer" ]; then
-    prev_question=$(jq -r '.question // empty' "$job_file" 2>/dev/null || echo "")
-    resume_plan="$RUNNER_DIR/$id.resume.md"
-    {
+prev_question=$(jq -r '.question // empty'       "$job_file" 2>/dev/null || echo "")
+
+{
+    if [ -r "$preamble_path" ] && [ -s "$preamble_path" ]; then
+        cat "$preamble_path"
+        printf '\n---\n\n'
+    fi
+
+    if [ -n "$pending_answer" ]; then
         printf '# Resumed plan — operator answered your question\n\n'
         printf 'A previous worker on this job paused itself with `mother await`.\n'
         printf 'The operator has answered. Pick up from where the prior worker left off.\n\n'
@@ -233,17 +252,20 @@ if [ -n "$pending_answer" ]; then
         printf 'previous run — your branch is `%s`. Run `git status` and `git log --oneline`\n' "$branch"
         printf 'before resuming so you orient yourself in the in-progress work.\n\n'
         printf '## Original plan (for reference)\n\n'
-        cat "$plan_path"
-    } > "$resume_plan"
-    resolved_plan_path="$resume_plan"
+    fi
 
+    cat "$plan_path"
+} > "$spawn_prompt"
+resolved_plan_path="$spawn_prompt"
+
+if [ -n "$pending_answer" ]; then
     # Consume the answer + question so the next spawn (if any) starts clean.
     # Keep resumed_at / resume_count for the audit trail.
     merged=$(jq '.pending_answer = null | .question = null' "$job_file") \
         && _atomic_write "$job_file" "$merged"
     _append_event "resumed_from_input" \
-        "$(jq -nc --arg q "$prev_question" --arg a "$pending_answer" --arg p "$resume_plan" \
-            '{question: $q, answer: $a, resume_plan: $p}')"
+        "$(jq -nc --arg q "$prev_question" --arg a "$pending_answer" --arg p "$spawn_prompt" \
+            '{question: $q, answer: $a, resume_prompt: $p}')"
 fi
 
 marker_file="$RUNNER_DIR/$id.exit"
@@ -450,7 +472,7 @@ current_state=$(jq -r '.state' "$job_file" 2>/dev/null)
 if [ "$current_state" = "awaiting" ]; then
     _append_event "worker_exited_paused" \
         "$(jq -nc --arg pr "${pr_url:-}" '{pr_url: $pr}')"
-    rm -f "$marker_file" "$wrapper"
+    rm -f "$marker_file" "$wrapper" "$spawn_prompt"
     # The runner_died_early trap only fires while state == "running"; awaiting
     # is safe by virtue of that, but disarm anyway for clarity.
     trap - EXIT
