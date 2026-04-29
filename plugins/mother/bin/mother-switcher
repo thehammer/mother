@@ -5,11 +5,16 @@
 #   bind Space display-popup -w 80% -h 80% -E "$HOME/.local/bin/mother-switcher"
 #
 # Bindings inside fzf:
-#   enter     → tail the job's log (mother logs --follow)
+#   enter     → swap the preview pane to a live tail of the job's log
+#               (`mother logs --follow`). The popup keeps running and every
+#               other binding still works on the highlighted job; esc/ctrl-q
+#               close the popup as usual. Selecting a different job in the
+#               list switches the tail to that job's log automatically.
 #   ctrl-x    → cancel a live job and reload the list
 #   ctrl-r    → retry a failed/cancelled job and reload the list
 #   ctrl-d    → archive a terminal-state job (immediate, regardless of age)
 #   ctrl-p    → show the job's plan file
+#   esc       → close the popup (fzf default)
 #   ctrl-q    → quit
 #
 # Rows are colored by state (succeeded/running/failed/cancelled/queued) and
@@ -119,9 +124,9 @@ printf '%s\n' "$rows" | fzf \
     --delimiter $'\t' \
     --with-nth '2..' \
     --preview "\"$MOTHER_BIN\" peek {1} --watch" \
-    --preview-window 'right:60%:wrap' \
-    --header 'enter: logs  ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-p: plan  ctrl-q: quit' \
-    --bind "enter:execute(\"$MOTHER_BIN\" logs {1} --follow)" \
+    --preview-window 'up:60%:wrap' \
+    --header 'ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-p: plan  esc/ctrl-q: quit' \
+    --bind "enter:change-preview(\"$MOTHER_BIN\" logs {1} --follow)+change-preview-window(up:60%:wrap:follow)" \
     --bind "ctrl-x:execute-silent(\"$MOTHER_BIN\" cancel {1})+reload($reload_cmd)" \
     --bind "ctrl-r:execute-silent(\"$MOTHER_BIN\" retry {1})+reload($reload_cmd)" \
     --bind "ctrl-d:execute-silent(\"$MOTHER_BIN\" archive {1})+reload($reload_cmd)" \
