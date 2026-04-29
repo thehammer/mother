@@ -219,8 +219,31 @@ echo
 # stream-json + verbose gives us a live per-event log (one JSON object per
 # line). \`mother logs --follow\` pretty-prints these via mother-stream-pretty;
 # the raw file stays authoritative and greppable.
-claude --agent "$worker_agent" --session-id "$session_id" -p "\$(cat "$plan_path")" --output-format stream-json --verbose
-echo \$? > "$marker_file"
+#
+# Run claude in the background so we can forward signals to it. Without this,
+# a SIGTERM to the wrapper would kill bash and orphan claude — which is the
+# failure mode mother's reaper needs to escape when claude refuses to exit
+# after emitting its final 'result' event. With the trap in place, a SIGTERM
+# to the wrapper unblocks claude (gracefully on a healthy session, after
+# SIGKILL escalation from mother-run-job on a wedged one), 'wait' returns
+# its real exit code, and the marker file is written normally.
+claude_pid=""
+_forward_signal() {
+    [ -n "\$claude_pid" ] && kill -TERM "\$claude_pid" 2>/dev/null || true
+}
+trap _forward_signal TERM INT
+claude --agent "$worker_agent" --session-id "$session_id" -p "\$(cat "$plan_path")" --output-format stream-json --verbose &
+claude_pid=\$!
+# wait may be interrupted by the trap (signal raises EINTR and bash returns
+# 128+sig); loop until claude is actually gone before recording its real
+# exit code.
+rc=0
+while :; do
+    wait "\$claude_pid" 2>/dev/null
+    rc=\$?
+    kill -0 "\$claude_pid" 2>/dev/null || break
+done
+echo "\$rc" > "$marker_file"
 WRAP
 chmod +x "$wrapper"
 
@@ -230,30 +253,135 @@ disown 2>/dev/null || true
 _job_update ".worker_pid = $worker_pid"
 _append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" '{pid: $pid, session_id: $sid}')"
 
+# Reaper tunables. RESULT_GRACE_SECONDS is how long we let the worker linger
+# after we observe a top-level "result" event in the stream-json log before
+# forcing it down (Layer 1 in the bug report). IDLE_REAP_SECONDS is the
+# log-mtime watchdog (Layer 2): if the worker hasn't written a single byte
+# in that long, we treat it as wedged regardless of whether we ever saw a
+# result. Both knobs default conservatively — five minutes is plenty for
+# any sane post-result cleanup, and 30 minutes of total log silence is
+# already unusual even for long-running tool calls (claude emits periodic
+# system events while waiting on tools).
+RESULT_GRACE_SECONDS="${MOTHER_RESULT_GRACE_SECONDS:-300}"
+IDLE_REAP_SECONDS="${MOTHER_IDLE_REAP_SECONDS:-1800}"
+
+# _terminate_worker: SIGTERM the wrapper + its direct children, wait up to
+# 10s for them to exit, then SIGKILL stragglers. We hit the children
+# explicitly because the cancel/reap path has historically just SIGTERM'd
+# the wrapper, which would leave a hung claude orphaned (the failure mode
+# this bug fix is closing). With the wrapper's signal trap in place, the
+# direct kill is mostly belt-and-suspenders, but it's also what saves us
+# if the wrapper itself has somehow died.
+_terminate_worker() {
+    local kids
+    kids=$(pgrep -P "$worker_pid" 2>/dev/null || true)
+    [ -n "$kids" ] && kill -TERM $kids 2>/dev/null || true
+    kill -TERM "$worker_pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$worker_pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$worker_pid" 2>/dev/null; then
+        kids=$(pgrep -P "$worker_pid" 2>/dev/null || true)
+        [ -n "$kids" ] && kill -KILL $kids 2>/dev/null || true
+        kill -KILL "$worker_pid" 2>/dev/null || true
+    fi
+}
+
+# _log_mtime: epoch seconds of the log file's last write, or 0 if missing.
+# Wrapped because macOS uses `stat -f %m` and Linux uses `stat -c %Y`.
+_log_mtime() {
+    [ -f "$log_path" ] || { echo 0; return; }
+    stat -f %m "$log_path" 2>/dev/null \
+        || stat -c %Y "$log_path" 2>/dev/null \
+        || echo 0
+}
+
 # Poll for the marker file.
 cancel_requested=0
+final_result_epoch=0
+reaped_reason=""
 while [ ! -f "$marker_file" ]; do
     sleep 2
-    # Honor cancellation: TERM, grace period, then KILL.
+
+    # Honor cancellation: TERM, grace period, then KILL (handled in the helper).
     if [ "$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
         cancel_requested=1
-        kill -TERM "$worker_pid" 2>/dev/null || true
-        waited=0
-        while kill -0 "$worker_pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
-            sleep 1
-            waited=$((waited + 1))
-        done
-        kill -0 "$worker_pid" 2>/dev/null && kill -KILL "$worker_pid" 2>/dev/null || true
+        _terminate_worker
         break
+    fi
+
+    # Live observability. Two things we want to know about *as they happen*,
+    # not just after claude exits:
+    #   1. The PR URL (so `mother status` reflects the artifact even while
+    #      the wrapper is still running). Without this, the bug's
+    #      "PR exists but mother shows pr_url: null" symptom persists for
+    #      the entire post-result-hang window.
+    #   2. The top-level `result` event in the stream-json output. Once we
+    #      see it, the agent has emitted its canonical "I'm done" signal —
+    #      from here on, mother is the timekeeper for how long the wrapper
+    #      gets to gracefully wind down.
+    if [ -f "$log_path" ]; then
+        if [ -z "$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)" ]; then
+            _live_pr_url=$(grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' "$log_path" 2>/dev/null | tail -1 || true)
+            if [ -n "$_live_pr_url" ]; then
+                _job_update ".pr_url = \"$_live_pr_url\""
+                _append_event "pr_opened" "$(jq -nc --arg url "$_live_pr_url" '{url: $url}')"
+            fi
+        fi
+
+        if [ "$final_result_epoch" -eq 0 ]; then
+            # stream-json emits one complete JSON event per line. The result
+            # event has top-level "type":"result". The whitespace tolerance
+            # below is paranoia — claude's SDK currently emits compact JSON,
+            # but stream formatters change.
+            if grep -Eq '"type"[[:space:]]*:[[:space:]]*"result"' "$log_path" 2>/dev/null; then
+                final_result_epoch=$(date +%s)
+                _job_update ".final_result_at = \"$(iso_now)\""
+                _append_event "final_result_observed" "{}"
+            fi
+        fi
+    fi
+
+    # Layer 1 — result observed + grace window expired. The worker has
+    # signalled completion and then sat idle past the patience threshold;
+    # force it down and treat the job as succeeded (with metadata noting
+    # we had to reap).
+    if [ "$final_result_epoch" -gt 0 ]; then
+        _now_epoch=$(date +%s)
+        if [ $((_now_epoch - final_result_epoch)) -ge "$RESULT_GRACE_SECONDS" ]; then
+            reaped_reason="result_grace_expired"
+            _append_event "reaping_after_result_grace" "$(jq -nc --argjson grace "$RESULT_GRACE_SECONDS" '{grace_seconds: $grace}')"
+            _terminate_worker
+            break
+        fi
+    fi
+
+    # Layer 2 — log has been silent past the idle threshold. Catches the
+    # "claude hung BEFORE emitting result" case that Layer 1 can't see.
+    # Without a result event we don't know whether the work artifact
+    # exists, so the final transition will mark this `failed`.
+    _mtime=$(_log_mtime)
+    if [ "$_mtime" -gt 0 ]; then
+        _now_epoch=$(date +%s)
+        if [ $((_now_epoch - _mtime)) -ge "$IDLE_REAP_SECONDS" ]; then
+            reaped_reason="idle_timeout"
+            _append_event "reaping_after_idle_timeout" "$(jq -nc --argjson seconds "$IDLE_REAP_SECONDS" --argjson last_activity "$_mtime" '{idle_seconds: $seconds, last_activity_epoch: $last_activity}')"
+            _terminate_worker
+            break
+        fi
     fi
 done
 
 exit_code=0
 [ -f "$marker_file" ] && exit_code=$(cat "$marker_file")
 
-# Best-effort: extract a PR URL from the log.
-pr_url=""
-if [ -f "$log_path" ]; then
+# Best-effort: extract a PR URL from the log if we didn't already pick it up
+# during the poll loop. Skipped if pr_url was already recorded — re-emitting
+# `pr_opened` would double-count in the event trail.
+pr_url=$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)
+if [ -z "$pr_url" ] && [ -f "$log_path" ]; then
     pr_url=$(grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' "$log_path" | tail -1 || true)
     if [ -n "$pr_url" ]; then
         _job_update ".pr_url = \"$pr_url\""
@@ -269,6 +397,18 @@ fi
 # Final transition.
 if [ "$cancel_requested" -eq 1 ]; then
     _transition cancelled "$(jq -nc '{reason: "user"}')"
+elif [ -n "$reaped_reason" ]; then
+    # We forced the worker down via one of the reap heuristics. If we'd
+    # already observed the agent's final `result` event by then, the work
+    # is complete and the worker just refused to exit — call it succeeded
+    # with a note. If we reaped without ever seeing a result (idle timeout
+    # mid-work), the outcome is genuinely indeterminate, so mark it failed
+    # so the operator notices.
+    if [ "$final_result_epoch" -gt 0 ]; then
+        _transition succeeded "$(jq -nc --arg pr "$pr_url" --arg reason "$reaped_reason" '{pr_url: $pr, reaped: $reason}')"
+    else
+        _transition failed "$(jq -nc --arg reason "$reaped_reason" '{reason: $reason}')"
+    fi
 elif [ "$exit_code" = "0" ]; then
     _transition succeeded "$(jq -nc --arg pr "$pr_url" '{pr_url: $pr}')"
 else
