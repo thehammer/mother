@@ -480,6 +480,60 @@ if [ "$current_state" = "awaiting" ]; then
     exit 0
 fi
 
+# Verify the artifact: when we're about to mark `succeeded` but didn't
+# capture a pr_url during the run, sanity-check that the branch was at
+# least pushed to origin. Worktree jobs are spun off on a fresh branch
+# whose implicit contract is "the work is shipped to that branch on
+# origin." Trusting the `result` event alone (even with subtype=success)
+# is how we ended up calling jobs succeeded after the agent yielded
+# mid-work — e.g. when an agent uses `Monitor` to wait for lint and ends
+# its turn expecting a follow-up turn that `claude -p` never delivers.
+#
+# Returns 0 to allow the caller to transition to succeeded; returns 1
+# after having transitioned to failed itself, in which case the caller
+# must NOT also transition.
+_verify_artifact_or_fail() {
+    # If a pr_url was captured (live or post-loop), the artifact is real.
+    [ -z "${pr_url:-}" ] || return 0
+    # Only worktree jobs carry the "branch must be on origin" contract.
+    # main-dir jobs share a workspace and can't be verified this way.
+    [ "$isolation" = "worktree" ] || return 0
+    [ -d "$work_dir" ] || return 0  # worktree gone — don't fail spuriously
+
+    if (cd "$work_dir" && git ls-remote --exit-code origin "$branch" >/dev/null 2>&1); then
+        # Branch on origin — work shipped to remote, just no PR opened.
+        # Probably still a success (some workflows push without opening
+        # a PR; some PR-opening tools fail silently after the push). Note
+        # it on the events trail so an operator can decide whether to open
+        # the PR by hand.
+        _append_event "no_pr_url_but_branch_pushed" \
+            "$(jq -nc --arg b "$branch" '{branch: $b}')"
+        return 0
+    fi
+
+    # Branch is NOT on origin → nothing was pushed → work didn't ship,
+    # regardless of what the result event claimed. Gather context that'll
+    # help the operator decide whether to retry or hand-finish.
+    local commits_ahead=0 uncommitted=0
+    commits_ahead=$(cd "$work_dir" && git rev-list --count "$base_ref..HEAD" 2>/dev/null || echo 0)
+    uncommitted=$(cd "$work_dir" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+    _transition failed "$(jq -nc \
+        --arg b "$branch" \
+        --arg base "$base_ref" \
+        --argjson commits "${commits_ahead:-0}" \
+        --argjson uncommitted "${uncommitted:-0}" \
+        '{
+            reason: "no_pr_no_push",
+            branch: $b,
+            base_ref: $base,
+            local_commits_ahead_of_base: $commits,
+            uncommitted_files: $uncommitted,
+            note: "agent emitted result event but never pushed the branch; work is not on origin"
+        }')"
+    return 1
+}
+
 # Final transition.
 if [ "$cancel_requested" -eq 1 ]; then
     _transition cancelled "$(jq -nc '{reason: "user"}')"
@@ -487,16 +541,20 @@ elif [ -n "$reaped_reason" ]; then
     # We forced the worker down via one of the reap heuristics. If we'd
     # already observed the agent's final `result` event by then, the work
     # is complete and the worker just refused to exit — call it succeeded
-    # with a note. If we reaped without ever seeing a result (idle timeout
-    # mid-work), the outcome is genuinely indeterminate, so mark it failed
-    # so the operator notices.
+    # with a note (subject to artifact verification). If we reaped without
+    # ever seeing a result (idle timeout mid-work), the outcome is
+    # indeterminate; mark failed so the operator notices.
     if [ "$final_result_epoch" -gt 0 ]; then
-        _transition succeeded "$(jq -nc --arg pr "$pr_url" --arg reason "$reaped_reason" '{pr_url: $pr, reaped: $reason}')"
+        if _verify_artifact_or_fail; then
+            _transition succeeded "$(jq -nc --arg pr "$pr_url" --arg reason "$reaped_reason" '{pr_url: $pr, reaped: $reason}')"
+        fi
     else
         _transition failed "$(jq -nc --arg reason "$reaped_reason" '{reason: $reason}')"
     fi
 elif [ "$exit_code" = "0" ]; then
-    _transition succeeded "$(jq -nc --arg pr "$pr_url" '{pr_url: $pr}')"
+    if _verify_artifact_or_fail; then
+        _transition succeeded "$(jq -nc --arg pr "$pr_url" '{pr_url: $pr}')"
+    fi
 else
     _transition failed "$(jq -nc --argjson code "$exit_code" '{exit_code: $code}')"
 fi

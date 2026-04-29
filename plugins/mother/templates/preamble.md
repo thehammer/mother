@@ -66,6 +66,32 @@ The lightest weight signal is still "fail clearly with explanation" — pause
 is for cases where rolling back would be expensive enough to justify the
 operator's attention before more work piles on top of the wrong fork.
 
+## Don't yield mid-work
+
+Mother runs you in `claude -p` mode — single-shot, no second turn. When you
+emit your final result event your session ends, full stop. There is no "I'll
+come back when X is done." Once you yield, you're done.
+
+Concretely: **don't end your turn while a background process is still
+running.** Don't use `Monitor` (or any async-notify primitive) to wait for
+something — the notification has nowhere to go because the runtime closes
+the conversation as soon as you yield. If you need to wait for a long-
+running command (lint, tests, CI, build), run it **synchronously** in a
+Bash tool: `npm test`, not `npm test &` plus a Monitor wait.
+
+The plan's "Acceptance criteria" / "Approach" sections describe what done
+looks like. Typically that's: edits → commit → push → open PR. **Don't
+emit your final result event until every one of those steps has actually
+happened.** If you yield with uncommitted changes or without pushing, the
+job will be marked **failed** with `reason: no_pr_no_push` (Mother
+verifies the artifact independently of whatever your result event claims),
+and a retry will start over from scratch — wasting the work you just did.
+
+This is different from `mother await`: `await` is an explicit, intentional
+pause that preserves your worktree and resumes you with the operator's
+answer in your next prompt. Yielding without finishing is an accidental
+"I'm done" signal that has no resume mechanism.
+
 ---
 
 The rest of this prompt is your actual plan. Read on.
