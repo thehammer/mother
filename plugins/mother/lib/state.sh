@@ -116,6 +116,91 @@ _job_transition() {
     _append_event "$id" "$new" "$detail"
 }
 
+# ---------- quota awareness ----------
+#
+# Claude Code's statusline payload exposes the user's rolling 5h/7d quota
+# usage with reset epochs. Outside an interactive Claude Code session that
+# data is unreachable directly — but the user's statusline can dump the
+# `rate_limits` slice to a cache file (see plugins/mother/statusline/segment.sh
+# `mother_capture_rate_limits`), and the daemon reads that cache here.
+#
+# Cache schema (the `rate_limits` object as Claude Code emits it):
+#   { "five_hour": {"used_percentage": N, "resets_at": <epoch>},
+#     "seven_day": {"used_percentage": N, "resets_at": <epoch>} }
+#
+# Caps are operator-tunable percentages. Default 90% means "Mother stops
+# dispatching when either window reaches 90% of the quota." Set lower to
+# leave more headroom for interactive use.
+
+: "${MOTHER_RATE_LIMIT_CACHE:=$MOTHER_ROOT/rate-limits.json}"
+: "${MOTHER_QUOTA_CAP_5H_PCT:=90}"
+: "${MOTHER_QUOTA_CAP_7D_PCT:=90}"
+
+# _quota_pct_for_window: stdout the effective used_percentage for a given
+# window name ("five_hour" or "seven_day"). Smart staleness: if the
+# window's resets_at is in the past, the window has rolled over since the
+# cache was written, so we treat its percentage as 0 (in our favor).
+# Returns 0 (silently) if the cache is missing/empty/malformed — no signal
+# means no gating.
+_quota_pct_for_window() {
+    local field="$1"
+    local cache="$MOTHER_RATE_LIMIT_CACHE"
+    [ -r "$cache" ] || { echo 0; return; }
+    local rl; rl=$(cat "$cache" 2>/dev/null)
+    [ -n "$rl" ] || { echo 0; return; }
+    local pct reset now
+    pct=$(printf '%s' "$rl" | jq -r --arg f "$field" '.[$f].used_percentage // 0' 2>/dev/null || echo 0)
+    reset=$(printf '%s' "$rl" | jq -r --arg f "$field" '.[$f].resets_at // 0' 2>/dev/null || echo 0)
+    now=$(date +%s)
+    # Strip fractional seconds defensively; bash arithmetic only handles ints.
+    pct="${pct%.*}"
+    case "$pct" in ''|null) pct=0 ;; esac
+    case "$reset" in ''|null) reset=0 ;; esac
+    if [ "$reset" -gt 0 ] && [ "$now" -gt "$reset" ]; then
+        echo 0
+    else
+        echo "$pct"
+    fi
+}
+
+# _quota_check: returns 0 (under cap, dispatch OK) or 1 (at-or-over cap,
+# hold). Both windows are checked; either tripping is enough to gate.
+_quota_check() {
+    local p5 p7
+    p5=$(_quota_pct_for_window five_hour)
+    p7=$(_quota_pct_for_window seven_day)
+    if [ "$p5" -ge "$MOTHER_QUOTA_CAP_5H_PCT" ] \
+        || [ "$p7" -ge "$MOTHER_QUOTA_CAP_7D_PCT" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# _quota_offending_window: the window name that's over cap, in the form
+# `quota_5h` or `quota_7d`. 5h takes precedence (it has the shorter reset,
+# so it's the one auto-resume can react to soonest). Empty if neither.
+_quota_offending_window() {
+    local p5 p7
+    p5=$(_quota_pct_for_window five_hour)
+    p7=$(_quota_pct_for_window seven_day)
+    if [ "$p5" -ge "$MOTHER_QUOTA_CAP_5H_PCT" ]; then echo "quota_5h"; return; fi
+    if [ "$p7" -ge "$MOTHER_QUOTA_CAP_7D_PCT" ]; then echo "quota_7d"; return; fi
+    echo ""
+}
+
+# _quota_resume_at_for: stdout the resets_at epoch for a given window name
+# (`quota_5h` or `quota_7d`). 0 if the cache is missing.
+_quota_resume_at_for() {
+    local cache="$MOTHER_RATE_LIMIT_CACHE"
+    [ -r "$cache" ] || { echo 0; return; }
+    local rl; rl=$(cat "$cache" 2>/dev/null)
+    case "$1" in
+        quota_5h) printf '%s' "$rl" | jq -r '.five_hour.resets_at // 0' 2>/dev/null || echo 0 ;;
+        quota_7d) printf '%s' "$rl" | jq -r '.seven_day.resets_at // 0' 2>/dev/null || echo 0 ;;
+        *) echo 0 ;;
+    esac
+}
+
 # Promote queued jobs whose dependencies are all succeeded to ready.
 _promote_ready() {
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f | while read -r f; do

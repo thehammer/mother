@@ -230,17 +230,127 @@ _maybe_archive() {
     fi
 }
 
+# ---------- quota-aware dispatch ----------
+#
+# `_quota_check` (in lib/state.sh) returns 1 when either rolling window
+# (5h or 7d) is at or over its operator-set cap. The daemon uses it to:
+#
+#   1. Auto-resume awaiting jobs whose blocking window has reset
+#      (system pauses set `paused_reason: "quota_*"` and `auto_resume_at`;
+#      we promote those back to `ready` once both the timestamp has passed
+#      and the cache shows quota under cap).
+#   2. Refuse to spawn new jobs while over cap (pre-dispatch gate). Jobs
+#      stay in `ready` and get retried each tick.
+#   3. Pause running jobs that are mid-flight when the cap trips, so
+#      headroom returns to the operator's interactive sessions instead of
+#      being eaten by background work.
+#
+# Mid-flight pause exemptions (do NOT pause):
+#   - The job already emitted its final `result` event — winding down anyway.
+#   - The job is already `awaiting` (paused for some other reason).
+#   - The job has `cancel_requested` — operator wants it gone, not preserved.
+
+_auto_resume_check() {
+    local now; now=$(date +%s)
+    local f state reason resume_at id merged
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
+        [ "$state" = "awaiting" ] || continue
+        reason=$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)
+        case "$reason" in quota_*) ;; *) continue ;; esac
+        resume_at=$(jq -r '.auto_resume_at // 0' "$f" 2>/dev/null)
+        case "$resume_at" in ''|null) resume_at=0 ;; esac
+        # Strip fractional seconds defensively.
+        resume_at="${resume_at%.*}"
+        [ "$resume_at" -gt 0 ] || continue
+        [ "$now" -ge "$resume_at" ] || continue
+        # Only resume if quota is now actually under cap. The window may
+        # have reset on the clock but if we're already pushing the next
+        # window (back-to-back heavy use) we should keep waiting.
+        if ! _quota_check; then continue; fi
+        id=$(jq -r '.id' "$f")
+        _log "auto-resuming $id (paused_reason=$reason; resume window has passed)"
+        merged=$(jq --arg ts "$(_iso_now)" '
+            .state = "ready"
+            | .pending_answer = "Quota window has reset — continue from where you left off."
+            | .resumed_at = $ts
+            | .resume_count = ((.resume_count // 0) + 1)
+            | .auto_resume_at = null
+            | .paused_reason = null
+            | .pause_requested = null
+        ' "$f") && _atomic_write "$f" "$merged"
+        _append_event "$id" "auto_resumed" \
+            "$(jq -nc --arg r "$reason" '{from_paused_reason: $r}')"
+    done
+}
+
+_maybe_pause_running() {
+    # Caller has already verified quota is over cap. Walk currently-tracked
+    # children, find their job json, set `pause_requested` + paused_reason
+    # + auto_resume_at on the eligible ones. mother-run-job's poll loop
+    # picks up `pause_requested` on its next tick and handles the rest
+    # (terminate worker, transition state to `awaiting`).
+    local reason resume_at
+    reason=$(_quota_offending_window)
+    [ -n "$reason" ] || return 0
+    resume_at=$(_quota_resume_at_for "$reason")
+    [ "${resume_at:-0}" -gt 0 ] || return 0
+
+    local f pid job_id job_file fr ar cr pr merged
+    for f in "$CHILDREN_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        pid=$(basename "$f" .json)
+        job_id=$(jq -r '.job_id // empty' "$f" 2>/dev/null)
+        [ -n "$job_id" ] || continue
+        job_file="$JOBS_DIR/$job_id.json"
+        [ -f "$job_file" ] || continue
+        # Exemptions.
+        fr=$(jq -r '.final_result_at // ""' "$job_file" 2>/dev/null)
+        [ -n "$fr" ] && continue   # already winding down
+        ar=$(jq -r '.state // ""'             "$job_file" 2>/dev/null)
+        [ "$ar" = "awaiting" ] && continue
+        cr=$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)
+        [ "$cr" = "true" ] && continue
+        pr=$(jq -r '.pause_requested // false'  "$job_file" 2>/dev/null)
+        [ "$pr" = "true" ] && continue   # already requested
+
+        merged=$(jq --arg r "$reason" --argjson ts "$resume_at" '
+            .pause_requested = true
+            | .paused_reason = $r
+            | .auto_resume_at = $ts
+        ' "$job_file") && _atomic_write "$job_file" "$merged"
+        _log "requested pause of $job_id (reason=$reason, resume_at=$resume_at)"
+        _append_event "$job_id" "pause_requested" \
+            "$(jq -nc --arg r "$reason" --argjson ts "$resume_at" \
+                '{paused_reason: $r, auto_resume_at: $ts}')"
+    done
+}
+
 _loop() {
     while [ "$SHUTDOWN" -eq 0 ]; do
         _reap_children
         _recover_orphans "$MOTHER_ORPHAN_GRACE"
+        # Auto-resume system-paused jobs whose window has rolled over
+        # BEFORE _promote_ready, so resumed jobs are eligible for the
+        # current tick's spawn budget.
+        _auto_resume_check
         _promote_ready
-        while [ "$(_count_running_children)" -lt "$MOTHER_CONCURRENCY" ]; do
-            local next
-            next=$(_pick_next_ready)
-            [ -n "$next" ] || break
-            _spawn_job "$next"
-        done
+
+        if _quota_check; then
+            # Under cap — normal dispatch.
+            while [ "$(_count_running_children)" -lt "$MOTHER_CONCURRENCY" ]; do
+                local next
+                next=$(_pick_next_ready)
+                [ -n "$next" ] || break
+                _spawn_job "$next"
+            done
+        else
+            # Over cap — hold new dispatches and try to pause anything
+            # still running so headroom returns to interactive use.
+            _maybe_pause_running
+        fi
+
         _maybe_archive
         # Sleep in short slices so signal handling is responsive.
         local slept=0

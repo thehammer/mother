@@ -381,6 +381,25 @@ while [ ! -f "$marker_file" ]; do
         break
     fi
 
+    # Honor a system-initiated pause (daemon's quota gate). Same kill path
+    # as cancel, but the state transitions to `awaiting` (not cancelled) so
+    # the daemon's auto-resume can pick the job back up when the offending
+    # window resets. We transition state BEFORE killing the worker so the
+    # post-loop short-circuit at line ~470 (the `awaiting` exit path) finds
+    # the right state and skips the terminal-transition logic.
+    if [ "$(jq -r '.pause_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
+        _pause_reason=$(jq -r '.paused_reason // "system"' "$job_file" 2>/dev/null)
+        _pause_resume_at=$(jq -r '.auto_resume_at // 0'    "$job_file" 2>/dev/null)
+        _job_update '.state = "awaiting"
+            | .question = "Mother paused this job because the quota cap was reached. Auto-resumes when the blocking window resets."
+            | .pause_requested = null'
+        _append_event "paused_for_quota" \
+            "$(jq -nc --arg r "$_pause_reason" --argjson ts "${_pause_resume_at:-0}" \
+                '{paused_reason: $r, auto_resume_at: $ts}')"
+        _terminate_worker
+        break
+    fi
+
     # Live observability. Two things we want to know about *as they happen*,
     # not just after claude exits:
     #   1. The PR URL (so `mother status` reflects the artifact even while

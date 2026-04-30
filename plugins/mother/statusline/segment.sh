@@ -19,6 +19,37 @@
 : "${MOTHER_STATUSLINE_CACHE:=/tmp/.mother-statusline}"
 : "${MOTHER_STATUSLINE_TTL:=10}"  # seconds
 : "${MOTHER_ROOT:=$HOME/.mother}"
+: "${MOTHER_RATE_LIMIT_CACHE:=$MOTHER_ROOT/rate-limits.json}"
+: "${MOTHER_QUOTA_CAP_5H_PCT:=90}"
+: "${MOTHER_QUOTA_CAP_7D_PCT:=90}"
+
+# mother_capture_rate_limits: persist the rate_limits portion of a statusline
+# JSON payload so tooling that runs outside an interactive Claude Code
+# session (notably mother-runner's quota gate) can read the user's true
+# rolling quota state. Call from your statusline.sh with the same JSON
+# input you pipe through your own jq calls — it's one extra jq invocation.
+#
+# Schema written:
+#   { "five_hour": {"used_percentage": N, "resets_at": <epoch>},
+#     "seven_day": {"used_percentage": N, "resets_at": <epoch>} }
+#
+# Older Claude Code versions may not include `rate_limits` in the payload
+# — in that case the cache file is left untouched (so a stale-but-real
+# cache from a recent render isn't wiped on a payload that lacks the
+# field).
+mother_capture_rate_limits() {
+    local input="$1"
+    local cache="$MOTHER_RATE_LIMIT_CACHE"
+    mkdir -p "$(dirname "$cache")" 2>/dev/null
+    local tmp="$cache.tmp.$$"
+    printf '%s' "$input" \
+        | jq -c 'select(.rate_limits) | .rate_limits' > "$tmp" 2>/dev/null
+    if [ -s "$tmp" ]; then
+        mv "$tmp" "$cache"
+    else
+        rm -f "$tmp"
+    fi
+}
 
 # Refresh the cache by scanning $MOTHER_ROOT/jobs/*.json and counting by state.
 # Writes "R:Q:F" atomically. Safe to call from the background.
@@ -93,6 +124,32 @@ mother_segment() {
     # orange makes them stand out without crying wolf the way red would.
     [ "$_ma" -gt 0 ] && out="${out} \033[38;5;208m?${_ma}${reset}"  # orange — awaiting input
     [ "$_mf" -gt 0 ] && out="${out} \033[38;5;203m!${_mf}${reset}"  # red — failed
+
+    # Quota gate indicator: 🚦 if either rolling window is over its cap.
+    # Rendered last so it sits next to the failure count, signalling that
+    # Mother is currently holding new dispatches back. Cheap inline check —
+    # one jq call against the small rate_limits cache. We don't surface the
+    # actual percentages here; `mother list` / popup peek can show those.
+    if [ -r "$MOTHER_RATE_LIMIT_CACHE" ]; then
+        local _rl_p5 _rl_r5 _rl_p7 _rl_r7
+        IFS=$'\t' read -r _rl_p5 _rl_r5 _rl_p7 _rl_r7 < <(jq -r '
+            [(.five_hour.used_percentage // 0),
+             (.five_hour.resets_at // 0),
+             (.seven_day.used_percentage // 0),
+             (.seven_day.resets_at // 0)] | @tsv
+        ' "$MOTHER_RATE_LIMIT_CACHE" 2>/dev/null) || true
+        : "${_rl_p5:=0}" "${_rl_r5:=0}" "${_rl_p7:=0}" "${_rl_r7:=0}"
+        local _now; _now=$(date +%s)
+        # If a window has rolled over since the cache was written, treat
+        # its percentage as 0 (in our favor — the new window is fresh).
+        [ "${_rl_r5%.*}" -gt 0 ] && [ "$_now" -gt "${_rl_r5%.*}" ] && _rl_p5=0
+        [ "${_rl_r7%.*}" -gt 0 ] && [ "$_now" -gt "${_rl_r7%.*}" ] && _rl_p7=0
+        if [ "${_rl_p5%.*}" -ge "$MOTHER_QUOTA_CAP_5H_PCT" ] \
+            || [ "${_rl_p7%.*}" -ge "$MOTHER_QUOTA_CAP_7D_PCT" ]; then
+            out="${out} \033[38;5;208m🚦${reset}"
+        fi
+    fi
+
     out="${out} "
 
     printf '%b' "$out"

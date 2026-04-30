@@ -613,20 +613,24 @@ cmd_await() {
     local state; state=$(jq -r .state "$(_job_path "$id")")
     [ "$state" = "running" ] || _die "await: job is in state $state, expected running"
 
-    # Single atomic write: set question/paused_at/state and clear any stale
-    # pending_answer (so a resume after this pause must come from a fresh
-    # `mother resume` call, not a leftover from a previous cycle).
+    # Single atomic write: set question/paused_at/paused_reason/state and
+    # clear any stale pending_answer or auto_resume_at (so a resume after
+    # this pause must come from a fresh `mother resume` call, not a
+    # leftover from a previous cycle or a system-pause that's been
+    # superseded by an operator-initiated one).
     local job_file merged
     job_file=$(_job_path "$id")
     merged=$(jq --arg q "$question" --arg ts "$(_iso_now)" '
         .question = $q
         | .paused_at = $ts
+        | .paused_reason = "user"
         | .pending_answer = null
+        | .auto_resume_at = null
         | .state = "awaiting"
     ' "$job_file") || _die "await: jq update failed"
     _atomic_write "$job_file" "$merged"
     _append_event "$id" "awaiting_input" \
-        "$(jq -nc --arg q "$question" '{question: $q}')"
+        "$(jq -nc --arg q "$question" '{question: $q, paused_reason: "user"}')"
 
     cat <<EOF
 mother: question recorded for $id
@@ -686,13 +690,18 @@ cmd_resume() {
     # Single atomic write: stash the answer, mark resumed_at, bump
     # resume_count (defaulting from null on first resume), and transition
     # straight to `ready` so the daemon's next promotion tick spawns a
-    # fresh worker without going through `queued`.
+    # fresh worker without going through `queued`. Also clear the system-
+    # pause fields if they were set — the operator's manual resume
+    # supersedes any pending auto-resume.
     local job_file merged
     job_file=$(_job_path "$id")
     merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" '
         .pending_answer = $a
         | .resumed_at = $ts
         | .resume_count = ((.resume_count // 0) + 1)
+        | .auto_resume_at = null
+        | .paused_reason = null
+        | .pause_requested = null
         | .state = "ready"
     ' "$job_file") || _die "resume: jq update failed"
     _atomic_write "$job_file" "$merged"
@@ -1126,10 +1135,23 @@ Worker prompt env vars:
                           plugin's templates/preamble.md. Point at
                           /dev/null (or a missing path) to disable.
 
+Quota gate env vars (require statusline integration — see segment.sh
+`mother_capture_rate_limits`):
+  MOTHER_RATE_LIMIT_CACHE  path the statusline writes rate_limits to
+                           (default: ~/.mother/rate-limits.json).
+  MOTHER_QUOTA_CAP_5H_PCT  refuse new dispatches when 5h window is at
+                           or over this percentage (default: 90).
+  MOTHER_QUOTA_CAP_7D_PCT  same for 7d window (default: 90).
+                           Lower these to leave more headroom for
+                           interactive use; e.g. cap=70 reserves the
+                           top 30% for non-Mother work.
+
 State flows:
   queued -> ready -> running -> succeeded | failed | cancelled
-  running -> awaiting -> ready -> running     (when a worker calls `await`,
-                                               then operator runs `resume`)
+  running -> awaiting -> ready -> running     (worker calls `await`, operator
+                                               runs `resume`; OR daemon's
+                                               quota gate pauses + auto-
+                                               resumes when window resets)
 
 See docs/design.md for the full design.
 EOF
