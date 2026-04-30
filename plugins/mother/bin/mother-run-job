@@ -152,6 +152,62 @@ else
         exit 1
     fi
     work_dir="$repo_path"
+
+    # Workspace setup. main-dir jobs share the operator's checkout, so the
+    # worker can land on any branch with any pile of pending edits if we
+    # don't normalize before spawn. Two pieces:
+    #
+    #   1. Stash any pre-existing uncommitted/untracked changes under a
+    #      job-ID-keyed message. The marker file at $RUNNER_DIR/<id>.stash
+    #      records both the stash message and the branch the operator was
+    #      on, so the teardown can return them to that branch before
+    #      popping (otherwise a stash made on branch X would get popped
+    #      onto whatever branch the worker left us on).
+    #
+    #   2. Ensure the target branch exists & is checked out. Existing
+    #      branch → checkout. Missing branch → create from base_ref. We
+    #      fetch first so base_ref is current.
+    #
+    # Both run on every spawn (including resumes) so the workspace contract
+    # is symmetrical with lock acquire/release: each acquire pairs with a
+    # release, and setup/teardown bracket every cycle.
+    (cd "$work_dir" && git fetch --quiet origin "${base_ref#origin/}" 2>/dev/null) || true
+
+    # Stash if dirty.
+    stash_marker="$RUNNER_DIR/$id.stash"
+    if [ -n "$(cd "$work_dir" && git status --porcelain 2>/dev/null)" ]; then
+        stash_orig_branch=$(cd "$work_dir" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        stash_msg="mother:auto-stash:$id"
+        if (cd "$work_dir" && git stash push --include-untracked -m "$stash_msg" >/dev/null 2>&1); then
+            # Marker stores both pieces, separated by a newline.
+            printf '%s\n%s\n' "$stash_msg" "$stash_orig_branch" > "$stash_marker"
+            _append_event "auto_stashed" \
+                "$(jq -nc --arg m "$stash_msg" --arg b "$stash_orig_branch" \
+                    '{stash_message: $m, original_branch: $b}')"
+        else
+            _append_event "auto_stash_failed" \
+                "$(jq -nc --arg m "$stash_msg" '{stash_message: $m, note: "git stash push failed; checkout may still succeed if dirty files do not conflict"}')"
+        fi
+    fi
+
+    # Ensure target branch is checked out (create from base_ref if missing).
+    if (cd "$work_dir" && git rev-parse --verify "$branch" >/dev/null 2>&1); then
+        if ! (cd "$work_dir" && git checkout --quiet "$branch" 2>/dev/null); then
+            echo "mother-run-job: failed to checkout existing branch $branch" >&2
+            _transition failed "$(jq -nc --arg b "$branch" '{reason: "checkout_failed", branch: $b}')"
+            lock_release "$lock_name" >/dev/null 2>&1 || true
+            exit 1
+        fi
+        _append_event "branch_checked_out" "$(jq -nc --arg b "$branch" '{branch: $b, created: false}')"
+    else
+        if ! (cd "$work_dir" && git checkout --quiet -b "$branch" "$base_ref" 2>/dev/null); then
+            echo "mother-run-job: failed to create branch $branch from $base_ref" >&2
+            _transition failed "$(jq -nc --arg b "$branch" --arg base "$base_ref" '{reason: "branch_create_failed", branch: $b, base: $base}')"
+            lock_release "$lock_name" >/dev/null 2>&1 || true
+            exit 1
+        fi
+        _append_event "branch_checked_out" "$(jq -nc --arg b "$branch" --arg base "$base_ref" '{branch: $b, created: true, base: $base}')"
+    fi
 fi
 
 # Persist resolved work_dir on the job JSON so peek (and similar consumers)
@@ -322,6 +378,21 @@ disown 2>/dev/null || true
 _job_update ".worker_pid = $worker_pid"
 _append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" '{pid: $pid, session_id: $sid}')"
 
+# Capture the log file's size at spawn time. The wrapper tees to $log_path
+# with `-a`, so on resume cycles the file already contains content from
+# previous runs (one per pause/resume). The result-event detector in the
+# poll loop below uses this offset to ignore content older than this run
+# — without it, the resumed worker's poll loop would see the previous
+# run's `result` event (the one emitted around the `mother await` call)
+# and immediately start the post-result-grace timer, reaping the worker
+# 5 min later regardless of what it's actually doing.
+log_offset_at_spawn=0
+if [ -f "$log_path" ]; then
+    log_offset_at_spawn=$(stat -f %z "$log_path" 2>/dev/null \
+        || stat -c %s "$log_path" 2>/dev/null \
+        || echo 0)
+fi
+
 # Reaper tunables. RESULT_GRACE_SECONDS is how long we let the worker linger
 # after we observe a top-level "result" event in the stream-json log before
 # forcing it down (Layer 1 in the bug report). IDLE_REAP_SECONDS is the
@@ -422,9 +493,15 @@ while [ ! -f "$marker_file" ]; do
         if [ "$final_result_epoch" -eq 0 ]; then
             # stream-json emits one complete JSON event per line. The result
             # event has top-level "type":"result". The whitespace tolerance
-            # below is paranoia — claude's SDK currently emits compact JSON,
-            # but stream formatters change.
-            if grep -Eq '"type"[[:space:]]*:[[:space:]]*"result"' "$log_path" 2>/dev/null; then
+            # is paranoia — claude's SDK currently emits compact JSON, but
+            # stream formatters change. Crucially we only look at log content
+            # newer than this worker's spawn (`log_offset_at_spawn`), not the
+            # whole file: on resume cycles the file already contains a
+            # previous run's `result` event, and scanning the whole thing
+            # would set final_result_epoch instantly and trip the post-
+            # result-grace reaper before this worker has done any new work.
+            if tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
+                | grep -Eq '"type"[[:space:]]*:[[:space:]]*"result"' 2>/dev/null; then
                 final_result_epoch=$(date +%s)
                 _job_update ".final_result_at = \"$(iso_now)\""
                 _append_event "final_result_observed" "{}"
@@ -477,8 +554,38 @@ if [ -z "$pr_url" ] && [ -f "$log_path" ]; then
     fi
 fi
 
-# Release main-dir lock if we took one.
+# Release main-dir lock if we took one. Before releasing, restore any
+# auto-stash to the operator's original branch so their pre-job working
+# state isn't lost (and isn't accidentally applied to whatever branch the
+# worker left us on). The marker file's two-line format is:
+#   line 1: stash message
+#   line 2: original branch name (may be empty if HEAD was detached)
+# If `git stash pop` fails (conflict, etc.), we leave the stash in place
+# and emit an event — operator can resolve manually rather than us silently
+# discarding their work.
 if [ "$isolation" = "main-dir" ]; then
+    if [ -f "${stash_marker:-/dev/null}" ]; then
+        _stash_msg=$(sed -n '1p' "$stash_marker" 2>/dev/null)
+        _stash_orig_branch=$(sed -n '2p' "$stash_marker" 2>/dev/null)
+        if [ -n "$_stash_orig_branch" ] \
+            && (cd "$work_dir" && git rev-parse --verify "$_stash_orig_branch" >/dev/null 2>&1); then
+            (cd "$work_dir" && git checkout --quiet "$_stash_orig_branch" 2>/dev/null) || true
+        fi
+        _stash_ref=$(cd "$work_dir" && git stash list 2>/dev/null \
+            | awk -F: -v msg="$_stash_msg" '$0 ~ msg {print $1; exit}')
+        if [ -n "$_stash_ref" ]; then
+            if (cd "$work_dir" && git stash pop --quiet "$_stash_ref" 2>/dev/null); then
+                _append_event "auto_stash_restored" \
+                    "$(jq -nc --arg m "$_stash_msg" --arg b "$_stash_orig_branch" \
+                        '{stash_message: $m, original_branch: $b}')"
+            else
+                _append_event "auto_stash_restore_failed" \
+                    "$(jq -nc --arg m "$_stash_msg" --arg ref "$_stash_ref" \
+                        '{stash_message: $m, stash_ref: $ref, note: "git stash pop failed; resolve manually via git stash list / git stash pop"}')"
+            fi
+        fi
+        rm -f "$stash_marker"
+    fi
     lock_release "${repo}:workspace" >/dev/null 2>&1 || true
 fi
 
