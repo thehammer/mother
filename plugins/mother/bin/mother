@@ -554,23 +554,65 @@ cmd_retry() {
     local id="${1:-}"
     [ -n "$id" ] || _die "retry: <id> required"
     _job_exists "$id" || _die "no such job: $id"
-    local state; state=$(jq -r .state "$(_job_path "$id")")
+    local job_file; job_file=$(_job_path "$id")
+    local state; state=$(jq -r .state "$job_file")
     case "$state" in failed|cancelled) ;; *) _die "can only retry failed/cancelled jobs (state=$state)" ;; esac
 
-    local plan_file
-    plan_file=$(_plan_path "$id")
-    [ -f "$plan_file" ] || _die "plan not found for $id"
+    # In-place retry: reset state on the SAME job_id rather than creating a
+    # new one. Three reasons:
+    #
+    #   - Downstream jobs with `--depends-on $id` automatically unblock
+    #     when the retry succeeds. A new job_id would leave them stranded
+    #     forever, pinned to the original failed id.
+    #   - The retry inherits depends_on naturally — no need to re-derive
+    #     it from CLI flags that may not have been preserved.
+    #   - The events file becomes a single audit trail of attempts on
+    #     this job, separated by `retried` boundaries. `mother status`
+    #     keeps the full history together.
+    #
+    # Worktree state carries forward: any commits from the failed run
+    # are still on the branch, and the new run picks up there. Operators
+    # who want a clean retry should `mother cancel` and `mother add`
+    # afresh instead.
+    #
+    # State target: `ready` if all dependencies are succeeded, otherwise
+    # `queued` so _promote_ready handles them.
+    local deps; deps=$(jq -c '.depends_on // []' "$job_file")
+    local has_unmet=0 dep dep_state
+    for dep in $(echo "$deps" | jq -r '.[]'); do
+        dep_state="missing"
+        [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
+        case "$dep_state" in succeeded) ;; *) has_unmet=1; break ;; esac
+    done
+    local new_state="ready"
+    [ "$has_unmet" -eq 1 ] && new_state="queued"
 
-    # Re-add using the original job's metadata
-    cmd_add \
-        --plan-file "$plan_file" \
-        --repo       "$(jq -r .repo       "$(_job_path "$id")")" \
-        --repo-path  "$(jq -r .repo_path  "$(_job_path "$id")")" \
-        --branch     "$(jq -r .branch     "$(_job_path "$id")")" \
-        --base       "$(jq -r .base_ref   "$(_job_path "$id")")" \
-        --isolation  "$(jq -r .isolation  "$(_job_path "$id")")" \
-        --executor   "$(jq -r .executor   "$(_job_path "$id")")" \
-        --title      "$(jq -r .title      "$(_job_path "$id")")"
+    # Atomic write: reset state + clear ephemeral fields from the prior
+    # run, while preserving depends_on, plan_path, repo metadata, and
+    # pr_url (operators occasionally retry to re-attempt push of an
+    # already-opened PR; clearing pr_url would lose that pointer).
+    local merged
+    merged=$(jq --arg s "$new_state" '
+        .state = $s
+        | .finished_at = null
+        | .worker_pid = null
+        | .actual_cost_usd = null
+        | .cancel_requested = null
+        | .pause_requested = null
+        | .final_result_at = null
+        | .paused_at = null
+        | .paused_reason = null
+        | .auto_resume_at = null
+        | .pending_answer = null
+        | .question = null
+        | .resumed_at = null
+        | .retry_count = ((.retry_count // 0) + 1)
+    ' "$job_file") || _die "retry: jq update failed"
+    _atomic_write "$job_file" "$merged"
+    _append_event "$id" "retried" \
+        "$(jq -nc --arg from "$state" --arg to "$new_state" \
+            '{from_state: $from, to_state: $to}')"
+    echo "$id: $state -> $new_state"
 }
 
 # ---------- await ----------

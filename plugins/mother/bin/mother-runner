@@ -92,6 +92,30 @@ _count_running_children() {
     find "$CHILDREN_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
+# Supervisor liveness check, used by the reaper to avoid racing the
+# in-process supervisor's terminal transition. CHILDREN_DIR tracks the
+# mother-run-job (supervisor) PIDs along with the job_id they own; the
+# job json's `worker_pid` is a different process — the wrapper bash that
+# runs claude. The wrapper exits when claude exits (natural completion),
+# leaving the supervisor in a post-exit window: it has to wake from its
+# 2s poll-loop sleep, read the marker file, scan for pr_url, and write
+# the terminal transition. Reaping based on `worker_pid` alone fires
+# during that window and clobbers the supervisor's pending succeeded
+# write — sometimes leaving the job stuck in `failed: runner_died`
+# despite the work being committed.
+_supervisor_alive_for_job() {
+    local job_id="$1" f pid jid
+    for f in "$CHILDREN_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        pid="$(basename "$f" .json)"
+        jid="$(jq -r '.job_id // empty' "$f" 2>/dev/null)"
+        if [ "$jid" = "$job_id" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ---------- ready-job selection ----------
 
 _pick_next_ready() {
@@ -168,6 +192,15 @@ _recover_orphans() {
 
         if [ -n "$pid" ]; then
             if ! kill -0 "$pid" 2>/dev/null; then
+                # Worker is gone, but the supervisor (mother-run-job) may
+                # still be in its post-exit window. Reaping here would
+                # race the supervisor's terminal transition — see comment
+                # on _supervisor_alive_for_job. Defer when supervisor is
+                # still alive; only reap when the whole supervision tree
+                # is gone.
+                if _supervisor_alive_for_job "$id"; then
+                    continue
+                fi
                 _log "marking $id $terminal_state (pid $pid gone; cancel_requested=$cancel_req)"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
             fi
