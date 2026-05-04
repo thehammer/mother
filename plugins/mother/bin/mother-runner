@@ -41,6 +41,10 @@ MOTHER_SHUTDOWN_GRACE="${MOTHER_SHUTDOWN_GRACE:-30}"
 MOTHER_ARCHIVE_INTERVAL="${MOTHER_ARCHIVE_INTERVAL:-3600}"   # seconds between retention sweeps
 MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
 
+# Kill switches: set to 0 to disable without redeploying.
+MOTHER_ESCALATION_ENABLED="${MOTHER_ESCALATION_ENABLED:-1}"
+MOTHER_ADHERENCE_ENABLED="${MOTHER_ADHERENCE_ENABLED:-1}"
+
 PIDFILE="$RUNNER_DIR/runner.pid"
 CHILDREN_DIR="$RUNNER_DIR/children"
 mkdir -p "$CHILDREN_DIR"
@@ -360,6 +364,101 @@ _maybe_pause_running() {
     done
 }
 
+# ---------- auto-escalation ----------
+
+# After a job transitions to `failed`, auto-escalate it if escalation is
+# enabled and the escalation cap hasn't been reached.
+_auto_escalate_failed() {
+    [ "$MOTHER_ESCALATION_ENABLED" = "1" ] || return 0
+    local f state esc_count id
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
+        [ "$state" = "failed" ] || continue
+        esc_count=$(jq -r '.escalation_count // 0' "$f" 2>/dev/null)
+        [ "$esc_count" -lt 2 ] || continue
+        # Only auto-escalate jobs that haven't been manually cancelled/archived.
+        id=$(jq -r '.id' "$f")
+        _log "auto-escalating $id (escalation_count=$esc_count)"
+        "$MOTHER_BIN_DIR/mother" escalate "$id" 2>&1 | while read -r line; do _log "escalate: $line"; done
+    done
+}
+
+# ---------- adherence loop ----------
+
+_ADHERENCE_LOCK="$RUNNER_DIR/adherence-review.lockdir"
+
+_run_adherence_pending() {
+    [ "$MOTHER_ADHERENCE_ENABLED" = "1" ] || return 0
+
+    # Mark jobs that just succeeded with a PR url as adherence-pending.
+    local f state pr adherence_pending adherence_attempts id
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
+        [ "$state" = "succeeded" ] || continue
+        pr=$(jq -r '.pr_url // empty' "$f" 2>/dev/null)
+        [ -n "$pr" ] || continue
+        adherence_pending=$(jq -r '.adherence_pending // empty' "$f" 2>/dev/null)
+        adherence_attempts=$(jq -r '.adherence_attempts // 0' "$f" 2>/dev/null)
+        adherence_status=$(jq -r '.adherence_status // empty' "$f" 2>/dev/null)
+        # Skip if already reviewed or blocked.
+        case "$adherence_status" in
+            passed|blocked_for_human) continue ;;
+        esac
+        # Mark as pending if not already.
+        if [ "$adherence_pending" != "true" ]; then
+            merged=$(jq '.adherence_pending = true' "$f") && _atomic_write "$f" "$merged"
+            id=$(jq -r '.id' "$f")
+            _log "marked $id adherence_pending=true"
+        fi
+    done
+
+    # Run one adherence review per tick, serialized by lock.
+    if mkdir "$_ADHERENCE_LOCK" 2>/dev/null; then
+        for f in "$JOBS_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            adherence_pending=$(jq -r '.adherence_pending // false' "$f" 2>/dev/null)
+            [ "$adherence_pending" = "true" ] || continue
+            adherence_attempts=$(jq -r '.adherence_attempts // 0' "$f" 2>/dev/null)
+            [ "$adherence_attempts" -lt 2 ] || continue
+            state=$(jq -r '.state // ""' "$f" 2>/dev/null)
+            # Only review succeeded jobs (or adherence_rework jobs being re-tried).
+            case "$state" in succeeded|adherence_rework) ;; *) continue ;; esac
+            id=$(jq -r '.id' "$f")
+            _log "running adherence review for $id (attempt=$adherence_attempts)"
+            if "$MOTHER_BIN_DIR/mother" adherence-review "$id" 2>&1 | while read -r line; do _log "adherence: $line"; done; then
+                _log "adherence review passed for $id"
+            else
+                local post_status; post_status=$(jq -r '.adherence_status // ""' "$JOBS_DIR/$id.json" 2>/dev/null)
+                case "$post_status" in
+                    failed_first)
+                        # Kick a fresh Cody run via the retry plumbing but in adherence_rework state.
+                        # The pending_answer was already set by cmd_adherence_review.
+                        merged=$(jq --arg s "ready" '
+                            .state = $s
+                            | .finished_at = null
+                            | .worker_pid = null
+                            | .actual_cost_usd = null
+                            | .cancel_requested = null
+                            | .pause_requested = null
+                            | .final_result_at = null
+                        ' "$JOBS_DIR/$id.json") && _atomic_write "$JOBS_DIR/$id.json" "$merged"
+                        _append_event "$id" "adherence_rework_kicked" \
+                            "$(jq -nc --arg id "$id" '{id: $id, note: "adherence failed first attempt; re-queuing"}')"
+                        _log "adherence failed for $id (first attempt) — re-queuing"
+                        ;;
+                    blocked_for_human)
+                        _log "adherence failed for $id (second attempt) — blocked_for_human"
+                        ;;
+                esac
+            fi
+            break  # one review per tick
+        done
+        rmdir "$_ADHERENCE_LOCK" 2>/dev/null || true
+    fi
+}
+
 _loop() {
     while [ "$SHUTDOWN" -eq 0 ]; do
         _reap_children
@@ -368,7 +467,13 @@ _loop() {
         # BEFORE _promote_ready, so resumed jobs are eligible for the
         # current tick's spawn budget.
         _auto_resume_check
+        # Auto-escalate failed jobs (before promote_ready so escalated jobs
+        # land in ready and are eligible this tick).
+        _auto_escalate_failed
         _promote_ready
+        # Process adherence-pending jobs (after reaping so fresh succeeded
+        # state is visible).
+        _run_adherence_pending
 
         if _quota_check; then
             # Under cap — normal dispatch.

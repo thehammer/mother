@@ -246,6 +246,100 @@ else
     worker_agent="mother:cody"
 fi
 
+# ---- Tier / model / effort resolution ----
+#
+# Priority:
+#   1. suggested_config.cody.model + suggested_config.cody.effort from the job
+#      (Archie sets these at plan time; they encode the task-aware routing hint).
+#   2. current_tier on the job (may have been bumped by escalation).
+#   3. Env-level defaults (MOTHER_DEFAULT_MODEL / MOTHER_DEFAULT_EFFORT).
+#
+# Tier is also persisted on the job so escalation logic has a clear baseline.
+
+# Helper: tier ladder functions (mirrors bin/mother — duplicated here to avoid
+# sourcing the CLI bin into the worker context).
+_tier_model() {
+    case "$1" in
+        tier_0) echo "sonnet" ;;
+        tier_1) echo "sonnet" ;;
+        tier_2) echo "sonnet" ;;
+        tier_3) echo "opus"   ;;
+        *)      echo "sonnet" ;;
+    esac
+}
+_tier_effort() {
+    case "$1" in
+        tier_0) echo "medium" ;;
+        tier_1) echo "high"   ;;
+        tier_2) echo "xhigh"  ;;
+        tier_3) echo "high"   ;;
+        *)      echo "medium" ;;
+    esac
+}
+
+MOTHER_DEFAULT_MODEL="${MOTHER_DEFAULT_MODEL:-sonnet}"
+MOTHER_DEFAULT_EFFORT="${MOTHER_DEFAULT_EFFORT:-medium}"
+
+current_tier=$(jq -r '.current_tier // "tier_0"' "$job_file")
+escalation_count=$(jq -r '.escalation_count // 0' "$job_file")
+
+# Resolve model/effort from suggested_config.cody if not a skip entry.
+sc_model=$(jq -r '.suggested_config.cody.model // empty' "$job_file" 2>/dev/null || echo "")
+sc_effort=$(jq -r '.suggested_config.cody.effort // empty' "$job_file" 2>/dev/null || echo "")
+sc_skip=$(jq -r '.suggested_config.cody.skip // false' "$job_file" 2>/dev/null || echo "false")
+
+if [ "$sc_skip" = "true" ]; then
+    # skip:true means run at tier defaults rather than at a named model.
+    worker_model=$(_tier_model "$current_tier")
+    worker_effort=$(_tier_effort "$current_tier")
+elif [ -n "$sc_model" ] && [ -n "$sc_effort" ]; then
+    # Use Archie's suggestion if the tier hasn't been escalated above baseline.
+    if [ "$current_tier" = "tier_0" ]; then
+        worker_model="$sc_model"
+        worker_effort="$sc_effort"
+    else
+        # Escalated — use the tier's model/effort (which is higher than the hint).
+        worker_model=$(_tier_model "$current_tier")
+        worker_effort=$(_tier_effort "$current_tier")
+    fi
+else
+    # No suggested_config — fall back to env defaults (old plans).
+    worker_model="${MOTHER_DEFAULT_MODEL}"
+    worker_effort="${MOTHER_DEFAULT_EFFORT}"
+fi
+
+# Persist current_tier on the job (first run sets it; escalations bump it externally).
+_job_update ".current_tier = \"$current_tier\""
+
+# Build sub-agent routing lines from suggested_config.
+_routing_line() {
+    local agent="$1"
+    local skip_val model_val effort_val
+    skip_val=$(jq -r --arg a "$agent" '.suggested_config[$a].skip // false' "$job_file" 2>/dev/null || echo "false")
+    if [ "$skip_val" = "true" ]; then
+        printf '  %s: skip: true\n' "$agent"
+    else
+        model_val=$(jq -r --arg a "$agent" '.suggested_config[$a].model // "sonnet"' "$job_file" 2>/dev/null || echo "sonnet")
+        effort_val=$(jq -r --arg a "$agent" '.suggested_config[$a].effort // "medium"' "$job_file" 2>/dev/null || echo "medium")
+        printf '  %s: model=%s, effort=%s\n' "$agent" "$model_val" "$effort_val"
+    fi
+}
+
+routing_redd=$(_routing_line redd)
+routing_marty=$(_routing_line marty)
+routing_perri=$(_routing_line perri)
+
+routing_context="# Mother routing context
+
+You are running at: model=$worker_model, effort=$worker_effort, tier=$current_tier.
+This is escalation attempt $escalation_count of 2.
+When delegating to Redd / Marty / Perri via the Task tool, use:
+$routing_redd
+$routing_marty
+$routing_perri
+
+---"
+
 # Generate a deterministic session ID and pass it to claude via --session-id
 # so the transcript filename is predictable. Without this, main-dir jobs
 # sharing a work_dir all land in the same ~/.claude/projects/<slug>/ and
@@ -291,6 +385,10 @@ prev_question=$(jq -r '.question // empty'       "$job_file" 2>/dev/null || echo
         printf '\n---\n\n'
     fi
 
+    # Routing context stanza: insert after preamble, before plan (or resume context).
+    # Tells Cody which model/effort it's running at and how to configure sub-agents.
+    printf '%s\n\n' "$routing_context"
+
     if [ -n "$pending_answer" ]; then
         printf '# Resumed plan — operator answered your question\n\n'
         printf 'A previous worker on this job paused itself with `mother await`.\n'
@@ -334,10 +432,15 @@ exec > >(tee -a "$log_path") 2>&1
 # "..."\` without bookkeeping. Without this, the agent has no clean way to
 # discover which job it belongs to.
 export MOTHER_JOB_ID="$id"
+# Export effort for agents that honor MOTHER_EFFORT (e.g. to set thinking budgets).
+export MOTHER_EFFORT="$worker_effort"
 echo "=== mother job $id starting at \$(date) ==="
 echo "=== working dir: \$PWD ==="
 echo "=== branch:      $branch ==="
 echo "=== agent:       $worker_agent ==="
+echo "=== model:       $worker_model ==="
+echo "=== effort:      $worker_effort ==="
+echo "=== tier:        $current_tier ==="
 echo "=== session-id:  $session_id ==="
 echo "=== plan:        $resolved_plan_path ==="
 echo
@@ -357,7 +460,7 @@ _forward_signal() {
     [ -n "\$claude_pid" ] && kill -TERM "\$claude_pid" 2>/dev/null || true
 }
 trap _forward_signal TERM INT
-claude --agent "$worker_agent" --session-id "$session_id" -p "\$(cat "$resolved_plan_path")" --output-format stream-json --verbose &
+claude --agent "$worker_agent" --model "$worker_model" --session-id "$session_id" -p "\$(cat "$resolved_plan_path")" --output-format stream-json --verbose &
 claude_pid=\$!
 # wait may be interrupted by the trap (signal raises EINTR and bash returns
 # 128+sig); loop until claude is actually gone before recording its real
@@ -660,6 +763,56 @@ _verify_artifact_or_fail() {
     return 1
 }
 
+# Metrics log: append a record to ~/.mother/metrics/runs.jsonl on every
+# terminal transition. One JSON line per stage outcome.
+METRICS_DIR="$MOTHER_ROOT/metrics"
+mkdir -p "$METRICS_DIR"
+_metrics_file="$METRICS_DIR/runs.jsonl"
+
+_append_metrics() {
+    local outcome="$1"
+    local now_epoch; now_epoch=$(date +%s)
+    local started_epoch=0
+    local started_at_raw; started_at_raw=$(jq -r '.started_at // empty' "$job_file" 2>/dev/null)
+    if [ -n "$started_at_raw" ]; then
+        local started_sec="${started_at_raw%%.*}"
+        case "$started_sec" in *Z) ;; *) started_sec="${started_sec}Z" ;; esac
+        started_epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$started_sec" +%s 2>/dev/null \
+            || date -u -d "$started_sec" +%s 2>/dev/null || echo 0)
+    fi
+    local wall_time=0
+    [ "$started_epoch" -gt 0 ] && wall_time=$(( now_epoch - started_epoch ))
+    local log_size=0
+    [ -f "$log_path" ] && log_size=$(stat -f %z "$log_path" 2>/dev/null \
+        || stat -c %s "$log_path" 2>/dev/null || echo 0)
+    local retry_count; retry_count=$(jq -r '.retry_count // 0' "$job_file" 2>/dev/null)
+    local esc_count_val; esc_count_val=$(jq -r '.escalation_count // 0' "$job_file" 2>/dev/null)
+    local line
+    line=$(jq -nc \
+        --arg ts "$(iso_now)" \
+        --arg job_id "$id" \
+        --arg stage "cody" \
+        --arg model "$worker_model" \
+        --arg effort "$worker_effort" \
+        --arg tier "$current_tier" \
+        --arg outcome "$outcome" \
+        --argjson retry_count "${retry_count:-0}" \
+        --argjson escalation_count "${esc_count_val:-0}" \
+        --argjson wall_time_seconds "$wall_time" \
+        --argjson log_size_bytes "${log_size:-0}" \
+        --arg pr_url "${pr_url:-}" \
+        '{
+            ts: $ts, job_id: $job_id, stage: $stage,
+            model: $model, effort: $effort, tier: $tier,
+            outcome: $outcome, retry_count: $retry_count,
+            escalation_count: $escalation_count,
+            wall_time_seconds: $wall_time_seconds,
+            log_size_bytes: $log_size_bytes,
+            pr_url: $pr_url
+        }')
+    _with_lock "$_metrics_file" _append_line "$_metrics_file" "$line"
+}
+
 # Final transition.
 if [ "$cancel_requested" -eq 1 ]; then
     _transition cancelled "$(jq -nc '{reason: "user"}')"
@@ -673,16 +826,23 @@ elif [ -n "$reaped_reason" ]; then
     if [ "$final_result_epoch" -gt 0 ]; then
         if _verify_artifact_or_fail; then
             _transition succeeded "$(jq -nc --arg pr "$pr_url" --arg reason "$reaped_reason" '{pr_url: $pr, reaped: $reason}')"
+            _append_metrics "succeeded"
         fi
     else
         _transition failed "$(jq -nc --arg reason "$reaped_reason" '{reason: $reason}')"
+        _append_metrics "failed"
     fi
 elif [ "$exit_code" = "0" ]; then
     if _verify_artifact_or_fail; then
         _transition succeeded "$(jq -nc --arg pr "$pr_url" '{pr_url: $pr}')"
+        _append_metrics "succeeded"
+    else
+        # _verify_artifact_or_fail already transitioned to failed.
+        _append_metrics "failed"
     fi
 else
     _transition failed "$(jq -nc --argjson code "$exit_code" '{exit_code: $code}')"
+    _append_metrics "failed"
 fi
 
 rm -f "$marker_file" "$wrapper"

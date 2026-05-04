@@ -65,3 +65,82 @@ Don't delete resolved reports. The standalone narrative
 ("here's what was broken and why") is more useful for future debugging
 than the commit message alone, and the resolved footer ties it back to
 the fix.
+
+## Routing & adherence
+
+Mother now supports task-aware routing, failure-tier escalation, and
+plan-adherence review. Here's what was added and how to work with it.
+
+### New job fields
+
+| Field | Type | Description |
+|---|---|---|
+| `suggested_config` | object | Model/effort hints from Archie's plan (cody/redd/marty/perri). |
+| `current_tier` | string | Current escalation tier (`tier_0`–`tier_3`). |
+| `escalation_count` | int | Number of times this job has been escalated. |
+| `adherence_attempts` | int | Number of adherence reviews run so far. |
+| `adherence_pending` | bool | True when a succeeded job awaits adherence review. |
+| `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. |
+| `adherence_notes` | string | Archie's notes from the last review (populated on fail). |
+
+### Tier ladder
+
+Escalation bumps the job up this ladder (cap: 2 escalations):
+
+| Tier | Model | Effort |
+|---|---|---|
+| `tier_0` | sonnet | medium |
+| `tier_1` | sonnet | high |
+| `tier_2` | sonnet | xhigh |
+| `tier_3` | opus | high |
+
+### Kill switches
+
+Both features can be disabled without redeploying by setting env vars in the
+launchd plist or shell environment:
+
+- `MOTHER_ESCALATION_ENABLED=0` — disable auto-escalation of failed jobs.
+- `MOTHER_ADHERENCE_ENABLED=0` — disable adherence review of succeeded jobs.
+
+### Metrics file
+
+Every terminal transition (succeeded or failed) appends a JSON line to
+`~/.mother/metrics/runs.jsonl`. Schema:
+
+```json
+{
+  "ts": "2026-05-04T12:00:00.000000Z",
+  "job_id": "...",
+  "stage": "cody",
+  "model": "sonnet",
+  "effort": "high",
+  "tier": "tier_1",
+  "outcome": "succeeded",
+  "retry_count": 0,
+  "escalation_count": 1,
+  "wall_time_seconds": 1234,
+  "log_size_bytes": 56789,
+  "pr_url": "https://github.com/..."
+}
+```
+
+Query with `jq` — e.g. summarise success rate by tier:
+
+```bash
+jq -s 'group_by(.tier) | map({tier: .[0].tier, total: length, passed: map(select(.outcome == "succeeded")) | length})' ~/.mother/metrics/runs.jsonl
+```
+
+### suggested_config (required in every plan)
+
+Plans must include a `suggested_config:` YAML block (see `archie.md`). Without it,
+`mother add` fails. Archie writes this block automatically.
+
+### Tests
+
+The bats test suite lives at `plugins/mother/tests/`. Run with:
+
+```bash
+./plugins/mother/scripts/run-tests.sh
+```
+
+Requires `bats` (`brew install bats-core`).

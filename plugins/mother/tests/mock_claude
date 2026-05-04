@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# mock_claude — records argv and exits with configurable status.
+#
+# Controlled by env vars:
+#   MOCK_CLAUDE_EXIT       exit code (default 0)
+#   MOCK_CLAUDE_ARGS_FILE  file to record args to (default: /tmp/mock-claude-args)
+#   MOCK_CLAUDE_STDOUT     text to print to stdout (optional)
+#   MOCK_CLAUDE_STDERR     text to print to stderr (optional)
+
+args_file="${MOCK_CLAUDE_ARGS_FILE:-/tmp/mock-claude-args}"
+exit_code="${MOCK_CLAUDE_EXIT:-0}"
+
+# Record the full argument list.
+printf '%s\n' "$@" >> "$args_file"
+echo "---" >> "$args_file"
+
+[ -n "${MOCK_CLAUDE_STDOUT:-}" ] && printf '%s\n' "$MOCK_CLAUDE_STDOUT"
+[ -n "${MOCK_CLAUDE_STDERR:-}" ] && printf '%s\n' "$MOCK_CLAUDE_STDERR" >&2
+
+exit "$exit_code"
