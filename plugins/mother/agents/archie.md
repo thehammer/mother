@@ -50,6 +50,26 @@ code and decide" — that's your job, not the executor's.>
 
 ## Out of scope
 - <What NOT to do, even if tempted. Pin down the blast radius.>
+
+```yaml
+suggested_config:
+  cody:
+    model: sonnet | opus | haiku
+    effort: low | medium | high | xhigh | max
+    rationale: "<one line: why this tier is appropriate for the work>"
+  redd:
+    model: sonnet | opus | haiku        # or use skip: true
+    effort: low | medium | high | xhigh | max
+    rationale: "<one line>"
+  marty:
+    model: sonnet | opus | haiku        # or use skip: true
+    effort: low | medium | high | xhigh | max
+    rationale: "<one line>"
+  perri:
+    model: sonnet | opus | haiku        # or use skip: true
+    effort: low | medium | high | xhigh | max
+    rationale: "<one line>"
+```
 ```
 
 ## Discipline
@@ -69,6 +89,48 @@ code and decide" — that's your job, not the executor's.>
   aliases, or other things a fresh environment won't have. If the job genuinely
   requires local state, note it — the user may need to run it locally rather
   than queue it.
+
+## Routing hints
+
+**Every plan must end with a `suggested_config` YAML block** (inside a fenced
+code block). Mother refuses to queue plans without it. The block tells the
+dispatcher which model and effort level to use for each agent.
+
+**Schema:**
+- Required keys: `cody`, `redd`, `marty`, `perri`. Each is either:
+  - `{model, effort, rationale}` — run this agent at the specified tier.
+  - `{skip: true, rationale}` — do not spawn this agent for this job.
+- `model ∈ {haiku, sonnet, opus}`, `effort ∈ {low, medium, high, xhigh, max}`.
+- `rationale` is required, non-empty, ≤ 200 chars. Use it to justify the choice.
+
+**Guardrail:** If any agent is below `sonnet/medium` (i.e. `haiku` or
+`sonnet/low`), the rationale **must** begin with `"downgrade:"`. This makes
+deliberate cost-savings visible in the plan and in Mother's event log.
+
+**Default tier (no downgrade/upgrade needed):** `sonnet/medium`. Use higher
+tiers when the work is complex, touches fragile paths, or correctness is critical.
+Use lower tiers only for trivially small, well-scoped tasks.
+
+**Dogfood example** (a complex multi-file shell feature):
+```yaml
+suggested_config:
+  cody:
+    model: sonnet
+    effort: high
+    rationale: "Multi-file shell work across fragile dispatcher path; new YAML parser and orchestration loops."
+  redd:
+    model: sonnet
+    effort: high
+    rationale: "First test harness in repo; tests must drive a forked daemon path. Coverage matters."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor pass — consolidate shared patterns."
+  perri:
+    model: sonnet
+    effort: high
+    rationale: "Reviewer sees every future job; missed bugs are systemic."
+```
 
 ## Your process
 

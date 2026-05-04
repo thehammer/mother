@@ -160,6 +160,72 @@ switcher.
 - **Redd** and **Marty** — optional companion agents for test-first and
   refactor phases of red-green-refactor. Cody uses them when available.
 
+## Routing, escalation, and adherence review
+
+### Plan-time routing (`suggested_config`)
+
+Every plan must end with a `suggested_config:` YAML block (inside a fenced
+code block). `mother add` rejects plans that lack or have invalid blocks.
+
+```yaml
+suggested_config:
+  cody:
+    model: sonnet          # haiku | sonnet | opus
+    effort: high           # low | medium | high | xhigh | max
+    rationale: "Multi-file shell work; touches fragile dispatcher path."
+  redd:
+    model: sonnet
+    effort: high
+    rationale: "First test harness in repo; tests must drive daemon path."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor pass."
+  perri:
+    skip: true             # skip: true means don't spawn this agent
+    rationale: "Simple enough for Cody to self-verify."
+```
+
+Archie writes this block automatically for you. The model/effort is wired
+through to the `claude --model <m>` flag and the `MOTHER_EFFORT` env var that
+workers receive. Escalation overrides the block (see below).
+
+### Failure-tier escalation
+
+When a job fails, the daemon auto-escalates it (if enabled) up a fixed ladder:
+
+```
+tier_0: sonnet/medium  →  tier_1: sonnet/high  →  tier_2: sonnet/xhigh  →  tier_3: opus/high
+                                               ↑ cap: 2 escalations per job
+```
+
+Manual escalation: `mother escalate <id>` (same as auto, but operator-initiated).
+
+Kill switch: `MOTHER_ESCALATION_ENABLED=0` (env var, e.g. in launchd plist).
+
+### Plan-adherence review
+
+After a job succeeds and opens a PR, the daemon schedules an adherence review.
+Archie (at `opus` tier) reads the original plan, the PR diff, CI status, and
+Perri's comments, then emits a structured verdict:
+
+- **pass** — job stays `succeeded`, nothing to do.
+- **fail (first attempt)** — job re-queues as `adherence_rework` with Archie's
+  notes prepended to the next Cody run's prompt.
+- **fail (second attempt)** — job is marked `[ADHERENCE-BLOCKED]` for human review.
+
+`mother list` and `mother status` show blocked jobs prominently.
+
+Manual review: `mother adherence-review <id>`.
+
+Kill switch: `MOTHER_ADHERENCE_ENABLED=0`.
+
+### Metrics
+
+Every terminal transition appends a JSON line to `~/.mother/metrics/runs.jsonl`
+with model, effort, tier, wall_time_seconds, log_size_bytes, pr_url, and more.
+Query with `jq` — e.g. `jq -s 'map(.outcome) | group_by(.) | map({outcome: .[0], count: length})' ~/.mother/metrics/runs.jsonl`.
+
 ## Reliability behaviors
 
 Mother runs unattended for long stretches and the agents it spawns aren't

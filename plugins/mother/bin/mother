@@ -53,6 +53,167 @@ _gen_id() {
 
 _die() { echo "mother: $*" >&2; exit 1; }
 
+# ---------- suggested_config parsing ----------
+
+# _parse_suggested_config <plan_file>
+# Extracts the ```yaml ... ``` block containing suggested_config from a plan
+# file, validates its structure, and prints the JSON representation of the
+# suggested_config object to stdout. Returns 0 on success, 1 with an error
+# message (suitable for _die) on failure.
+_parse_suggested_config() {
+    local plan_file="$1"
+
+    # Extract the first ```yaml ... ``` block that contains suggested_config.
+    # Use python3 since it's universally available and handles edge cases.
+    local yaml_block
+    yaml_block=$(python3 - "$plan_file" <<'PYEOF'
+import sys, re
+
+plan_path = sys.argv[1]
+with open(plan_path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+# Find all ```yaml ... ``` blocks
+blocks = re.findall(r'```yaml\n(.*?)```', content, re.DOTALL)
+for block in blocks:
+    if 'suggested_config' in block:
+        print(block.strip())
+        sys.exit(0)
+
+print("ERROR: no suggested_config block found", file=sys.stderr)
+sys.exit(1)
+PYEOF
+) 2>/dev/null || { echo "suggested_config block is missing from the plan (add a \`\`\`yaml suggested_config: ... \`\`\` block)"; return 1; }
+
+    # Parse the YAML block into JSON.
+    local raw_json
+    raw_json=$(printf '%s\n' "$yaml_block" | python3 -c "
+import yaml, json, sys
+try:
+    data = yaml.safe_load(sys.stdin)
+    if data is None:
+        print('ERROR: empty YAML block', file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(data))
+except yaml.YAMLError as e:
+    print(f'ERROR: YAML parse error: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null) || { echo "suggested_config block contains invalid YAML"; return 1; }
+
+    # Extract the suggested_config sub-object.
+    local sc_json
+    sc_json=$(printf '%s\n' "$raw_json" | jq '.suggested_config // empty' 2>/dev/null)
+    [ -n "$sc_json" ] && [ "$sc_json" != "null" ] \
+        || { echo "suggested_config key not found inside the YAML block"; return 1; }
+
+    # Validate the structure.
+    local valid_models="haiku sonnet opus"
+    local valid_efforts="low medium high xhigh max"
+    local required_agents="cody redd marty perri"
+
+    for agent in $required_agents; do
+        local entry
+        entry=$(printf '%s\n' "$sc_json" | jq --arg a "$agent" '.[$a] // empty')
+        [ -n "$entry" ] && [ "$entry" != "null" ] \
+            || { echo "suggested_config.$agent is missing (required: cody, redd, marty, perri)"; return 1; }
+
+        local skip_val
+        skip_val=$(printf '%s\n' "$entry" | jq -r '.skip // false')
+
+        local rationale
+        rationale=$(printf '%s\n' "$entry" | jq -r '.rationale // empty')
+        [ -n "$rationale" ] \
+            || { echo "suggested_config.$agent.rationale is required and must be non-empty"; return 1; }
+        [ "${#rationale}" -le 200 ] \
+            || { echo "suggested_config.$agent.rationale must be ≤ 200 characters (got ${#rationale})"; return 1; }
+
+        if [ "$skip_val" = "true" ]; then
+            # skip:true entries are valid — no model/effort required.
+            continue
+        fi
+
+        local model effort
+        model=$(printf '%s\n' "$entry" | jq -r '.model // empty')
+        effort=$(printf '%s\n' "$entry" | jq -r '.effort // empty')
+
+        [ -n "$model" ] || { echo "suggested_config.$agent.model is required (haiku|sonnet|opus)"; return 1; }
+        [ -n "$effort" ] || { echo "suggested_config.$agent.effort is required (low|medium|high|xhigh|max)"; return 1; }
+
+        # Validate model enum.
+        local model_ok=0
+        for m in $valid_models; do [ "$model" = "$m" ] && model_ok=1; done
+        [ "$model_ok" -eq 1 ] \
+            || { echo "suggested_config.$agent.model '$model' is invalid (must be one of: haiku sonnet opus)"; return 1; }
+
+        # Validate effort enum.
+        local effort_ok=0
+        for e in $valid_efforts; do [ "$effort" = "$e" ] && effort_ok=1; done
+        [ "$effort_ok" -eq 1 ] \
+            || { echo "suggested_config.$agent.effort '$effort' is invalid (must be one of: low medium high xhigh max)"; return 1; }
+
+        # Downgrade guardrail: haiku or sonnet/low require "downgrade:" in rationale.
+        local needs_guardrail=0
+        [ "$model" = "haiku" ] && needs_guardrail=1
+        [ "$model" = "sonnet" ] && [ "$effort" = "low" ] && needs_guardrail=1
+        if [ "$needs_guardrail" -eq 1 ]; then
+            case "$rationale" in
+                *"downgrade:"*) ;;
+                *) { echo "suggested_config.$agent: model=$model/effort=$effort is a downgrade below sonnet/medium; rationale must contain the literal string 'downgrade:' to make the justification explicit"; return 1; } ;;
+            esac
+        fi
+    done
+
+    printf '%s\n' "$sc_json"
+}
+
+# ---------- tier ladder ----------
+
+# Tier definitions (sourced by both mother and mother-run-job via lib/state.sh
+# additions, but also defined here for CLI use).
+# Ladder: tier_0 < tier_1 < tier_2 < tier_3
+# Each tier: "model/effort"
+TIER_LADDER="tier_0 tier_1 tier_2 tier_3"
+
+_tier_model() {
+    case "$1" in
+        tier_0) echo "sonnet" ;;
+        tier_1) echo "sonnet" ;;
+        tier_2) echo "sonnet" ;;
+        tier_3) echo "opus"   ;;
+        *)      echo "sonnet" ;;
+    esac
+}
+
+_tier_effort() {
+    case "$1" in
+        tier_0) echo "medium" ;;
+        tier_1) echo "high"   ;;
+        tier_2) echo "xhigh"  ;;
+        tier_3) echo "high"   ;;
+        *)      echo "medium" ;;
+    esac
+}
+
+_tier_next() {
+    case "$1" in
+        tier_0) echo "tier_1" ;;
+        tier_1) echo "tier_2" ;;
+        tier_2) echo "tier_3" ;;
+        tier_3) echo ""        ;;  # at cap
+        *)      echo "tier_1" ;;
+    esac
+}
+
+_tier_num() {
+    case "$1" in
+        tier_0) echo 0 ;;
+        tier_1) echo 1 ;;
+        tier_2) echo 2 ;;
+        tier_3) echo 3 ;;
+        *)      echo 0 ;;
+    esac
+}
+
 # ---------- add ----------
 
 cmd_add() {
@@ -91,6 +252,11 @@ cmd_add() {
     [ -z "$title" ] && title=$(head -1 "$plan_file" | sed -E 's/^#+ *//;s/^[[:space:]]+//;s/[[:space:]]+$//')
     [ -z "$title" ] && title="(untitled)"
 
+    # Parse and validate the suggested_config block from the plan.
+    local suggested_config_json
+    suggested_config_json=$(_parse_suggested_config "$plan_file") \
+        || _die "add: $suggested_config_json"
+
     local id deps_json job_json max_cost_json
     id=$(_gen_id)
     if [ -n "$depends_on" ]; then
@@ -116,6 +282,7 @@ cmd_add() {
         --arg plan_path "$(_plan_path "$id")" \
         --arg log_path "$(_log_path "$id")" \
         --arg created_at "$(_iso_now)" \
+        --argjson suggested_config "$suggested_config_json" \
         '{
             id: $id, title: $title, repo: $repo, repo_path: $repo_path,
             branch: $branch, base_ref: $base_ref, isolation: $isolation,
@@ -123,7 +290,11 @@ cmd_add() {
             plan_path: $plan_path, log_path: $log_path,
             state: "queued", created_at: $created_at,
             started_at: null, finished_at: null,
-            pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null
+            pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null,
+            suggested_config: $suggested_config,
+            current_tier: "tier_0",
+            escalation_count: 0,
+            adherence_attempts: 0
         }')
     _atomic_write "$(_job_path "$id")" "$job_json"
     _append_event "$id" "queued" "$(jq -nc --arg title "$title" '{title: $title}')"
@@ -168,10 +339,27 @@ cmd_list() {
             echo "(no jobs)"
             return 0
         fi
-        printf "%-28s  %-10s  %-18s  %-12s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "TITLE"
-        echo "$rows" | jq -r '.[] | [.id, .state, .repo, .isolation, .title] | @tsv' | \
-            while IFS=$'\t' read -r id st repo iso title; do
-                printf "%-28s  %-10s  %-18s  %-12s  %s\n" "$id" "$st" "$repo" "$iso" "$title"
+        printf "%-28s  %-16s  %-18s  %-12s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "TITLE"
+        echo "$rows" | jq -r '.[] |
+            [
+                .id,
+                .state,
+                (.adherence_status // ""),
+                (.current_tier // ""),
+                .repo,
+                .isolation,
+                .title
+            ] | @tsv' | \
+            while IFS=$'\t' read -r id st adherence_status current_tier repo iso title; do
+                # Compose the state display field with markers.
+                local state_display="$st"
+                [ "$adherence_status" = "blocked_for_human" ] && state_display="[ADHERENCE-BLOCKED] $st"
+                case "$current_tier" in
+                    tier_1) state_display="$state_display tier:1" ;;
+                    tier_2) state_display="$state_display tier:2" ;;
+                    tier_3) state_display="$state_display tier:3" ;;
+                esac
+                printf "%-28s  %-16s  %-18s  %-12s  %s\n" "$id" "$state_display" "$repo" "$iso" "$title"
             done
     fi
 }
@@ -195,8 +383,27 @@ cmd_status() {
             "$(_job_path "$id")" \
             <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
     else
+        local job_file; job_file=$(_job_path "$id")
+        local adherence_status; adherence_status=$(jq -r '.adherence_status // empty' "$job_file")
+        local current_tier; current_tier=$(jq -r '.current_tier // "tier_0"' "$job_file")
+        local esc_count; esc_count=$(jq -r '.escalation_count // 0' "$job_file")
+
+        if [ "$adherence_status" = "blocked_for_human" ]; then
+            echo ""
+            echo "⚠️  [ADHERENCE-BLOCKED] This job requires human review."
+            echo "   Archie reviewed the PR diff twice and flagged adherence issues."
+            echo "   See .adherence_notes on the job JSON for details."
+            echo ""
+        fi
+        if [ "$current_tier" != "tier_0" ] && [ -n "$current_tier" ]; then
+            local tier_num; tier_num=$(_tier_num "$current_tier")
+            local model; model=$(_tier_model "$current_tier")
+            local effort; effort=$(_tier_effort "$current_tier")
+            echo "  Tier: $current_tier (model=$model, effort=$effort, escalations=$esc_count)"
+            echo ""
+        fi
         echo "=== job ==="
-        jq . "$(_job_path "$id")"
+        jq . "$job_file"
         echo
         echo "=== events ==="
         if [ -f "$(_events_path "$id")" ]; then
@@ -591,6 +798,8 @@ cmd_retry() {
     # run, while preserving depends_on, plan_path, repo metadata, and
     # pr_url (operators occasionally retry to re-attempt push of an
     # already-opened PR; clearing pr_url would lose that pointer).
+    # Preserve routing fields: suggested_config, current_tier, escalation_count.
+    # Reset adherence state since we're doing a fresh run.
     local merged
     merged=$(jq --arg s "$new_state" '
         .state = $s
@@ -607,12 +816,198 @@ cmd_retry() {
         | .question = null
         | .resumed_at = null
         | .retry_count = ((.retry_count // 0) + 1)
+        | .adherence_pending = null
+        | .adherence_status = null
+        | .adherence_notes = null
+        | .adherence_attempts = 0
     ' "$job_file") || _die "retry: jq update failed"
     _atomic_write "$job_file" "$merged"
     _append_event "$id" "retried" \
         "$(jq -nc --arg from "$state" --arg to "$new_state" \
             '{from_state: $from, to_state: $to}')"
     echo "$id: $state -> $new_state"
+}
+
+# ---------- escalate ----------
+#
+# Escalate a failed job to the next tier on the model/effort ladder. This is
+# the manual path; mother-runner also calls it automatically when a child fails
+# and escalation_count < 2. Caps at 2 escalations (tier_3) — above the cap,
+# returns non-zero with a clear message.
+#
+# Escalation bumps `current_tier`, increments `escalation_count`, resets
+# ephemeral run state (same as retry), and transitions the job back to `ready`.
+# `suggested_config` is preserved so routing hints survive escalation.
+
+cmd_escalate() {
+    local id="${1:-}"
+    [ -n "$id" ] || _die "escalate: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+    local job_file; job_file=$(_job_path "$id")
+    local state; state=$(jq -r .state "$job_file")
+    case "$state" in
+        failed) ;;
+        *) _die "escalate: can only escalate failed jobs (state=$state)" ;;
+    esac
+
+    local esc_count; esc_count=$(jq -r '.escalation_count // 0' "$job_file")
+    if [ "$esc_count" -ge 2 ]; then
+        echo "mother: escalate: job $id has already been escalated $esc_count times (cap is 2); escalation refused" >&2
+        return 1
+    fi
+
+    local current_tier; current_tier=$(jq -r '.current_tier // "tier_0"' "$job_file")
+    local next_tier; next_tier=$(_tier_next "$current_tier")
+    if [ -z "$next_tier" ]; then
+        echo "mother: escalate: job $id is already at the top tier ($current_tier); escalation refused" >&2
+        return 1
+    fi
+
+    # Determine dependency state for the target state.
+    local deps; deps=$(jq -c '.depends_on // []' "$job_file")
+    local has_unmet=0 dep dep_state
+    for dep in $(echo "$deps" | jq -r '.[]'); do
+        dep_state="missing"
+        [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
+        case "$dep_state" in succeeded) ;; *) has_unmet=1; break ;; esac
+    done
+    local new_state="ready"
+    [ "$has_unmet" -eq 1 ] && new_state="queued"
+
+    local merged
+    merged=$(jq \
+        --arg s "$new_state" \
+        --arg tier "$next_tier" \
+        --argjson esc "$((esc_count + 1))" \
+        '
+        .state = $s
+        | .current_tier = $tier
+        | .escalation_count = $esc
+        | .finished_at = null
+        | .worker_pid = null
+        | .actual_cost_usd = null
+        | .cancel_requested = null
+        | .pause_requested = null
+        | .final_result_at = null
+        | .paused_at = null
+        | .paused_reason = null
+        | .auto_resume_at = null
+        | .pending_answer = null
+        | .question = null
+        | .resumed_at = null
+        | .adherence_pending = null
+        | .adherence_status = null
+        | .adherence_notes = null
+        | .adherence_attempts = 0
+    ' "$job_file") || _die "escalate: jq update failed"
+    _atomic_write "$job_file" "$merged"
+    _append_event "$id" "escalated" \
+        "$(jq -nc \
+            --arg from "$current_tier" --arg to "$next_tier" \
+            --arg from_state "$state" --arg to_state "$new_state" \
+            --argjson esc "$((esc_count + 1))" \
+            '{from_tier: $from, to_tier: $to, from_state: $from_state, to_state: $to_state, escalation_count: $esc}')"
+    echo "$id: escalated $current_tier -> $next_tier (escalation_count=$((esc_count + 1)))"
+}
+
+# ---------- adherence-review ----------
+#
+# Spawn Archie to review whether a job's PR diff matches the original plan.
+# Reads the plan from events/<id>-plan.md, fetches the PR diff and CI summary,
+# constructs a structured prompt, and calls claude --agent archie in headless mode.
+# Parses the verdict (pass/fail) and stores it on the job JSON.
+# Returns 0 on pass, 1 on fail, 2 on error.
+
+cmd_adherence_review() {
+    local id="${1:-}"
+    [ -n "$id" ] || _die "adherence-review: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+    local job_file; job_file=$(_job_path "$id")
+    local state; state=$(jq -r .state "$job_file")
+    case "$state" in succeeded|adherence_rework) ;; *) _die "adherence-review: job must be in succeeded or adherence_rework state (state=$state)" ;; esac
+
+    local pr_url; pr_url=$(jq -r '.pr_url // empty' "$job_file")
+    [ -n "$pr_url" ] || _die "adherence-review: job $id has no pr_url"
+
+    # Resolve the plan file.
+    local plan_file; plan_file=$(_plan_path "$id")
+    [ -f "$plan_file" ] || _die "adherence-review: plan file not found for $id"
+
+    # Resolve the adherence prompt template.
+    local template_file="$MOTHER_BIN_DIR/../templates/adherence-prompt.md"
+    [ -f "$template_file" ] || _die "adherence-review: template not found at $template_file"
+
+    # Gather artifacts (best-effort).
+    local pr_diff pr_checks pr_comments
+    pr_diff=$(gh pr diff "$pr_url" 2>/dev/null || echo "(diff unavailable)")
+    pr_checks=$(gh pr checks "$pr_url" 2>/dev/null || echo "(CI status unavailable)")
+    pr_comments=$(gh pr view "$pr_url" --comments 2>/dev/null || echo "(comments unavailable)")
+
+    # Build the prompt from template + artifacts.
+    local review_prompt
+    review_prompt=$(cat "$template_file")
+    review_prompt=$(printf '%s\n\n## Original Plan\n\n```\n%s\n```\n\n## PR Diff\n\n```diff\n%s\n```\n\n## CI Status\n\n```\n%s\n```\n\n## PR Comments (Perri review)\n\n```\n%s\n```\n' \
+        "$review_prompt" \
+        "$(cat "$plan_file")" \
+        "$pr_diff" \
+        "$pr_checks" \
+        "$pr_comments")
+
+    # Invoke Archie for the review.
+    local archie_model="opus"
+    local raw_verdict
+    raw_verdict=$(claude --agent archie --model "$archie_model" -p "$review_prompt" 2>/dev/null || true)
+
+    # Parse the verdict.
+    local verdict notes
+    verdict=$(printf '%s\n' "$raw_verdict" | grep -Eo 'ADHERENCE:[[:space:]]*(pass|fail)' | head -1 | awk '{print $NF}' || true)
+    notes=$(printf '%s\n' "$raw_verdict" | awk '/^NOTES:/{p=1; next} p{print}' || true)
+
+    if [ -z "$verdict" ]; then
+        # Could not parse verdict — treat as error, don't mutate job state.
+        echo "mother: adherence-review: could not parse ADHERENCE line from Archie's response" >&2
+        echo "Raw response preview:" >&2
+        printf '%s\n' "$raw_verdict" | head -20 >&2
+        return 2
+    fi
+
+    local esc_attempts; esc_attempts=$(jq -r '.adherence_attempts // 0' "$job_file")
+    local new_attempts=$((esc_attempts + 1))
+    local adherence_status
+
+    if [ "$verdict" = "pass" ]; then
+        adherence_status="passed"
+        _job_update "$id" \
+            ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$(printf '%s' "$notes" | sed 's/"/\\"/g')\" | .adherence_pending = false | .adherence_attempts = $new_attempts"
+        _append_event "$id" "adherence_reviewed" \
+            "$(jq -nc --arg verdict "pass" --arg notes "$notes" --argjson attempts "$new_attempts" \
+                '{verdict: $verdict, notes: $notes, attempts: $attempts}')"
+        echo "$id: adherence review: PASS"
+        return 0
+    else
+        # fail
+        if [ "$esc_attempts" -eq 0 ]; then
+            adherence_status="failed_first"
+            # Transition to adherence_rework so runner can kick a fresh Cody run.
+            local notes_escaped; notes_escaped=$(printf '%s' "$notes" | sed 's/"/\\"/g')
+            _job_update "$id" \
+                ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$notes_escaped\" | .adherence_attempts = $new_attempts | .pending_answer = \"$notes_escaped\" | .state = \"adherence_rework\""
+            _append_event "$id" "adherence_reviewed" \
+                "$(jq -nc --arg verdict "fail" --arg notes "$notes" --argjson attempts "$new_attempts" --arg status "$adherence_status" \
+                    '{verdict: $verdict, notes: $notes, attempts: $attempts, status: $status}')"
+            echo "$id: adherence review: FAIL (first attempt) — transitioning to adherence_rework"
+            return 1
+        else
+            adherence_status="blocked_for_human"
+            _job_update "$id" \
+                ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$(printf '%s' "$notes" | sed 's/"/\\"/g')\" | .adherence_attempts = $new_attempts | .adherence_pending = false"
+            _append_event "$id" "adherence_reviewed" \
+                "$(jq -nc --arg verdict "fail" --arg notes "$notes" --argjson attempts "$new_attempts" --arg status "$adherence_status" \
+                    '{verdict: $verdict, notes: $notes, attempts: $attempts, status: $status}')"
+            echo "$id: adherence review: FAIL (second attempt) — marking blocked_for_human"
+            return 1
+        fi
+    fi
 }
 
 # ---------- await ----------
@@ -1147,7 +1542,9 @@ Usage:
   mother plan ID
   mother cancel ID
   mother retry ID
-  mother await [ID] --question TEXT      (worker-side: pause for operator input)
+  mother escalate ID                         (bump failed job to next model tier)
+  mother adherence-review ID                 (check PR diff against original plan)
+  mother await [ID] --question TEXT          (worker-side: pause for operator input)
   mother resume ID ANSWER | --from-file PATH | -    (operator-side: answer + resume)
   mother events [--since-cursor SESSION_ID] [--since ISO_TS]
   mother drafts list | save --plan-file PATH | show ID | rm ID
@@ -1165,10 +1562,22 @@ Add options:
   --title TEXT         (default: first heading of plan file)
   --format json|text   (default: text — prints job id only)
 
+Plan file requirements:
+  Every plan must include a ```yaml suggested_config: ... ``` block specifying
+  model+effort for cody, redd, marty, perri (or skip: true). Valid models:
+  haiku | sonnet | opus. Valid efforts: low | medium | high | xhigh | max.
+  Downgrading below sonnet/medium requires "downgrade:" prefix in rationale.
+
+Escalation tier ladder:
+  tier_0: sonnet/medium  →  tier_1: sonnet/high  →  tier_2: sonnet/xhigh
+  →  tier_3: opus/high   (cap: 2 escalations per job)
+
 Daemon env vars:
-  MOTHER_CONCURRENCY      (default: 2)   max parallel jobs
-  MOTHER_POLL_INTERVAL    (default: 2)   seconds between ticks
-  MOTHER_SHUTDOWN_GRACE   (default: 30)  seconds to wait for children on stop
+  MOTHER_CONCURRENCY           (default: 2)    max parallel jobs
+  MOTHER_POLL_INTERVAL         (default: 2)    seconds between ticks
+  MOTHER_SHUTDOWN_GRACE        (default: 30)   seconds to wait for children on stop
+  MOTHER_ESCALATION_ENABLED    (default: 1)    auto-escalate failed jobs (0 to disable)
+  MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
 
 Worker prompt env vars:
   MOTHER_PREAMBLE_PATH    path to a markdown file prepended to every
@@ -1176,6 +1585,8 @@ Worker prompt env vars:
                           pause via `mother await`. Defaults to the
                           plugin's templates/preamble.md. Point at
                           /dev/null (or a missing path) to disable.
+  MOTHER_DEFAULT_MODEL    (default: sonnet)   fallback model when not set by plan
+  MOTHER_DEFAULT_EFFORT   (default: medium)   fallback effort when not set by plan
 
 Quota gate env vars (require statusline integration — see segment.sh
 `mother_capture_rate_limits`):
@@ -1194,6 +1605,13 @@ State flows:
                                                runs `resume`; OR daemon's
                                                quota gate pauses + auto-
                                                resumes when window resets)
+  failed  -> ready  (via mother escalate — bumps tier and re-queues)
+  succeeded -> adherence_rework -> ready  (Archie flags drift; Cody re-runs)
+  [ADHERENCE-BLOCKED] — second adherence fail; needs human review
+
+Metrics:
+  ~/.mother/metrics/runs.jsonl — one JSON line per terminal transition
+  (succeeded/failed) with model, effort, tier, wall_time, pr_url, etc.
 
 See docs/design.md for the full design.
 EOF
@@ -1205,23 +1623,25 @@ main() {
     local sub="${1:-help}"
     shift || true
     case "$sub" in
-        add)     cmd_add "$@" ;;
-        list)    cmd_list "$@" ;;
-        status)  cmd_status "$@" ;;
-        logs)    cmd_logs "$@" ;;
-        peek)    cmd_peek "$@" ;;
-        attach)  cmd_attach "$@" ;;
-        plan)    cmd_plan "$@" ;;
-        cancel)  cmd_cancel "$@" ;;
-        retry)   cmd_retry "$@" ;;
-        await)   cmd_await "$@" ;;
-        resume)  cmd_resume "$@" ;;
-        events)  cmd_events "$@" ;;
-        drafts)  cmd_drafts "$@" ;;
-        daemon)  cmd_daemon "$@" ;;
-        archive) cmd_archive "$@" ;;
-        run)     cmd_run "$@" ;;
-        help|-h|--help) cmd_help ;;
+        add)               cmd_add "$@" ;;
+        list)              cmd_list "$@" ;;
+        status)            cmd_status "$@" ;;
+        logs)              cmd_logs "$@" ;;
+        peek)              cmd_peek "$@" ;;
+        attach)            cmd_attach "$@" ;;
+        plan)              cmd_plan "$@" ;;
+        cancel)            cmd_cancel "$@" ;;
+        retry)             cmd_retry "$@" ;;
+        escalate)          cmd_escalate "$@" ;;
+        adherence-review)  cmd_adherence_review "$@" ;;
+        await)             cmd_await "$@" ;;
+        resume)            cmd_resume "$@" ;;
+        events)            cmd_events "$@" ;;
+        drafts)            cmd_drafts "$@" ;;
+        daemon)            cmd_daemon "$@" ;;
+        archive)           cmd_archive "$@" ;;
+        run)               cmd_run "$@" ;;
+        help|-h|--help)    cmd_help ;;
         *) _die "unknown subcommand: $sub (try: mother help)" ;;
     esac
 }

@@ -30,6 +30,9 @@ echo ""
 echo "Optional:"
 _check "fzf"     fzf     || echo "             (required for mother-switcher; install with 'brew install fzf')"
 _check "gh"      gh      || echo "             (nice-to-have for agents that open PRs)"
+_check "bats"    bats    || echo "             (required for test suite; install with 'brew install bats-core')"
+_check "yq"      yq      || echo "             (used for suggested_config parsing; install with 'brew install yq')"
+_check "python3" python3 || echo "             (fallback YAML parser for suggested_config; usually pre-installed)"
 echo ""
 
 if [ "$missing" -eq 0 ]; then
