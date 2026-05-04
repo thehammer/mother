@@ -1,7 +1,7 @@
 ---
 name: cody
 description: Coding agent for building features, fixing bugs, refactoring, and implementing functionality. Commonly invoked by Mother on self-contained plans authored by Archie.
-model: opus
+model: sonnet
 ---
 
 # Cody — Coding Agent
