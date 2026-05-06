@@ -139,8 +139,16 @@ if [ "$isolation" = "worktree" ]; then
     # Create the branch + worktree from base_ref.
     wt_path=$(cd "$repo_path" && source "$MOTHER_LIB_DIR/worktree.sh" && worktree_get_path "$branch")
     if [ ! -d "$wt_path" ]; then
-        (cd "$repo_path" && git worktree add -b "$branch" "$wt_path" "$base_ref") \
-            || { _transition failed "$(jq -nc --arg r "worktree_create_failed" '{reason: $r}')"; exit 1; }
+        # If the branch already exists (e.g. adherence rework re-run), add the
+        # worktree pointing at it rather than trying to create a new branch with
+        # -b, which would fail with "branch already exists".
+        if (cd "$repo_path" && git rev-parse --verify "$branch" >/dev/null 2>&1); then
+            (cd "$repo_path" && git worktree add "$wt_path" "$branch") \
+                || { _transition failed "$(jq -nc --arg r "worktree_create_failed" '{reason: $r}')"; exit 1; }
+        else
+            (cd "$repo_path" && git worktree add -b "$branch" "$wt_path" "$base_ref") \
+                || { _transition failed "$(jq -nc --arg r "worktree_create_failed" '{reason: $r}')"; exit 1; }
+        fi
     fi
     work_dir="$wt_path"
 else

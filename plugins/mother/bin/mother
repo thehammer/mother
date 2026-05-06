@@ -1426,7 +1426,7 @@ _archive_one() {
     local state finished year_month dest_dir
     state=$(jq -r '.state // ""' "$job_file")
     case "$state" in
-        succeeded|failed|cancelled) ;;
+        succeeded|failed|cancelled|adherence_rework) ;;
         *) echo "archive: $id is $state, not a terminal state — skipping" >&2; return 1 ;;
     esac
 
@@ -1496,7 +1496,7 @@ cmd_archive() {
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f")
-        case "$state" in succeeded|failed|cancelled) ;; *) skipped=$((skipped + 1)); continue ;; esac
+        case "$state" in succeeded|failed|cancelled|adherence_rework) ;; *) skipped=$((skipped + 1)); continue ;; esac
         finished=$(jq -r '.finished_at // ""' "$f")
         [ -n "$finished" ] || { skipped=$((skipped + 1)); continue; }
         if [ "$finished" \> "$cutoff_iso" ]; then

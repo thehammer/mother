@@ -13,13 +13,14 @@
 #   ctrl-x    → cancel a live job and reload the list
 #   ctrl-r    → retry a failed/cancelled job and reload the list
 #   ctrl-d    → archive a terminal-state job (immediate, regardless of age)
+#   ctrl-a    → archive ALL terminal-state jobs now
 #   ctrl-p    → show the job's plan file
 #   esc       → close the popup (fzf default)
 #   ctrl-q    → quit
 #
-# Rows are colored by state (succeeded/running/awaiting/failed/cancelled/queued) and
-# carry an elapsed-duration column. The preview pane runs `mother peek --watch`
-# so the snapshot refreshes while the popup is open.
+# Rows are colored by state (succeeded/running/awaiting/failed/cancelled/queued/
+# adherence_rework) and carry an elapsed-duration column. The preview pane runs
+# `mother peek --watch` so the snapshot refreshes while the popup is open.
 #
 # Use absolute paths in fzf bindings so the popup works regardless of the
 # shell's $PATH inside the tmux popup.
@@ -49,21 +50,24 @@ fi
 # Build one TAB-separated row per job:
 #   <id>\t<colored_state>\t<duration>\t<repo>\t<title>
 # `--with-nth 2..` hides the id from the fzf display but keeps it as {1}.
-# State is padded to 10 chars BEFORE wrapping in ANSI escapes so columns align
+# State is padded to 18 chars BEFORE wrapping in ANSI escapes so columns align
 # under `--ansi`. Duration is derived in jq from started_at/finished_at (now
 # for running jobs), right-padded to 6 chars.
 _format_rows() {
     "$MOTHER_BIN" list --format json | jq -r '
         def rpad(s; n): (s + (" " * n))[0:n];
+        def ucfirst: (.[0:1] | ascii_upcase) + .[1:];
+        def humanize(s): s | split("_") | map(ucfirst) | join(" ");
         def color_state(st):
-            (rpad(st; 10)) as $padded
-            | if   st == "succeeded" then "[38;5;114m" + $padded + "[0m"
-              elif st == "running"   then "[38;5;220m" + $padded + "[0m"
-              elif st == "failed"    then "[38;5;203m" + $padded + "[0m"
-              elif st == "cancelled" then "[38;5;245m" + $padded + "[0m"
-              elif st == "awaiting"  then "[38;5;208m" + $padded + "[0m"
+            (rpad(humanize(st); 18)) as $padded
+            | if   st == "succeeded"        then "[38;5;114m" + $padded + "[0m"
+              elif st == "running"          then "[38;5;220m" + $padded + "[0m"
+              elif st == "failed"           then "[38;5;203m" + $padded + "[0m"
+              elif st == "cancelled"        then "[38;5;245m" + $padded + "[0m"
+              elif st == "awaiting"         then "[38;5;208m" + $padded + "[0m"
+              elif st == "adherence_rework" then "[38;5;213m" + $padded + "[0m"
               elif st == "queued" or st == "ready" then
-                                          "[38;5;75m"  + $padded + "[0m"
+                                                 "[38;5;75m"  + $padded + "[0m"
               else $padded end;
             def fmt_dur(s):
                 if   s <  60   then (s | tostring) + "s"
@@ -125,12 +129,13 @@ printf '%s\n' "$rows" | fzf \
     --delimiter $'\t' \
     --with-nth '2..' \
     --preview "\"$MOTHER_BIN\" peek {1} --watch" \
-    --preview-window 'up:60%:wrap' \
-    --header 'ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-p: plan  esc/ctrl-q: quit' \
+    --preview-window 'up:60%:wrap:follow' \
+    --header 'ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-a: archive all  ctrl-p: plan  esc/ctrl-q: quit' \
     --bind "enter:change-preview(\"$MOTHER_BIN\" logs {1} --follow)+change-preview-window(up:60%:wrap:follow)" \
     --bind "ctrl-x:execute-silent(\"$MOTHER_BIN\" cancel {1})+reload($reload_cmd)" \
     --bind "ctrl-r:execute-silent(\"$MOTHER_BIN\" retry {1})+reload($reload_cmd)" \
     --bind "ctrl-d:execute-silent(\"$MOTHER_BIN\" archive {1})+reload($reload_cmd)" \
+    --bind "ctrl-a:execute-silent(\"$MOTHER_BIN\" archive --older-than 0)+reload($reload_cmd)" \
     --bind "ctrl-p:execute(\"$MOTHER_BIN\" plan {1})" \
     --bind 'ctrl-q:abort' \
     >/dev/null
