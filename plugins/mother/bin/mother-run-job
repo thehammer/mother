@@ -677,6 +677,16 @@ while [ ! -f "$marker_file" ]; do
     if [ "$final_result_epoch" -gt 0 ]; then
         _now_epoch=$(date +%s)
         if [ $((_now_epoch - final_result_epoch)) -ge "$RESULT_GRACE_SECONDS" ]; then
+            # Stale-supervisor guard: a resume cycle may have spawned a new
+            # mother-run-job for this job, updating worker_pid in the job
+            # file. If our worker_pid no longer matches, we are the old
+            # (stale) supervisor — break cleanly rather than killing the
+            # wrong wrapper and writing a spurious exit code to the shared
+            # marker file, which would cause the active run to fail.
+            _live_wpid=$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)
+            if [ "$_live_wpid" != "$worker_pid" ]; then
+                break
+            fi
             reaped_reason="result_grace_expired"
             _append_event "reaping_after_result_grace" "$(jq -nc --argjson grace "$RESULT_GRACE_SECONDS" '{grace_seconds: $grace}')"
             _terminate_worker
@@ -692,6 +702,11 @@ while [ ! -f "$marker_file" ]; do
     if [ "$_mtime" -gt 0 ]; then
         _now_epoch=$(date +%s)
         if [ $((_now_epoch - _mtime)) -ge "$IDLE_REAP_SECONDS" ]; then
+            # Same stale-supervisor guard as Layer 1.
+            _live_wpid=$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)
+            if [ "$_live_wpid" != "$worker_pid" ]; then
+                break
+            fi
             reaped_reason="idle_timeout"
             _append_event "reaping_after_idle_timeout" "$(jq -nc --argjson seconds "$IDLE_REAP_SECONDS" --argjson last_activity "$_mtime" '{idle_seconds: $seconds, last_activity_epoch: $last_activity}')"
             _terminate_worker
@@ -874,6 +889,19 @@ _append_metrics() {
         }')
     _with_lock "$_metrics_file" _append_line "$_metrics_file" "$line"
 }
+
+# Stale-supervisor guard: if a resume cycle updated worker_pid in the job
+# file to a different wrapper, we are no longer the active supervisor. Exit
+# cleanly without making any state transition — the active run will handle
+# its own terminal transition. We do NOT delete the marker file here because
+# it may already belong to the active run.
+_final_wpid=$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)
+if [ "$_final_wpid" != "$worker_pid" ]; then
+    rm -f "$wrapper"
+    trap - EXIT
+    echo "job $id: stale supervisor exiting (active worker_pid=$_final_wpid, ours=$worker_pid)"
+    exit 0
+fi
 
 # Final transition.
 if [ "$cancel_requested" -eq 1 ]; then
