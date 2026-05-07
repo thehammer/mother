@@ -327,14 +327,36 @@ posture_at_spawn="normal"
 posture_bias_applied="none"
 if [ "$current_tier" = "tier_0" ]; then
     posture_at_spawn=$(_resolve_posture)
-    POSTURE_BIAS_ACTION="none"
-    biased_tier=$(_apply_posture_bias "$current_tier" "$posture_at_spawn")
-    posture_bias_applied="${POSTURE_BIAS_ACTION:-none}"
-    if [ "$biased_tier" != "$current_tier" ]; then
-        # Override current_tier and re-derive model/effort from the biased tier.
-        # Posture reflects real-time budget reality and trumps a static plan-time
-        # hint when the posture demands it. Log the override.
-        current_tier="$biased_tier"
+    # Inline the bias case rather than delegating to _apply_posture_bias via
+    # command substitution — a subshell can't propagate variables back to the
+    # parent, so any side-effecting variable set inside $() is lost.
+    _idx=$(_tier_index "$current_tier")
+    case "$posture_at_spawn" in
+        conservative)
+            posture_bias_applied="clamp"
+            current_tier="tier_0"
+            ;;
+        elevated)
+            _new=$(( _idx + 1 )); [ "$_new" -gt 2 ] && _new=2
+            _biased=$(_tier_from_index "$_new")
+            if [ "$_biased" != "$current_tier" ]; then
+                posture_bias_applied="up1"
+                current_tier="$_biased"
+            fi
+            ;;
+        flush)
+            _new=$(( _idx + 1 )); [ "$_new" -gt 3 ] && _new=3
+            _biased=$(_tier_from_index "$_new")
+            if [ "$_biased" != "$current_tier" ]; then
+                posture_bias_applied="up1"
+                current_tier="$_biased"
+            fi
+            ;;
+        normal|*)
+            posture_bias_applied="none"
+            ;;
+    esac
+    if [ "$posture_bias_applied" != "none" ]; then
         worker_model=$(_tier_model "$current_tier")
         worker_effort=$(_tier_effort "$current_tier")
         _append_event "posture_bias_applied" \
