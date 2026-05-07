@@ -954,7 +954,18 @@ cmd_adherence_review() {
         "$pr_comments")
 
     # Invoke Archie for the review.
+    # Apply posture bias: conservative posture clamps to sonnet; all others
+    # keep the default opus (adherence review is a hard reasoning task).
+    # MOTHER_POSTURE_ENABLED=0 disables the bias entirely.
     local archie_model="opus"
+    local review_posture
+    review_posture=$(_resolve_posture)
+    if [ "$review_posture" = "conservative" ]; then
+        archie_model="sonnet"
+    fi
+    _append_event "$id" "adherence_review_spawned" \
+        "$(jq -nc --arg m "$archie_model" --arg p "$review_posture" \
+            '{model: $m, posture: $p}')"
     local raw_verdict
     raw_verdict=$(claude --agent archie --model "$archie_model" -p "$review_prompt" 2>/dev/null || true)
 

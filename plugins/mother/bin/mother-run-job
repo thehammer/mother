@@ -47,6 +47,8 @@ job_file="$JOBS_DIR/$id.json"
 [ -f "$job_file" ] || { echo "mother-run-job: no such job: $id" >&2; exit 1; }
 
 # shellcheck source=/dev/null
+source "$MOTHER_LIB_DIR/state.sh"
+# shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/worktree.sh"
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/locks.sh"
@@ -314,6 +316,32 @@ else
     # No suggested_config — fall back to env defaults (old plans).
     worker_model="${MOTHER_DEFAULT_MODEL}"
     worker_effort="${MOTHER_DEFAULT_EFFORT}"
+fi
+
+# ---- Posture bias (Bishop) ----
+# Applied to the *initial* tier only. Failure escalation is applied by the
+# escalation logic before this script runs (it bumps current_tier on the job).
+# That means escalated jobs already have current_tier > tier_0 here, so the
+# guard below ensures escalation dominates: posture bias is a no-op for them.
+posture_at_spawn="normal"
+posture_bias_applied="none"
+if [ "$current_tier" = "tier_0" ]; then
+    posture_at_spawn=$(_resolve_posture)
+    POSTURE_BIAS_ACTION="none"
+    biased_tier=$(_apply_posture_bias "$current_tier" "$posture_at_spawn")
+    posture_bias_applied="${POSTURE_BIAS_ACTION:-none}"
+    if [ "$biased_tier" != "$current_tier" ]; then
+        # Override current_tier and re-derive model/effort from the biased tier.
+        # Posture reflects real-time budget reality and trumps a static plan-time
+        # hint when the posture demands it. Log the override.
+        current_tier="$biased_tier"
+        worker_model=$(_tier_model "$current_tier")
+        worker_effort=$(_tier_effort "$current_tier")
+        _append_event "posture_bias_applied" \
+            "$(jq -nc --arg p "$posture_at_spawn" --arg a "$posture_bias_applied" \
+                --arg t "$current_tier" --arg m "$worker_model" --arg e "$worker_effort" \
+                '{posture: $p, action: $a, new_tier: $t, model: $m, effort: $e}')"
+    fi
 fi
 
 # Persist current_tier on the job (first run sets it; escalations bump it externally).
@@ -809,6 +837,8 @@ _append_metrics() {
         --argjson wall_time_seconds "$wall_time" \
         --argjson log_size_bytes "${log_size:-0}" \
         --arg pr_url "${pr_url:-}" \
+        --arg posture_at_spawn "${posture_at_spawn:-normal}" \
+        --arg posture_bias_applied "${posture_bias_applied:-none}" \
         '{
             ts: $ts, job_id: $job_id, stage: $stage,
             model: $model, effort: $effort, tier: $tier,
@@ -816,7 +846,9 @@ _append_metrics() {
             escalation_count: $escalation_count,
             wall_time_seconds: $wall_time_seconds,
             log_size_bytes: $log_size_bytes,
-            pr_url: $pr_url
+            pr_url: $pr_url,
+            posture_at_spawn: $posture_at_spawn,
+            posture_bias_applied: $posture_bias_applied
         }')
     _with_lock "$_metrics_file" _append_line "$_metrics_file" "$line"
 }

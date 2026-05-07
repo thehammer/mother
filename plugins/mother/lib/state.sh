@@ -201,6 +201,84 @@ _quota_resume_at_for() {
     esac
 }
 
+# ---------- Bishop budget-posture helpers ----------
+#
+# These helpers are the single source of truth for posture resolution and bias
+# logic. Sourced by both bin/mother (adherence-review) and bin/mother-run-job
+# (Cody spawn). Callers set MOTHER_POSTURE_ENABLED=0 to disable.
+
+# _tier_index: map tier name to integer; -1 on unknown.
+_tier_index() {
+    case "$1" in
+        tier_0) echo 0 ;;
+        tier_1) echo 1 ;;
+        tier_2) echo 2 ;;
+        tier_3) echo 3 ;;
+        *)      echo -1 ;;
+    esac
+}
+
+_tier_from_index() {
+    case "$1" in
+        0) echo tier_0 ;;
+        1) echo tier_1 ;;
+        2) echo tier_2 ;;
+        3) echo tier_3 ;;
+        *) echo tier_0 ;;
+    esac
+}
+
+# _resolve_posture: best-effort fetch of current Bishop posture.
+# Echoes one of: conservative | normal | elevated | flush.
+# Falls back to `normal` if bishop is not on PATH, the call fails, or output
+# is unrecognized. Honors MOTHER_POSTURE_ENABLED=0 to disable entirely.
+_resolve_posture() {
+    if [ "${MOTHER_POSTURE_ENABLED:-1}" = "0" ]; then
+        echo "normal"; return 0
+    fi
+    if ! command -v bishop >/dev/null 2>&1; then
+        echo "normal"; return 0
+    fi
+    bishop --refresh >/dev/null 2>&1 || true
+    local p
+    p=$(bishop get posture 2>/dev/null | tr -d '[:space:]')
+    case "$p" in
+        conservative|normal|elevated|flush) echo "$p" ;;
+        *) echo "normal" ;;
+    esac
+}
+
+# _apply_posture_bias: given a resolved tier and a posture, return the biased
+# tier per the rules. Echoes the new tier on stdout. Sets POSTURE_BIAS_ACTION
+# in the caller's scope to one of: clamp | up1 | none.
+_apply_posture_bias() {
+    local resolved="$1" posture="$2"
+    local idx; idx=$(_tier_index "$resolved")
+    [ "$idx" -lt 0 ] && idx=0
+    case "$posture" in
+        conservative)
+            POSTURE_BIAS_ACTION="clamp"
+            _tier_from_index 0
+            ;;
+        elevated)
+            local new=$((idx + 1))
+            [ "$new" -gt 2 ] && new=2
+            POSTURE_BIAS_ACTION="up1"
+            _tier_from_index "$new"
+            ;;
+        flush)
+            local new=$((idx + 1))
+            [ "$new" -gt 3 ] && new=3
+            POSTURE_BIAS_ACTION="up1"
+            _tier_from_index "$new"
+            ;;
+        normal|*)
+            POSTURE_BIAS_ACTION="none"
+            echo "$resolved"
+            ;;
+    esac
+}
+
 # Promote queued jobs whose dependencies are all succeeded to ready.
 _promote_ready() {
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f | while read -r f; do
