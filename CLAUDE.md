@@ -144,3 +144,37 @@ The bats test suite lives at `plugins/mother/tests/`. Run with:
 ```
 
 Requires `bats` (`brew install bats-core`).
+
+## Bishop budget posture
+
+Mother consumes `~/.claude/budget-posture.json`, produced by Bishop
+(`~/.local/bin/bishop`, source at `~/Code/bishop/`). Bishop computes a
+"budget posture" from Claude Code's rolling 5-hour and 7-day quota windows and
+writes the result to that file. Mother reads posture at Cody-spawn time and at
+adherence-review time to bias the model/effort tier.
+
+**Kill switch:** set `MOTHER_POSTURE_ENABLED=0` (in the launchd plist or shell
+environment) to disable posture bias entirely. The default is `1` (enabled).
+
+**Posture levels and bias semantics:**
+
+| Posture | Effect on initial tier |
+|---|---|
+| `conservative` | Clamp to `tier_0` (sonnet / medium) |
+| `normal` | No change |
+| `elevated` | +1 tier from resolved, capped at `tier_2` (sonnet / xhigh) |
+| `flush` | +1 tier from resolved, capped at `tier_3` (opus / high) |
+
+**Bias-first-then-escalation contract:** posture bias is applied to the
+*initial* resolved tier (`current_tier == tier_0`). Failure escalation
+(`escalation_count`) bumps `current_tier` externally before `mother-run-job`
+runs, so escalated jobs already have `current_tier > tier_0` when the posture
+block executes — the `tier_0` guard ensures escalation always dominates and
+escalated jobs are never pulled back down by `conservative` posture.
+
+**Degradation:** if Bishop is not installed or `bishop get posture` fails,
+`_resolve_posture` echoes `normal` and Mother proceeds with no bias.
+
+**New metrics fields** on each `runs.jsonl` line (since this feature):
+- `posture_at_spawn` — posture level observed at Cody-spawn time.
+- `posture_bias_applied` — action taken: `clamp`, `up1`, or `none`.
