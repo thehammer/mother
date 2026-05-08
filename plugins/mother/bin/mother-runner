@@ -423,8 +423,9 @@ _run_adherence_pending() {
             adherence_attempts=$(jq -r '.adherence_attempts // 0' "$f" 2>/dev/null)
             [ "$adherence_attempts" -lt 2 ] || continue
             state=$(jq -r '.state // ""' "$f" 2>/dev/null)
-            # Only review succeeded jobs (or adherence_rework jobs being re-tried).
-            case "$state" in succeeded|adherence_rework) ;; *) continue ;; esac
+            # Only review jobs that just succeeded (re-queued rework jobs go through
+            # succeeded again on their second pass, so this covers both passes).
+            case "$state" in succeeded) ;; *) continue ;; esac
             id=$(jq -r '.id' "$f")
             _log "running adherence review for $id (attempt=$adherence_attempts)"
             if "$MOTHER_BIN_DIR/mother" adherence-review "$id" 2>&1 | while read -r line; do _log "adherence: $line"; done; then
@@ -433,10 +434,12 @@ _run_adherence_pending() {
                 local post_status; post_status=$(jq -r '.adherence_status // ""' "$JOBS_DIR/$id.json" 2>/dev/null)
                 case "$post_status" in
                     failed_first)
-                        # Kick a fresh Cody run via the retry plumbing but in adherence_rework state.
-                        # The pending_answer was already set by cmd_adherence_review.
-                        merged=$(jq --arg s "ready" '
-                            .state = $s
+                        # Re-queue for a fresh Cody run. pending_answer already set by
+                        # cmd_adherence_review. Mark activity=cody_rework so the list
+                        # view shows it's a second attempt.
+                        merged=$(jq '
+                            .state = "ready"
+                            | .activity = "cody_rework"
                             | .finished_at = null
                             | .worker_pid = null
                             | .actual_cost_usd = null
@@ -445,11 +448,12 @@ _run_adherence_pending() {
                             | .final_result_at = null
                         ' "$JOBS_DIR/$id.json") && _atomic_write "$JOBS_DIR/$id.json" "$merged"
                         _append_event "$id" "adherence_rework_kicked" \
-                            "$(jq -nc --arg id "$id" '{id: $id, note: "adherence failed first attempt; re-queuing"}')"
-                        _log "adherence failed for $id (first attempt) — re-queuing"
+                            "$(jq -nc --arg id "$id" '{id: $id, note: "adherence failed first attempt; re-queuing with activity=cody_rework"}')"
+                        _log "adherence failed for $id (first attempt) — re-queuing (activity=cody_rework)"
                         ;;
                     blocked_for_human)
-                        _log "adherence failed for $id (second attempt) — blocked_for_human"
+                        # cmd_adherence_review already transitioned to awaiting+adherence_blocked.
+                        _log "adherence failed for $id (second attempt) — job is now awaiting (adherence_blocked)"
                         ;;
                 esac
             fi

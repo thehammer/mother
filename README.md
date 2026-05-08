@@ -210,11 +210,14 @@ Archie (at `opus` tier) reads the original plan, the PR diff, CI status, and
 Perri's comments, then emits a structured verdict:
 
 - **pass** — job stays `succeeded`, nothing to do.
-- **fail (first attempt)** — job re-queues as `adherence_rework` with Archie's
-  notes prepended to the next Cody run's prompt.
-- **fail (second attempt)** — job is marked `[ADHERENCE-BLOCKED]` for human review.
+- **fail (first attempt)** — job re-queues to `ready` with `activity=cody_rework`;
+  Archie's notes are prepended to the next Cody run's prompt.
+- **fail (second attempt)** — job transitions to `awaiting` with
+  `activity=adherence_blocked`; shows as `?` in the statusline. Run
+  `mother resume <id> "<instructions>"` after reviewing the PR, or
+  `mother cancel <id>` to abandon it.
 
-`mother list` and `mother status` show blocked jobs prominently.
+`mother list` and `mother status` surface the activity sub-state prominently.
 
 Manual review: `mother adherence-review <id>`.
 

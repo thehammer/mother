@@ -80,8 +80,30 @@ plan-adherence review. Here's what was added and how to work with it.
 | `escalation_count` | int | Number of times this job has been escalated. |
 | `adherence_attempts` | int | Number of adherence reviews run so far. |
 | `adherence_pending` | bool | True when a succeeded job awaits adherence review. |
-| `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. |
+| `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. Audit trail only — do not use for operational logic. |
 | `adherence_notes` | string | Archie's notes from the last review (populated on fail). |
+| `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human). Cleared on resume. |
+
+### State machine
+
+`state` is the operational status. `activity` clarifies what's happening within
+a state — think of it as a sub-state that's always optional to read but useful
+for display and routing.
+
+| state | activity | meaning |
+|---|---|---|
+| `queued` | — | waiting on dependencies |
+| `ready` | — | runnable, waiting for daemon slot |
+| `running` | (none) | Cody running (first attempt) |
+| `running` | `cody_rework` | Cody running (second attempt, after adherence fail) |
+| `awaiting` | (none) | Cody asked a question; answer with `mother resume` |
+| `awaiting` | `adherence_blocked` | Archie failed twice; human must review PR, then `resume` or `cancel` |
+| `succeeded` | — | terminal: all work done |
+| `failed` | — | terminal: gave up after escalation cap |
+| `cancelled` | — | terminal: explicitly cancelled |
+
+Terminal states are exactly `succeeded`, `failed`, `cancelled`. Only terminal
+jobs can be archived.
 
 ### Tier ladder
 

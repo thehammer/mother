@@ -344,16 +344,16 @@ cmd_list() {
             [
                 .id,
                 .state,
-                (.adherence_status // ""),
+                (.activity // ""),
                 (.current_tier // ""),
                 .repo,
                 .isolation,
                 .title
             ] | @tsv' | \
-            while IFS=$'\t' read -r id st adherence_status current_tier repo iso title; do
+            while IFS=$'\t' read -r id st activity current_tier repo iso title; do
                 # Compose the state display field with markers.
                 local state_display="$st"
-                [ "$adherence_status" = "blocked_for_human" ] && state_display="[ADHERENCE-BLOCKED] $st"
+                [ -n "$activity" ] && state_display="$st [$activity]"
                 case "$current_tier" in
                     tier_1) state_display="$state_display tier:1" ;;
                     tier_2) state_display="$state_display tier:2" ;;
@@ -384,15 +384,17 @@ cmd_status() {
             <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
     else
         local job_file; job_file=$(_job_path "$id")
-        local adherence_status; adherence_status=$(jq -r '.adherence_status // empty' "$job_file")
+        local activity; activity=$(jq -r '.activity // empty' "$job_file")
         local current_tier; current_tier=$(jq -r '.current_tier // "tier_0"' "$job_file")
         local esc_count; esc_count=$(jq -r '.escalation_count // 0' "$job_file")
 
-        if [ "$adherence_status" = "blocked_for_human" ]; then
+        if [ "$activity" = "adherence_blocked" ]; then
             echo ""
             echo "⚠️  [ADHERENCE-BLOCKED] This job requires human review."
             echo "   Archie reviewed the PR diff twice and flagged adherence issues."
-            echo "   See .adherence_notes on the job JSON for details."
+            echo "   Run: mother resume $id \"<your instructions>\""
+            echo "   Or:  mother cancel $id  (to abandon the PR)"
+            echo "   See .adherence_notes on the job JSON for Archie's findings."
             echo ""
         fi
         if [ "$current_tier" != "tier_0" ] && [ -n "$current_tier" ]; then
@@ -924,7 +926,7 @@ cmd_adherence_review() {
     _job_exists "$id" || _die "no such job: $id"
     local job_file; job_file=$(_job_path "$id")
     local state; state=$(jq -r .state "$job_file")
-    case "$state" in succeeded|adherence_rework) ;; *) _die "adherence-review: job must be in succeeded or adherence_rework state (state=$state)" ;; esac
+    case "$state" in succeeded) ;; *) _die "adherence-review: job must be in succeeded state (state=$state)" ;; esac
 
     local pr_url; pr_url=$(jq -r '.pr_url // empty' "$job_file")
     [ -n "$pr_url" ] || _die "adherence-review: job $id has no pr_url"
@@ -999,23 +1001,27 @@ cmd_adherence_review() {
         # fail
         if [ "$esc_attempts" -eq 0 ]; then
             adherence_status="failed_first"
-            # Transition to adherence_rework so runner can kick a fresh Cody run.
+            # Store notes and pending_answer; runner re-queues with activity=cody_rework.
             local notes_escaped; notes_escaped=$(printf '%s' "$notes" | sed 's/"/\\"/g')
             _job_update "$id" \
-                ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$notes_escaped\" | .adherence_attempts = $new_attempts | .pending_answer = \"$notes_escaped\" | .state = \"adherence_rework\""
+                ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$notes_escaped\" | .adherence_attempts = $new_attempts | .pending_answer = \"$notes_escaped\""
             _append_event "$id" "adherence_reviewed" \
                 "$(jq -nc --arg verdict "fail" --arg notes "$notes" --argjson attempts "$new_attempts" --arg status "$adherence_status" \
                     '{verdict: $verdict, notes: $notes, attempts: $attempts, status: $status}')"
-            echo "$id: adherence review: FAIL (first attempt) — transitioning to adherence_rework"
+            echo "$id: adherence review: FAIL (first attempt) — re-queuing for cody_rework"
             return 1
         else
             adherence_status="blocked_for_human"
+            # Transition to awaiting so the operator sees it in the statusline ?-count.
+            local notes_escaped; notes_escaped=$(printf '%s' "$notes" | sed 's/"/\\"/g')
             _job_update "$id" \
-                ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$(printf '%s' "$notes" | sed 's/"/\\"/g')\" | .adherence_attempts = $new_attempts | .adherence_pending = false"
+                ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$notes_escaped\" | .adherence_attempts = $new_attempts | .adherence_pending = false | .activity = \"adherence_blocked\" | .state = \"awaiting\" | .paused_at = \"$(_iso_now)\" | .paused_reason = \"adherence_blocked\""
             _append_event "$id" "adherence_reviewed" \
                 "$(jq -nc --arg verdict "fail" --arg notes "$notes" --argjson attempts "$new_attempts" --arg status "$adherence_status" \
                     '{verdict: $verdict, notes: $notes, attempts: $attempts, status: $status}')"
-            echo "$id: adherence review: FAIL (second attempt) — marking blocked_for_human"
+            _append_event "$id" "awaiting_input" \
+                "$(jq -nc --arg notes "$notes" '{paused_reason: "adherence_blocked", notes: $notes}')"
+            echo "$id: adherence review: FAIL (second attempt) — transitioning to awaiting (adherence_blocked)"
             return 1
         fi
     fi
@@ -1150,6 +1156,7 @@ cmd_resume() {
         | .auto_resume_at = null
         | .paused_reason = null
         | .pause_requested = null
+        | .activity = null
         | .state = "ready"
     ' "$job_file") || _die "resume: jq update failed"
     _atomic_write "$job_file" "$merged"
@@ -1437,7 +1444,7 @@ _archive_one() {
     local state finished year_month dest_dir
     state=$(jq -r '.state // ""' "$job_file")
     case "$state" in
-        succeeded|failed|cancelled|adherence_rework) ;;
+        succeeded|failed|cancelled) ;;
         *) echo "archive: $id is $state, not a terminal state — skipping" >&2; return 1 ;;
     esac
 
@@ -1507,7 +1514,7 @@ cmd_archive() {
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f")
-        case "$state" in succeeded|failed|cancelled|adherence_rework) ;; *) skipped=$((skipped + 1)); continue ;; esac
+        case "$state" in succeeded|failed|cancelled) ;; *) skipped=$((skipped + 1)); continue ;; esac
         finished=$(jq -r '.finished_at // ""' "$f")
         [ -n "$finished" ] || { skipped=$((skipped + 1)); continue; }
         if [ "$finished" \> "$cutoff_iso" ]; then
@@ -1616,9 +1623,18 @@ State flows:
                                                runs `resume`; OR daemon's
                                                quota gate pauses + auto-
                                                resumes when window resets)
-  failed  -> ready  (via mother escalate — bumps tier and re-queues)
-  succeeded -> adherence_rework -> ready  (Archie flags drift; Cody re-runs)
-  [ADHERENCE-BLOCKED] — second adherence fail; needs human review
+  failed    -> ready     (via mother escalate — bumps tier and re-queues)
+  succeeded -> ready     (Archie flags drift on first review; Cody re-runs
+                          with activity=cody_rework)
+  succeeded -> awaiting  (Archie flags drift on second review; job sits in
+                          awaiting with activity=adherence_blocked until
+                          operator runs `mother resume` or `mother cancel`)
+
+Activity sub-states (visible in `mother list`, indicate what a job is doing
+within its current state):
+  running  [cody_rework]       — second Cody attempt after adherence fail
+  awaiting [adherence_blocked] — needs human to review PR and resume/cancel
+  awaiting (no activity)       — Cody asked a question; answer with `resume`
 
 Metrics:
   ~/.mother/metrics/runs.jsonl — one JSON line per terminal transition
