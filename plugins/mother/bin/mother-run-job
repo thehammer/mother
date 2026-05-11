@@ -644,7 +644,11 @@ while [ ! -f "$marker_file" ]; do
     #      gets to gracefully wind down.
     if [ -f "$log_path" ]; then
         if [ -z "$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)" ]; then
-            _live_pr_url=$(grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' "$log_path" 2>/dev/null | tail -1 || true)
+            # Only scan log content written by THIS worker (past log_offset_at_spawn)
+            # to avoid picking up PR URLs left by previous runs on the same log file
+            # (e.g. escalation retries on the same job ID).
+            _live_pr_url=$(tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
+                | grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | tail -1 || true)
             if [ -n "$_live_pr_url" ]; then
                 _job_update ".pr_url = \"$_live_pr_url\""
                 _append_event "pr_opened" "$(jq -nc --arg url "$_live_pr_url" '{url: $url}')"
@@ -721,12 +725,31 @@ exit_code=0
 # Best-effort: extract a PR URL from the log if we didn't already pick it up
 # during the poll loop. Skipped if pr_url was already recorded — re-emitting
 # `pr_opened` would double-count in the event trail.
+# Only scan content from this worker's spawn to avoid picking up stale URLs
+# from prior runs on the same log file (escalation/retry cycles).
 pr_url=$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)
 if [ -z "$pr_url" ] && [ -f "$log_path" ]; then
-    pr_url=$(grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' "$log_path" | tail -1 || true)
+    pr_url=$(tail -c "+$((log_offset_at_spawn + 1))" "$log_path" \
+        | grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | tail -1 || true)
     if [ -n "$pr_url" ]; then
         _job_update ".pr_url = \"$pr_url\""
         _append_event "pr_opened" "$(jq -nc --arg url "$pr_url" '{url: $url}')"
+    fi
+fi
+
+# Validate that the PR URL we captured (if any) actually belongs to this job's
+# branch. A stale URL from a prior run on the same branch, or a wrong-PR
+# attachment from a rapid escalation sequence, would otherwise cause adherence
+# review to run against an unrelated diff.
+if [ -n "${pr_url:-}" ]; then
+    _pr_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
+    if [ -n "$_pr_head" ] && [ "$_pr_head" != "$branch" ]; then
+        _append_event "pr_url_branch_mismatch" \
+            "$(jq -nc --arg url "$pr_url" --arg pr_branch "$_pr_head" --arg job_branch "$branch" \
+                '{note: "pr_url headRefName does not match job branch; clearing stale URL", \
+                  pr_url: $url, pr_branch: $pr_branch, job_branch: $job_branch}')"
+        _job_update ".pr_url = null"
+        pr_url=""
     fi
 fi
 
@@ -782,6 +805,75 @@ if [ "$current_state" = "awaiting" ]; then
     exit 0
 fi
 
+# ---------- auto-continuation ----------
+#
+# When a job is reaped due to idle_timeout (stream died mid-work, no result
+# event observed), rather than failing immediately we attempt a continuation:
+# a fresh Cody spawn on the same worktree, given the original plan plus a
+# preamble summarising what commits are already on the branch.
+#
+# Capped at MOTHER_MAX_CONTINUATIONS (default 3). Kill switch:
+# MOTHER_CONTINUATIONS_ENABLED=0. Only triggers when no result event was
+# observed (final_result_epoch == 0) — if the agent already finished, we
+# let _verify_artifact_or_fail decide.
+
+_attempt_continuation() {
+    local reason="$1"
+    [ "${MOTHER_CONTINUATIONS_ENABLED:-1}" = "1" ] || return 1
+
+    local max_cont="${MOTHER_MAX_CONTINUATIONS:-3}"
+    local cont_count; cont_count=$(jq -r '.continuation_count // 0' "$job_file" 2>/dev/null)
+    [ "$cont_count" -lt "$max_cont" ] || return 1
+
+    local new_count=$(( cont_count + 1 ))
+
+    # Summarise what's already committed so the resumed worker doesn't redo it.
+    local git_log_summary=""
+    if [ -d "${work_dir:-}" ]; then
+        git_log_summary=$(cd "$work_dir" && git log --oneline "${base_ref}..HEAD" 2>/dev/null || true)
+    fi
+    [ -z "$git_log_summary" ] && git_log_summary="(no commits ahead of base yet)"
+
+    local preamble
+    preamble=$(printf '%s\n%s\n\n%s\n\n%s\n\n%s\n\n%s\n' \
+        "# Continuation (attempt ${new_count} of ${max_cont})" \
+        "" \
+        "A previous worker on this job was interrupted before it could finish (reason: ${reason})." \
+        "The following commits are already on branch \`${branch}\` — **do not redo this work**:" \
+        "\`\`\`" \
+        "${git_log_summary}" \
+    )
+    preamble="${preamble}
+\`\`\`
+
+Resume from the first uncommitted step in the original plan below. Skip any steps whose work is already committed above. Run \`git log --oneline\` first to orient yourself.
+
+## Original Plan
+
+"
+
+    local merged
+    merged=$(jq --arg pa "$preamble" --argjson c "$new_count" '
+        .pending_answer = $pa
+        | .continuation_count = $c
+        | .state = "ready"
+        | .finished_at = null
+        | .worker_pid = null
+        | .actual_cost_usd = null
+        | .cancel_requested = null
+        | .pause_requested = null
+        | .final_result_at = null
+        | .activity = "continuation"
+    ' "$job_file") && _atomic_write "$job_file" "$merged"
+
+    _append_event "continuation_queued" \
+        "$(jq -nc --arg reason "$reason" --argjson count "$new_count" --argjson max "$max_cont" \
+            '{reason: $reason, continuation_count: $count, max_continuations: $max}')"
+
+    echo "job $id: idle_timeout — queuing continuation ${new_count}/${max_cont}"
+    return 0
+}
+
 # Verify the artifact: when we're about to mark `succeeded` but didn't
 # capture a pr_url during the run, sanity-check that the branch was at
 # least pushed to origin. Worktree jobs are spun off on a fresh branch
@@ -795,6 +887,11 @@ fi
 # after having transitioned to failed itself, in which case the caller
 # must NOT also transition.
 _verify_artifact_or_fail() {
+    # Plans with no_pr:true explicitly opt out of the push/PR contract.
+    # The success condition is "worker exited cleanly with commits on the branch."
+    local job_no_pr; job_no_pr=$(jq -r '.no_pr // false' "$job_file" 2>/dev/null)
+    [ "$job_no_pr" = "true" ] && return 0
+
     # If a pr_url was captured (live or post-loop), the artifact is real.
     [ -z "${pr_url:-}" ] || return 0
     # Only worktree jobs carry the "branch must be on origin" contract.
@@ -911,13 +1008,17 @@ elif [ -n "$reaped_reason" ]; then
     # already observed the agent's final `result` event by then, the work
     # is complete and the worker just refused to exit — call it succeeded
     # with a note (subject to artifact verification). If we reaped without
-    # ever seeing a result (idle timeout mid-work), the outcome is
-    # indeterminate; mark failed so the operator notices.
+    # ever seeing a result (idle timeout mid-work), attempt a continuation
+    # first; fall back to failed if the continuation cap is reached.
     if [ "$final_result_epoch" -gt 0 ]; then
         if _verify_artifact_or_fail; then
             _transition succeeded "$(jq -nc --arg pr "$pr_url" --arg reason "$reaped_reason" '{pr_url: $pr, reaped: $reason}')"
             _append_metrics "succeeded"
         fi
+    elif [ "$reaped_reason" = "idle_timeout" ] && _attempt_continuation "$reaped_reason"; then
+        # Continuation queued — don't transition to failed; the re-queued
+        # worker will handle the terminal transition.
+        _append_metrics "continuation"
     else
         _transition failed "$(jq -nc --arg reason "$reaped_reason" '{reason: $reason}')"
         _append_metrics "failed"

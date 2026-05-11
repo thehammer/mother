@@ -96,6 +96,7 @@ for display and routing.
 | `ready` | — | runnable, waiting for daemon slot |
 | `running` | (none) | Cody running (first attempt) |
 | `running` | `cody_rework` | Cody running (second attempt, after adherence fail) |
+| `running` | `continuation` | Cody re-running after idle_timeout (auto-continuation) |
 | `awaiting` | (none) | Cody asked a question; answer with `mother resume` |
 | `awaiting` | `adherence_blocked` | Archie failed twice; human must review PR, then `resume` or `cancel` |
 | `succeeded` | — | terminal: all work done |
@@ -116,13 +117,21 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `tier_2` | sonnet | xhigh |
 | `tier_3` | opus | high |
 
+### Job fields (additional)
+
+| Field | Type | Description |
+|---|---|---|
+| `no_pr` | bool | Set by `no_pr: true` in the plan YAML block. Skips the `no_pr_no_push` failure check. Success condition becomes "worker exited cleanly with commits on the branch." |
+| `continuation_count` | int | Number of auto-continuation attempts so far. Incremented each time an `idle_timeout` triggers a re-queue. |
+
 ### Kill switches
 
-Both features can be disabled without redeploying by setting env vars in the
-launchd plist or shell environment:
+All three background behaviours can be disabled without redeploying:
 
 - `MOTHER_ESCALATION_ENABLED=0` — disable auto-escalation of failed jobs.
 - `MOTHER_ADHERENCE_ENABLED=0` — disable adherence review of succeeded jobs.
+- `MOTHER_CONTINUATIONS_ENABLED=0` — disable auto-continuation on idle_timeout.
+- `MOTHER_MAX_CONTINUATIONS=N` — cap continuation attempts (default: 3).
 
 ### Metrics file
 

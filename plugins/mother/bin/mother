@@ -53,7 +53,7 @@ _gen_id() {
 
 _die() { echo "mother: $*" >&2; exit 1; }
 
-# ---------- suggested_config parsing ----------
+# ---------- plan metadata parsing ----------
 
 # _parse_suggested_config <plan_file>
 # Extracts the ```yaml ... ``` block containing suggested_config from a plan
@@ -166,6 +166,32 @@ except yaml.YAMLError as e:
     printf '%s\n' "$sc_json"
 }
 
+# _parse_no_pr <plan_file>
+# Returns "true" if the plan's YAML block contains `no_pr: true`, else "false".
+# The flag opts the job out of the `no_pr_no_push` failure check, for plans
+# that explicitly instruct the worker not to push or open a PR.
+_parse_no_pr() {
+    local plan_file="$1"
+    python3 - "$plan_file" <<'PYEOF' 2>/dev/null || echo "false"
+import sys, re
+try:
+    import yaml
+except ImportError:
+    print("false"); sys.exit(0)
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    content = f.read()
+
+blocks = re.findall(r'```yaml\n(.*?)```', content, re.DOTALL)
+for block in blocks:
+    if 'suggested_config' in block:
+        data = yaml.safe_load(block.strip()) or {}
+        print("true" if data.get("no_pr", False) is True else "false")
+        sys.exit(0)
+print("false")
+PYEOF
+}
+
 # ---------- tier ladder ----------
 
 # Tier definitions (sourced by both mother and mother-run-job via lib/state.sh
@@ -257,6 +283,10 @@ cmd_add() {
     suggested_config_json=$(_parse_suggested_config "$plan_file") \
         || _die "add: $suggested_config_json"
 
+    # Parse the no_pr flag (opt-out of the no_pr_no_push failure check).
+    local no_pr_flag
+    no_pr_flag=$(_parse_no_pr "$plan_file")
+
     local id deps_json job_json max_cost_json
     id=$(_gen_id)
     if [ -n "$depends_on" ]; then
@@ -267,6 +297,9 @@ cmd_add() {
     max_cost_json=$([ -n "$max_cost" ] && echo "$max_cost" || echo "null")
 
     cp "$plan_file" "$(_plan_path "$id")"
+
+    local no_pr_json
+    [ "$no_pr_flag" = "true" ] && no_pr_json="true" || no_pr_json="false"
 
     job_json=$(jq -n \
         --arg id "$id" \
@@ -283,6 +316,7 @@ cmd_add() {
         --arg log_path "$(_log_path "$id")" \
         --arg created_at "$(_iso_now)" \
         --argjson suggested_config "$suggested_config_json" \
+        --argjson no_pr "$no_pr_json" \
         '{
             id: $id, title: $title, repo: $repo, repo_path: $repo_path,
             branch: $branch, base_ref: $base_ref, isolation: $isolation,
@@ -292,6 +326,7 @@ cmd_add() {
             started_at: null, finished_at: null,
             pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null,
             suggested_config: $suggested_config,
+            no_pr: $no_pr,
             current_tier: "tier_0",
             escalation_count: 0,
             adherence_attempts: 0
@@ -1632,9 +1667,10 @@ State flows:
 
 Activity sub-states (visible in `mother list`, indicate what a job is doing
 within its current state):
-  running  [cody_rework]       — second Cody attempt after adherence fail
-  awaiting [adherence_blocked] — needs human to review PR and resume/cancel
-  awaiting (no activity)       — Cody asked a question; answer with `resume`
+  running/ready [continuation]   — re-queued after idle_timeout (auto-continuation)
+  running       [cody_rework]    — second Cody attempt after adherence fail
+  awaiting      [adherence_blocked] — needs human to review PR; resume or cancel
+  awaiting      (no activity)    — Cody asked a question; answer with `resume`
 
 Metrics:
   ~/.mother/metrics/runs.jsonl — one JSON line per terminal transition
