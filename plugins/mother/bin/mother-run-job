@@ -518,7 +518,7 @@ _forward_signal() {
     [ -n "\$claude_pid" ] && kill -TERM "\$claude_pid" 2>/dev/null || true
 }
 trap _forward_signal TERM INT
-claude --agent "$worker_agent" --model "$worker_model" --session-id "$session_id" -p "\$(cat "$resolved_plan_path")" --output-format stream-json --verbose &
+claude --dangerously-skip-permissions --agent "$worker_agent" --model "$worker_model" --session-id "$session_id" -p "\$(cat "$resolved_plan_path")" --output-format stream-json --verbose &
 claude_pid=\$!
 # wait may be interrupted by the trap (signal raises EINTR and bash returns
 # 128+sig); loop until claude is actually gone before recording its real
