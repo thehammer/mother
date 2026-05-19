@@ -87,7 +87,7 @@ All good."
 # ---------------------------------------------------------------------------
 # Fail verdict — first attempt
 
-@test "adherence-review: fail on first attempt -> adherence_rework, attempts=1, notes stored" {
+@test "adherence-review: fail on first attempt -> failed_first status, state unchanged, attempts=1, notes stored" {
     _make_succeeded_job "job-fail1"
 
     export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
@@ -99,8 +99,9 @@ The PR skipped the acceptance criterion about updating the README."
 
     run jq -r '.adherence_status' "$JOBS_DIR/job-fail1.json"
     [ "$output" = "failed_first" ]
+    # State stays succeeded; the runner re-queues with activity=cody_rework on next pickup.
     run jq -r '.state' "$JOBS_DIR/job-fail1.json"
-    [ "$output" = "adherence_rework" ]
+    [ "$output" = "succeeded" ]
     run jq -r '.adherence_attempts' "$JOBS_DIR/job-fail1.json"
     [ "$output" = "1" ]
 
@@ -136,14 +137,15 @@ Still drifted. Please review manually."
 # ---------------------------------------------------------------------------
 # cmd_list displays [ADHERENCE-BLOCKED] marker
 
-@test "cmd_list shows [ADHERENCE-BLOCKED] marker for blocked jobs" {
+@test "cmd_list shows adherence_blocked activity in state column for blocked jobs" {
     _make_succeeded_job "job-blocked"
-    merged=$(jq '.adherence_status = "blocked_for_human"' "$JOBS_DIR/job-blocked.json") \
+    # Second-fail transitions job to awaiting with activity=adherence_blocked.
+    merged=$(jq '.state = "awaiting" | .activity = "adherence_blocked" | .adherence_status = "blocked_for_human"' "$JOBS_DIR/job-blocked.json") \
         && printf '%s' "$merged" > "$JOBS_DIR/job-blocked.json"
 
     run mother list
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "ADHERENCE-BLOCKED" ]]
+    [[ "$output" =~ "adherence_blocked" ]]
 }
 
 # ---------------------------------------------------------------------------
