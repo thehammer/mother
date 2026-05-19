@@ -279,19 +279,222 @@ _apply_posture_bias() {
     esac
 }
 
-# Promote queued jobs whose dependencies are all succeeded to ready.
+# ---------- dependency helpers ----------
+
+# Poll interval for PR-merge state cache (seconds). Lower this to check more
+# frequently at the cost of more `gh` calls. Default: 60.
+: "${MOTHER_DEP_PR_POLL_INTERVAL:=60}"
+
+# Cache dir for PR-merge state responses, keyed by SHA-1 of the pr_url.
+# Built lazily on first use.
+_PR_CACHE_DIR="${MOTHER_ROOT}/cache/pr-state"
+
+# _pr_is_merged <pr_url>
+# Check whether a GitHub PR is merged. Echoes:
+#   merged     — gh returned state=MERGED
+#   not_merged — gh returned a non-MERGED state
+#   unknown    — gh call failed (network, auth, 404, etc.)
+# Caches the result under ${MOTHER_ROOT}/cache/pr-state/<sha1-of-url>.json
+# and reuses it if checked_at is within MOTHER_DEP_PR_POLL_INTERVAL seconds.
+# On unknown, returns non-zero so callers can treat it as pending.
+_pr_is_merged() {
+    local pr_url="$1"
+    # Build cache dir lazily.
+    mkdir -p "$_PR_CACHE_DIR"
+    local key; key=$(printf '%s' "$pr_url" | shasum 2>/dev/null | awk '{print $1}')
+    [ -z "$key" ] && key=$(printf '%s' "$pr_url" | sha1sum 2>/dev/null | awk '{print $1}')
+    local cache_file="$_PR_CACHE_DIR/${key}.json"
+
+    # Check for a fresh cached result.
+    if [ -f "$cache_file" ]; then
+        local checked_at now age
+        checked_at=$(jq -r '.checked_at // 0' "$cache_file" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        # Defensive: strip decimals if present.
+        checked_at="${checked_at%.*}"
+        case "$checked_at" in ''|null|0) checked_at=0 ;; esac
+        age=$((now - checked_at))
+        if [ "$age" -lt "$MOTHER_DEP_PR_POLL_INTERVAL" ]; then
+            local cached_state; cached_state=$(jq -r '.state // "unknown"' "$cache_file" 2>/dev/null || echo unknown)
+            echo "$cached_state"
+            [ "$cached_state" = "unknown" ] && return 1
+            return 0
+        fi
+    fi
+
+    # Call gh with a 5-second timeout where available (timeout ships with
+    # GNU coreutils; macOS only has it with homebrew coreutils as gtimeout).
+    local _timeout_cmd=""
+    command -v timeout  >/dev/null 2>&1 && _timeout_cmd="timeout 5"
+    [ -z "$_timeout_cmd" ] && command -v gtimeout >/dev/null 2>&1 && _timeout_cmd="gtimeout 5"
+    local raw_state
+    if ! raw_state=$($_timeout_cmd gh pr view "$pr_url" --json state -q .state 2>/dev/null); then
+        # gh failed — write unknown to cache so we don't hammer on errors.
+        printf '{"state":"unknown","checked_at":%s}' "$(date +%s)" > "$cache_file"
+        echo "unknown"
+        return 1
+    fi
+    raw_state=$(printf '%s' "$raw_state" | tr -d '[:space:]')
+    local result
+    if [ "$raw_state" = "MERGED" ]; then
+        result="merged"
+    else
+        result="not_merged"
+    fi
+    printf '{"state":"%s","checked_at":%s}' "$result" "$(date +%s)" > "$cache_file"
+    echo "$result"
+    return 0
+}
+
+# _dep_merge_state <dep_id>
+# Determine whether a dependency job's work is ready for a child to start.
+# Echoes one of:
+#   satisfied        — dep is a no-PR job in succeeded, or dep's PR is merged
+#   pending          — dep is still in progress or PR not yet merged
+#   parent_cancelled — dep is in cancelled state
+#   parent_failed    — dep is in failed state
+#   missing          — dep job file does not exist
+_dep_merge_state() {
+    local dep_id="$1"
+    local dep_file; dep_file=$(_job_path "$dep_id")
+
+    if [ ! -f "$dep_file" ]; then
+        echo "missing"
+        return 0
+    fi
+
+    local dep_state; dep_state=$(jq -r .state "$dep_file")
+    local no_pr; no_pr=$(jq -r '.no_pr // false' "$dep_file")
+    local pr_url; pr_url=$(jq -r '.pr_url // empty' "$dep_file")
+
+    case "$dep_state" in
+        cancelled)
+            echo "parent_cancelled"
+            return 0
+            ;;
+        failed)
+            echo "parent_failed"
+            return 0
+            ;;
+        succeeded)
+            if [ "$no_pr" = "true" ]; then
+                echo "satisfied"
+                return 0
+            fi
+            if [ -n "$pr_url" ]; then
+                local merged; merged=$(_pr_is_merged "$pr_url") || true
+                if [ "$merged" = "merged" ]; then
+                    echo "satisfied"
+                else
+                    echo "pending"
+                fi
+                return 0
+            fi
+            # succeeded but no pr_url and no_pr is false — cannot confirm merge.
+            echo "pending"
+            return 0
+            ;;
+        *)
+            # queued, ready, running, awaiting, waiting — not done yet.
+            echo "pending"
+            return 0
+            ;;
+    esac
+}
+
+# _cascade_parent_terminal <dep_id> <reason>
+# Find every waiting job whose depends_on contains <dep_id> and cancel it
+# with the given reason (parent_cancelled or parent_failed), unless the job
+# has keep_on_parent_cancel: true, in which case it remains in waiting.
+_cascade_parent_terminal() {
+    local dep_id="$1" reason="$2"
+    find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f | while read -r f; do
+        local state; state=$(jq -r .state "$f")
+        [ "$state" = "waiting" ] || continue
+        # Check whether this job depends on dep_id.
+        local has_dep; has_dep=$(jq -r --arg dep "$dep_id" \
+            'if (.depends_on // []) | map(. == $dep) | any then "yes" else "no" end' "$f")
+        [ "$has_dep" = "yes" ] || continue
+        local child_id; child_id=$(jq -r .id "$f")
+        local keep; keep=$(jq -r '.keep_on_parent_cancel // false' "$f")
+        if [ "$keep" = "true" ]; then
+            # Operator opted out of cascade — leave in waiting.
+            continue
+        fi
+        _job_transition "$child_id" cancelled \
+            "$(jq -nc --arg reason "$reason" --arg parent_id "$dep_id" \
+                '{reason: $reason, parent_id: $parent_id}')"
+    done
+}
+
+# Promote queued/waiting jobs whose dependencies are satisfied.
+#
+# waiting -> queued: when all deps are merge-satisfied (or no-PR succeeded).
+#   - If any dep is parent_cancelled/parent_failed, cascade cancellation
+#     to children that don't have keep_on_parent_cancel.
+#   - "pending" deps: leave in waiting.
+#
+# queued -> ready: all deps are in succeeded state (legacy/backward-compat path).
+#   Note: in the new flow, cmd_add writes waiting (not queued) for jobs with
+#   deps. The queued path here handles any pre-existing on-disk jobs that were
+#   enqueued before the waiting state existed.
 _promote_ready() {
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f | while read -r f; do
         local state; state=$(jq -r .state "$f")
-        [ "$state" = "queued" ] || continue
-        local deps; deps=$(jq -c '.depends_on' "$f")
-        local id; id=$(jq -r .id "$f")
-        local blocked=0
-        for dep in $(echo "$deps" | jq -r '.[]'); do
-            local dep_state="missing"
-            [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
-            case "$dep_state" in succeeded) ;; *) blocked=1; break ;; esac
-        done
-        [ "$blocked" -eq 0 ] && _job_transition "$id" ready '{}'
+        case "$state" in
+            waiting)
+                local id; id=$(jq -r .id "$f")
+                local deps; deps=$(jq -c '.depends_on // []' "$f")
+                local all_satisfied=1 any_terminal=0 terminal_dep="" terminal_reason=""
+                for dep in $(echo "$deps" | jq -r '.[]'); do
+                    local dms; dms=$(_dep_merge_state "$dep")
+                    case "$dms" in
+                        satisfied) ;;
+                        parent_cancelled)
+                            any_terminal=1
+                            terminal_dep="$dep"
+                            terminal_reason="parent_cancelled"
+                            all_satisfied=0
+                            break
+                            ;;
+                        parent_failed)
+                            any_terminal=1
+                            terminal_dep="$dep"
+                            terminal_reason="parent_failed"
+                            all_satisfied=0
+                            break
+                            ;;
+                        missing)
+                            # Treat missing as parent_cancelled — dep is gone.
+                            any_terminal=1
+                            terminal_dep="$dep"
+                            terminal_reason="parent_cancelled"
+                            all_satisfied=0
+                            break
+                            ;;
+                        *)
+                            # pending
+                            all_satisfied=0
+                            ;;
+                    esac
+                done
+                if [ "$any_terminal" -eq 1 ]; then
+                    _cascade_parent_terminal "$terminal_dep" "$terminal_reason"
+                elif [ "$all_satisfied" -eq 1 ]; then
+                    _job_transition "$id" queued '{}'
+                fi
+                ;;
+            queued)
+                local deps; deps=$(jq -c '.depends_on' "$f")
+                local id; id=$(jq -r .id "$f")
+                local blocked=0
+                for dep in $(echo "$deps" | jq -r '.[]'); do
+                    local dep_state="missing"
+                    [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
+                    case "$dep_state" in succeeded) ;; *) blocked=1; break ;; esac
+                done
+                [ "$blocked" -eq 0 ] && _job_transition "$id" ready '{}'
+                ;;
+        esac
     done
 }

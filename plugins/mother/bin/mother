@@ -245,21 +245,22 @@ _tier_num() {
 cmd_add() {
     local plan_file="" repo="" repo_path="" branch="" base_ref="origin/main"
     local isolation="worktree" executor="local-tmux" max_cost="" depends_on=""
-    local format="text" title=""
+    local format="text" title="" keep_on_parent_cancel="false"
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --plan-file)   plan_file="$2"; shift 2 ;;
-            --repo)        repo="$2"; shift 2 ;;
-            --repo-path)   repo_path="$2"; shift 2 ;;
-            --branch)      branch="$2"; shift 2 ;;
-            --base)        base_ref="$2"; shift 2 ;;
-            --isolation)   isolation="$2"; shift 2 ;;
-            --executor)    executor="$2"; shift 2 ;;
-            --max-cost)    max_cost="$2"; shift 2 ;;
-            --depends-on)  depends_on="$2"; shift 2 ;;
-            --title)       title="$2"; shift 2 ;;
-            --format)      format="$2"; shift 2 ;;
+            --plan-file)             plan_file="$2"; shift 2 ;;
+            --repo)                  repo="$2"; shift 2 ;;
+            --repo-path)             repo_path="$2"; shift 2 ;;
+            --branch)                branch="$2"; shift 2 ;;
+            --base)                  base_ref="$2"; shift 2 ;;
+            --isolation)             isolation="$2"; shift 2 ;;
+            --executor)              executor="$2"; shift 2 ;;
+            --max-cost)              max_cost="$2"; shift 2 ;;
+            --depends-on)            depends_on="$2"; shift 2 ;;
+            --keep-on-parent-cancel) keep_on_parent_cancel="true"; shift ;;
+            --title)                 title="$2"; shift 2 ;;
+            --format)                format="$2"; shift 2 ;;
             *) _die "unknown flag for add: $1" ;;
         esac
     done
@@ -287,19 +288,45 @@ cmd_add() {
     local no_pr_flag
     no_pr_flag=$(_parse_no_pr "$plan_file")
 
-    local id deps_json job_json max_cost_json
-    id=$(_gen_id)
+    # v1: single dependency only. Split on comma and require exactly one id.
+    local dep_id="" deps_json
     if [ -n "$depends_on" ]; then
         deps_json=$(printf '%s' "$depends_on" | jq -Rc 'split(",") | map(select(length > 0))')
+        local dep_count; dep_count=$(printf '%s' "$deps_json" | jq 'length')
+        [ "$dep_count" -eq 1 ] || _die "add: v1 supports a single --depends-on id (got $dep_count)"
+        dep_id=$(printf '%s' "$deps_json" | jq -r '.[0]')
     else
         deps_json='[]'
     fi
+
+    local id max_cost_json
+    id=$(_gen_id)
     max_cost_json=$([ -n "$max_cost" ] && echo "$max_cost" || echo "null")
 
     cp "$plan_file" "$(_plan_path "$id")"
 
     local no_pr_json
     [ "$no_pr_flag" = "true" ] && no_pr_json="true" || no_pr_json="false"
+
+    # Determine initial state: waiting if dep is not yet merge-satisfied,
+    # queued otherwise (no-dep jobs always start queued).
+    local initial_state="queued" initial_event="queued"
+    if [ -n "$dep_id" ]; then
+        local dms; dms=$(_dep_merge_state "$dep_id")
+        case "$dms" in
+            satisfied)
+                initial_state="queued"
+                initial_event="queued"
+                ;;
+            *)
+                # pending, parent_cancelled, parent_failed, missing — start as
+                # waiting. The next _promote_ready tick will cascade-cancel or
+                # promote as appropriate. This keeps a single audit trail.
+                initial_state="waiting"
+                initial_event="waiting"
+                ;;
+        esac
+    fi
 
     job_json=$(jq -n \
         --arg id "$id" \
@@ -317,22 +344,33 @@ cmd_add() {
         --arg created_at "$(_iso_now)" \
         --argjson suggested_config "$suggested_config_json" \
         --argjson no_pr "$no_pr_json" \
+        --arg initial_state "$initial_state" \
+        --argjson keep_on_parent_cancel "$([ "$keep_on_parent_cancel" = "true" ] && echo true || echo false)" \
         '{
             id: $id, title: $title, repo: $repo, repo_path: $repo_path,
             branch: $branch, base_ref: $base_ref, isolation: $isolation,
             executor: $executor, depends_on: $deps, max_cost_usd: $max_cost,
             plan_path: $plan_path, log_path: $log_path,
-            state: "queued", created_at: $created_at,
+            state: $initial_state, created_at: $created_at,
             started_at: null, finished_at: null,
             pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null,
             suggested_config: $suggested_config,
             no_pr: $no_pr,
+            keep_on_parent_cancel: $keep_on_parent_cancel,
             current_tier: "tier_0",
             escalation_count: 0,
             adherence_attempts: 0
         }')
     _atomic_write "$(_job_path "$id")" "$job_json"
-    _append_event "$id" "queued" "$(jq -nc --arg title "$title" '{title: $title}')"
+
+    # Emit the matching initial event.
+    if [ "$initial_event" = "waiting" ]; then
+        _append_event "$id" "waiting" \
+            "$(jq -nc --arg title "$title" --arg dep_id "$dep_id" \
+                '{title: $title, dep_id: $dep_id}')"
+    else
+        _append_event "$id" "queued" "$(jq -nc --arg title "$title" '{title: $title}')"
+    fi
 
     if [ "$format" = "json" ]; then
         jq -n --arg id "$id" '{id: $id}'
@@ -374,27 +412,49 @@ cmd_list() {
             echo "(no jobs)"
             return 0
         fi
-        printf "%-28s  %-16s  %-18s  %-12s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "TITLE"
-        echo "$rows" | jq -r '.[] |
-            [
-                .id,
-                .state,
-                (.activity // ""),
-                (.current_tier // ""),
-                .repo,
-                .isolation,
-                .title
-            ] | @tsv' | \
-            while IFS=$'\t' read -r id st activity current_tier repo iso title; do
-                # Compose the state display field with markers.
-                local state_display="$st"
+        # Check whether any row is in 'waiting' state to decide whether to
+        # render the WAIT-ON column.
+        local has_waiting
+        has_waiting=$(echo "$rows" | jq 'map(select(.state == "waiting")) | length > 0')
+
+        if [ "$has_waiting" = "true" ]; then
+            printf "%-28s  %-16s  %-18s  %-12s  %-24s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "WAIT-ON" "TITLE"
+        else
+            printf "%-28s  %-16s  %-18s  %-12s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "TITLE"
+        fi
+        # Iterate one compact JSON object per line. This avoids IFS/TSV field-
+        # splitting issues in bash 3.2 on macOS: tab is whitespace and read
+        # collapses consecutive tabs (empty fields), corrupting rows when
+        # activity is empty.
+        echo "$rows" | jq -c '.[]' | \
+            while IFS='' read -r job; do
+                local id st activity current_tier repo iso dep_ids title state_display
+                id=$(printf '%s' "$job"          | jq -r .id)
+                st=$(printf '%s' "$job"          | jq -r .state)
+                activity=$(printf '%s' "$job"    | jq -r '.activity // ""')
+                current_tier=$(printf '%s' "$job"| jq -r '.current_tier // ""')
+                repo=$(printf '%s' "$job"        | jq -r .repo)
+                iso=$(printf '%s' "$job"         | jq -r .isolation)
+                dep_ids=$(printf '%s' "$job"     | jq -r '.depends_on // [] | join(",")')
+                title=$(printf '%s' "$job"       | jq -r .title)
+                # Compose state display with activity and tier markers.
+                state_display="$st"
                 [ -n "$activity" ] && state_display="$st [$activity]"
                 case "$current_tier" in
                     tier_1) state_display="$state_display tier:1" ;;
                     tier_2) state_display="$state_display tier:2" ;;
                     tier_3) state_display="$state_display tier:3" ;;
                 esac
-                printf "%-28s  %-16s  %-18s  %-12s  %s\n" "$id" "$state_display" "$repo" "$iso" "$title"
+                if [ "$has_waiting" = "true" ]; then
+                    local wait_col="-"
+                    if [ "$st" = "waiting" ] && [ -n "$dep_ids" ]; then
+                        local dms; dms=$(_dep_merge_state "$dep_ids")
+                        wait_col="${dep_ids}:${dms}"
+                    fi
+                    printf "%-28s  %-16s  %-18s  %-12s  %-24s  %s\n" "$id" "$state_display" "$repo" "$iso" "$wait_col" "$title"
+                else
+                    printf "%-28s  %-16s  %-18s  %-12s  %s\n" "$id" "$state_display" "$repo" "$iso" "$title"
+                fi
             done
     fi
 }
@@ -778,6 +838,10 @@ cmd_cancel() {
     local state; state=$(jq -r .state "$(_job_path "$id")")
     case "$state" in
         queued|ready)   _job_transition "$id" cancelled '{"reason":"user"}' ;;
+        waiting)        # Direct cancellation — no live worker. Any children
+                        # waiting on this job will be cascaded by _promote_ready
+                        # on the next daemon tick.
+                        _job_transition "$id" cancelled '{"reason":"user"}' ;;
         awaiting)       # No live worker to signal — the job paused itself and
                         # the worker process already exited. Transition direct
                         # to cancelled so it leaves the queue immediately.
@@ -795,7 +859,17 @@ cmd_cancel() {
 # ---------- retry ----------
 
 cmd_retry() {
-    local id="${1:-}"
+    local id="${1:-}" skip_dep_check=0
+    # Consume flags before the positional id.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --skip-dep-check) skip_dep_check=1; shift ;;
+            --) shift; break ;;
+            -*) _die "unknown flag for retry: $1" ;;
+            *)  break ;;
+        esac
+    done
+    id="${1:-$id}"
     [ -n "$id" ] || _die "retry: <id> required"
     _job_exists "$id" || _die "no such job: $id"
     local job_file; job_file=$(_job_path "$id")
@@ -819,17 +893,37 @@ cmd_retry() {
     # who want a clean retry should `mother cancel` and `mother add`
     # afresh instead.
     #
-    # State target: `ready` if all dependencies are succeeded, otherwise
-    # `queued` so _promote_ready handles them.
+    # State target: re-evaluate deps.
+    #   - No deps: ready.
+    #   - --skip-dep-check: ready (operator override).
+    #   - Otherwise: use _dep_merge_state; if all satisfied → ready/queued,
+    #     else → waiting (dep PR not yet merged). This prevents re-dispatch
+    #     against a base that doesn't include the parent's work.
     local deps; deps=$(jq -c '.depends_on // []' "$job_file")
-    local has_unmet=0 dep dep_state
-    for dep in $(echo "$deps" | jq -r '.[]'); do
-        dep_state="missing"
-        [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
-        case "$dep_state" in succeeded) ;; *) has_unmet=1; break ;; esac
-    done
+    local has_deps; has_deps=$(printf '%s' "$deps" | jq 'length > 0')
     local new_state="ready"
-    [ "$has_unmet" -eq 1 ] && new_state="queued"
+    if [ "$has_deps" = "true" ] && [ "$skip_dep_check" -eq 0 ]; then
+        local dep has_unmet=0 dms
+        for dep in $(printf '%s' "$deps" | jq -r '.[]'); do
+            dms=$(_dep_merge_state "$dep")
+            case "$dms" in
+                satisfied) ;;
+                *) has_unmet=1; break ;;
+            esac
+        done
+        if [ "$has_unmet" -eq 1 ]; then
+            new_state="waiting"
+        fi
+    elif [ "$has_deps" = "true" ] && [ "$skip_dep_check" -eq 1 ]; then
+        # Operator said to skip dep check — use old logic for backward compat.
+        local dep dep_state has_unmet=0
+        for dep in $(printf '%s' "$deps" | jq -r '.[]'); do
+            dep_state="missing"
+            [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
+            case "$dep_state" in succeeded) ;; *) has_unmet=1; break ;; esac
+        done
+        [ "$has_unmet" -eq 1 ] && new_state="queued"
+    fi
 
     # Atomic write: reset state + clear ephemeral fields from the prior
     # run, while preserving depends_on, plan_path, repo metadata, and
@@ -1611,7 +1705,12 @@ Add options:
   --isolation worktree|main-dir   (default: worktree)
   --executor local-tmux           (only option in phase 2)
   --max-cost USD
-  --depends-on ID[,ID...]
+  --depends-on ID      v1: single dependency id only (comma list with >1 id
+                       is rejected with an error)
+  --keep-on-parent-cancel
+                       when set, this job stays in `waiting` even if its
+                       parent is cancelled or fails (default: cascade to
+                       cancelled)
   --title TEXT         (default: first heading of plan file)
   --format json|text   (default: text — prints job id only)
 
@@ -1631,6 +1730,9 @@ Daemon env vars:
   MOTHER_SHUTDOWN_GRACE        (default: 30)   seconds to wait for children on stop
   MOTHER_ESCALATION_ENABLED    (default: 1)    auto-escalate failed jobs (0 to disable)
   MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
+  MOTHER_DEP_PR_POLL_INTERVAL  (default: 60)   seconds to cache gh PR-merge state;
+                               lower to check more frequently at the cost of
+                               more gh API calls
 
 Worker prompt env vars:
   MOTHER_PREAMBLE_PATH    path to a markdown file prepended to every
@@ -1664,6 +1766,20 @@ State flows:
   succeeded -> awaiting  (Archie flags drift on second review; job sits in
                           awaiting with activity=adherence_blocked until
                           operator runs `mother resume` or `mother cancel`)
+
+Dependency state flows (--depends-on):
+  waiting -> queued -> ready -> running -> ...
+             (dep's PR is merged, or dep is a no-PR job that has succeeded)
+  waiting -> cancelled
+             (dep is cancelled or failed; default policy — use
+             --keep-on-parent-cancel to opt a child out of cascade)
+  waiting -> cancelled  (operator runs `mother cancel <child-id>`)
+
+  v1 constraint: a job may have at most one dependency id. Comma-separated
+  lists with more than one id are rejected at add time.
+
+  `mother retry` re-evaluates the dep by default; pass --skip-dep-check
+  to bypass and restart the job immediately.
 
 Activity sub-states (visible in `mother list`, indicate what a job is doing
 within its current state):

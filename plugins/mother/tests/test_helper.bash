@@ -95,6 +95,58 @@ suggested_config:
 PLAN
 }
 
+# Create a plan file with no_pr: true in the YAML block.
+# Produces a plan whose worker is not expected to open a PR.
+# Usage: make_plan_no_pr <path>
+make_plan_no_pr() {
+    local dest="$1"
+    cat > "$dest" <<'PLAN'
+# Test plan (no_pr)
+
+## Context
+A no-PR test plan.
+
+## Target
+- **Repo:** testrepo
+- **Branch:** feature/test
+- **Base:** origin/main
+
+## Files to change
+- `foo.sh` — add something
+
+## Approach
+1. Do the thing.
+
+## Acceptance criteria
+- It works.
+
+## Out of scope
+- Nothing.
+
+no_pr: true
+
+```yaml
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard work."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard tests."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard review."
+```
+PLAN
+}
+
 # Create a plan file with a custom suggested_config block.
 # Usage: make_plan_with_config <path> <yaml-block>
 make_plan_with_config() {
