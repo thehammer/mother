@@ -175,3 +175,122 @@ Still drifted. Please review manually."
     run jq -r '.adherence_status // "null"' "$JOBS_DIR/job-no-adh.json"
     [ "$output" = "null" ]
 }
+
+# ---------------------------------------------------------------------------
+# Backward compatibility: non-pipeline job uses legacy ADHERENCE: pass/fail path
+
+@test "adherence-review: non-pipeline job still parses ADHERENCE: pass and sets adherence_status=passed" {
+    _make_succeeded_job "job-legacy-pass"
+
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: pass
+NOTES:
+All good."
+
+    run mother adherence-review "job-legacy-pass"
+    [ "$status" -eq 0 ]
+
+    # Legacy path: adherence_status=passed, adherence_reviewed event emitted.
+    run jq -r '.adherence_status' "$JOBS_DIR/job-legacy-pass.json"
+    [ "$output" = "passed" ]
+
+    assert_event_kind "job-legacy-pass" "adherence_reviewed"
+
+    # Must NOT emit a "reviewed" event (that's the pipeline path).
+    local events_file="$EVENTS_DIR/job-legacy-pass.jsonl"
+    run grep '"reviewed"' "$events_file"
+    [ "$status" -ne 0 ]
+}
+
+@test "adherence-review: non-pipeline job ADHERENCE: fail produces adherence_reviewed event (not reviewed)" {
+    _make_succeeded_job "job-legacy-fail"
+
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
+NOTES:
+The PR missed the README update."
+
+    run mother adherence-review "job-legacy-fail"
+    [ "$status" -ne 0 ]
+
+    run jq -r '.adherence_status' "$JOBS_DIR/job-legacy-fail.json"
+    [ "$output" = "failed_first" ]
+
+    assert_event_kind "job-legacy-fail" "adherence_reviewed"
+
+    # Must NOT emit a "reviewed" event.
+    local events_file="$EVENTS_DIR/job-legacy-fail.jsonl"
+    run grep '"reviewed"' "$events_file"
+    [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Pipeline job delegation
+
+# Helper: make a succeeded pipeline job.
+_make_succeeded_pipeline_job() {
+    local id="$1"
+
+    export TEST_REPO_DIR="$MOTHER_ROOT/testrepo-${id}"
+    git init -q "$TEST_REPO_DIR"
+    git -C "$TEST_REPO_DIR" config user.email "test@test.com"
+    git -C "$TEST_REPO_DIR" config user.name "Test"
+    touch "$TEST_REPO_DIR/README.md"
+    git -C "$TEST_REPO_DIR" add -A
+    git -C "$TEST_REPO_DIR" commit -q -m "init"
+
+    make_pipeline_job "$id" "cody"
+    local merged
+    merged=$(jq '.state = "succeeded"' "$JOBS_DIR/$id.json")
+    printf '%s' "$merged" > "$JOBS_DIR/$id.json"
+}
+
+@test "adherence-review: pipeline job delegates to findings path (emits reviewed, not adherence_reviewed)" {
+    _make_succeeded_pipeline_job "job-pipe-adh1"
+
+    export MOCK_CLAUDE_STDOUT="I have reviewed the implementation.
+
+\`\`\`findings
+[]
+\`\`\`"
+
+    run mother adherence-review "job-pipe-adh1"
+    [ "$status" -eq 0 ]
+
+    # Should emit a "reviewed" event with reviewer=archie.
+    assert_event_kind "job-pipe-adh1" "reviewed"
+
+    local events_file="$EVENTS_DIR/job-pipe-adh1.jsonl"
+    run grep '"reviewed"' "$events_file"
+    [[ "$output" =~ '"reviewer":"archie"' ]]
+
+    # Must NOT emit the legacy "adherence_reviewed" event.
+    run grep '"adherence_reviewed"' "$events_file"
+    [ "$status" -ne 0 ]
+}
+
+@test "adherence-review: pipeline job persists findings under reviewer_findings.archie" {
+    _make_succeeded_pipeline_job "job-pipe-adh2"
+
+    export MOCK_CLAUDE_STDOUT="Here are my findings.
+
+\`\`\`findings
+[
+  {
+    \"id\": \"f1\",
+    \"target\": \"cody\",
+    \"severity\": \"advisory\",
+    \"summary\": \"Minor cleanup\",
+    \"detail\": \"Clean up the helper.\",
+    \"location\": \"lib/foo.sh:10\"
+  }
+]
+\`\`\`"
+
+    run mother adherence-review "job-pipe-adh2"
+    [ "$status" -eq 0 ]
+
+    run jq -r '.pipeline.reviewer_findings.archie | length' "$JOBS_DIR/job-pipe-adh2.json"
+    [ "$output" = "1" ]
+
+    run jq -r '.pipeline.reviewer_findings.archie[0].reviewer' "$JOBS_DIR/job-pipe-adh2.json"
+    [ "$output" = "archie" ]
+}
