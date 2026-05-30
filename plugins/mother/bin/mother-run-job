@@ -52,6 +52,15 @@ source "$MOTHER_LIB_DIR/state.sh"
 source "$MOTHER_LIB_DIR/worktree.sh"
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/locks.sh"
+# shellcheck source=/dev/null
+source "$MOTHER_LIB_DIR/request-types.sh"
+# findings.sh (W3+) and phase-prompt.sh (W2) are optional guards — both must
+# be present for pipeline phase prompts; guarded so W2 builds even if W3 hasn't
+# extended findings.sh yet.
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/findings.sh" ]     && source "$MOTHER_LIB_DIR/findings.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ] && source "$MOTHER_LIB_DIR/phase-prompt.sh"
 
 mother_cli="$MOTHER_BIN_DIR/mother"
 
@@ -135,6 +144,45 @@ plan_path=$(jq -r .plan_path  "$job_file")
 log_path=$(jq -r .log_path    "$job_file")
 base_ref=$(jq -r .base_ref    "$job_file")
 repo=$(jq -r .repo            "$job_file")
+prd_path=$(jq -r '.prd_path // empty' "$job_file" 2>/dev/null || echo "")
+
+# ---- Pipeline phase resolution ----
+# When kind == "pipeline", resolve phase_agent + phase_request_type via the
+# request-types registry (W1). Non-spawnable phases (review/done/blocked) fail
+# fast — the pipeline driver (W4) owns those; they must never reach spawn.
+# Legacy jobs (kind absent) leave all three variables empty; the sentinel
+# ("phase_agent is empty") preserves the legacy code path byte-for-byte.
+kind=$(jq -r '.kind // empty' "$job_file" 2>/dev/null || echo "")
+phase=""; phase_agent=""; phase_request_type=""
+if [ "$kind" = "pipeline" ]; then
+    phase=$(jq -r '.pipeline.phase // empty' "$job_file" 2>/dev/null || echo "")
+    case "$phase" in
+        redd|cody|marty)
+            # rt_agent_for_phase echoes a colon-separated token, e.g. "redd:test".
+            _rt=$(rt_agent_for_phase "$phase") \
+                || { _transition failed \
+                        "$(jq -nc --arg p "$phase" \
+                            '{reason: "unknown_pipeline_phase", phase: $p}')"; exit 1; }
+            phase_agent="${_rt%%:*}"
+            phase_request_type="${_rt#*:}"
+            ;;
+        "")
+            _transition failed \
+                "$(jq -nc '{reason: "non_spawnable_phase", phase: "empty", note: "pipeline job is missing pipeline.phase"}')"
+            exit 1
+            ;;
+        *)
+            # review / done / blocked and anything else must not be spawned here.
+            _transition failed \
+                "$(jq -nc --arg p "$phase" \
+                    '{reason: "non_spawnable_phase", phase: $p, note: "review/done/blocked are driver-owned, not spawnable by mother-run-job"}')"
+            exit 1
+            ;;
+    esac
+    _append_event "pipeline_phase_spawn" \
+        "$(jq -nc --arg ph "$phase" --arg a "$phase_agent" --arg rt "$phase_request_type" \
+            '{phase: $ph, agent: $a, request_type: $rt}')"
+fi
 
 # Resolve working directory.
 work_dir=""
@@ -243,19 +291,22 @@ fi
 # Worker agent resolution, in priority order:
 #   1. MOTHER_WORKER_AGENT, if set — honored absolutely. Permanent overrides
 #      belong in the launchd plist's EnvironmentVariables block.
-#   2. Plain `cody`, if the user has one in the project's
-#      $work_dir/.claude/agents/cody.md or their global
-#      ~/.claude/agents/cody.md — their personal customizations beat our
-#      shipped defaults.
-#   3. `mother:cody` — the plugin-shipped fallback that works out-of-the-box
+#   2. Plain <agent>, if the user has one in the project's
+#      $work_dir/.claude/agents/<agent>.md or their global
+#      ~/.claude/agents/<agent>.md — their personal customizations beat our
+#      shipped defaults. For legacy (non-pipeline) jobs the agent is cody.
+#      For pipeline phases, it is the phase_agent resolved above.
+#   3. `mother:<agent>` — the plugin-shipped fallback that works out-of-the-box
 #      on fresh installs. Claude Code namespaces plugin-shipped agents with
 #      the plugin's name.
+_agent_basename="${phase_agent:-cody}"
 if [ -n "${MOTHER_WORKER_AGENT:-}" ]; then
     worker_agent="$MOTHER_WORKER_AGENT"
-elif [ -f "$work_dir/.claude/agents/cody.md" ] || [ -f "$HOME/.claude/agents/cody.md" ]; then
-    worker_agent="cody"
+elif [ -f "$work_dir/.claude/agents/$_agent_basename.md" ] \
+    || [ -f "$HOME/.claude/agents/$_agent_basename.md" ]; then
+    worker_agent="$_agent_basename"
 else
-    worker_agent="mother:cody"
+    worker_agent="mother:$_agent_basename"
 fi
 
 # ---- Tier / model / effort resolution ----
@@ -295,10 +346,14 @@ MOTHER_DEFAULT_EFFORT="${MOTHER_DEFAULT_EFFORT:-medium}"
 current_tier=$(jq -r '.current_tier // "tier_0"' "$job_file")
 escalation_count=$(jq -r '.escalation_count // 0' "$job_file")
 
-# Resolve model/effort from suggested_config.cody if not a skip entry.
-sc_model=$(jq -r '.suggested_config.cody.model // empty' "$job_file" 2>/dev/null || echo "")
-sc_effort=$(jq -r '.suggested_config.cody.effort // empty' "$job_file" 2>/dev/null || echo "")
-sc_skip=$(jq -r '.suggested_config.cody.skip // false' "$job_file" 2>/dev/null || echo "false")
+# Resolve model/effort from suggested_config.<sc_key> where sc_key is the
+# phase agent for pipeline jobs (redd/cody/marty) or "cody" for legacy jobs.
+# The posture bias, tier_0 guard, and escalation interaction below are
+# byte-identical to the pre-W2 code — only this key changes (D3).
+sc_key="${phase_agent:-cody}"
+sc_model=$(jq -r --arg k "$sc_key" '.suggested_config[$k].model // empty' "$job_file" 2>/dev/null || echo "")
+sc_effort=$(jq -r --arg k "$sc_key" '.suggested_config[$k].effort // empty' "$job_file" 2>/dev/null || echo "")
+sc_skip=$(jq -r --arg k "$sc_key" '.suggested_config[$k].skip // false' "$job_file" 2>/dev/null || echo "false")
 
 if [ "$sc_skip" = "true" ]; then
     # skip:true means run at tier defaults rather than at a named model.
@@ -446,29 +501,61 @@ prev_question=$(jq -r '.question // empty'       "$job_file" 2>/dev/null || echo
     fi
 
     # Routing context stanza: insert after preamble, before plan (or resume context).
-    # Tells Cody which model/effort it's running at and how to configure sub-agents.
+    # Tells the worker agent which model/effort it's running at and how to configure sub-agents.
     printf '%s\n\n' "$routing_context"
 
-    if [ -n "$pending_answer" ]; then
-        printf '# Resumed plan — operator answered your question\n\n'
-        printf 'A previous worker on this job paused itself with `mother await`.\n'
-        printf 'The operator has answered. Pick up from where the prior worker left off.\n\n'
-        printf '## The question you (or your predecessor) asked\n\n'
-        if [ -n "$prev_question" ]; then
-            printf '%s\n\n' "$prev_question"
-        else
-            printf '_(no question recorded — this should not happen; proceed with the answer below as guidance)_\n\n'
+    if [ "$kind" = "pipeline" ] && [ -n "$phase_agent" ]; then
+        # ---- Pipeline phase prompt: request-type-driven ----
+        # Renders a header identifying the request type and one titled section
+        # per input key declared by rt_inputs, in declaration order (D1/D2).
+        # The resume/continuation path is legacy-only in W2 — pipeline jobs do
+        # not use mother await for phases yet (that is W4's concern).
+        _contract=$(rt_contract "$phase_agent" "$phase_request_type" 2>/dev/null \
+            || echo "(no contract description)")
+        printf '# Request type: %s:%s\n\n' "$phase_agent" "$phase_request_type"
+        printf '%s\n\n' "$_contract"
+        printf '---\n\n'
+        # Collect the declared input keys. Using a variable + <<< (here-string)
+        # keeps the while-loop body in the current shell scope (bash 3.2-safe),
+        # unlike a pipe or heredoc which may fork a subshell and lose variable
+        # assignments in the loop body.
+        _inputs_list=$(rt_inputs "$phase_agent" "$phase_request_type" 2>/dev/null || echo "")
+        # Pre-check whether 'plan' is declared; always include it as the spine
+        # even if a future request type somehow omits it from rt_inputs.
+        _declared_plan=$(printf '%s\n' "$_inputs_list" | grep -c '^plan$' 2>/dev/null || echo 0)
+        while IFS= read -r _input_key; do
+            [ -z "$_input_key" ] && continue
+            phase_render_input "$_input_key" "$work_dir" "$plan_path" \
+                "${prd_path:-}" "${base_ref:-}" "$job_file" "$phase_agent"
+        done <<< "$_inputs_list"
+        if [ "${_declared_plan:-0}" -eq 0 ]; then
+            phase_render_input "plan" "$work_dir" "$plan_path" \
+                "${prd_path:-}" "${base_ref:-}" "$job_file" "$phase_agent"
         fi
-        printf "## The operator's answer\n\n"
-        printf '%s\n\n' "$pending_answer"
-        printf '## Worktree state at pause time\n\n'
-        printf 'Your work directory at `%s` retains all changes and commits from the\n' "$work_dir"
-        printf 'previous run — your branch is `%s`. Run `git status` and `git log --oneline`\n' "$branch"
-        printf 'before resuming so you orient yourself in the in-progress work.\n\n'
-        printf '## Original plan (for reference)\n\n'
-    fi
+    else
+        # ---- Legacy (non-pipeline) prompt: preamble + routing + plan ----
+        # This path is byte-for-byte the pre-W2 behavior. No pipeline header.
+        if [ -n "$pending_answer" ]; then
+            printf '# Resumed plan — operator answered your question\n\n'
+            printf 'A previous worker on this job paused itself with `mother await`.\n'
+            printf 'The operator has answered. Pick up from where the prior worker left off.\n\n'
+            printf '## The question you (or your predecessor) asked\n\n'
+            if [ -n "$prev_question" ]; then
+                printf '%s\n\n' "$prev_question"
+            else
+                printf '_(no question recorded — this should not happen; proceed with the answer below as guidance)_\n\n'
+            fi
+            printf "## The operator's answer\n\n"
+            printf '%s\n\n' "$pending_answer"
+            printf '## Worktree state at pause time\n\n'
+            printf 'Your work directory at `%s` retains all changes and commits from the\n' "$work_dir"
+            printf 'previous run — your branch is `%s`. Run `git status` and `git log --oneline`\n' "$branch"
+            printf 'before resuming so you orient yourself in the in-progress work.\n\n'
+            printf '## Original plan (for reference)\n\n'
+        fi
 
-    cat "$plan_path"
+        cat "$plan_path"
+    fi
 } > "$spawn_prompt"
 resolved_plan_path="$spawn_prompt"
 
@@ -963,7 +1050,7 @@ _append_metrics() {
     line=$(jq -nc \
         --arg ts "$(iso_now)" \
         --arg job_id "$id" \
-        --arg stage "cody" \
+        --arg stage "${phase_agent:-cody}" \
         --arg model "$worker_model" \
         --arg effort "$worker_effort" \
         --arg tier "$current_tier" \
