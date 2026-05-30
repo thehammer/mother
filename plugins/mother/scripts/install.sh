@@ -110,6 +110,16 @@ case ":$PATH:" in
         ;;
 esac
 
+# Build the IPC broker sidecar. Optional: the daemon runs without it when
+# MOTHER_BROKER_ENABLED=0, so a missing Go toolchain is a warning, not a
+# hard failure.
+echo ""
+if command -v go >/dev/null 2>&1; then
+    "$PLUGIN_DIR/scripts/build-broker.sh" || echo "warning: broker build failed; the daemon will run without it" >&2
+else
+    echo "note: go not found — skipping broker build (set MOTHER_BROKER_ENABLED=0 or install Go 1.22+)" >&2
+fi
+
 # Run doctor. Don't abort on non-zero — let the caller see the report.
 doctor_status=0
 "$PLUGIN_DIR/scripts/doctor.sh" || doctor_status=$?

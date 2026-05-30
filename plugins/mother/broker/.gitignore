@@ -1,0 +1,4 @@
+# Built binaries — produced by scripts/build-broker.sh (into bin/) or by a
+# bare `go build` (into the package dir). Never tracked.
+/bin/
+/mother-broker

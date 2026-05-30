@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+
+# --- mother plugin path resolver (prepended during port) ---
+# Resolves symlinks so the plugin works when installed via `ln -s` into a bin dir.
+_MOTHER_RAW="${BASH_SOURCE[0]}"
+while [ -L "$_MOTHER_RAW" ]; do
+    _link="$(readlink "$_MOTHER_RAW")"
+    case "$_link" in
+        /*) _MOTHER_RAW="$_link" ;;
+        *)  _MOTHER_RAW="$(dirname "$_MOTHER_RAW")/$_link" ;;
+    esac
+done
+_MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
+: "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
+: "${MOTHER_LIB_DIR:=$_MOTHER_SELF/../lib}"
+# -----------------------------------------------------------
+
+# mother-broker — thin launcher for the Go IPC broker sidecar.
+#
+# Locates the compiled binary (plugins/mother/broker/bin/mother-broker),
+# wires MOTHER_CLI so the broker's answer/cancel/retry shell-outs find the
+# sibling `mother` CLI, and execs it. The broker reads the rest of its
+# configuration (MOTHER_ROOT, socket path, tunables) from the environment.
+#
+# Build the binary first with scripts/build-broker.sh. If it's missing this
+# launcher prints a clear message and exits non-zero so the supervisor logs
+# the reason rather than failing silently.
+
+set -u
+
+_BROKER_BIN="$MOTHER_BIN_DIR/../broker/bin/mother-broker"
+
+if [ ! -x "$_BROKER_BIN" ]; then
+    echo "mother-broker: binary not found at $_BROKER_BIN" >&2
+    echo "mother-broker: build it with: $MOTHER_BIN_DIR/../scripts/build-broker.sh" >&2
+    exit 127
+fi
+
+# The broker routes mutations through the existing CLI — point it at our
+# sibling `mother` (absolute path so it works regardless of the broker's CWD).
+: "${MOTHER_CLI:=$MOTHER_BIN_DIR/mother}"
+export MOTHER_CLI MOTHER_BIN_DIR MOTHER_LIB_DIR
+
+exec "$_BROKER_BIN" "$@"
