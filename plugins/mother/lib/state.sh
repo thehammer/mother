@@ -252,6 +252,28 @@ _resolve_posture() {
     esac
 }
 
+# _resolve_cost_model: best-effort detection of the account's billing mode.
+# Echoes one of: subscription | metered | unknown.
+# Degrades to `unknown` if bishop is absent, the call fails, the posture
+# file lacks a billing_mode key, or the value is unrecognised.
+_resolve_cost_model() {
+    local bm=""
+    if command -v bishop >/dev/null 2>&1; then
+        bm=$(bishop get billing_mode 2>/dev/null | tr -d '[:space:]')
+    fi
+    case "$bm" in
+        subscription|metered) echo "$bm"; return 0 ;;
+    esac
+    local pf="${BUDGET_POSTURE_FILE:-$HOME/.claude/budget-posture.json}"
+    if [ -r "$pf" ]; then
+        bm=$(jq -r '.billing_mode // empty' "$pf" 2>/dev/null | tr -d '[:space:]')
+    fi
+    case "$bm" in
+        subscription|metered) echo "$bm"; return 0 ;;
+    esac
+    echo "unknown"
+}
+
 # _apply_posture_bias: given a resolved tier and a posture, return the biased
 # tier per the rules. Echoes the new tier on stdout. Sets POSTURE_BIAS_ACTION
 # in the caller's scope to one of: clamp | up1 | none.
