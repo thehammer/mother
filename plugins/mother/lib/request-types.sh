@@ -51,7 +51,7 @@ rt_inputs() {
         perri:review)
             printf "diff\npr_comments\ntests" ;;
         redd:test)
-            printf "plan\ntests" ;;
+            printf "prd\nplan\ntests" ;;
         cody:implement)
             printf "plan\ntests" ;;
         marty:refactor)

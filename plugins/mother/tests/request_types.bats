@@ -87,6 +87,12 @@ teardown() {
     [ -n "$output" ]
 }
 
+@test "rt_inputs: redd:test input list contains prd" {
+    run bash -c "source '$_LIB' && rt_inputs redd test"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"prd"* ]]
+}
+
 @test "rt_inputs: cody:implement returns non-empty input list" {
     run bash -c "source '$_LIB' && rt_inputs cody implement"
     [ "$status" -eq 0 ]
