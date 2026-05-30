@@ -197,3 +197,79 @@ assert_event_kind() {
         return 1
     fi
 }
+
+# Create a pipeline job JSON directly with kind="pipeline" and a pipeline object.
+# Requires TEST_REPO_DIR to be set (a valid git repo path) and a plan file.
+# Usage: make_pipeline_job <id> <phase> [extra-jq-filter]
+make_pipeline_job() {
+    local id="$1" phase="$2" extra="${3:-.}"
+    local plan_file="$MOTHER_ROOT/plans/${id}.md"
+    local log_file="$LOGS_DIR/${id}.log"
+    mkdir -p "$MOTHER_ROOT/plans"
+    make_plan "$plan_file"
+    touch "$log_file"
+
+    # Distinct effort values per agent so tests can assert differentiation.
+    # redd=high, marty=xhigh, cody=medium — all valid tier values, all different.
+    local sc
+    sc='{"cody":{"model":"sonnet","effort":"medium","rationale":"cody-test"},
+         "redd":{"model":"sonnet","effort":"high","rationale":"redd-test"},
+         "marty":{"model":"sonnet","effort":"xhigh","rationale":"marty-test"},
+         "perri":{"model":"sonnet","effort":"high","rationale":"perri-test"}}'
+
+    jq -n \
+        --arg id "$id" \
+        --arg phase "$phase" \
+        --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg plan_path "$plan_file" \
+        --arg log_path "$log_file" \
+        --arg repo_path "${TEST_REPO_DIR:-/tmp/testrepo}" \
+        --argjson sc "$sc" \
+        '{
+            id: $id,
+            title: "test pipeline job",
+            repo: "testrepo",
+            repo_path: $repo_path,
+            branch: ("feature/test-" + $id),
+            base_ref: "main",
+            isolation: "main-dir",
+            executor: "local-tmux",
+            depends_on: [],
+            max_cost_usd: null,
+            plan_path: $plan_path,
+            log_path: $log_path,
+            prd_path: null,
+            state: "ready",
+            created_at: $created_at,
+            started_at: null,
+            finished_at: null,
+            pr_url: null,
+            tmux_window: null,
+            worker_pid: null,
+            actual_cost_usd: null,
+            retry_count: 0,
+            escalation_count: 0,
+            adherence_attempts: 0,
+            current_tier: "tier_0",
+            no_pr: true,
+            kind: "pipeline",
+            pipeline: {phase: $phase, findings: []},
+            suggested_config: $sc
+        }' | jq "$extra" > "$JOBS_DIR/$id.json"
+}
+
+# Read the spawn prompt file for a job, if it exists.
+# Usage: read_spawn_prompt <id>
+read_spawn_prompt() {
+    local id="$1"
+    cat "$RUNNER_DIR/$id.prompt.md" 2>/dev/null || echo ""
+}
+
+# Extract the value of a named CLI flag from the mock_claude args file.
+# Usage: mock_claude_flag_value <flag>  (e.g. "--agent")
+# Prints the argument that follows the flag on its own line.
+mock_claude_flag_value() {
+    local flag="$1"
+    awk -v f="$flag" '$0==f {getline; print; exit}' \
+        "${MOCK_CLAUDE_ARGS_FILE:-/tmp/mock-claude-args}" 2>/dev/null || echo ""
+}
