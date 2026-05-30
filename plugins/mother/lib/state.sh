@@ -22,19 +22,23 @@ mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" "$CURSORS_DIR" "$RU
 
 # ---------- primitives ----------
 
-# Microsecond-precision ISO timestamp so events emitted in the same second
-# sort correctly and the hook's cursor advances past all of them. Always
-# include fractional seconds so lexicographic and chronological orders match.
-# Uses /usr/bin/perl (universal on macOS, Time::HiRes in core) with an
-# absolute path so subshells with restricted PATH still get timestamps.
+# Millisecond-precision RFC 3339 timestamp (e.g. 2026-05-30T09:30:56.510Z).
+# Fractional seconds are always present so events emitted in the same second
+# sort correctly (lexicographic order matches chronological order) and the
+# hook's cursor advances past all of them. Millisecond (not microsecond)
+# precision is required: Swift's JSONDecoder .iso8601 strategy — used by the
+# Nostromo app to decode the mother_jobs IPC payload — rejects 6-digit
+# fractional seconds, which silently breaks job display. Uses /usr/bin/perl
+# (universal on macOS, Time::HiRes in core) with an absolute path so
+# subshells with restricted PATH still get timestamps.
 _iso_now() {
     /usr/bin/perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
         my ($s, $us) = gettimeofday();
         my @t = gmtime($s);
-        printf "%sT%s.%06dZ\n",
+        printf "%sT%s.%03dZ\n",
             strftime("%Y-%m-%d", @t),
             strftime("%H:%M:%S", @t),
-            $us;
+            int($us / 1000);
     '
 }
 
