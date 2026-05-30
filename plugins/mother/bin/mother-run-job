@@ -55,7 +55,9 @@ source "$MOTHER_LIB_DIR/locks.sh"
 
 mother_cli="$MOTHER_BIN_DIR/mother"
 
-iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# Delegate to _iso_now (sourced from state.sh) so worker-written timestamps
+# match the millisecond RFC 3339 format used everywhere else in job JSON.
+iso_now() { _iso_now; }
 _atomic_write() {
     # NB: `path` collides with zsh's special array for PATH — use _target.
     local _target="$1" content="$2" tmp="${1}.tmp.$$"
