@@ -423,3 +423,190 @@ suggested_config:
 
     [ "$status" -eq 0 ]
 }
+
+# ---------------------------------------------------------------------------
+# plan_summary — extraction
+
+@test "mother add extracts plan_summary from ## Summary section" {
+    local plan="$MOTHER_ROOT/plan.md"
+    cat > "$plan" <<'PLAN'
+# Test plan
+
+## Summary
+This is the summary paragraph that should be extracted.
+
+## Context
+This is the context section, not the summary.
+
+## Target
+- **Repo:** testrepo
+- **Branch:** feature/test
+- **Base:** origin/main
+
+## Files to change
+- `foo.sh` — add something
+
+## Approach
+1. Do the thing.
+
+## Acceptance criteria
+- It works.
+
+## Out of scope
+- Nothing.
+
+```yaml
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard work."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard tests."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard review."
+```
+PLAN
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    run jq -r '.plan_summary' "$JOBS_DIR/$id.json"
+    [ "$output" = "This is the summary paragraph that should be extracted." ]
+}
+
+@test "mother add falls back to first prose paragraph when no Summary section" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    # make_plan's first body paragraph under ## Context is "A test plan."
+    run jq -r '.plan_summary' "$JOBS_DIR/$id.json"
+    [ "$output" = "A test plan." ]
+}
+
+@test "mother add caps plan_summary at 500 chars with ellipsis on word boundary" {
+    local plan="$MOTHER_ROOT/plan.md"
+    # 120 repetitions of "word" joined by spaces = 600 chars
+    local long_para
+    long_para=$(python3 -c "print(' '.join(['word'] * 120))")
+
+    cat > "$plan" <<PLAN
+# Test plan
+
+## Summary
+${long_para}
+
+## Target
+- **Repo:** testrepo
+- **Branch:** feature/test
+- **Base:** origin/main
+
+## Files to change
+- \`foo.sh\` — add something
+
+## Approach
+1. Do the thing.
+
+## Acceptance criteria
+- It works.
+
+## Out of scope
+- Nothing.
+
+\`\`\`yaml
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard work."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard tests."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard review."
+\`\`\`
+PLAN
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    # Length must be <= 500
+    run jq -r '.plan_summary | length' "$JOBS_DIR/$id.json"
+    [ "$output" -le 500 ]
+
+    # Must end with ellipsis (truncation occurred)
+    run jq -r '.plan_summary' "$JOBS_DIR/$id.json"
+    [[ "$output" =~ \.\.\.$ ]]
+}
+
+@test "mother add sets plan_summary to empty string when no usable paragraph" {
+    local plan="$MOTHER_ROOT/plan.md"
+    cat > "$plan" <<'PLAN'
+# Only a heading here
+
+```yaml
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard work."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard tests."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard review."
+```
+PLAN
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    run jq -r '.plan_summary' "$JOBS_DIR/$id.json"
+    [ "$output" = "" ]
+}
