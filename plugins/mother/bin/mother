@@ -55,6 +55,63 @@ _die() { echo "mother: $*" >&2; exit 1; }
 
 # ---------- plan metadata parsing ----------
 
+# _validate_sc_entry <sc_json> <agent>
+# Validates a single suggested_config entry for <agent>: rationale present
+# and ≤ 200 chars; if skip:false, model and effort are present, valid, and
+# satisfy the downgrade guardrail. Prints a diagnostic to stdout and returns 1
+# on failure; returns 0 on success. Callers decide whether a missing entry is
+# an error (required) or silent pass (optional) — this helper is only called
+# when the entry is known to be present.
+_validate_sc_entry() {
+    local sc_json="$1" agent="$2"
+    local valid_models="haiku sonnet opus"
+    local valid_efforts="low medium high xhigh max"
+
+    local entry
+    entry=$(printf '%s\n' "$sc_json" | jq --arg a "$agent" '.[$a]')
+
+    local skip_val
+    skip_val=$(printf '%s\n' "$entry" | jq -r '.skip // false')
+
+    local rationale
+    rationale=$(printf '%s\n' "$entry" | jq -r '.rationale // empty')
+    [ -n "$rationale" ] \
+        || { echo "suggested_config.$agent.rationale is required and must be non-empty"; return 1; }
+    [ "${#rationale}" -le 200 ] \
+        || { echo "suggested_config.$agent.rationale must be ≤ 200 characters (got ${#rationale})"; return 1; }
+
+    [ "$skip_val" = "true" ] && return 0
+
+    local model effort
+    model=$(printf '%s\n' "$entry" | jq -r '.model // empty')
+    effort=$(printf '%s\n' "$entry" | jq -r '.effort // empty')
+
+    [ -n "$model" ] || { echo "suggested_config.$agent.model is required (haiku|sonnet|opus)"; return 1; }
+    [ -n "$effort" ] || { echo "suggested_config.$agent.effort is required (low|medium|high|xhigh|max)"; return 1; }
+
+    local model_ok=0
+    for m in $valid_models; do [ "$model" = "$m" ] && model_ok=1; done
+    [ "$model_ok" -eq 1 ] \
+        || { echo "suggested_config.$agent.model '$model' is invalid (must be one of: haiku sonnet opus)"; return 1; }
+
+    local effort_ok=0
+    for e in $valid_efforts; do [ "$effort" = "$e" ] && effort_ok=1; done
+    [ "$effort_ok" -eq 1 ] \
+        || { echo "suggested_config.$agent.effort '$effort' is invalid (must be one of: low medium high xhigh max)"; return 1; }
+
+    # Downgrade guardrail: haiku or sonnet/low require "downgrade:" in rationale.
+    local needs_guardrail=0
+    [ "$model" = "haiku" ] && needs_guardrail=1
+    [ "$model" = "sonnet" ] && [ "$effort" = "low" ] && needs_guardrail=1
+    if [ "$needs_guardrail" -eq 1 ]; then
+        case "$rationale" in
+            *"downgrade:"*) ;;
+            *) { echo "suggested_config.$agent: model=$model/effort=$effort is a downgrade below sonnet/medium; rationale must contain the literal string 'downgrade:' to make the justification explicit"; return 1; } ;;
+        esac
+    fi
+    return 0
+}
+
 # _parse_suggested_config <plan_file>
 # Extracts the ```yaml ... ``` block containing suggested_config from a plan
 # file, validates its structure, and prints the JSON representation of the
@@ -106,61 +163,26 @@ except yaml.YAMLError as e:
     [ -n "$sc_json" ] && [ "$sc_json" != "null" ] \
         || { echo "suggested_config key not found inside the YAML block"; return 1; }
 
-    # Validate the structure.
-    local valid_models="haiku sonnet opus"
-    local valid_efforts="low medium high xhigh max"
+    # Validate required and optional agent entries.
     local required_agents="cody redd marty perri"
+    local optional_agents="ada archie"
 
     for agent in $required_agents; do
         local entry
         entry=$(printf '%s\n' "$sc_json" | jq --arg a "$agent" '.[$a] // empty')
         [ -n "$entry" ] && [ "$entry" != "null" ] \
             || { echo "suggested_config.$agent is missing (required: cody, redd, marty, perri)"; return 1; }
+        local msg
+        msg=$(_validate_sc_entry "$sc_json" "$agent") || { echo "$msg"; return 1; }
+    done
 
-        local skip_val
-        skip_val=$(printf '%s\n' "$entry" | jq -r '.skip // false')
-
-        local rationale
-        rationale=$(printf '%s\n' "$entry" | jq -r '.rationale // empty')
-        [ -n "$rationale" ] \
-            || { echo "suggested_config.$agent.rationale is required and must be non-empty"; return 1; }
-        [ "${#rationale}" -le 200 ] \
-            || { echo "suggested_config.$agent.rationale must be ≤ 200 characters (got ${#rationale})"; return 1; }
-
-        if [ "$skip_val" = "true" ]; then
-            # skip:true entries are valid — no model/effort required.
-            continue
-        fi
-
-        local model effort
-        model=$(printf '%s\n' "$entry" | jq -r '.model // empty')
-        effort=$(printf '%s\n' "$entry" | jq -r '.effort // empty')
-
-        [ -n "$model" ] || { echo "suggested_config.$agent.model is required (haiku|sonnet|opus)"; return 1; }
-        [ -n "$effort" ] || { echo "suggested_config.$agent.effort is required (low|medium|high|xhigh|max)"; return 1; }
-
-        # Validate model enum.
-        local model_ok=0
-        for m in $valid_models; do [ "$model" = "$m" ] && model_ok=1; done
-        [ "$model_ok" -eq 1 ] \
-            || { echo "suggested_config.$agent.model '$model' is invalid (must be one of: haiku sonnet opus)"; return 1; }
-
-        # Validate effort enum.
-        local effort_ok=0
-        for e in $valid_efforts; do [ "$effort" = "$e" ] && effort_ok=1; done
-        [ "$effort_ok" -eq 1 ] \
-            || { echo "suggested_config.$agent.effort '$effort' is invalid (must be one of: low medium high xhigh max)"; return 1; }
-
-        # Downgrade guardrail: haiku or sonnet/low require "downgrade:" in rationale.
-        local needs_guardrail=0
-        [ "$model" = "haiku" ] && needs_guardrail=1
-        [ "$model" = "sonnet" ] && [ "$effort" = "low" ] && needs_guardrail=1
-        if [ "$needs_guardrail" -eq 1 ]; then
-            case "$rationale" in
-                *"downgrade:"*) ;;
-                *) { echo "suggested_config.$agent: model=$model/effort=$effort is a downgrade below sonnet/medium; rationale must contain the literal string 'downgrade:' to make the justification explicit"; return 1; } ;;
-            esac
-        fi
+    # Optional reviewer entries (ada, archie) must be well-formed when present.
+    for agent in $optional_agents; do
+        local entry
+        entry=$(printf '%s\n' "$sc_json" | jq --arg a "$agent" '.[$a] // empty')
+        [ -n "$entry" ] && [ "$entry" != "null" ] || continue  # absent = OK
+        local msg
+        msg=$(_validate_sc_entry "$sc_json" "$agent") || { echo "$msg"; return 1; }
     done
 
     printf '%s\n' "$sc_json"
@@ -189,6 +211,36 @@ for block in blocks:
         print("true" if data.get("no_pr", False) is True else "false")
         sys.exit(0)
 print("false")
+PYEOF
+}
+
+# _parse_pipeline_config <plan_file>
+# Returns the pipeline: object from the plan's YAML block as JSON.
+# Returns "null" (literal string) if the pipeline: key is absent.
+# The caller decides whether pipeline.enabled is true.
+_parse_pipeline_config() {
+    local plan_file="$1"
+    python3 - "$plan_file" <<'PYEOF' 2>/dev/null || echo "null"
+import sys, re, json
+try:
+    import yaml
+except ImportError:
+    print("null"); sys.exit(0)
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    content = f.read()
+
+blocks = re.findall(r'```yaml\n(.*?)```', content, re.DOTALL)
+for block in blocks:
+    if 'suggested_config' in block:
+        data = yaml.safe_load(block.strip()) or {}
+        pipeline = data.get("pipeline")
+        if pipeline is None:
+            print("null")
+        else:
+            print(json.dumps(pipeline))
+        sys.exit(0)
+print("null")
 PYEOF
 }
 
@@ -287,6 +339,16 @@ cmd_add() {
     local no_pr_flag
     no_pr_flag=$(_parse_no_pr "$plan_file")
 
+    # Parse the pipeline config (optional; absent -> non-pipeline job).
+    local pipeline_config_json is_pipeline
+    pipeline_config_json=$(_parse_pipeline_config "$plan_file")
+    is_pipeline=0
+    if [ "$pipeline_config_json" != "null" ] && [ -n "$pipeline_config_json" ]; then
+        local pipeline_enabled
+        pipeline_enabled=$(printf '%s' "$pipeline_config_json" | jq -r '.enabled // false')
+        [ "$pipeline_enabled" = "true" ] && is_pipeline=1
+    fi
+
     local id deps_json job_json max_cost_json
     id=$(_gen_id)
     if [ -n "$depends_on" ]; then
@@ -331,6 +393,24 @@ cmd_add() {
             escalation_count: 0,
             adherence_attempts: 0
         }')
+    # For pipeline jobs, merge the pipeline object onto the base job JSON.
+    # Non-pipeline plans get today's exact shape (no kind, no pipeline key).
+    if [ "$is_pipeline" -eq 1 ]; then
+        job_json=$(printf '%s' "$job_json" | jq \
+            --argjson pc "$pipeline_config_json" \
+            '. + {
+                kind: "pipeline",
+                pipeline: {
+                    phase: "redd",
+                    review_cycle: 0,
+                    cycle_cap: ($pc.cycle_cap // 3),
+                    reviewers: ($pc.reviewers // []),
+                    findings: [],
+                    findings_history: []
+                }
+            }')
+    fi
+
     _atomic_write "$(_job_path "$id")" "$job_json"
     _append_event "$id" "queued" "$(jq -nc --arg title "$title" '{title: $title}')"
 

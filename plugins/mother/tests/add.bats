@@ -263,3 +263,163 @@ PLAN
 
     [ "$status" -eq 0 ]
 }
+
+# ---------------------------------------------------------------------------
+# pipeline: block — job kind and initial state
+
+@test "mother add with pipeline block produces job with kind=pipeline and initialized pipeline object" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan_with_config "$plan" \
+'pipeline:
+  enabled: true
+  reviewers:
+    - ada
+    - archie
+    - perri
+  cycle_cap: 3
+suggested_config:
+  cody:
+    model: sonnet
+    effort: high
+    rationale: "Standard implementation work."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard tests."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard review."
+  ada:
+    model: opus
+    effort: high
+    rationale: "PRD-level review requires thorough analysis."
+  archie:
+    model: opus
+    effort: high
+    rationale: "Architecture review requires thorough analysis."'
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    [ -n "$id" ]
+
+    assert_job_field "$id" '.kind' "pipeline"
+    assert_job_field "$id" '.pipeline.phase' "redd"
+    assert_job_field "$id" '.pipeline.review_cycle' "0"
+    assert_job_field "$id" '.pipeline.cycle_cap' "3"
+    assert_job_field "$id" '.pipeline.findings | length' "0"
+
+    # Reviewers list contains all three expected reviewers
+    run jq -r '.pipeline.reviewers | contains(["ada","archie","perri"])' \
+        "$JOBS_DIR/$id.json"
+    [ "$output" = "true" ]
+}
+
+@test "mother add without pipeline block produces job without kind or pipeline key" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    assert_job_field "$id" '.kind // "null"' "null"
+    assert_job_field "$id" '.pipeline // "null"' "null"
+}
+
+@test "mother add with pipeline.enabled false does not produce pipeline job" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan_with_config "$plan" \
+'pipeline:
+  enabled: false
+  reviewers:
+    - ada
+  cycle_cap: 2
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."'
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    assert_job_field "$id" '.kind // "null"' "null"
+}
+
+@test "mother add with pipeline plan including ada and archie in suggested_config succeeds" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan_with_config "$plan" \
+'pipeline:
+  enabled: true
+  reviewers:
+    - ada
+    - archie
+  cycle_cap: 2
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard implementation."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard tests."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard review."
+  ada:
+    model: opus
+    effort: high
+    rationale: "Pipeline review requires thorough analysis."
+  archie:
+    model: opus
+    effort: high
+    rationale: "Pipeline review requires thorough analysis."'
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+}
