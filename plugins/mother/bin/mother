@@ -41,6 +41,15 @@ set -u
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/state.sh"
 
+# Pipeline support libs (W1/W2). Guard each with [ -r ] to match the
+# optional-source pattern used in mother-run-job.
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/request-types.sh" ] && source "$MOTHER_LIB_DIR/request-types.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/findings.sh" ]      && source "$MOTHER_LIB_DIR/findings.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ]  && source "$MOTHER_LIB_DIR/phase-prompt.sh"
+
 # ---------- CLI-only helpers ----------
 
 _gen_id() {
@@ -1145,6 +1154,233 @@ cmd_escalate() {
     echo "$id: escalated $current_tier -> $next_tier (escalation_count=$((esc_count + 1)))"
 }
 
+# ---------- review-phase ----------
+#
+# Run a single reviewer (ada, archie, or perri) in the `review` request type
+# against a job's artifacts. Captures the reviewer's ```findings block,
+# validates it, tags each finding with the emitting reviewer, and persists the
+# array to .pipeline.reviewer_findings.<reviewer>. Does NOT transition job state
+# or merge across reviewers — that is W4's job.
+#
+# Returns 0 on success, 2 on parse/validation error.
+# Usage: cmd_review_phase <id> --reviewer <ada|archie|perri>
+
+cmd_review_phase() {
+    local id="" reviewer=""
+    # Parse positional + flags.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --reviewer)   reviewer="$2"; shift 2 ;;
+            --reviewer=*) reviewer="${1#*=}"; shift ;;
+            --) shift; break ;;
+            -*) _die "review-phase: unknown flag: $1" ;;
+            *)
+                if [ -z "$id" ]; then id="$1"; shift
+                else _die "review-phase: unexpected argument: $1"
+                fi ;;
+        esac
+    done
+    [ -n "$id" ]       || _die "review-phase: <id> required"
+    [ -n "$reviewer" ] || _die "review-phase: --reviewer required"
+    _job_exists "$id"  || _die "no such job: $id"
+
+    # Validate reviewer name.
+    case "$reviewer" in
+        ada|archie|perri) ;;
+        *) _die "review-phase: --reviewer must be one of: ada archie perri" ;;
+    esac
+
+    # Defensive: confirm the request type is registered.
+    if type rt_exists >/dev/null 2>&1; then
+        rt_exists "$reviewer" "review" \
+            || _die "review-phase: ($reviewer, review) is not a registered request type"
+    fi
+
+    local job_file; job_file=$(_job_path "$id")
+
+    # Resolve plan file: prefer job's plan_path field (set by mother add and
+    # mother-run-job), fall back to the event-dir convention used by legacy jobs.
+    local plan_file
+    plan_file=$(jq -r '.plan_path // empty' "$job_file")
+    if [ -z "$plan_file" ] || [ ! -f "$plan_file" ]; then
+        plan_file=$(_plan_path "$id")
+    fi
+    [ -f "$plan_file" ] || _die "review-phase: plan file not found for $id"
+
+    # Resolve PR URL (best-effort — a pipeline job may be reviewed pre-PR).
+    local pr_url
+    pr_url=$(jq -r '.pr_url // empty' "$job_file")
+
+    # Resolve reviewer model from suggested_config, default to sonnet.
+    local reviewer_model
+    reviewer_model=$(jq -r --arg r "$reviewer" \
+        '.suggested_config[$r].model // "sonnet"' "$job_file" 2>/dev/null || echo "sonnet")
+    # Normalize empty/null.
+    case "${reviewer_model:-}" in
+        ""| "null") reviewer_model="sonnet" ;;
+    esac
+
+    # Apply posture bias: conservative clamps to sonnet.
+    local review_posture
+    review_posture=$(_resolve_posture)
+    if [ "$review_posture" = "conservative" ]; then
+        reviewer_model="sonnet"
+    fi
+
+    # Resolve template files.
+    local tmpl_dir="$MOTHER_BIN_DIR/../templates"
+    local review_prompt_tmpl="$tmpl_dir/review-prompt.md"
+    local checklist_tmpl="$tmpl_dir/review-checklists/${reviewer}.md"
+    local findings_tmpl="$tmpl_dir/findings-prompt.md"
+    [ -f "$review_prompt_tmpl" ] || _die "review-phase: template not found: $review_prompt_tmpl"
+    [ -f "$checklist_tmpl" ]     || _die "review-phase: checklist not found: $checklist_tmpl"
+    [ -f "$findings_tmpl" ]      || _die "review-phase: template not found: $findings_tmpl"
+
+    # Build prompt: checklist + review-prompt scaffold + artifact sections + findings format.
+    local review_prompt artifacts_section pr_comments_section
+    review_prompt=$(printf '%s\n\n%s\n\n' \
+        "$(cat "$checklist_tmpl")" \
+        "$(cat "$review_prompt_tmpl")")
+
+    # Render artifact sections declared by rt_inputs for this reviewer.
+    local inputs_list=""
+    if type rt_inputs >/dev/null 2>&1; then
+        inputs_list=$(rt_inputs "$reviewer" "review" 2>/dev/null || true)
+    fi
+
+    # Determine work_dir and base_ref from job.
+    local work_dir base_ref prd_path
+    work_dir=$(jq -r '.repo_path // empty' "$job_file")
+    base_ref=$(jq -r '.base_ref // empty' "$job_file")
+    prd_path=$(jq -r '.prd_path // empty' "$job_file")
+
+    # Render each declared input section (plan/prd/tests/diff via phase_render_input;
+    # pr_comments gathered inline).
+    artifacts_section=""
+    if [ -n "$inputs_list" ]; then
+        local key
+        while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            if [ "$key" = "pr_comments" ]; then
+                # Best-effort gather of PR comments.
+                if [ -n "${pr_url:-}" ]; then
+                    pr_comments_section=$(gh pr view "$pr_url" --comments 2>/dev/null \
+                        || echo "(no PR comments available)")
+                else
+                    pr_comments_section="(no PR yet)"
+                fi
+                artifacts_section=$(printf '%s\n## PR Comments\n\n%s\n\n' \
+                    "$artifacts_section" "$pr_comments_section")
+            elif type phase_render_input >/dev/null 2>&1; then
+                local rendered
+                rendered=$(phase_render_input "$key" "${work_dir:-}" "$plan_file" \
+                    "${prd_path:-}" "${base_ref:-}" "$job_file" "$reviewer" 2>/dev/null || true)
+                artifacts_section=$(printf '%s\n%s\n' "$artifacts_section" "$rendered")
+            fi
+        done <<EOF
+$inputs_list
+EOF
+    fi
+
+    # Append findings-prompt.md as the final instruction.
+    review_prompt=$(printf '%s\n%s\n\n%s\n' \
+        "$review_prompt" \
+        "$artifacts_section" \
+        "$(cat "$findings_tmpl")")
+
+    # Emit spawn event.
+    _append_event "$id" "review_spawned" \
+        "$(jq -nc --arg r "$reviewer" --arg m "$reviewer_model" --arg p "$review_posture" \
+            '{reviewer: $r, model: $m, posture: $p}')"
+
+    # Spawn the reviewer.
+    local tmpfile
+    tmpfile=$(mktemp)
+    claude --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" \
+        > "$tmpfile" 2>/dev/null || true
+
+    # Extract findings block.
+    local raw_findings
+    raw_findings=$(findings_extract "$tmpfile" 2>/dev/null || true)
+    rm -f "$tmpfile"
+
+    # Handle absent block: treat as empty array (satisfied reviewer).
+    if [ -z "$raw_findings" ]; then
+        raw_findings="[]"
+        _append_event "$id" "review_no_findings_block" \
+            "$(jq -nc --arg r "$reviewer" '{reviewer: $r}')"
+    fi
+
+    # Validate.
+    local validate_err
+    if ! validate_err=$(findings_validate "$raw_findings" 2>&1); then
+        _append_event "$id" "review_parse_error" \
+            "$(jq -nc --arg r "$reviewer" --arg d "$validate_err" \
+                '{reviewer: $r, diagnostic: $d}')"
+        echo "mother: review-phase: $reviewer emitted invalid findings: $validate_err" >&2
+        return 2
+    fi
+
+    # Tag each finding with the emitting reviewer.
+    local tagged_findings
+    tagged_findings=$(printf '%s' "$raw_findings" \
+        | jq --arg r "$reviewer" 'map(. + {reviewer: $r})')
+
+    # Compute per-reviewer exit decision (informational for the event).
+    local decision
+    decision=$(findings_exit_decision "$tagged_findings" 2>/dev/null || echo "ship")
+
+    local finding_count
+    finding_count=$(printf '%s' "$tagged_findings" | jq 'length')
+
+    # Persist to .pipeline.reviewer_findings.<reviewer> via atomic write.
+    # Guard: ensure .pipeline and .pipeline.reviewer_findings exist as objects
+    # before the targeted set, so jq doesn't reject a null intermediate path.
+    local merged_job
+    merged_job=$(jq --argjson rf "$tagged_findings" --arg r "$reviewer" '
+        (.pipeline //= {}) |
+        (.pipeline.reviewer_findings //= {}) |
+        .pipeline.reviewer_findings[$r] = $rf
+    ' "$job_file") \
+        || _die "review-phase: jq update for reviewer_findings failed"
+    _atomic_write "$job_file" "$merged_job"
+
+    # Emit reviewed event.
+    _append_event "$id" "reviewed" \
+        "$(jq -nc --arg r "$reviewer" --argjson fc "$finding_count" --arg d "$decision" \
+            '{reviewer: $r, finding_count: $fc, decision: $d}')"
+
+    echo "$id: $reviewer review: $finding_count findings ($decision)"
+    return 0
+}
+
+# ---------- _merge_reviewer_findings ----------
+#
+# Pure helper: reads .pipeline.reviewer_findings (an object keyed by reviewer
+# name) from the given job, concatenates all reviewers' arrays into one flat
+# array, and re-assigns stable ids f1..fN across the merged set. Echoes the
+# merged JSON array on stdout. No state mutation.
+#
+# Two reviewers' contradictory findings both survive (no semantic dedup).
+# Usage: _merge_reviewer_findings <id>
+
+_merge_reviewer_findings() {
+    local id="$1"
+    _job_exists "$id" || _die "_merge_reviewer_findings: no such job: $id"
+    local job_file; job_file=$(_job_path "$id")
+
+    # Pull the reviewer_findings object; default to empty object if absent.
+    local rf_obj
+    rf_obj=$(jq -r '.pipeline.reviewer_findings // {}' "$job_file" 2>/dev/null || echo "{}")
+
+    # Concatenate all arrays in a stable key order (sorted alphabetically).
+    # Re-assign ids f1..fN across the merged set.
+    printf '%s' "$rf_obj" | jq '
+        [ to_entries | sort_by(.key) | .[].value[] ]
+        | to_entries | map(.value + {id: ("f" + ((.key + 1) | tostring))})
+    '
+}
+
 # ---------- adherence-review ----------
 #
 # Spawn Archie to review whether a job's PR diff matches the original plan.
@@ -1160,6 +1396,13 @@ cmd_adherence_review() {
     local job_file; job_file=$(_job_path "$id")
     local state; state=$(jq -r .state "$job_file")
     case "$state" in succeeded) ;; *) _die "adherence-review: job must be in succeeded state (state=$state)" ;; esac
+
+    # Pipeline jobs delegate to the structured findings path.
+    local kind; kind=$(jq -r '.kind // ""' "$job_file")
+    if [ "$kind" = "pipeline" ]; then
+        cmd_review_phase "$id" --reviewer archie
+        return $?
+    fi
 
     local pr_url; pr_url=$(jq -r '.pr_url // empty' "$job_file")
     [ -n "$pr_url" ] || _die "adherence-review: job $id has no pr_url"
@@ -1795,6 +2038,8 @@ Usage:
   mother retry ID
   mother escalate ID                         (bump failed job to next model tier)
   mother adherence-review ID                 (check PR diff against original plan)
+  mother review-phase ID --reviewer AGENT    (run one pipeline reviewer: ada|archie|perri)
+  mother merge-findings ID                   (merge per-reviewer findings into one array; stdout only)
   mother await [ID] --question TEXT          (worker-side: pause for operator input)
   mother resume ID ANSWER | --from-file PATH | -    (operator-side: answer + resume)
   mother events [--since-cursor SESSION_ID] [--since ISO_TS]
@@ -1895,6 +2140,8 @@ main() {
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;
         adherence-review)  cmd_adherence_review "$@" ;;
+        review-phase)      cmd_review_phase "$@" ;;
+        merge-findings)    _merge_reviewer_findings "${1:-}" ;;
         await)             cmd_await "$@" ;;
         resume)            cmd_resume "$@" ;;
         events)            cmd_events "$@" ;;
