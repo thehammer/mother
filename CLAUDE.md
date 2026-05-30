@@ -83,6 +83,7 @@ plan-adherence review. Here's what was added and how to work with it.
 | `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. Audit trail only — do not use for operational logic. |
 | `adherence_notes` | string | Archie's notes from the last review (populated on fail). |
 | `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human). Cleared on resume. |
+| `cost_model` | string | Account billing mode at enqueue time: `subscription`, `metered`, or `unknown`. Clients suppress dollar displays when `subscription`. |
 
 ### State machine
 

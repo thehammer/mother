@@ -451,6 +451,9 @@ cmd_add() {
         [ "$pipeline_enabled" = "true" ] && is_pipeline=1
     fi
 
+    local cost_model
+    cost_model=$(_resolve_cost_model)
+
     local id deps_json job_json max_cost_json
     id=$(_gen_id)
     if [ -n "$depends_on" ]; then
@@ -485,6 +488,7 @@ cmd_add() {
         --arg created_at "$(_iso_now)" \
         --argjson suggested_config "$suggested_config_json" \
         --argjson no_pr "$no_pr_json" \
+        --arg cost_model "$cost_model" \
         '{
             id: $id, title: $title, repo: $repo, repo_path: $repo_path,
             branch: $branch, base_ref: $base_ref, isolation: $isolation,
@@ -496,6 +500,7 @@ cmd_add() {
             pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null,
             suggested_config: $suggested_config,
             no_pr: $no_pr,
+            cost_model: $cost_model,
             current_tier: "tier_0",
             escalation_count: 0,
             adherence_attempts: 0

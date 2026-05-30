@@ -492,6 +492,22 @@ PLAN
     local plan="$MOTHER_ROOT/plan.md"
     make_plan "$plan"
 
+# cost_model — billing-mode detection at enqueue time
+
+@test "mother add sets cost_model=subscription when bishop reports subscription" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # Install a bishop shim that echoes "subscription" for "get billing_mode".
+    local mock_bin="$MOTHER_ROOT/mock-bin"
+    cat > "$mock_bin/bishop" <<'SHIM'
+#!/usr/bin/env bash
+if [ "$1" = "get" ] && [ "$2" = "billing_mode" ]; then
+    echo "subscription"
+fi
+SHIM
+    chmod +x "$mock_bin/bishop"
+
     run mother add \
         --plan-file "$plan" \
         --repo testrepo \
@@ -554,6 +570,21 @@ suggested_config:
     rationale: "Standard review."
 \`\`\`
 PLAN
+    run jq -r '.cost_model' "$JOBS_DIR/$id.json"
+    [ "$output" = "subscription" ]
+}
+
+@test "mother add sets cost_model=metered via posture file when bishop returns nothing" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # Ensure no bishop shim is installed (mock-bin only has claude).
+    rm -f "$MOTHER_ROOT/mock-bin/bishop"
+
+    # Point the helper at a fixture file with billing_mode=metered.
+    local fixture="$MOTHER_ROOT/budget-posture.json"
+    printf '{"billing_mode":"metered"}' > "$fixture"
+    export BUDGET_POSTURE_FILE="$fixture"
 
     run mother add \
         --plan-file "$plan" \
@@ -598,6 +629,19 @@ suggested_config:
     rationale: "Standard review."
 ```
 PLAN
+    run jq -r '.cost_model' "$JOBS_DIR/$id.json"
+    [ "$output" = "metered" ]
+}
+
+@test "mother add sets cost_model=unknown when bishop is absent and posture file has no billing_mode" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # No bishop shim.
+    rm -f "$MOTHER_ROOT/mock-bin/bishop"
+
+    # Point at a non-existent file so the fallback also fails.
+    export BUDGET_POSTURE_FILE="$MOTHER_ROOT/no-such-file.json"
 
     run mother add \
         --plan-file "$plan" \
@@ -609,4 +653,6 @@ PLAN
     local id="$output"
     run jq -r '.plan_summary' "$JOBS_DIR/$id.json"
     [ "$output" = "" ]
+    run jq -r '.cost_model' "$JOBS_DIR/$id.json"
+    [ "$output" = "unknown" ]
 }
