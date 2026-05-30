@@ -44,10 +44,17 @@ MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
 # Kill switches: set to 0 to disable without redeploying.
 MOTHER_ESCALATION_ENABLED="${MOTHER_ESCALATION_ENABLED:-1}"
 MOTHER_ADHERENCE_ENABLED="${MOTHER_ADHERENCE_ENABLED:-1}"
+MOTHER_BROKER_ENABLED="${MOTHER_BROKER_ENABLED:-1}"
 
 PIDFILE="$RUNNER_DIR/runner.pid"
 CHILDREN_DIR="$RUNNER_DIR/children"
+BROKER_PIDFILE="$RUNNER_DIR/broker.pid"
 mkdir -p "$CHILDREN_DIR"
+
+# Broker restart backoff state (seconds). Reset to 1 whenever the broker is
+# observed alive; doubled (capped) on each restart attempt.
+_BROKER_BACKOFF=1
+_BROKER_NEXT_RESTART=0
 
 SHUTDOWN=0
 
@@ -118,6 +125,65 @@ _supervisor_alive_for_job() {
         fi
     done
     return 1
+}
+
+# ---------- broker supervision (B9) ----------
+#
+# The IPC broker is a long-lived Go sidecar that fans out state/activity/
+# await/quota/current_activity events to connected clients and routes
+# answer/cancel/retry commands back through the `mother` CLI. The daemon
+# supervises it: started when the daemon starts, SIGTERM'd on drain, and
+# restarted with bounded backoff if it dies. Everything is gated behind
+# MOTHER_BROKER_ENABLED (default 1) so the daemon runs identically to before
+# when the broker is disabled.
+
+_broker_pid() {
+    [ -f "$BROKER_PIDFILE" ] && cat "$BROKER_PIDFILE" 2>/dev/null || echo ""
+}
+
+_broker_alive() {
+    local p; p=$(_broker_pid)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+_start_broker() {
+    [ "$MOTHER_BROKER_ENABLED" = "1" ] || return 0
+    _broker_alive && return 0
+    # Detach like the job workers: nohup + background + disown so daemon
+    # signals don't cascade. The broker tees its own diagnostics to
+    # logs/broker.log.
+    nohup "$MOTHER_BIN_DIR/mother-broker" </dev/null >>"$LOGS_DIR/broker.log" 2>&1 &
+    local pid=$!
+    disown 2>/dev/null || true
+    echo "$pid" > "$BROKER_PIDFILE"
+    _log "started broker (pid $pid)"
+}
+
+_stop_broker() {
+    local p; p=$(_broker_pid)
+    [ -n "$p" ] || return 0
+    if kill -0 "$p" 2>/dev/null; then
+        kill -TERM "$p" 2>/dev/null || true
+        _log "stopped broker (pid $p)"
+    fi
+    rm -f "$BROKER_PIDFILE"
+}
+
+# _reap_broker: if the broker is enabled but not alive, restart it once the
+# backoff window has elapsed. Called each loop tick.
+_reap_broker() {
+    [ "$MOTHER_BROKER_ENABLED" = "1" ] || return 0
+    if _broker_alive; then
+        _BROKER_BACKOFF=1
+        return 0
+    fi
+    local now; now=$(date +%s)
+    [ "$now" -ge "$_BROKER_NEXT_RESTART" ] || return 0
+    _log "broker not running — restarting (backoff=${_BROKER_BACKOFF}s)"
+    _start_broker
+    _BROKER_NEXT_RESTART=$((now + _BROKER_BACKOFF))
+    _BROKER_BACKOFF=$((_BROKER_BACKOFF * 2))
+    [ "$_BROKER_BACKOFF" -gt 30 ] && _BROKER_BACKOFF=30
 }
 
 # ---------- ready-job selection ----------
@@ -466,6 +532,7 @@ _run_adherence_pending() {
 _loop() {
     while [ "$SHUTDOWN" -eq 0 ]; do
         _reap_children
+        _reap_broker
         _recover_orphans "$MOTHER_ORPHAN_GRACE"
         # Auto-resume system-paused jobs whose window has rolled over
         # BEFORE _promote_ready, so resumed jobs are eligible for the
@@ -504,6 +571,7 @@ _loop() {
 }
 
 _drain() {
+    _stop_broker
     _log "drain: waiting up to ${MOTHER_SHUTDOWN_GRACE}s for ${MOTHER_CONCURRENCY} slots to clear"
     local elapsed=0
     while [ "$elapsed" -lt "$MOTHER_SHUTDOWN_GRACE" ]; do
@@ -527,6 +595,7 @@ main() {
     trap '_on_signal' TERM INT
     _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
     _recover_orphans
+    _start_broker
     _loop
     _drain
     _remove_pidfile

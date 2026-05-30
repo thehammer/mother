@@ -369,3 +369,160 @@ Each phase is independently useful.
 - Any prior session-spawning scope in general-purpose launcher agents — narrower
   now (mother-runner owns spawning for queued jobs). Launchers remain for
   deploying services and non-queue tmux orchestration.
+
+---
+
+## Broker / IPC protocol (W1)
+
+The **broker** is a long-lived Go sidecar that gives clients a single bidirectional
+connection over which they get current state, receive every subsequent change as a
+server-push, and send correlatable commands — replacing shell-out + filesystem
+polling. It is **remote-ready**: the event model and command surface hold unchanged
+when TCP replaces the local Unix socket (W4).
+
+This section is the spec a client author codes against. The architecture bets are
+recorded inline as B1–B9.
+
+### Process model (B1)
+
+- The broker is a **separate process**, supervised by `mother-runner` (started on
+  daemon start, SIGTERM'd on drain, restarted with bounded backoff if it dies).
+  Gated by `MOTHER_BROKER_ENABLED` (default 1); with it `0`, Mother runs exactly as
+  before.
+- **Bash stays the sole writer of job state.** The broker is a reader + a CLI caller:
+  - It learns of changes by tailing the append-only event logs
+    (`$MOTHER_ROOT/events/<id>.jsonl`) with fsnotify — the same logs bash already
+    writes via `_append_event`. No second writer to job JSON.
+  - It executes `answer`/`cancel`/`retry` by shelling out to the existing `mother`
+    CLI (`mother resume`/`cancel`/`retry`), so every mutation routes through the one
+    atomic state path.
+- The broker holds **no durable state**: on start it rebuilds its world from the
+  job records and event logs, so a restart is safe and cheap.
+
+### Transport boundary (B2)
+
+The transport is Go's `net.Listener`/`net.Conn`. W1 binds a Unix socket at
+`$MOTHER_ROOT/broker.sock`. Moving to TCP is a one-line change in the listener;
+everything above operates on an `io.ReadWriteCloser` and is transport-blind.
+
+No event or command payload contains a local filesystem path the client must open,
+and initial state is delivered **in-band** over the connection. Session/transcript/
+log *content* is exposed as data where needed; clients never receive a path to open.
+
+### Framing & envelope (B3)
+
+**Newline-delimited JSON** (NDJSON): one JSON object per line, `\n`-terminated, UTF-8,
+no embedded raw newlines (escaped per JSON). Debuggable with `nc -U broker.sock | jq .`.
+
+Every message — both directions — carries:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `v` | int | Envelope version (currently `1`). |
+| `dir` | string | `event` (server→client, unsolicited), `cmd` (client→server), or `ack` (server→client, correlated reply). |
+| `t` | string | Type tag. `event`: an event type; `cmd`: a command name; `ack`: mirrors the command it answers. |
+| `id` | string | On `cmd`: client-chosen, echoed on the matching `ack` (the correlation key). On `event`: broker-assigned monotonic per-connection id (gap detection). On `ack`: equals the `cmd`'s id. |
+| `ts` | string | Millisecond ISO-8601 UTC (e.g. `2026-05-30T09:30:56.510Z`), matching `state.sh`'s `_iso_now` so protocol events sort with the on-disk logs. |
+
+Type-specific fields live under `data`. Errors are an `ack` with `data.ok=false` and a
+structured `data.error` (B8).
+
+### Connect-time handshake (B8)
+
+Immediately on connect the broker sends a `hello` event:
+`data = {protocol_version: 1, capabilities: [<category>..., <command>...]}`. A client
+compares `protocol_version` and inspects `capabilities` to discover support (e.g.
+`output` is absent until W2). An older client keeps working against a newer broker for
+shared capabilities; the broker never rejects a connection for an unknown-but-additive
+client field.
+
+### Subscriptions & commands (B4)
+
+A connection may hold **multiple independent named subscriptions**. Each has a
+client-chosen `sub` name and a selector — server-side filtering from day one (never a
+firehose):
+
+- `subscribe {sub, jobs, categories}` → `ack`, then a `snapshot` event for the
+  selected jobs, then matching live events. Snapshot + live-tail attach happen
+  atomically inside the broker (under the fan-out lock), so the client gets current
+  state then every subsequent change with **neither gap nor dup** (B5). `jobs` is a
+  list of ids or `["all"]`; `categories` is a subset of the categories below.
+- `unsubscribe {sub}` → tears down one subscription.
+- `query.list {jobs?, state?, repo?}` → one-shot `ack` with job records (the
+  `mother list --format json` equivalent, served from broker memory).
+- `query.get {job}` → one-shot `ack` with one job record + its event history.
+- `answer {job, text}` → routes to `mother resume <job> -` (text on stdin).
+- `cancel {job}` → routes to `mother cancel <job>`.
+- `retry {job}` → routes to `mother retry <job>`.
+
+The `snapshot` event carries `data = {sub, jobs: [<job record>...]}` — initial state
+delivered in-band. Each job record's dynamic fields (`state`, `question`,
+`paused_reason`, `current_activity`) are overlaid from the broker's event-derived
+fold so the snapshot is consistent with the live stream.
+
+### Event categories & ordering (B5)
+
+| Category | Source | Reconnect semantics |
+|---|---|---|
+| `state` | the seven state transitions | Resync — snapshot re-establishes authoritative state; intermediate transitions not replayed. |
+| `activity` | activity sub-state + pipeline kinds | Resync, folded into snapshot. |
+| `await` | `awaiting_input` (carries question) | Resync — snapshot job record carries `question`/`paused_reason`. |
+| `current_activity` | broker-derived from the worker transcript | None (ephemeral); snapshot carries the latest value, no history. |
+| `quota` | `pause_requested`/`auto_resumed`/`paused_for_quota` | Resync for current pause state; live changes pushed. |
+| `output` | worker session stream | **W2 — deferred**; advertised as absent in W1's `hello`. |
+
+**Per-job ordering is guaranteed** (each job's events come from one append-only log,
+read in file order). **Cross-job global ordering is not promised**; each event carries
+its source `ts` for within-job sorting.
+
+The canonical **event→state fold** (B7 — shared vocabulary with the SDLC-pipeline
+feature): the seven state kinds map to themselves; `awaiting_input` and
+`paused_for_quota` ⇒ `awaiting`; `resumed`/`auto_resumed` ⇒ `ready`;
+`retried`/`escalated` carry the resulting state in `detail.to_state`. The pipeline
+feature emits its phase/cycle events through `_append_event` using shared type names
+so the broker surfaces them under `activity` with zero broker changes.
+
+### current_activity (B6)
+
+The broker tails each running job's Claude transcript (resolved via `session_id` +
+`work_dir`, the same logic `mother peek` uses) and, on each new `tool_use`, pushes a
+`current_activity` event with the rendered string (e.g. `"Edit: src/lib.rs"`) — the
+polled field becomes a pushed value, with no client-side file I/O. The full
+turn-by-turn `output` stream is W2.
+
+### Errors (B8)
+
+Every `ack` carries `data.ok` (bool). On failure, `data.error = {code, message}` where
+`code` is from a **closed enumeration** — clients switch on `code`, never the message:
+
+| `code` | Condition |
+|---|---|
+| `no_such_job` | command names a job that does not exist |
+| `invalid_state` | command invalid for the job's current state |
+| `malformed` | envelope/command failed to parse or validate |
+| `unavailable` | broker restarting / transiently unable to serve — back off and retry |
+| `version_mismatch` | client/broker protocol version incompatible |
+| `unauthorized` | reserved for the network-auth path (W4); never returned by W1's local transport |
+| `internal` | broker-side failure (e.g. CLI shell-out errored) |
+
+### Disconnect, backpressure, lifecycle (B9)
+
+- **Disconnect:** a read error/EOF reclaims the client's goroutine and subscriptions
+  immediately. A periodic `ping` event (every `MOTHER_BROKER_PING_SEC`, default 15s)
+  doubles as a liveness probe — a dead/half-open peer makes the writer's send fail,
+  dropping the client. Inbound silence is NOT a drop condition: a pure subscriber that
+  only listens stays connected.
+- **Backpressure:** each client has a bounded outbound buffer
+  (`MOTHER_BROKER_CLIENT_BUF`, default 1024 messages). On overflow the broker drops the
+  slowest client rather than blocking the fan-out — a slow client harms only itself.
+- **Lifecycle:** supervised by `mother-runner` (bounded restart with backoff). During a
+  restart, connecting clients get connection-refused; mid-stream clients see EOF and
+  should reconnect with backoff (the `unavailable` notice distinguishes this from a
+  fatal error).
+
+### Build & ship
+
+The broker is a single static binary built by `scripts/build-broker.sh` into
+`plugins/mother/broker/bin/mother-broker` (gitignored). `scripts/run-tests.sh` builds
+it and runs `go test ./broker/...` alongside the bats suite. `mother broker status|path`
+are read-only diagnostics.

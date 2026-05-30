@@ -1772,6 +1772,35 @@ cmd_daemon() {
     esac
 }
 
+# ---------- broker ----------
+#
+# Read-only diagnostics for the IPC broker sidecar (supervised by the daemon).
+# Reports the socket path and whether the broker process is alive. Does NOT
+# start/stop the broker — that's the daemon's job (see mother-runner).
+
+cmd_broker() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+    local sock="${MOTHER_BROKER_SOCK:-$MOTHER_ROOT/broker.sock}"
+    local pidfile="$RUNNER_DIR/broker.pid"
+    case "$sub" in
+        path)
+            echo "$sock"
+            ;;
+        status)
+            local p=""
+            [ -f "$pidfile" ] && p=$(cat "$pidfile" 2>/dev/null)
+            if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+                echo "running (pid $p, socket $sock)"
+                [ -S "$sock" ] || echo "  warning: socket not present at $sock" >&2
+            else
+                echo "stopped"
+            fi
+            ;;
+        *) _die "unknown broker subcommand: $sub (status|path)" ;;
+    esac
+}
+
 # ---------- help ----------
 
 cmd_help() {
@@ -1795,6 +1824,7 @@ Usage:
   mother events [--since-cursor SESSION_ID] [--since ISO_TS]
   mother drafts list | save --plan-file PATH | show ID | rm ID
   mother daemon start [--foreground] | stop | status | install | uninstall
+  mother broker status | path                (IPC broker diagnostics)
   mother archive [--older-than DAYS] [--dry-run]
   mother run --once
 
@@ -1824,6 +1854,14 @@ Daemon env vars:
   MOTHER_SHUTDOWN_GRACE        (default: 30)   seconds to wait for children on stop
   MOTHER_ESCALATION_ENABLED    (default: 1)    auto-escalate failed jobs (0 to disable)
   MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
+  MOTHER_BROKER_ENABLED        (default: 1)    supervise the IPC broker sidecar (0 to disable)
+
+IPC broker env vars (the long-lived sidecar that pushes events to clients):
+  MOTHER_BROKER_SOCK           (default: ~/.mother/broker.sock)  Unix socket path
+  MOTHER_BROKER_PING_SEC       (default: 15)   heartbeat interval (seconds)
+  MOTHER_BROKER_CLIENT_BUF     (default: 1024) per-client outbound buffer (messages)
+  MOTHER_BROKER_ACTIVITY_SEC   (default: 1)    current_activity transcript poll interval
+  MOTHER_CLAUDE_PROJECTS_DIR   (default: ~/.claude/projects)  transcript root for current_activity
 
 Worker prompt env vars:
   MOTHER_PREAMBLE_PATH    path to a markdown file prepended to every
@@ -1895,6 +1933,7 @@ main() {
         events)            cmd_events "$@" ;;
         drafts)            cmd_drafts "$@" ;;
         daemon)            cmd_daemon "$@" ;;
+        broker)            cmd_broker "$@" ;;
         archive)           cmd_archive "$@" ;;
         run)               cmd_run "$@" ;;
         help|-h|--help)    cmd_help ;;
