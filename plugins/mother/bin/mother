@@ -214,6 +214,108 @@ print("false")
 PYEOF
 }
 
+# _extract_plan_summary <plan_file>
+# Extracts a short prose summary from the plan markdown. Returns the first
+# paragraph of a ## Summary section if present, otherwise the first non-heading,
+# non-list, non-code-fence, non-blockquote paragraph in the document.
+# The result is normalised to single-spaced prose and capped at 500 characters
+# on a word boundary with a trailing ellipsis. Prints an empty string (and exits
+# 0) when nothing usable is found or the file cannot be parsed.
+_extract_plan_summary() {
+    local plan_file="$1"
+    python3 - "$plan_file" <<'PYEOF' 2>/dev/null || true
+import sys, re
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        content = f.read()
+except Exception:
+    print(""); sys.exit(0)
+
+lines = content.splitlines()
+
+def first_paragraph(block_lines):
+    """Return the first non-empty paragraph (consecutive non-blank lines) from
+    a list of lines, joined with a single space. Returns '' if none found."""
+    paragraph = []
+    for ln in block_lines:
+        stripped = ln.strip()
+        if stripped:
+            paragraph.append(stripped)
+        elif paragraph:
+            break
+    return " ".join(paragraph)
+
+def normalise(text):
+    """Collapse whitespace to single spaces and strip."""
+    return re.sub(r'\s+', ' ', text).strip()
+
+def cap(text, limit=500):
+    """Cap at limit chars on a word boundary, appending '...' if truncated."""
+    if len(text) <= limit:
+        return text
+    # Find last space within limit - 3 chars (room for ellipsis)
+    window = text[:limit - 3]
+    cut = window.rfind(' ')
+    if cut <= 0:
+        # No space found; hard-cut
+        return text[:limit - 3] + '...'
+    return window[:cut] + '...'
+
+# Rule 1: look for a Summary heading (any level, case-insensitive).
+summary_idx = None
+for i, ln in enumerate(lines):
+    if re.match(r'^#{1,6}\s+Summary\s*$', ln, re.IGNORECASE):
+        summary_idx = i
+        break
+
+if summary_idx is not None:
+    # Collect lines after the heading up to the next heading or EOF.
+    body = []
+    for ln in lines[summary_idx + 1:]:
+        if re.match(r'^#{1,6}\s', ln):
+            break
+        body.append(ln)
+    result = first_paragraph(body)
+    if result:
+        print(cap(normalise(result))); sys.exit(0)
+
+# Rule 2: fallback — find the first suitable prose paragraph in the whole doc.
+in_fence = False
+paragraph = []
+for ln in lines:
+    # Track fenced code blocks.
+    if re.match(r'^```', ln):
+        in_fence = not in_fence
+        if paragraph:
+            break
+        continue
+    if in_fence:
+        if paragraph:
+            break
+        continue
+    stripped = ln.strip()
+    if not stripped:
+        if paragraph:
+            break
+        continue
+    # Skip headings, list items, blockquotes.
+    if re.match(r'^#{1,6}\s', stripped):
+        continue
+    if re.match(r'^\s*[-*+]\s', stripped) or re.match(r'^\s*\d+\.\s', stripped):
+        continue
+    if re.match(r'^\s*>', stripped):
+        continue
+    paragraph.append(stripped)
+
+if paragraph:
+    result = " ".join(paragraph)
+    print(cap(normalise(result))); sys.exit(0)
+
+print(""); sys.exit(0)
+PYEOF
+}
+
 # _parse_pipeline_config <plan_file>
 # Returns the pipeline: object from the plan's YAML block as JSON.
 # Returns "null" (literal string) if the pipeline: key is absent.
@@ -363,6 +465,9 @@ cmd_add() {
     local no_pr_json
     [ "$no_pr_flag" = "true" ] && no_pr_json="true" || no_pr_json="false"
 
+    local plan_summary
+    plan_summary=$(_extract_plan_summary "$plan_file" 2>/dev/null || true)
+
     job_json=$(jq -n \
         --arg id "$id" \
         --arg title "$title" \
@@ -376,6 +481,7 @@ cmd_add() {
         --argjson max_cost "$max_cost_json" \
         --arg plan_path "$(_plan_path "$id")" \
         --arg log_path "$(_log_path "$id")" \
+        --arg plan_summary "$plan_summary" \
         --arg created_at "$(_iso_now)" \
         --argjson suggested_config "$suggested_config_json" \
         --argjson no_pr "$no_pr_json" \
@@ -384,6 +490,7 @@ cmd_add() {
             branch: $branch, base_ref: $base_ref, isolation: $isolation,
             executor: $executor, depends_on: $deps, max_cost_usd: $max_cost,
             plan_path: $plan_path, log_path: $log_path,
+            plan_summary: $plan_summary,
             state: "queued", created_at: $created_at,
             started_at: null, finished_at: null,
             pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null,
@@ -517,6 +624,12 @@ cmd_status() {
             local model; model=$(_tier_model "$current_tier")
             local effort; effort=$(_tier_effort "$current_tier")
             echo "  Tier: $current_tier (model=$model, effort=$effort, escalations=$esc_count)"
+            echo ""
+        fi
+        local plan_summary
+        plan_summary=$(jq -r '.plan_summary // ""' "$job_file")
+        if [ -n "$plan_summary" ]; then
+            echo "Summary: $plan_summary"
             echo ""
         fi
         echo "=== job ==="
