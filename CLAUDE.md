@@ -82,7 +82,7 @@ plan-adherence review. Here's what was added and how to work with it.
 | `adherence_pending` | bool | True when a succeeded job awaits adherence review. |
 | `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. Audit trail only — do not use for operational logic. |
 | `adherence_notes` | string | Archie's notes from the last review (populated on fail). |
-| `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human). Cleared on resume. |
+| `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human) or `pipeline_phase` / `pipeline_review` / `pipeline_blocked` (pipeline jobs). Cleared on resume. |
 | `cost_model` | string | Account billing mode at enqueue time: `subscription`, `metered`, or `unknown`. Clients suppress dollar displays when `subscription`. |
 
 ### State machine
@@ -100,7 +100,11 @@ for display and routing.
 | `running` | `continuation` | Cody re-running after idle_timeout (auto-continuation) |
 | `awaiting` | (none) | Cody asked a question; answer with `mother resume` |
 | `awaiting` | `adherence_blocked` | Archie failed twice; human must review PR, then `resume` or `cancel` |
-| `succeeded` | — | terminal: all work done |
+| `running` | `pipeline_phase` | pipeline job: a build agent (redd/cody/marty) is actively running |
+| `ready` | `pipeline_phase` | pipeline job: next build agent queued (driver just advanced the phase) |
+| `succeeded` | `pipeline_review` | pipeline job: all build phases done, concurrent review in progress |
+| `awaiting` | `pipeline_blocked` | pipeline job: blocked for human (human-blocking finding, cap hit, or empty reviewers) |
+| `succeeded` | — | terminal: all work done (for pipeline jobs, set by the driver on ship) |
 | `failed` | — | terminal: gave up after escalation cap |
 | `cancelled` | — | terminal: explicitly cancelled |
 
@@ -124,15 +128,18 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 |---|---|---|
 | `no_pr` | bool | Set by `no_pr: true` in the plan YAML block. Skips the `no_pr_no_push` failure check. Success condition becomes "worker exited cleanly with commits on the branch." |
 | `continuation_count` | int | Number of auto-continuation attempts so far. Incremented each time an `idle_timeout` triggers a re-queue. |
+| `pipeline.review_cycle` | int | Number of review cycles completed so far (0-indexed). Incremented once per continue-cycle. Surfaced by W5 as `review_cycle_count`. |
 
 ### Kill switches
 
-All three background behaviours can be disabled without redeploying:
+All background behaviours can be disabled without redeploying:
 
 - `MOTHER_ESCALATION_ENABLED=0` — disable auto-escalation of failed jobs.
 - `MOTHER_ADHERENCE_ENABLED=0` — disable adherence review of succeeded jobs.
 - `MOTHER_CONTINUATIONS_ENABLED=0` — disable auto-continuation on idle_timeout.
 - `MOTHER_MAX_CONTINUATIONS=N` — cap continuation attempts (default: 3).
+- `MOTHER_PIPELINE_ENABLED=0` — disable the pipeline driver entirely; `kind: "pipeline"` jobs are left untouched by the driver.
+- `MOTHER_PIPELINE_CYCLE_CAP=N` — override the default cycle cap (default: 3) for pipeline jobs that do not set `pipeline.cycle_cap` themselves.
 
 ### Metrics file
 
