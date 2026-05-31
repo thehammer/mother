@@ -37,6 +37,11 @@ type hub struct {
 	pingSeconds int
 	clientBuf   int
 
+	// W2: output category support. outputSrc is nil when output is disabled.
+	outputSrc    *outputSource
+	replayBytes  int64 // MOTHER_BROKER_OUTPUT_REPLAY_BYTES
+	outputMaxGap int   // MOTHER_BROKER_OUTPUT_MAX_GAP
+
 	mu       sync.Mutex
 	clients  map[*client]bool
 	jobState map[string]*derivedState
@@ -140,25 +145,85 @@ func foldState(kind string, detail json.RawMessage) (string, bool) {
 }
 
 func (h *hub) deliverLocked(cl *client, ev rawEvent) {
-	matched := false
+	// Find the first subscription that matches this event. A client rarely
+	// has multiple overlapping output subscriptions, so using the first match
+	// for gap tracking is correct in the common case.
+	var matchedSub *subscription
 	for _, s := range cl.subs {
 		if s.matches(ev) {
-			matched = true
+			matchedSub = s
 			break
 		}
 	}
-	if !matched {
+	if matchedSub == nil {
 		return
 	}
+
+	if ev.category == CatOutput {
+		// Output has a softer backpressure policy: drop events with a gap
+		// marker rather than disconnecting the client on overflow.
+		h.deliverOutputLocked(cl, matchedSub, ev)
+	} else {
+		// Non-output categories retain the W1 hard drop-the-client policy:
+		// losing a state/await event corrupts the client's view.
+		data := mergeData(ev.detail, map[string]any{"job": ev.jobID, "category": ev.category})
+		if !cl.enqueue(newEvent(ev.kind, "", data)) {
+			go cl.drop("slow client: outbound buffer overflow")
+		}
+	}
+}
+
+// deliverOutputLocked implements the output-specific backpressure policy
+// (B9, W2). On buffer overflow it drops the event and records a gap rather
+// than disconnecting the client. On recovery it prepends a gap marker so the
+// client knows content was elided. Falls back to hard drop only when the gap
+// counter exceeds h.outputMaxGap (durable stall).
+//
+// Must be called under h.mu.
+func (h *hub) deliverOutputLocked(cl *client, s *subscription, ev rawEvent) {
 	data := mergeData(ev.detail, map[string]any{"job": ev.jobID, "category": ev.category})
-	if !cl.enqueue(newEvent(ev.kind, "", data)) {
-		go cl.drop("slow client: outbound buffer overflow")
+	msg := newEvent(ev.kind, "", data)
+
+	if s.pendingGap {
+		// Prepend a gap marker before the next successful delivery so the
+		// client knows how many output events it missed.
+		gapDetail, _ := json.Marshal(map[string]any{
+			"subtype": OutputSubtypeGap,
+			"dropped": s.gapCount,
+		})
+		gapData := mergeData(gapDetail, map[string]any{"job": ev.jobID, "category": CatOutput})
+		gapMsg := newEvent(TypeOutput, "", gapData)
+		if !cl.enqueue(gapMsg) {
+			// Still no room — increment gap counter and bail.
+			s.gapCount++
+			if s.gapCount > h.outputMaxGap {
+				go cl.drop("output gap ceiling exceeded")
+			}
+			return
+		}
+		// Gap marker sent; reset gap state.
+		s.pendingGap = false
+		s.gapCount = 0
+	}
+
+	if !cl.enqueue(msg) {
+		s.gapCount++
+		s.pendingGap = true
+		if s.gapCount > h.outputMaxGap {
+			go cl.drop("output gap ceiling exceeded")
+		}
 	}
 }
 
 // subscribe registers a subscription and atomically emits its snapshot, so no
 // live event for the subscription is delivered before the snapshot and none
 // is missed after it.
+//
+// For output subscriptions (W2): after the snapshot, a best-effort bounded
+// replay of each matching running job's log is enqueued under the same lock.
+// This ensures the replay/live boundary has no gap and no dup: the outputSource
+// updates its offset before calling emit (which blocks on h.mu), so the offset
+// we read here reflects exactly the bytes the live tail will start from.
 func (h *hub) subscribe(cl *client, sub *subscription) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -167,6 +232,36 @@ func (h *hub) subscribe(cl *client, sub *subscription) {
 	data, _ := json.Marshal(map[string]any{"sub": sub.name, "jobs": jobs})
 	if !cl.enqueue(newEvent(TypeSnapshot, "", data)) {
 		go cl.drop("slow client: outbound buffer overflow")
+		return
+	}
+
+	// Output replay (W2): enqueue best-effort historical output for running
+	// jobs before releasing the lock so the live tail picks up exactly where
+	// the replay ends.
+	if sub.categories[CatOutput] && h.outputSrc != nil && h.replayBytes > 0 {
+		h.replayOutputLocked(cl, sub)
+	}
+}
+
+// replayOutputLocked enqueues a bounded tail of output events for each
+// running job that matches the subscription. Called under h.mu. Best-effort:
+// failed enqueues are silently skipped (the replay is not guaranteed).
+func (h *hub) replayOutputLocked(cl *client, sub *subscription) {
+	for _, raw := range h.store.list(listFilter{state: "running"}) {
+		var j struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(raw, &j) != nil || j.ID == "" {
+			continue
+		}
+		if !sub.matchesJob(j.ID) {
+			continue
+		}
+		events := h.outputSrc.replayJob(j.ID, h.replayBytes)
+		for _, ev := range events {
+			data := mergeData(ev.detail, map[string]any{"job": ev.jobID, "category": ev.category})
+			_ = cl.enqueue(newEvent(ev.kind, "", data)) // best-effort
+		}
 	}
 }
 
@@ -277,8 +372,12 @@ func (h *hub) serve(conn *clientConn) *client {
 }
 
 func (cl *client) sendHello() {
-	caps := make([]string, 0, len(w1Categories)+len(w1Commands))
-	caps = append(caps, w1Categories...)
+	// Use liveCategories (the runtime-active set) so the advertised
+	// capabilities and validCategories() validation always agree. When
+	// MOTHER_BROKER_OUTPUT_ENABLED=0, liveCategories excludes CatOutput
+	// and this hello will not advertise it.
+	caps := make([]string, 0, len(liveCategories)+len(w1Commands))
+	caps = append(caps, liveCategories...)
 	caps = append(caps, w1Commands...)
 	data, _ := json.Marshal(map[string]any{
 		"protocol_version": ProtocolVersion,

@@ -43,6 +43,7 @@ const (
 	TypePing            = "ping"
 	TypeSnapshot        = "snapshot"
 	TypeCurrentActivity = "current_activity"
+	TypeOutput          = "output" // W2 — carries a structured output sub-event
 
 	// Client→server command names.
 	CmdSubscribe   = "subscribe"
@@ -52,6 +53,18 @@ const (
 	CmdAnswer      = "answer"
 	CmdCancel      = "cancel"
 	CmdRetry       = "retry"
+)
+
+// Output event sub-types (data.subtype on TypeOutput events). These mirror
+// the taxonomy mother-stream-pretty parses so the broker and pretty-printer
+// agree on shape.
+const (
+	OutputSubtypeSystem     = "system"      // stream-json type=system subtype=init
+	OutputSubtypeText       = "text"        // assistant content part type=text
+	OutputSubtypeToolUse    = "tool_use"    // assistant content part type=tool_use
+	OutputSubtypeToolResult = "tool_result" // user content part type=tool_result
+	OutputSubtypeResult     = "result"      // stream-json type=result
+	OutputSubtypeGap        = "gap"         // synthetic gap marker (slow client)
 )
 
 // Event categories (B4/B5). A subscription selects a subset of these.
@@ -64,11 +77,18 @@ const (
 	CatOutput          = "output" // W2 — advertised as absent in W1's hello
 )
 
-// w1Categories is the set of categories this W1 broker can deliver. Note the
-// deliberate absence of CatOutput, which arrives in W2.
+// w1Categories is the full set of categories this broker knows about,
+// including CatOutput (added in W2). The runtime-active set may be a subset
+// when MOTHER_BROKER_OUTPUT_ENABLED=0; see liveCategories.
 var w1Categories = []string{
-	CatState, CatActivity, CatAwait, CatCurrentActivity, CatQuota,
+	CatState, CatActivity, CatAwait, CatCurrentActivity, CatQuota, CatOutput,
 }
+
+// liveCategories is the runtime-active subset of w1Categories. Populated by
+// main() based on config; defaults to w1Categories so tests get the full set
+// without needing to call loadConfig. Both sendHello and validCategories read
+// this variable, so they always agree.
+var liveCategories = w1Categories
 
 // w1Commands is the set of commands this W1 broker accepts.
 var w1Commands = []string{
