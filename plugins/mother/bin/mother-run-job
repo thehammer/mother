@@ -42,6 +42,90 @@ EVENTS_DIR="$MOTHER_ROOT/events"
 LOGS_DIR="$MOTHER_ROOT/logs"
 RUNNER_DIR="$MOTHER_ROOT/runner"
 
+# ---------------------------------------------------------------------------
+# PR URL capture helpers — defined early so SOURCE_ONLY=1 sourcing works.
+# ---------------------------------------------------------------------------
+
+# Parse a git remote URL to "owner/repo". Handles both SSH (git@github.com:o/r)
+# and HTTPS (https://github.com/o/r) GitHub remotes. Returns empty for
+# non-GitHub remotes. Strips trailing .git suffix before parsing.
+_job_owner_repo_from_url() {
+    local url="$1"
+    url="${url%.git}"
+    local or
+    or=$(echo "$url" | sed -n 's|.*github\.com[:/]\(.*\)|\1|p')
+    echo "${or:-}"
+}
+
+# Echoes the job's origin repo as "owner/repo" by reading $work_dir's git
+# remote, or empty if work_dir is unset/missing or remote isn't GitHub.
+_job_owner_repo() {
+    [ -d "${work_dir:-}" ] || { echo ""; return; }
+    local url
+    url=$(cd "$work_dir" && git remote get-url origin 2>/dev/null) || { echo ""; return; }
+    _job_owner_repo_from_url "$url"
+}
+
+# Scrape a log file for pull-request URLs belonging to the given owner/repo,
+# ignoring foreign-repo placeholders. Echoes the last matching URL, or empty.
+# Usage: _scrape_pr_url_filtered <log_file> <owner_repo> [offset_bytes]
+# When offset_bytes > 0, only bytes past that offset are scanned (escalation
+# safety — prior runs are written at the head of a shared log file).
+_scrape_pr_url_filtered() {
+    local _log="$1" _or="$2" _offset="${3:-0}"
+    [ -f "$_log" ] || { echo ""; return; }
+    local matches
+    if [ "${_offset:-0}" -gt 0 ]; then
+        matches=$(tail -c "+$((_offset + 1))" "$_log" 2>/dev/null \
+            | grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' || true)
+    else
+        matches=$(grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' "$_log" 2>/dev/null || true)
+    fi
+    [ -n "$matches" ] || { echo ""; return; }
+    if [ -n "$_or" ]; then
+        echo "$matches" | grep -F "https://github.com/${_or}/pull/" | tail -1 || true
+    else
+        echo "$matches" | tail -1 || true
+    fi
+}
+
+# Authoritative: ask GitHub which open PR has the given branch as head in the
+# given repo. Echoes the URL or empty. Never reads the transcript.
+# Usage: _derive_pr_url_from_branch <owner_repo> <branch>
+_derive_pr_url_from_branch() {
+    local _or="$1" _br="$2"
+    [ -n "$_or" ] || { echo ""; return; }
+    local _out
+    _out=$(gh pr list --repo "$_or" --head "$_br" --state open --json url 2>/dev/null) || { echo ""; return; }
+    [ -n "$_out" ] || { echo ""; return; }
+    echo "$_out" | jq -r 'if type == "array" then .[0].url // empty else .url // empty end' 2>/dev/null || echo ""
+}
+
+# Validate the pr_url stored on a job file. Runs gh pr view to check the URL
+# resolves and its headRefName matches the expected branch. Clears pr_url in
+# the job file when the URL is unresolvable or points to the wrong branch.
+# Does NOT emit events — the call site handles event emission.
+# Usage: _validate_and_clear_pr_url <job_id> <branch>
+_validate_and_clear_pr_url() {
+    local _jid="$1" _branch="$2"
+    local _jf="${JOBS_DIR}/${_jid}.json"
+    [ -f "$_jf" ] || return
+    local _url; _url=$(jq -r '.pr_url // empty' "$_jf" 2>/dev/null)
+    [ -n "$_url" ] || return
+    local _head; _head=$(gh pr view "$_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
+    if [ -z "$_head" ] || [ "$_head" != "$_branch" ]; then
+        local _merged _tmp
+        _merged=$(jq '.pr_url = null' "$_jf" 2>/dev/null) || return
+        _tmp="${_jf}.tmp.$$"
+        printf '%s' "$_merged" > "$_tmp" && mv "$_tmp" "$_jf"
+    fi
+}
+
+# Allow sourcing helpers without running job logic (used by bats tests).
+[ "${SOURCE_ONLY:-}" = "1" ] && return 0
+
+# ---------------------------------------------------------------------------
+
 id="${1:?usage: mother-run-job <id>}"
 job_file="$JOBS_DIR/$id.json"
 [ -f "$job_file" ] || { echo "mother-run-job: no such job: $id" >&2; exit 1; }
@@ -736,8 +820,7 @@ while [ ! -f "$marker_file" ]; do
             # Only scan log content written by THIS worker (past log_offset_at_spawn)
             # to avoid picking up PR URLs left by previous runs on the same log file
             # (e.g. escalation retries on the same job ID).
-            _live_pr_url=$(tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
-                | grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | tail -1 || true)
+            _live_pr_url=$(_scrape_pr_url_filtered "$log_path" "$(_job_owner_repo)" "$log_offset_at_spawn")
             if [ -n "$_live_pr_url" ]; then
                 _job_update ".pr_url = \"$_live_pr_url\""
                 _append_event "pr_opened" "$(jq -nc --arg url "$_live_pr_url" '{url: $url}')"
@@ -811,15 +894,17 @@ done
 exit_code=0
 [ -f "$marker_file" ] && exit_code=$(cat "$marker_file")
 
-# Best-effort: extract a PR URL from the log if we didn't already pick it up
-# during the poll loop. Skipped if pr_url was already recorded — re-emitting
-# `pr_opened` would double-count in the event trail.
-# Only scan content from this worker's spawn to avoid picking up stale URLs
-# from prior runs on the same log file (escalation/retry cycles).
+# Authoritative PR URL capture: ask GitHub which open PR has this job's branch
+# as head. Only falls back to a repo-filtered log scrape if the branch query
+# finds nothing. Foreign-repo placeholder URLs in the transcript are ignored.
+# Skipped if pr_url was already recorded — re-emitting pr_opened would
+# double-count in the event trail.
 pr_url=$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)
-if [ -z "$pr_url" ] && [ -f "$log_path" ]; then
-    pr_url=$(tail -c "+$((log_offset_at_spawn + 1))" "$log_path" \
-        | grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | tail -1 || true)
+if [ -z "$pr_url" ]; then
+    pr_url=$(_derive_pr_url_from_branch "$(_job_owner_repo)" "$branch")
+    if [ -z "$pr_url" ] && [ -f "$log_path" ]; then
+        pr_url=$(_scrape_pr_url_filtered "$log_path" "$(_job_owner_repo)" "$log_offset_at_spawn")
+    fi
     if [ -n "$pr_url" ]; then
         _job_update ".pr_url = \"$pr_url\""
         _append_event "pr_opened" "$(jq -nc --arg url "$pr_url" '{url: $url}')"
@@ -830,15 +915,36 @@ fi
 # branch. A stale URL from a prior run on the same branch, or a wrong-PR
 # attachment from a rapid escalation sequence, would otherwise cause adherence
 # review to run against an unrelated diff.
+#
+# Hardened semantics: a gh pr view failure (URL unresolvable — wrong repo,
+# deleted PR, placeholder URL) now CLEARS pr_url just as a wrong-branch URL
+# does. Previously a failed lookup left the bogus URL in place.
 if [ -n "${pr_url:-}" ]; then
     _pr_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
-    if [ -n "$_pr_head" ] && [ "$_pr_head" != "$branch" ]; then
+    if [ -z "$_pr_head" ]; then
+        # URL did not resolve (wrong repo, nonexistent PR, network error, etc.)
+        _append_event "pr_url_unresolved" \
+            "$(jq -nc --arg url "$pr_url" --arg job_branch "$branch" \
+                '{note: "pr_url could not be resolved by gh pr view; clearing", \
+                  pr_url: $url, job_branch: $job_branch}')"
+        _job_update ".pr_url = null"
+        pr_url=""
+    elif [ "$_pr_head" != "$branch" ]; then
+        # URL resolves but its head branch does not match this job's branch.
         _append_event "pr_url_branch_mismatch" \
             "$(jq -nc --arg url "$pr_url" --arg pr_branch "$_pr_head" --arg job_branch "$branch" \
                 '{note: "pr_url headRefName does not match job branch; clearing stale URL", \
                   pr_url: $url, pr_branch: $pr_branch, job_branch: $job_branch}')"
         _job_update ".pr_url = null"
         pr_url=""
+    fi
+    # If the URL was cleared, attempt one authoritative re-derivation before
+    # giving up — the worker may have opened the PR moments before we checked.
+    if [ -z "$pr_url" ]; then
+        pr_url=$(_derive_pr_url_from_branch "$(_job_owner_repo)" "$branch")
+        if [ -n "$pr_url" ]; then
+            _job_update ".pr_url = \"$pr_url\""
+        fi
     fi
 fi
 
