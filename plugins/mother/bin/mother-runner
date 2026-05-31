@@ -604,13 +604,20 @@ _run_pipeline_review() {
         return 0
     fi
 
-    local review_cycle
+    local review_cycle reviewers_json
     review_cycle=$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null) || review_cycle=0
+    reviewers_json=$(jq -c '.pipeline.reviewers // []' "$job_file" 2>/dev/null) || reviewers_json="[]"
 
     _log "pipeline: $id: concurrent review started (cycle=${review_cycle:-0})"
     _job_update "$id" '.activity = "pipeline_review"'
     _append_event "$id" "pipeline_review_started" \
         "$(jq -nc --argjson cycle "${review_cycle:-0}" '{review_cycle: $cycle}')"
+    # W5 lifecycle event: review cycle start (additive alongside pipeline_review_started).
+    _append_event "$id" "review_cycle_started" \
+        "$(jq -nc \
+            --argjson cycle "${review_cycle:-0}" \
+            --argjson reviewers "${reviewers_json:-[]}" \
+            '{cycle: $cycle, reviewers: $reviewers}')"
 
     # Spawn all reviewers in parallel — each writes to its own
     # .pipeline.reviewer_findings.<reviewer> slot (W3 per-slot writes are
@@ -666,6 +673,17 @@ _run_pipeline_review() {
     # B4 exit truth table.
     local decision
     decision=$(findings_exit_decision "$merged_findings" 2>/dev/null) || decision="ship"
+
+    # W5 lifecycle event: review cycle completed (emitted before the B4 branch
+    # so the timestamp precedes any state transitions caused by the decision).
+    local findings_count_ev
+    findings_count_ev=$(printf '%s' "$merged_findings" | jq 'length' 2>/dev/null) || findings_count_ev=0
+    _append_event "$id" "review_cycle_completed" \
+        "$(jq -nc \
+            --argjson cycle "${review_cycle:-0}" \
+            --arg decision "$decision" \
+            --argjson findings_count "${findings_count_ev:-0}" \
+            '{cycle: $cycle, decision: $decision, findings_count: $findings_count}')"
 
     local now; now=$(_iso_now)
     case "$decision" in
@@ -763,6 +781,13 @@ _run_pipeline_review() {
                         --argjson cycle "$next_cycle" \
                         --argjson pending_agents "$pending_json" \
                         '{review_cycle: $cycle, pending_agents: $pending_agents}')"
+                # W5 lifecycle event: start the first build phase of the new cycle.
+                _append_event "$id" "phase_started" \
+                    "$(jq -nc \
+                        --argjson cycle "$next_cycle" \
+                        --arg agent "$first_agent" \
+                        --arg rt "$(_agent_request_type "$first_agent")" \
+                        '{cycle: $cycle, agent: $agent, request_type: $rt}')"
             fi
             ;;
     esac
@@ -797,9 +822,11 @@ _run_pipeline_job() {
             redd|cody|marty)
                 # Build phase just succeeded. Advance to the next eligible agent
                 # (B5 skip: only agents in pending_agents are eligible on re-runs).
-                local pending_agents next_phase
+                local pending_agents next_phase review_cycle
                 pending_agents=$(jq -r '.pipeline.pending_agents // [] | .[]' "$f" 2>/dev/null) \
                     || pending_agents=""
+                review_cycle=$(jq -r '.pipeline.review_cycle // 0' "$f" 2>/dev/null) \
+                    || review_cycle=0
                 next_phase=$(_pipeline_next_build_phase "$pipeline_phase" "$pending_agents")
 
                 if [ -n "$next_phase" ]; then
@@ -820,6 +847,19 @@ _run_pipeline_job() {
                     _append_event "$id" "pipeline_phase_advance" \
                         "$(jq -nc --arg from "$pipeline_phase" --arg to "$next_phase" \
                             '{from: $from, to: $to}')"
+                    # W5 lifecycle events: complete the old phase, start the new one.
+                    _append_event "$id" "phase_completed" \
+                        "$(jq -nc \
+                            --argjson cycle "${review_cycle:-0}" \
+                            --arg agent "$pipeline_phase" \
+                            --arg rt "$(_agent_request_type "$pipeline_phase")" \
+                            '{cycle: $cycle, agent: $agent, request_type: $rt}')"
+                    _append_event "$id" "phase_started" \
+                        "$(jq -nc \
+                            --argjson cycle "${review_cycle:-0}" \
+                            --arg agent "$next_phase" \
+                            --arg rt "$(_agent_request_type "$next_phase")" \
+                            '{cycle: $cycle, agent: $agent, request_type: $rt}')"
                 else
                     # No more eligible build agents — move to review phase.
                     # Keep state=succeeded so the driver picks it up next tick.
@@ -829,6 +869,13 @@ _run_pipeline_job() {
                         ".pipeline.phase = \"review\" | .activity = \"pipeline_review\""
                     _append_event "$id" "pipeline_phase_advance" \
                         "$(jq -nc --arg from "$pipeline_phase" --arg to "review" '{from: $from, to: $to}')"
+                    # W5 lifecycle event: complete the last build phase.
+                    _append_event "$id" "phase_completed" \
+                        "$(jq -nc \
+                            --argjson cycle "${review_cycle:-0}" \
+                            --arg agent "$pipeline_phase" \
+                            --arg rt "$(_agent_request_type "$pipeline_phase")" \
+                            '{cycle: $cycle, agent: $agent, request_type: $rt}')"
                 fi
                 break
                 ;;

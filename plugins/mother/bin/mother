@@ -567,7 +567,25 @@ cmd_list() {
     ')
 
     if [ "$format" = "json" ]; then
-        echo "$rows"
+        # For pipeline jobs, attach the derived `cycles` array; standard jobs
+        # pass through byte-identical so clients that don't expect `cycles` are
+        # unaffected (back-compat AC).
+        echo "$rows" | jq -c '.[]' | while IFS= read -r job_json; do
+            local kind job_id
+            kind=$(printf '%s' "$job_json" | jq -r '.kind // ""' 2>/dev/null) || kind=""
+            if [ "${kind:-}" = "pipeline" ]; then
+                job_id=$(printf '%s' "$job_json" | jq -r '.id' 2>/dev/null) || job_id=""
+                local cycles
+                cycles=$(_pipeline_cycles_json "$(_job_path "${job_id:-}")" 2>/dev/null) || cycles=""
+                if [ -n "${cycles:-}" ]; then
+                    printf '%s' "$job_json" | jq -c --argjson cycles "$cycles" '. + {cycles: $cycles}'
+                else
+                    printf '%s\n' "$job_json"
+                fi
+            else
+                printf '%s\n' "$job_json"
+            fi
+        done | jq -cs '.'
     else
         local count
         count=$(echo "$rows" | jq 'length')
@@ -584,12 +602,20 @@ cmd_list() {
                 (.current_tier // ""),
                 .repo,
                 .isolation,
-                .title
+                .title,
+                (.kind // "")
             ] | @tsv' | \
-            while IFS=$'\t' read -r id st activity current_tier repo iso title; do
+            while IFS=$'\t' read -r id st activity current_tier repo iso title kind; do
                 # Compose the state display field with markers.
                 local state_display="$st"
-                [ -n "$activity" ] && state_display="$st [$activity]"
+                if [ "${kind:-}" = "pipeline" ]; then
+                    # Pipeline jobs: replace the activity bracket with a pipeline-aware label.
+                    local pl_label
+                    pl_label=$(_pipeline_list_label "$(_job_path "$id")" 2>/dev/null) || pl_label=""
+                    [ -n "${pl_label:-}" ] && state_display="$st [$pl_label]"
+                else
+                    [ -n "$activity" ] && state_display="$st [$activity]"
+                fi
                 case "$current_tier" in
                     tier_1) state_display="$state_display tier:1" ;;
                     tier_2) state_display="$state_display tier:2" ;;
@@ -615,14 +641,33 @@ cmd_status() {
     _job_exists "$id" || _die "no such job: $id"
 
     if [ "$format" = "json" ]; then
-        jq -s '{job: .[0], events: .[1]}' \
-            "$(_job_path "$id")" \
-            <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
+        # For pipeline jobs, attach the derived cycles array to the job object.
+        local job_file; job_file=$(_job_path "$id")
+        local kind; kind=$(jq -r '.kind // ""' "$job_file" 2>/dev/null) || kind=""
+        if [ "${kind:-}" = "pipeline" ]; then
+            local cycles
+            cycles=$(_pipeline_cycles_json "$job_file" 2>/dev/null) || cycles=""
+            if [ -n "${cycles:-}" ]; then
+                jq -s --argjson cycles "$cycles" \
+                    '{job: (.[0] + {cycles: $cycles}), events: .[1]}' \
+                    "$job_file" \
+                    <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
+            else
+                jq -s '{job: .[0], events: .[1]}' \
+                    "$job_file" \
+                    <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
+            fi
+        else
+            jq -s '{job: .[0], events: .[1]}' \
+                "$job_file" \
+                <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
+        fi
     else
         local job_file; job_file=$(_job_path "$id")
         local activity; activity=$(jq -r '.activity // empty' "$job_file")
         local current_tier; current_tier=$(jq -r '.current_tier // "tier_0"' "$job_file")
         local esc_count; esc_count=$(jq -r '.escalation_count // 0' "$job_file")
+        local kind; kind=$(jq -r '.kind // ""' "$job_file" 2>/dev/null) || kind=""
 
         if [ "$activity" = "adherence_blocked" ]; then
             echo ""
@@ -633,8 +678,21 @@ cmd_status() {
             echo "   See .adherence_notes on the job JSON for Archie's findings."
             echo ""
         fi
+        if [ "$activity" = "pipeline_blocked" ]; then
+            echo ""
+            echo "⚠️  [PIPELINE-BLOCKED] This job requires human review."
+            echo "   The pipeline review found issues it could not resolve automatically."
+            echo "   Outstanding findings:"
+            jq -r '.pipeline.findings // [] | .[] |
+                "     - [\(.severity)] \(.summary)\(if .location then " (" + .location + ")" else "" end)"' \
+                "$job_file"
+            echo "   Options:"
+            echo "     mother resume $id \"<guidance>\"   — resume with instructions for the agents"
+            echo "     mother resume $id \"SHIP\"          — force ship despite findings"
+            echo "     mother cancel $id                   — abandon the job"
+            echo ""
+        fi
         if [ "$current_tier" != "tier_0" ] && [ -n "$current_tier" ]; then
-            local tier_num; tier_num=$(_tier_num "$current_tier")
             local model; model=$(_tier_model "$current_tier")
             local effort; effort=$(_tier_effort "$current_tier")
             echo "  Tier: $current_tier (model=$model, effort=$effort, escalations=$esc_count)"
@@ -646,6 +704,89 @@ cmd_status() {
             echo "Summary: $plan_summary"
             echo ""
         fi
+
+        # Pipeline section — only for pipeline jobs.
+        if [ "${kind:-}" = "pipeline" ]; then
+            local pl_phase pl_cycle pl_cap pl_reviewers
+            pl_phase=$(jq -r '.pipeline.phase // "unknown"' "$job_file")
+            pl_cycle=$(jq -r '.pipeline.review_cycle // 0' "$job_file")
+            pl_cap=$(jq -r '.pipeline.cycle_cap // 3' "$job_file")
+            pl_reviewers=$(jq -r '(.pipeline.reviewers // []) | join(", ")' "$job_file")
+
+            echo "=== pipeline ==="
+            case "${pl_phase:-}" in
+                done)    echo "  Phase:     done (shipped)" ;;
+                blocked) echo "  Phase:     blocked (cycle ${pl_cycle}/${pl_cap})" ;;
+                review)  echo "  Phase:     review (cycle ${pl_cycle}/${pl_cap})" ;;
+                *)       echo "  Phase:     ${pl_phase:-unknown} (cycle ${pl_cycle}/${pl_cap})" ;;
+            esac
+            echo "  Reviewers: ${pl_reviewers:-none}"
+            echo ""
+
+            # Per-phase status table from derived cycles.
+            local cycles_json
+            cycles_json=$(_pipeline_cycles_json "$job_file" 2>/dev/null) || cycles_json="[]"
+            if [ -n "${cycles_json:-}" ] && [ "${cycles_json:-[]}" != "[]" ]; then
+                local cur_cycle_num
+                cur_cycle_num=$(printf '%s' "$cycles_json" | jq -r 'last.cycle // 0')
+                echo "  Phase status (cycle ${cur_cycle_num}):"
+                printf '%s' "$cycles_json" | jq -r '
+                    last | .phases[] |
+                    [.agent, .state,
+                     (.started_at // ""),
+                     (.finished_at // ""),
+                     ((.findings // 0) | tostring)] | @tsv
+                ' | while IFS=$'\t' read -r agent state t0 t1 fc; do
+                    printf "    %-10s  %-12s" "$agent" "$state"
+                    [ -n "$t0" ] && printf "  started: %s" "${t0:0:19}"
+                    [ -n "$t1" ] && printf "  finished: %s" "${t1:0:19}"
+                    if [ "${fc:-0}" != "0" ] && [ -n "$fc" ]; then
+                        printf "  (%s findings)" "$fc"
+                    fi
+                    printf "\n"
+                done
+                echo ""
+            fi
+
+            # Findings per reviewer.
+            local rev_summary
+            rev_summary=$(jq -r '
+                .pipeline.reviewer_findings // {} |
+                to_entries |
+                if length == 0 then "(none)"
+                else map("\(.key): \(.value | length)") | join(", ")
+                end
+            ' "$job_file")
+            echo "  Findings per reviewer: ${rev_summary}"
+            echo ""
+
+            # Advisory findings (distinct from agent-actionable findings).
+            local adv_count
+            adv_count=$(jq -r '.pipeline.advisories // [] | length' "$job_file")
+            if [ "${adv_count:-0}" -gt 0 ]; then
+                echo "  Advisory findings:"
+                jq -r '.pipeline.advisories // [] | .[] |
+                    "    [advisory] \(.summary)\(if .reviewer then " (" + .reviewer + ")" else "" end)"' \
+                    "$job_file"
+            else
+                echo "  Advisory findings: (none)"
+            fi
+            echo ""
+
+            # Review cycle history (prior cycles from findings_history).
+            local hist_count
+            hist_count=$(jq -r '.pipeline.findings_history // [] | length' "$job_file")
+            if [ "${hist_count:-0}" -gt 0 ]; then
+                echo "  Review cycle history:"
+                jq -r '.pipeline.findings_history // [] | .[] |
+                    "    cycle \(.cycle + 1): \(.findings | length) finding(s)"' \
+                    "$job_file"
+            else
+                echo "  Review cycle history: (none)"
+            fi
+            echo ""
+        fi
+
         echo "=== job ==="
         jq . "$job_file"
         echo

@@ -352,15 +352,132 @@ func TestClassify_unknownKindsMapsToActivity(t *testing.T) {
 	activityKinds := []string{
 		"escalated", "resumed", "retried", "cancel_requested",
 		"adherence_passed", "adherence_failed",
-		"phase_started", "phase_completed",
-		"review_cycle_started", "review_cycle_completed",
-		"findings_routed",
 		"something_totally_unknown",
 	}
 	for _, kind := range activityKinds {
 		if got := classify(kind); got != CatActivity {
 			t.Errorf("classify(%q) = %q, want %q", kind, got, CatActivity)
 		}
+	}
+}
+
+// =============================================================================
+// W5 — pipeline event classification and advisory round-trip
+// =============================================================================
+
+func TestClassify_W4W5PipelineEventsClassifyAsActivity(t *testing.T) {
+	// All W4/W5 pipeline-progress events must map to CatActivity, not CatState.
+	// They are sub-state signals; the job's `state` field already drives CatState.
+	pipelineKinds := []string{
+		// W4 events
+		"pipeline_review_started",
+		"pipeline_shipped",
+		"pipeline_blocked",
+		"pipeline_cap_hit",
+		"pipeline_cycle_continued",
+		"pipeline_phase_advance",
+		"pipeline_error",
+		// W5 additive events
+		"phase_started",
+		"phase_completed",
+		"review_cycle_started",
+		"review_cycle_completed",
+	}
+	for _, kind := range pipelineKinds {
+		if got := classify(kind); got != CatActivity {
+			t.Errorf("classify(%q) = %q, want %q (should be activity, not state)", kind, got, CatActivity)
+		}
+	}
+}
+
+func TestSnapshot_pipelineAdvisoriesSurviveRoundTrip(t *testing.T) {
+	// A pipeline job's pipeline.advisories field must reach the snapshot
+	// verbatim (the broker passes raw job JSON through without stripping fields).
+	th := newTestHub(t, 1024)
+
+	advisories := []map[string]any{
+		{
+			"id":       "adv-1",
+			"summary":  "Consider caching this hot path",
+			"target":   "human",
+			"severity": "advisory",
+			"reviewer": "perri",
+		},
+		{
+			"id":       "adv-2",
+			"summary":  "Naming could be clearer",
+			"target":   "human",
+			"severity": "advisory",
+			"reviewer": "ada",
+		},
+	}
+
+	th.injectJob(t, "pipeline-adv-job", map[string]any{
+		"id":    "pipeline-adv-job",
+		"kind":  "pipeline",
+		"state": "succeeded",
+		"pipeline": map[string]any{
+			"phase":       "done",
+			"review_cycle": 0,
+			"advisories":  advisories,
+		},
+		"pipeline_reviewed": true,
+	})
+
+	conn := th.connect(t)
+	// Drain hello.
+	_, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading hello: %v", err)
+	}
+
+	snap := subscribeSimple(t, conn, "all-jobs", []string{}, []string{"state", "activity"})
+	data := mustDecodeData(t, snap)
+
+	rawJobs, ok := data["jobs"]
+	if !ok {
+		t.Fatal("snapshot data has no jobs key")
+	}
+	jobsSlice, ok := rawJobs.([]any)
+	if !ok {
+		t.Fatalf("snapshot jobs is not []any, got %T", rawJobs)
+	}
+
+	var found map[string]any
+	for _, j := range jobsSlice {
+		jm, ok := j.(map[string]any)
+		if !ok {
+			continue
+		}
+		if jm["id"] == "pipeline-adv-job" {
+			found = jm
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("pipeline-adv-job not found in snapshot")
+	}
+
+	pipelineObj, ok := found["pipeline"].(map[string]any)
+	if !ok {
+		t.Fatalf("pipeline field missing or wrong type in snapshot job; got %T", found["pipeline"])
+	}
+	snapshotAdvisories, ok := pipelineObj["advisories"].([]any)
+	if !ok {
+		t.Fatalf("pipeline.advisories missing or wrong type; got %T", pipelineObj["advisories"])
+	}
+	if len(snapshotAdvisories) != 2 {
+		t.Errorf("pipeline.advisories count = %d, want 2", len(snapshotAdvisories))
+	}
+	first, ok := snapshotAdvisories[0].(map[string]any)
+	if !ok {
+		t.Fatalf("advisories[0] wrong type: %T", snapshotAdvisories[0])
+	}
+	if got := first["summary"]; got != "Consider caching this hot path" {
+		t.Errorf("advisories[0].summary = %q, want %q", got, "Consider caching this hot path")
+	}
+	if got := first["reviewer"]; got != "perri" {
+		t.Errorf("advisories[0].reviewer = %q, want %q", got, "perri")
 	}
 }
 

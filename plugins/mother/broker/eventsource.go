@@ -36,9 +36,22 @@ type rawEvent struct {
 //   - the seven state names           → state
 //   - awaiting_input                  → await
 //   - pause_requested / auto_resumed / paused_for_quota → quota
-//   - everything else (escalated, resumed, retried, cancel_requested,
-//     adherence_*, and the pipeline kinds phase_started/phase_completed/
-//     review_cycle_started/review_cycle_completed/findings_routed) → activity
+//   - everything else                 → activity
+//
+// The "everything else" bucket includes (non-exhaustive):
+//   escalated, resumed, retried, cancel_requested, adherence_*,
+//   and the pipeline events emitted by W4/W5:
+//     pipeline_review_started, pipeline_shipped, pipeline_blocked,
+//     pipeline_cap_hit, pipeline_cycle_continued, pipeline_phase_advance,
+//     pipeline_error,
+//     phase_started, phase_completed,          (W5 additive)
+//     review_cycle_started, review_cycle_completed.  (W5 additive)
+//
+// Pipeline-progress events are classified as activity, not state.  The job's
+// `state` field already drives CatState; these events are sub-state signals
+// that clients use for progress display, not for coarse job-state tracking.
+// Adding explicit CatState cases for them is reserved for a future enhancement
+// where a client needs to distinguish them from generic activity.
 //
 // current_activity and output are NOT sourced from the logs: current_activity
 // is derived from the transcript (activity.go) and output ships in W2.

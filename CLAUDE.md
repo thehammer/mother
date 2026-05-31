@@ -217,3 +217,55 @@ escalated jobs are never pulled back down by `conservative` posture.
 **New metrics fields** on each `runs.jsonl` line (since this feature):
 - `posture_at_spawn` — posture level observed at Cody-spawn time.
 - `posture_bias_applied` — action taken: `clamp`, `up1`, or `none`.
+
+## Pipeline visibility (W5)
+
+W5 makes the SDLC pipeline observable. Key surfaces:
+
+### `cycles` derived field on JSON output
+
+`mother list --format json` and `mother status --format json` attach a `cycles`
+array to `kind: "pipeline"` jobs. Standard jobs carry no `cycles` key (back-compat
+guaranteed by a regression test). The `cycles` array is derived at read time from
+`pipeline.*` fields and the events log — W4 does not store it.
+
+Schema per cycle:
+```json
+{"cycle": 1, "phases": [
+  {"agent": "redd",  "request_type": "test",    "state": "completed",
+   "started_at": "...", "finished_at": "..."},
+  {"agent": "cody",  "request_type": "build",   "state": "running", "started_at": "..."},
+  {"agent": "marty", "request_type": "refactor", "state": "pending"},
+  {"agent": "perri", "request_type": "review",  "state": "pending", "findings": 0}
+]}
+```
+
+- Cycle numbers are **1-indexed** in output (`pipeline.review_cycle` is 0-indexed internally).
+- Timestamps (`started_at`, `finished_at`) come from W5 events; absent if the phase
+  ran before W5 events were added.
+- Build agents not in `pending_agents` on re-run cycles carry `"state": "skipped"`.
+
+### New lifecycle events (W5 additive — W4 events preserved)
+
+These four events are emitted by `mother-runner` alongside the existing `pipeline_*`
+events. All classify as `activity` in the IPC broker (not `state`).
+
+| Event | Detail fields | When emitted |
+|---|---|---|
+| `phase_started` | `{cycle, agent, request_type}` | When driver advances a build phase to `ready` |
+| `phase_completed` | `{cycle, agent, request_type}` | When driver advances past a completed build phase |
+| `review_cycle_started` | `{cycle, reviewers}` | Alongside `pipeline_review_started` |
+| `review_cycle_completed` | `{cycle, decision, findings_count}` | After B4 decision, before state transitions |
+
+The `_pipeline_cycles_json` helper uses these events for timestamps. If they're absent
+(e.g. job ran pre-W5), timestamps are simply omitted.
+
+### Advisory findings — display and IPC
+
+- `mother status <id>` renders a distinct `Advisory findings:` block in the pipeline
+  section, listing each advisory with `[advisory] <summary> (<reviewer>)`.
+- `mother list <id>` appends ` · N advisor(y/ies)` to the `shipped` label when
+  `pipeline.advisories` is non-empty.
+- The IPC broker's `mother_jobs` snapshot includes `pipeline.advisories` verbatim in
+  the raw job JSON passthrough — no Go change needed; the field reaches clients
+  automatically once W4 writes it.
