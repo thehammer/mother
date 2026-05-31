@@ -22,19 +22,23 @@ mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" "$CURSORS_DIR" "$RU
 
 # ---------- primitives ----------
 
-# Microsecond-precision ISO timestamp so events emitted in the same second
-# sort correctly and the hook's cursor advances past all of them. Always
-# include fractional seconds so lexicographic and chronological orders match.
-# Uses /usr/bin/perl (universal on macOS, Time::HiRes in core) with an
-# absolute path so subshells with restricted PATH still get timestamps.
+# Millisecond-precision RFC 3339 timestamp (e.g. 2026-05-30T09:30:56.510Z).
+# Fractional seconds are always present so events emitted in the same second
+# sort correctly (lexicographic order matches chronological order) and the
+# hook's cursor advances past all of them. Millisecond (not microsecond)
+# precision is required: Swift's JSONDecoder .iso8601 strategy — used by the
+# Nostromo app to decode the mother_jobs IPC payload — rejects 6-digit
+# fractional seconds, which silently breaks job display. Uses /usr/bin/perl
+# (universal on macOS, Time::HiRes in core) with an absolute path so
+# subshells with restricted PATH still get timestamps.
 _iso_now() {
     /usr/bin/perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
         my ($s, $us) = gettimeofday();
         my @t = gmtime($s);
-        printf "%sT%s.%06dZ\n",
+        printf "%sT%s.%03dZ\n",
             strftime("%Y-%m-%d", @t),
             strftime("%H:%M:%S", @t),
-            $us;
+            int($us / 1000);
     '
 }
 
@@ -248,6 +252,28 @@ _resolve_posture() {
     esac
 }
 
+# _resolve_cost_model: best-effort detection of the account's billing mode.
+# Echoes one of: subscription | metered | unknown.
+# Degrades to `unknown` if bishop is absent, the call fails, the posture
+# file lacks a billing_mode key, or the value is unrecognised.
+_resolve_cost_model() {
+    local bm=""
+    if command -v bishop >/dev/null 2>&1; then
+        bm=$(bishop get billing_mode 2>/dev/null | tr -d '[:space:]')
+    fi
+    case "$bm" in
+        subscription|metered) echo "$bm"; return 0 ;;
+    esac
+    local pf="${BUDGET_POSTURE_FILE:-$HOME/.claude/budget-posture.json}"
+    if [ -r "$pf" ]; then
+        bm=$(jq -r '.billing_mode // empty' "$pf" 2>/dev/null | tr -d '[:space:]')
+    fi
+    case "$bm" in
+        subscription|metered) echo "$bm"; return 0 ;;
+    esac
+    echo "unknown"
+}
+
 # _apply_posture_bias: given a resolved tier and a posture, return the biased
 # tier per the rules. Echoes the new tier on stdout. Sets POSTURE_BIAS_ACTION
 # in the caller's scope to one of: clamp | up1 | none.
@@ -279,6 +305,192 @@ _apply_posture_bias() {
     esac
 }
 
+# ---------- pipeline visibility helpers ----------
+#
+# These helpers are pure (read-only; echo JSON/string to stdout) and are the
+# single source of truth for the derived pipeline-progress data surfaced by
+# `mother list`, `mother status`, and the JSON output paths.
+
+# _agent_request_type <agent>
+# Maps an agent name to its W1 request_type label. Used in both the runner
+# (event payloads) and the cycles-derivation helper.
+_agent_request_type() {
+    case "${1:-}" in
+        redd)  echo "test"    ;;
+        cody)  echo "build"   ;;
+        marty) echo "refactor" ;;
+        *)     echo "review"  ;;
+    esac
+}
+
+# _pipeline_list_label <job_file>
+# Returns a compact pipeline-status string for the `list` table state column.
+# Examples: "cycle 0 · Redd", "review · 2 findings", "blocked · 1 finding",
+# "shipped", "shipped · 2 advisories".
+# Pure function — reads job file, echoes string.
+_pipeline_list_label() {
+    local job_file="${1:-}"
+    [ -f "$job_file" ] || return 0
+    local phase cycle findings_count adv_count
+    phase=$(jq -r '.pipeline.phase // ""' "$job_file" 2>/dev/null) || phase=""
+    cycle=$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null) || cycle=0
+    findings_count=$(jq -r '.pipeline.findings // [] | length' "$job_file" 2>/dev/null) || findings_count=0
+    adv_count=$(jq -r '.pipeline.advisories // [] | length' "$job_file" 2>/dev/null) || adv_count=0
+
+    case "${phase:-}" in
+        review)
+            printf 'review · %s finding(s)\n' "${findings_count:-0}"
+            ;;
+        blocked)
+            printf 'blocked · %s finding(s)\n' "${findings_count:-0}"
+            ;;
+        done)
+            if [ "${adv_count:-0}" -gt 0 ]; then
+                if [ "${adv_count:-0}" -eq 1 ]; then
+                    printf 'shipped · 1 advisory\n'
+                else
+                    printf 'shipped · %s advisories\n' "${adv_count:-0}"
+                fi
+            else
+                printf 'shipped\n'
+            fi
+            ;;
+        redd|cody|marty)
+            # Title-case the agent name (bash 3.2 safe — no arrays or printf %q tricks).
+            local first rest
+            first=$(printf '%s' "${phase:0:1}" | tr '[:lower:]' '[:upper:]')
+            rest="${phase:1}"
+            printf 'cycle %s · %s%s\n' "${cycle:-0}" "$first" "$rest"
+            ;;
+        *)
+            printf '%s\n' "${phase:-unknown}"
+            ;;
+    esac
+}
+
+# _pipeline_cycles_json <job_file>
+# Derives the FR2 `cycles` array for a pipeline job from its pipeline.* fields
+# and the events log.  Echoes a JSON array to stdout.  Echoes nothing (empty)
+# for non-pipeline jobs so callers can test with [ -n "$output" ].
+#
+# Schema: [{cycle: N, phases: [{agent, request_type, state,
+#           [started_at], [finished_at], [findings]}]}]
+#
+# Cycle numbers are 1-indexed in the output (cycle 0 internally → "cycle": 1).
+# Timestamps come from phase_started / phase_completed / review_cycle_started /
+# review_cycle_completed events emitted by W5's runner changes; absent → omitted.
+_pipeline_cycles_json() {
+    local job_file="${1:-}"
+    [ -f "$job_file" ] || return 0
+    local kind
+    kind=$(jq -r '.kind // ""' "$job_file" 2>/dev/null) || return 0
+    [ "$kind" = "pipeline" ] || return 0
+
+    local id job_json events_json events_file
+    id=$(jq -r '.id' "$job_file" 2>/dev/null) || return 0
+    job_json=$(jq -c '.' "$job_file" 2>/dev/null) || return 0
+    events_file=$(_events_path "$id")
+    if [ -f "$events_file" ]; then
+        events_json=$(jq -cs '.' "$events_file" 2>/dev/null) || events_json="[]"
+    else
+        events_json="[]"
+    fi
+    [ -n "$events_json" ] || events_json="[]"
+
+    jq -n --argjson job "$job_json" --argjson events "$events_json" '
+      ($job.pipeline.review_cycle // 0) as $cur_cycle |
+      ($job.pipeline.phase // "") as $cur_phase |
+      ($job.pipeline.reviewers // []) as $reviewers |
+      ($job.pipeline.pending_agents // []) as $pending_agents |
+      ($job.pipeline.findings_history // []) as $findings_history |
+      ($job.pipeline.reviewer_findings // {}) as $reviewer_findings |
+      ($job.state // "") as $job_state |
+      ($job.activity // "") as $activity |
+
+      ["redd", "cody", "marty"] as $build_order |
+
+      def req_type:
+        if . == "redd" then "test"
+        elif . == "cody" then "build"
+        elif . == "marty" then "refactor"
+        else "review"
+        end;
+
+      def find_ts_agent($kind; $cycle; $agent):
+        ($events | map(select(
+          .kind == $kind and
+          .detail.cycle == $cycle and
+          .detail.agent == $agent
+        )) | first) | .ts;
+
+      def find_ts_cycle($kind; $cycle):
+        ($events | map(select(
+          .kind == $kind and
+          .detail.cycle == $cycle
+        )) | first) | .ts;
+
+      def build_state($agent; $is_active; $is_current):
+        if ($is_active | not) then "skipped"
+        elif ($is_current | not) then "completed"
+        elif ($cur_phase == "review" or $cur_phase == "done" or $cur_phase == "blocked") then "completed"
+        elif $cur_phase == $agent then
+          (if $job_state == "running" then "running" else "pending" end)
+        else
+          (($build_order | index($agent)) as $ai |
+           ($build_order | index($cur_phase)) as $pi |
+           if ($pi >= 0 and $ai < $pi) then "completed" else "pending" end)
+        end;
+
+      [range($cur_cycle + 1)] | map(
+        . as $icycle |
+        ($icycle == $cur_cycle) as $is_current |
+
+        # Active build agents: all on cycle 0; only pending_agents on re-run cycles.
+        (if ($is_current and $icycle > 0 and ($pending_agents | length) > 0)
+         then ($build_order | map(. as $a | select($pending_agents | index($a) != null)))
+         else $build_order
+         end) as $active |
+
+        # Build phase entries.
+        ($build_order | map(
+          . as $agent |
+          ($active | index($agent) != null) as $is_active |
+          build_state($agent; $is_active; $is_current) as $state |
+          (find_ts_agent("phase_started"; $icycle; $agent)) as $t0 |
+          (find_ts_agent("phase_completed"; $icycle; $agent)) as $t1 |
+          {agent: $agent, request_type: ($agent | req_type), state: $state}
+          | if $t0 != null then . + {started_at: $t0} else . end
+          | if $t1 != null then . + {finished_at: $t1} else . end
+        )) as $build_phases |
+
+        # Review phase entries (one per reviewer).
+        ($reviewers | map(
+          . as $reviewer |
+          (if $icycle < $cur_cycle then
+            (($findings_history
+              | map(select(.cycle == $icycle))
+              | first // {findings: []})
+            | .findings | map(select(.reviewer == $reviewer)) | length)
+          else
+            ($reviewer_findings[$reviewer] // [] | length)
+          end) as $fc |
+          (if $icycle < $cur_cycle then "completed"
+           elif $activity == "pipeline_review" then "running"
+           elif ($cur_phase == "done" or $cur_phase == "blocked") then "completed"
+           else "pending"
+           end) as $state |
+          (find_ts_cycle("review_cycle_started"; $icycle)) as $t0 |
+          (find_ts_cycle("review_cycle_completed"; $icycle)) as $t1 |
+          {agent: $reviewer, request_type: "review", state: $state, findings: $fc}
+          | if $t0 != null then . + {started_at: $t0} else . end
+          | if $t1 != null then . + {finished_at: $t1} else . end
+        )) as $review_phases |
+
+        {cycle: ($icycle + 1), phases: ($build_phases + $review_phases)}
+      )
+    ' 2>/dev/null
+}
+
 # Promote queued jobs whose dependencies are all succeeded to ready.
 _promote_ready() {
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f | while read -r f; do
@@ -292,6 +504,30 @@ _promote_ready() {
             [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
             case "$dep_state" in succeeded) ;; *) blocked=1; break ;; esac
         done
-        [ "$blocked" -eq 0 ] && _job_transition "$id" ready '{}'
+        if [ "$blocked" -eq 0 ]; then
+            _job_transition "$id" ready '{}'
+            # W5: emit the cycle-0 phase_started for the first build agent. The runner
+            # only emits phase_started on phase *advance* (cycle >= the first advance)
+            # and on new review cycles, so without this the initial Redd phase has no
+            # started_at in the derived cycles array.
+            local kind; kind=$(jq -r '.kind // ""' "$f" 2>/dev/null) || kind=""
+            if [ "$kind" = "pipeline" ]; then
+                local ph cyc
+                ph=$(jq -r '.pipeline.phase // ""' "$f" 2>/dev/null) || ph=""
+                cyc=$(jq -r '.pipeline.review_cycle // 0' "$f" 2>/dev/null) || cyc=0
+                case "$ph" in
+                    redd|cody|marty)
+                        if [ "${cyc:-0}" = "0" ]; then
+                            _append_event "$id" "phase_started" \
+                                "$(jq -nc \
+                                    --argjson cycle 0 \
+                                    --arg agent "$ph" \
+                                    --arg rt "$(_agent_request_type "$ph")" \
+                                    '{cycle: $cycle, agent: $agent, request_type: $rt}')"
+                        fi
+                        ;;
+                esac
+            fi
+        fi
     done
 }

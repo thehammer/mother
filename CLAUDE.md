@@ -82,7 +82,8 @@ plan-adherence review. Here's what was added and how to work with it.
 | `adherence_pending` | bool | True when a succeeded job awaits adherence review. |
 | `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. Audit trail only — do not use for operational logic. |
 | `adherence_notes` | string | Archie's notes from the last review (populated on fail). |
-| `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human). Cleared on resume. |
+| `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human) or `pipeline_phase` / `pipeline_review` / `pipeline_blocked` (pipeline jobs). Cleared on resume. |
+| `cost_model` | string | Account billing mode at enqueue time: `subscription`, `metered`, or `unknown`. Clients suppress dollar displays when `subscription`. |
 
 ### State machine
 
@@ -99,7 +100,11 @@ for display and routing.
 | `running` | `continuation` | Cody re-running after idle_timeout (auto-continuation) |
 | `awaiting` | (none) | Cody asked a question; answer with `mother resume` |
 | `awaiting` | `adherence_blocked` | Archie failed twice; human must review PR, then `resume` or `cancel` |
-| `succeeded` | — | terminal: all work done |
+| `running` | `pipeline_phase` | pipeline job: a build agent (redd/cody/marty) is actively running |
+| `ready` | `pipeline_phase` | pipeline job: next build agent queued (driver just advanced the phase) |
+| `succeeded` | `pipeline_review` | pipeline job: all build phases done, concurrent review in progress |
+| `awaiting` | `pipeline_blocked` | pipeline job: blocked for human (human-blocking finding, cap hit, or empty reviewers) |
+| `succeeded` | — | terminal: all work done (for pipeline jobs, set by the driver on ship) |
 | `failed` | — | terminal: gave up after escalation cap |
 | `cancelled` | — | terminal: explicitly cancelled |
 
@@ -123,15 +128,18 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 |---|---|---|
 | `no_pr` | bool | Set by `no_pr: true` in the plan YAML block. Skips the `no_pr_no_push` failure check. Success condition becomes "worker exited cleanly with commits on the branch." |
 | `continuation_count` | int | Number of auto-continuation attempts so far. Incremented each time an `idle_timeout` triggers a re-queue. |
+| `pipeline.review_cycle` | int | Number of review cycles completed so far (0-indexed). Incremented once per continue-cycle. Surfaced by W5 as `review_cycle_count`. |
 
 ### Kill switches
 
-All three background behaviours can be disabled without redeploying:
+All background behaviours can be disabled without redeploying:
 
 - `MOTHER_ESCALATION_ENABLED=0` — disable auto-escalation of failed jobs.
 - `MOTHER_ADHERENCE_ENABLED=0` — disable adherence review of succeeded jobs.
 - `MOTHER_CONTINUATIONS_ENABLED=0` — disable auto-continuation on idle_timeout.
 - `MOTHER_MAX_CONTINUATIONS=N` — cap continuation attempts (default: 3).
+- `MOTHER_PIPELINE_ENABLED=0` — disable the pipeline driver entirely; `kind: "pipeline"` jobs are left untouched by the driver.
+- `MOTHER_PIPELINE_CYCLE_CAP=N` — override the default cycle cap (default: 3) for pipeline jobs that do not set `pipeline.cycle_cap` themselves.
 
 ### Metrics file
 
@@ -151,6 +159,8 @@ Every terminal transition (succeeded or failed) appends a JSON line to
   "escalation_count": 1,
   "wall_time_seconds": 1234,
   "log_size_bytes": 56789,
+  "tokens_in": 850762,
+  "tokens_out": 5434,
   "pr_url": "https://github.com/..."
 }
 ```
@@ -209,3 +219,61 @@ escalated jobs are never pulled back down by `conservative` posture.
 **New metrics fields** on each `runs.jsonl` line (since this feature):
 - `posture_at_spawn` — posture level observed at Cody-spawn time.
 - `posture_bias_applied` — action taken: `clamp`, `up1`, or `none`.
+- `tokens_in` — total input tokens consumed by the worker transcript (sum of
+  `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` across
+  all assistant turns, de-duplicated by message id). JSON `null` when the
+  transcript is unavailable or contains no assistant events.
+- `tokens_out` — total output (generated) tokens across all assistant turns,
+  de-duplicated by message id. JSON `null` when the transcript is unavailable.
+
+## Pipeline visibility (W5)
+
+W5 makes the SDLC pipeline observable. Key surfaces:
+
+### `cycles` derived field on JSON output
+
+`mother list --format json` and `mother status --format json` attach a `cycles`
+array to `kind: "pipeline"` jobs. Standard jobs carry no `cycles` key (back-compat
+guaranteed by a regression test). The `cycles` array is derived at read time from
+`pipeline.*` fields and the events log — W4 does not store it.
+
+Schema per cycle:
+```json
+{"cycle": 1, "phases": [
+  {"agent": "redd",  "request_type": "test",    "state": "completed",
+   "started_at": "...", "finished_at": "..."},
+  {"agent": "cody",  "request_type": "build",   "state": "running", "started_at": "..."},
+  {"agent": "marty", "request_type": "refactor", "state": "pending"},
+  {"agent": "perri", "request_type": "review",  "state": "pending", "findings": 0}
+]}
+```
+
+- Cycle numbers are **1-indexed** in output (`pipeline.review_cycle` is 0-indexed internally).
+- Timestamps (`started_at`, `finished_at`) come from W5 events; absent if the phase
+  ran before W5 events were added.
+- Build agents not in `pending_agents` on re-run cycles carry `"state": "skipped"`.
+
+### New lifecycle events (W5 additive — W4 events preserved)
+
+These four events are emitted by `mother-runner` alongside the existing `pipeline_*`
+events. All classify as `activity` in the IPC broker (not `state`).
+
+| Event | Detail fields | When emitted |
+|---|---|---|
+| `phase_started` | `{cycle, agent, request_type}` | When driver advances a build phase to `ready` |
+| `phase_completed` | `{cycle, agent, request_type}` | When driver advances past a completed build phase |
+| `review_cycle_started` | `{cycle, reviewers}` | Alongside `pipeline_review_started` |
+| `review_cycle_completed` | `{cycle, decision, findings_count}` | After B4 decision, before state transitions |
+
+The `_pipeline_cycles_json` helper uses these events for timestamps. If they're absent
+(e.g. job ran pre-W5), timestamps are simply omitted.
+
+### Advisory findings — display and IPC
+
+- `mother status <id>` renders a distinct `Advisory findings:` block in the pipeline
+  section, listing each advisory with `[advisory] <summary> (<reviewer>)`.
+- `mother list <id>` appends ` · N advisor(y/ies)` to the `shipped` label when
+  `pipeline.advisories` is non-empty.
+- The IPC broker's `mother_jobs` snapshot includes `pipeline.advisories` verbatim in
+  the raw job JSON passthrough — no Go change needed; the field reaches clients
+  automatically once W4 writes it.

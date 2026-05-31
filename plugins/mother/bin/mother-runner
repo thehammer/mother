@@ -35,6 +35,16 @@ set -u
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/state.sh"
 
+# W1–W3 substrate libs — sourced if present so the pipeline driver has
+# findings helpers in-process. Guarded so runner builds even before W1–W3
+# are merged (set -u safe: each var is read, not assigned).
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/findings.sh" ]      && source "$MOTHER_LIB_DIR/findings.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/request-types.sh" ] && source "$MOTHER_LIB_DIR/request-types.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ]  && source "$MOTHER_LIB_DIR/phase-prompt.sh"
+
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
 MOTHER_SHUTDOWN_GRACE="${MOTHER_SHUTDOWN_GRACE:-30}"
@@ -44,10 +54,19 @@ MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
 # Kill switches: set to 0 to disable without redeploying.
 MOTHER_ESCALATION_ENABLED="${MOTHER_ESCALATION_ENABLED:-1}"
 MOTHER_ADHERENCE_ENABLED="${MOTHER_ADHERENCE_ENABLED:-1}"
+MOTHER_BROKER_ENABLED="${MOTHER_BROKER_ENABLED:-1}"
+MOTHER_PIPELINE_ENABLED="${MOTHER_PIPELINE_ENABLED:-1}"
+MOTHER_PIPELINE_CYCLE_CAP="${MOTHER_PIPELINE_CYCLE_CAP:-3}"
 
 PIDFILE="$RUNNER_DIR/runner.pid"
 CHILDREN_DIR="$RUNNER_DIR/children"
+BROKER_PIDFILE="$RUNNER_DIR/broker.pid"
 mkdir -p "$CHILDREN_DIR"
+
+# Broker restart backoff state (seconds). Reset to 1 whenever the broker is
+# observed alive; doubled (capped) on each restart attempt.
+_BROKER_BACKOFF=1
+_BROKER_NEXT_RESTART=0
 
 SHUTDOWN=0
 
@@ -118,6 +137,65 @@ _supervisor_alive_for_job() {
         fi
     done
     return 1
+}
+
+# ---------- broker supervision (B9) ----------
+#
+# The IPC broker is a long-lived Go sidecar that fans out state/activity/
+# await/quota/current_activity events to connected clients and routes
+# answer/cancel/retry commands back through the `mother` CLI. The daemon
+# supervises it: started when the daemon starts, SIGTERM'd on drain, and
+# restarted with bounded backoff if it dies. Everything is gated behind
+# MOTHER_BROKER_ENABLED (default 1) so the daemon runs identically to before
+# when the broker is disabled.
+
+_broker_pid() {
+    [ -f "$BROKER_PIDFILE" ] && cat "$BROKER_PIDFILE" 2>/dev/null || echo ""
+}
+
+_broker_alive() {
+    local p; p=$(_broker_pid)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+_start_broker() {
+    [ "$MOTHER_BROKER_ENABLED" = "1" ] || return 0
+    _broker_alive && return 0
+    # Detach like the job workers: nohup + background + disown so daemon
+    # signals don't cascade. The broker tees its own diagnostics to
+    # logs/broker.log.
+    nohup "$MOTHER_BIN_DIR/mother-broker" </dev/null >>"$LOGS_DIR/broker.log" 2>&1 &
+    local pid=$!
+    disown 2>/dev/null || true
+    echo "$pid" > "$BROKER_PIDFILE"
+    _log "started broker (pid $pid)"
+}
+
+_stop_broker() {
+    local p; p=$(_broker_pid)
+    [ -n "$p" ] || return 0
+    if kill -0 "$p" 2>/dev/null; then
+        kill -TERM "$p" 2>/dev/null || true
+        _log "stopped broker (pid $p)"
+    fi
+    rm -f "$BROKER_PIDFILE"
+}
+
+# _reap_broker: if the broker is enabled but not alive, restart it once the
+# backoff window has elapsed. Called each loop tick.
+_reap_broker() {
+    [ "$MOTHER_BROKER_ENABLED" = "1" ] || return 0
+    if _broker_alive; then
+        _BROKER_BACKOFF=1
+        return 0
+    fi
+    local now; now=$(date +%s)
+    [ "$now" -ge "$_BROKER_NEXT_RESTART" ] || return 0
+    _log "broker not running — restarting (backoff=${_BROKER_BACKOFF}s)"
+    _start_broker
+    _BROKER_NEXT_RESTART=$((now + _BROKER_BACKOFF))
+    _BROKER_BACKOFF=$((_BROKER_BACKOFF * 2))
+    [ "$_BROKER_BACKOFF" -gt 30 ] && _BROKER_BACKOFF=30
 }
 
 # ---------- ready-job selection ----------
@@ -463,9 +541,361 @@ _run_adherence_pending() {
     fi
 }
 
+# ---------- pipeline driver ----------
+#
+# W4: orchestrates pipeline jobs (kind="pipeline") through the multi-phase
+# SDLC loop. Advances build phases (redd→cody→marty), runs concurrent reviews
+# (Ada + Archie + Perri), and applies the B4 loop-exit truth table (ship /
+# block_human / cap-hit / continue) on every review cycle.
+#
+# Gated by MOTHER_PIPELINE_ENABLED (default 1).
+
+_PIPELINE_DRIVER_LOCK="$RUNNER_DIR/pipeline-driver.lockdir"
+
+# _pipeline_next_build_phase <current> [pending_agents_newline_separated]
+# Returns the next eligible phase after <current> in forward order
+# (redd → cody → marty), restricted to agents in <pending_agents> when
+# non-empty. Prints nothing if we have reached the end.
+_pipeline_next_build_phase() {
+    local current="$1" pending="${2:-}"
+    local found=0 p
+    for p in redd cody marty; do
+        if [ "$found" -eq 1 ]; then
+            if [ -z "$pending" ] || printf '%s\n' "$pending" | grep -qxF "$p"; then
+                printf '%s\n' "$p"
+                return 0
+            fi
+        fi
+        [ "$p" = "$current" ] && found=1
+    done
+    return 0
+}
+
+# _pipeline_first_pending_agent <pending_agents_newline_separated>
+# Returns the first agent in forward order that appears in pending_agents.
+# Fallback to "cody" if empty (should not happen).
+_pipeline_first_pending_agent() {
+    local pending="${1:-}"
+    local p
+    for p in redd cody marty; do
+        printf '%s\n' "$pending" | grep -qxF "$p" && { printf '%s\n' "$p"; return 0; }
+    done
+    printf 'cody\n'
+}
+
+# _run_pipeline_review <id> <job_file>
+# Run the concurrent review phase for a pipeline job at phase=review.
+# Must be called while the pipeline driver lock is held.
+_run_pipeline_review() {
+    local id="$1" job_file="$2"
+
+    # Read reviewer list (newline-separated agent names).
+    local reviewers
+    reviewers=$(jq -r '.pipeline.reviewers // [] | .[]' "$job_file" 2>/dev/null) || reviewers=""
+
+    # Empty reviewer list is a misconfiguration — block for human.
+    if [ -z "$reviewers" ]; then
+        _log "pipeline: $id: empty reviewer list — blocking (pipeline_error)"
+        local now; now=$(_iso_now)
+        _job_update "$id" \
+            ".state = \"awaiting\" | .activity = \"pipeline_blocked\" | .pipeline.phase = \"blocked\" | .paused_at = \"$now\""
+        _append_event "$id" "pipeline_error" \
+            "$(jq -nc '{note: "empty reviewer list — pipeline blocked for human"}')"
+        return 0
+    fi
+
+    local review_cycle reviewers_json
+    review_cycle=$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null) || review_cycle=0
+    reviewers_json=$(jq -c '.pipeline.reviewers // []' "$job_file" 2>/dev/null) || reviewers_json="[]"
+
+    _log "pipeline: $id: concurrent review started (cycle=${review_cycle:-0})"
+    _job_update "$id" '.activity = "pipeline_review"'
+    _append_event "$id" "pipeline_review_started" \
+        "$(jq -nc --argjson cycle "${review_cycle:-0}" '{review_cycle: $cycle}')"
+    # W5 lifecycle event: review cycle start (additive alongside pipeline_review_started).
+    _append_event "$id" "review_cycle_started" \
+        "$(jq -nc \
+            --argjson cycle "${review_cycle:-0}" \
+            --argjson reviewers "${reviewers_json:-[]}" \
+            '{cycle: $cycle, reviewers: $reviewers}')"
+
+    # Spawn all reviewers in parallel — each writes to its own
+    # .pipeline.reviewer_findings.<reviewer> slot (W3 per-slot writes are
+    # isolated, so concurrent writers cannot clobber each other).
+    local review_log pids r
+    review_log="$LOGS_DIR/$id.pipeline-review.log"
+    pids=""
+    for r in $reviewers; do
+        _log "pipeline: $id: spawning reviewer $r"
+        "$MOTHER_BIN_DIR/mother" review-phase "$id" --reviewer "$r" \
+            >>"$review_log" 2>&1 &
+        pids="$pids $!"
+    done
+
+    # Wait for all reviewers. A reviewer returning 2 (parse error per W3) is
+    # tolerated: logged, treated as no findings for that slot, review continues.
+    local p
+    for p in $pids; do
+        wait "$p" 2>/dev/null \
+            || _log "pipeline: $id: a reviewer returned non-zero (tolerated — treated as no findings)"
+    done
+
+    # Merge all per-reviewer findings slots into a single re-id'd array.
+    local merged_findings
+    merged_findings=$("$MOTHER_BIN_DIR/mother" merge-findings "$id" 2>/dev/null) || merged_findings="[]"
+    [ -z "$merged_findings" ] && merged_findings="[]"
+
+    # Reload from disk (reviewers mutated the file; our local $job_file is stale).
+    local jf; jf=$(_job_path "$id")
+
+    # Snapshot current .pipeline.findings into history, then write merged set.
+    local old_findings history_entry merged_jf
+    old_findings=$(jq -c '.pipeline.findings // []' "$jf" 2>/dev/null) || old_findings="[]"
+    history_entry=$(jq -nc \
+        --argjson cycle "${review_cycle:-0}" \
+        --argjson findings "$old_findings" \
+        '{cycle: $cycle, findings: $findings}')
+    merged_jf=$(jq \
+        --argjson findings "$merged_findings" \
+        --argjson history_entry "$history_entry" \
+        '.pipeline.findings = $findings | .pipeline.findings_history += [$history_entry]' \
+        "$jf") && _atomic_write "$jf" "$merged_jf"
+
+    # Re-read for B4 decision (in case the above write raced with a reviewer).
+    jf=$(_job_path "$id")
+
+    # Resolve cycle cap: per-job value beats env default.
+    local cap
+    cap=$(jq -r ".pipeline.cycle_cap // ${MOTHER_PIPELINE_CYCLE_CAP:-3}" "$jf" 2>/dev/null) \
+        || cap="${MOTHER_PIPELINE_CYCLE_CAP:-3}"
+    [ -z "$cap" ] || [ "$cap" = "null" ] && cap="${MOTHER_PIPELINE_CYCLE_CAP:-3}"
+
+    # B4 exit truth table.
+    local decision
+    decision=$(findings_exit_decision "$merged_findings" 2>/dev/null) || decision="ship"
+
+    # W5 lifecycle event: review cycle completed (emitted before the B4 branch
+    # so the timestamp precedes any state transitions caused by the decision).
+    local findings_count_ev
+    findings_count_ev=$(printf '%s' "$merged_findings" | jq 'length' 2>/dev/null) || findings_count_ev=0
+    _append_event "$id" "review_cycle_completed" \
+        "$(jq -nc \
+            --argjson cycle "${review_cycle:-0}" \
+            --arg decision "$decision" \
+            --argjson findings_count "${findings_count_ev:-0}" \
+            '{cycle: $cycle, decision: $decision, findings_count: $findings_count}')"
+
+    local now; now=$(_iso_now)
+    case "$decision" in
+
+        block_human)
+            # Short-circuit: human-blocking finding — stop immediately.
+            _log "pipeline: $id: human-blocking finding — blocking job (pipeline_blocked)"
+            _job_update "$id" \
+                ".state = \"awaiting\" | .activity = \"pipeline_blocked\" | .pipeline.phase = \"blocked\" | .paused_at = \"$now\""
+            _append_event "$id" "pipeline_blocked" \
+                "$(jq -nc --argjson findings "$merged_findings" \
+                    '{reason: "human_blocking_finding", findings: $findings}')"
+            ;;
+
+        ship)
+            # No agent-actionable findings — ship.
+            _log "pipeline: $id: zero agent-actionable findings — shipping (pipeline_shipped)"
+            local advisories adv_count
+            advisories=$(findings_by_target "$merged_findings" "human" 2>/dev/null) || advisories="[]"
+            adv_count=$(printf '%s' "$advisories" | jq 'length' 2>/dev/null) || adv_count=0
+            local shipped
+            shipped=$(jq \
+                --argjson advisories "$advisories" \
+                --arg now "$now" \
+                '.state = "succeeded"
+                | .activity = null
+                | .pipeline.phase = "done"
+                | .pipeline_reviewed = true
+                | .pipeline.advisories = $advisories
+                | .finished_at = $now' \
+                "$jf") && _atomic_write "$jf" "$shipped"
+            _append_event "$id" "pipeline_shipped" \
+                "$(jq -nc --argjson advisories "$advisories" '{advisories: $advisories}')"
+            # Best-effort: post advisory findings as a PR comment so the human
+            # sees them on the shipped PR. Non-fatal if gh is unavailable.
+            if [ "${adv_count:-0}" -gt 0 ]; then
+                local pr_url
+                pr_url=$(jq -r '.pr_url // empty' "$jf" 2>/dev/null) || pr_url=""
+                if [ -n "${pr_url:-}" ]; then
+                    local adv_body
+                    adv_body=$(printf '%s' "$advisories" \
+                        | jq -r '.[] | "- [\(.severity)] \(.summary)"' 2>/dev/null) || adv_body=""
+                    gh pr comment "$pr_url" \
+                        --body "$(printf '## Pipeline Advisory Findings\n\n%s' "$adv_body")" \
+                        2>/dev/null \
+                        || _log "pipeline: $id: advisory PR comment failed (best-effort, ignored)"
+                fi
+            fi
+            ;;
+
+        continue)
+            # Agent-actionable findings remain. Check cap first.
+            local next_cycle
+            next_cycle=$(( ${review_cycle:-0} + 1 ))
+            if [ "$next_cycle" -gt "${cap:-3}" ]; then
+                _log "pipeline: $id: cycle cap hit (review_cycle=${review_cycle:-0}, cap=${cap:-3}) — blocking"
+                _job_update "$id" \
+                    ".state = \"awaiting\" | .activity = \"pipeline_blocked\" | .pipeline.phase = \"blocked\" | .paused_at = \"$now\""
+                _append_event "$id" "pipeline_cap_hit" \
+                    "$(jq -nc \
+                        --argjson cycle "${review_cycle:-0}" \
+                        --argjson cap "${cap:-3}" \
+                        --argjson findings "$merged_findings" \
+                        '{review_cycle: $cycle, cap: $cap, outstanding: $findings}')"
+            else
+                # Continue: increment cycle, compute pending_agents (B5), re-ready.
+                _log "pipeline: $id: agent findings found — continuing (cycle ${review_cycle:-0} -> $next_cycle)"
+                local pending_json pending_agents first_agent
+                pending_json=$(printf '%s' "$merged_findings" | jq -c \
+                    '[.[] | select(.target == "redd" or .target == "cody" or .target == "marty") | .target] | unique' \
+                    2>/dev/null) || pending_json="[]"
+                pending_agents=$(printf '%s' "$pending_json" | jq -r '.[]' 2>/dev/null) \
+                    || pending_agents=""
+                first_agent=$(_pipeline_first_pending_agent "$pending_agents")
+                local continued
+                continued=$(jq \
+                    --arg phase "$first_agent" \
+                    --argjson pending_agents "$pending_json" \
+                    --argjson next_cycle "$next_cycle" \
+                    '.pipeline.phase = $phase
+                    | .pipeline.pending_agents = $pending_agents
+                    | .pipeline.review_cycle = $next_cycle
+                    | .state = "ready"
+                    | .activity = "pipeline_phase"
+                    | .finished_at = null
+                    | .started_at = null
+                    | .worker_pid = null
+                    | .actual_cost_usd = null
+                    | .cancel_requested = null
+                    | .pause_requested = null
+                    | .final_result_at = null' \
+                    "$jf") && _atomic_write "$jf" "$continued"
+                _append_event "$id" "pipeline_cycle_continued" \
+                    "$(jq -nc \
+                        --argjson cycle "$next_cycle" \
+                        --argjson pending_agents "$pending_json" \
+                        '{review_cycle: $cycle, pending_agents: $pending_agents}')"
+                # W5 lifecycle event: start the first build phase of the new cycle.
+                _append_event "$id" "phase_started" \
+                    "$(jq -nc \
+                        --argjson cycle "$next_cycle" \
+                        --arg agent "$first_agent" \
+                        --arg rt "$(_agent_request_type "$first_agent")" \
+                        '{cycle: $cycle, agent: $agent, request_type: $rt}')"
+            fi
+            ;;
+    esac
+}
+
+# _run_pipeline_job — per-tick pipeline orchestrator.
+# Finds the first pipeline job that is actionable this tick and advances it
+# one step: build-phase succeeded → advance phase; review phase reached →
+# run concurrent review + B4 exit decision. Serialized by a mkdir lock;
+# one pipeline step per tick.
+_run_pipeline_job() {
+    [ "${MOTHER_PIPELINE_ENABLED:-1}" = "1" ] || return 0
+
+    if ! mkdir "$_PIPELINE_DRIVER_LOCK" 2>/dev/null; then
+        return 0  # another tick's driver run still holds the lock
+    fi
+
+    local f state kind pipeline_phase id
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        kind=$(jq -r '.kind // ""' "$f" 2>/dev/null) || continue
+        [ "$kind" = "pipeline" ] || continue
+        state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
+        [ "$state" = "succeeded" ] || continue
+        pipeline_phase=$(jq -r '.pipeline.phase // ""' "$f" 2>/dev/null) || continue
+        # done/blocked are terminal pipeline phases; skip.
+        case "$pipeline_phase" in done|blocked|"") continue ;; esac
+        id=$(jq -r '.id' "$f")
+
+        case "$pipeline_phase" in
+
+            redd|cody|marty)
+                # Build phase just succeeded. Advance to the next eligible agent
+                # (B5 skip: only agents in pending_agents are eligible on re-runs).
+                local pending_agents next_phase review_cycle
+                pending_agents=$(jq -r '.pipeline.pending_agents // [] | .[]' "$f" 2>/dev/null) \
+                    || pending_agents=""
+                review_cycle=$(jq -r '.pipeline.review_cycle // 0' "$f" 2>/dev/null) \
+                    || review_cycle=0
+                next_phase=$(_pipeline_next_build_phase "$pipeline_phase" "$pending_agents")
+
+                if [ -n "$next_phase" ]; then
+                    _log "pipeline: $id: phase=$pipeline_phase succeeded — advancing to $next_phase"
+                    local advanced
+                    advanced=$(jq --arg phase "$next_phase" \
+                        '.pipeline.phase = $phase
+                        | .state = "ready"
+                        | .activity = "pipeline_phase"
+                        | .finished_at = null
+                        | .started_at = null
+                        | .worker_pid = null
+                        | .actual_cost_usd = null
+                        | .cancel_requested = null
+                        | .pause_requested = null
+                        | .final_result_at = null' \
+                        "$f") && _atomic_write "$f" "$advanced"
+                    _append_event "$id" "pipeline_phase_advance" \
+                        "$(jq -nc --arg from "$pipeline_phase" --arg to "$next_phase" \
+                            '{from: $from, to: $to}')"
+                    # W5 lifecycle events: complete the old phase, start the new one.
+                    _append_event "$id" "phase_completed" \
+                        "$(jq -nc \
+                            --argjson cycle "${review_cycle:-0}" \
+                            --arg agent "$pipeline_phase" \
+                            --arg rt "$(_agent_request_type "$pipeline_phase")" \
+                            '{cycle: $cycle, agent: $agent, request_type: $rt}')"
+                    _append_event "$id" "phase_started" \
+                        "$(jq -nc \
+                            --argjson cycle "${review_cycle:-0}" \
+                            --arg agent "$next_phase" \
+                            --arg rt "$(_agent_request_type "$next_phase")" \
+                            '{cycle: $cycle, agent: $agent, request_type: $rt}')"
+                else
+                    # No more eligible build agents — move to review phase.
+                    # Keep state=succeeded so the driver picks it up next tick.
+                    # B6: do NOT touch current_tier or escalation_count.
+                    _log "pipeline: $id: phase=$pipeline_phase succeeded — all build phases done, moving to review"
+                    _job_update "$id" \
+                        ".pipeline.phase = \"review\" | .activity = \"pipeline_review\""
+                    _append_event "$id" "pipeline_phase_advance" \
+                        "$(jq -nc --arg from "$pipeline_phase" --arg to "review" '{from: $from, to: $to}')"
+                    # W5 lifecycle event: complete the last build phase.
+                    _append_event "$id" "phase_completed" \
+                        "$(jq -nc \
+                            --argjson cycle "${review_cycle:-0}" \
+                            --arg agent "$pipeline_phase" \
+                            --arg rt "$(_agent_request_type "$pipeline_phase")" \
+                            '{cycle: $cycle, agent: $agent, request_type: $rt}')"
+                fi
+                break
+                ;;
+
+            review)
+                # All build phases done. Run concurrent review + B4.
+                _run_pipeline_review "$id" "$f"
+                break
+                ;;
+
+        esac
+    done
+
+    rmdir "$_PIPELINE_DRIVER_LOCK" 2>/dev/null || true
+}
+
 _loop() {
     while [ "$SHUTDOWN" -eq 0 ]; do
         _reap_children
+        _reap_broker
         _recover_orphans "$MOTHER_ORPHAN_GRACE"
         # Auto-resume system-paused jobs whose window has rolled over
         # BEFORE _promote_ready, so resumed jobs are eligible for the
@@ -478,6 +908,10 @@ _loop() {
         # Process adherence-pending jobs (after reaping so fresh succeeded
         # state is visible).
         _run_adherence_pending
+        # Advance pipeline jobs one step per tick (build-phase transitions,
+        # concurrent review, B4 exit decision). After adherence so build-phase
+        # succeeded state is fully settled before the driver sees it.
+        [ "${MOTHER_PIPELINE_ENABLED:-1}" = "1" ] && _run_pipeline_job
 
         if _quota_check; then
             # Under cap — normal dispatch.
@@ -504,6 +938,7 @@ _loop() {
 }
 
 _drain() {
+    _stop_broker
     _log "drain: waiting up to ${MOTHER_SHUTDOWN_GRACE}s for ${MOTHER_CONCURRENCY} slots to clear"
     local elapsed=0
     while [ "$elapsed" -lt "$MOTHER_SHUTDOWN_GRACE" ]; do
@@ -527,11 +962,22 @@ main() {
     trap '_on_signal' TERM INT
     _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
     _recover_orphans
+    _start_broker
     _loop
     _drain
     _remove_pidfile
     _log "mother-runner exited"
     exit 0
 }
+
+# Test entry point: run one pipeline driver tick and exit without starting
+# the daemon loop. Used by pipeline_driver.bats.
+# Usage: mother-runner --driver-tick
+case "${1:-}" in
+    --driver-tick)
+        _run_pipeline_job
+        exit 0
+        ;;
+esac
 
 main "$@"
