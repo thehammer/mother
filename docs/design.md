@@ -372,7 +372,7 @@ Each phase is independently useful.
 
 ---
 
-## Broker / IPC protocol (W1)
+## Broker / IPC protocol (W1 + W2)
 
 The **broker** is a long-lived Go sidecar that gives clients a single bidirectional
 connection over which they get current state, receive every subsequent change as a
@@ -469,7 +469,7 @@ fold so the snapshot is consistent with the live stream.
 | `await` | `awaiting_input` (carries question) | Resync — snapshot job record carries `question`/`paused_reason`. |
 | `current_activity` | broker-derived from the worker transcript | None (ephemeral); snapshot carries the latest value, no history. |
 | `quota` | `pause_requested`/`auto_resumed`/`paused_for_quota` | Resync for current pause state; live changes pushed. |
-| `output` | worker session stream | **W2 — deferred**; advertised as absent in W1's `hello`. |
+| `output` | worker session stream (W2) | **Best-effort log-backed replay** — bounded tail on subscribe; live tail thereafter. See §output category below. |
 
 **Per-job ordering is guaranteed** (each job's events come from one append-only log,
 read in file order). **Cross-job global ordering is not promised**; each event carries
@@ -488,7 +488,95 @@ The broker tails each running job's Claude transcript (resolved via `session_id`
 `work_dir`, the same logic `mother peek` uses) and, on each new `tool_use`, pushes a
 `current_activity` event with the rendered string (e.g. `"Edit: src/lib.rs"`) — the
 polled field becomes a pushed value, with no client-side file I/O. The full
-turn-by-turn `output` stream is W2.
+turn-by-turn `output` stream is covered in §output category below.
+
+### Output category (W2)
+
+The `output` category delivers structured worker session output over the existing
+connection — no new on-disk format, no new writer, no shared-filesystem delivery. Each
+worker's entire output is already captured as **newline-delimited stream-json** in
+`$MOTHER_ROOT/logs/<id>.log` (written by `mother-run-job`'s `tee` wrapper). The broker
+tails that file, classifies each stream-json line into a typed `output` event, and fans
+it out in-band to subscribed clients.
+
+#### Event schema
+
+Every `output` event has `t = "output"`, `dir = "event"`, and `data` carrying at minimum:
+
+| `data` field | Type | Meaning |
+|---|---|---|
+| `category` | `"output"` | Always. Injected by the hub. |
+| `job` | string | Job ID. Injected by the hub. |
+| `subtype` | string | One of the sub-types below. |
+
+Sub-type-specific fields:
+
+| `data.subtype` | Source stream-json line | Additional `data` fields |
+|---|---|---|
+| `"system"` | `{"type":"system","subtype":"init",…}` | `session` (session ID), `model` |
+| `"text"` | assistant message, content part `type:"text"` | `text` (the assistant's prose) |
+| `"tool_use"` | assistant message, content part `type:"tool_use"` | `tool` (name), `brief` (one-line input summary, ≤110 runes) |
+| `"tool_result"` | user message, content part `type:"tool_result"` | `is_error` (bool), `size` (raw content bytes), `preview` (≤512 runes; `truncated:true` + `size` when elided) |
+| `"result"` | `{"type":"result",…}` | `subtype_val` (e.g. `"success"`), `cost_usd`, `duration_ms` |
+| `"gap"` | synthetic (slow-client marker) | `dropped` (int — number of output events that were dropped) |
+
+**Path safety (B2):** tool inputs that contain filesystem paths are rendered into the
+`brief` string as display content only. No `output` event carries a path-typed field at
+the top level that a client is expected to open.
+
+**Volume bounding (B9):** `tool_result.preview` is truncated at 512 runes; oversized
+results carry `truncated:true` and the original `size` in bytes. Banner lines
+(`=== mother job … ===`) and blank/malformed/partial lines produce no events.
+
+#### Reconnect semantics — best-effort log-backed replay
+
+On `subscribe … categories:["output"]`, the broker performs a best-effort replay of the
+job's recent output **before** registering the live tail, all under the hub's fan-out
+lock so the replay/live boundary has no gap and no duplicate:
+
+1. The broker reads the last `MOTHER_BROKER_OUTPUT_REPLAY_BYTES` (default 65536) of
+   `<id>.log` up to the committed byte offset of the output tail.
+2. Parsed lines are enqueued as `output` events ahead of the live tail.
+3. The live tail then starts exactly at the committed offset — no dup, no gap.
+
+The replay is **explicitly not a guaranteed full history**: a multi-megabyte log does
+not replay in full. Clients that need complete history should read the log file directly
+(best-effort, out-of-band).
+
+`output` events are **not folded into the `snapshot`**. The snapshot delivers
+authoritative job state; `output` is a stream, not state.
+
+For a job that has already finished (`state != "running"`), an `output` subscribe is
+valid but yields only the bounded replay (if a log exists) with no subsequent live events.
+
+#### Backpressure — gap marker, not disconnect
+
+W1's policy for `state`/`await`/etc. is **drop the client** on outbound-buffer overflow
+(losing a state transition corrupts the client's view). `output` is high-volume and
+replayable, so it uses a softer policy:
+
+1. The per-client bounded send channel (`MOTHER_BROKER_CLIENT_BUF`, default 1024) and
+   non-blocking dispatch are unchanged — the fan-out loop never blocks on a slow client.
+2. When an `output` event fails to enqueue (buffer full), the broker **does not drop
+   the client**. Instead it increments the subscription's drop counter and sets a
+   `pendingGap` flag.
+3. On the next **successful** output enqueue for that subscription, the broker first
+   emits a synthetic `output` event `subtype:"gap", data.dropped:<n>`, resetting the
+   counter. The client learns "you missed N output events here."
+4. Non-output events (`state`, `await`, etc.) keep the W1 hard-drop semantics
+   unchanged.
+5. **Hard ceiling:** if a subscription's drop counter exceeds
+   `MOTHER_BROKER_OUTPUT_MAX_GAP` (default 10000) — indicating a durably wedged client,
+   not a transient burst — the broker falls back to W1's drop-the-client path.
+
+#### Configuration knobs
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MOTHER_BROKER_OUTPUT_ENABLED` | `1` | Master switch. When `0`, `output` is absent from `hello.capabilities` and `subscribe categories:["output"]` returns `malformed`. |
+| `MOTHER_BROKER_OUTPUT_SEC` | `1` | Poll interval for `<id>.log` tailing (seconds). |
+| `MOTHER_BROKER_OUTPUT_REPLAY_BYTES` | `65536` | Byte window for best-effort replay on subscribe. |
+| `MOTHER_BROKER_OUTPUT_MAX_GAP` | `10000` | Per-subscription dropped-output ceiling before hard client drop. |
 
 ### Errors (B8)
 
@@ -513,8 +601,11 @@ Every `ack` carries `data.ok` (bool). On failure, `data.error = {code, message}`
   dropping the client. Inbound silence is NOT a drop condition: a pure subscriber that
   only listens stays connected.
 - **Backpressure:** each client has a bounded outbound buffer
-  (`MOTHER_BROKER_CLIENT_BUF`, default 1024 messages). On overflow the broker drops the
-  slowest client rather than blocking the fan-out — a slow client harms only itself.
+  (`MOTHER_BROKER_CLIENT_BUF`, default 1024 messages). For non-output categories, on
+  overflow the broker drops the slowest client rather than blocking the fan-out — a slow
+  client harms only itself. For the `output` category the broker uses a softer
+  gap-marker policy (see §output category above), falling back to a hard drop only when
+  the gap counter exceeds `MOTHER_BROKER_OUTPUT_MAX_GAP`.
 - **Lifecycle:** supervised by `mother-runner` (bounded restart with backoff). During a
   restart, connecting clients get connection-refused; mid-stream clients see EOF and
   should reconnect with backoff (the `unavailable` notice distinguishes this from a

@@ -19,6 +19,11 @@ type subscription struct {
 	allJobs    bool            // true when jobs includes "all" (or is empty)
 	jobs       map[string]bool // explicit job-id allow-set
 	categories map[string]bool // category allow-set
+
+	// Output backpressure state. Guarded by hub.mu (only touched in
+	// deliverLocked / deliverOutputLocked, both called under h.mu).
+	gapCount   int  // number of output events dropped since last successful delivery
+	pendingGap bool // true when a gap marker must be prepended on the next delivery
 }
 
 // subscribeArgs is the data payload of a `subscribe` command.
@@ -69,6 +74,12 @@ func (s *subscription) matches(ev rawEvent) bool {
 	return s.jobs[ev.jobID]
 }
 
+// matchesJob reports whether this subscription covers the given job ID.
+// Used by the replay path in the hub's subscribe handler.
+func (s *subscription) matchesJob(jobID string) bool {
+	return s.allJobs || s.jobs[jobID]
+}
+
 // selectedJobIDs returns the explicit job ids for snapshot scoping, or nil
 // when the subscription covers all jobs (caller enumerates the store).
 func (s *subscription) selectedJobIDs() []string {
@@ -83,15 +94,16 @@ func (s *subscription) selectedJobIDs() []string {
 	return out
 }
 
-// validCategories reports whether every requested category is one this W1
-// broker can deliver. Unknown/absent categories (e.g. "output" in W1) make
-// the subscribe a malformed request.
+// validCategories reports whether every requested category is one this broker
+// can currently deliver. Uses liveCategories (the runtime-active set, which
+// excludes CatOutput when MOTHER_BROKER_OUTPUT_ENABLED=0) so the validation
+// and the hello capabilities advertisement always agree.
 func validCategories(cats []string) bool {
 	if len(cats) == 0 {
 		return false
 	}
 	allowed := map[string]bool{}
-	for _, c := range w1Categories {
+	for _, c := range liveCategories {
 		allowed[c] = true
 	}
 	for _, c := range cats {

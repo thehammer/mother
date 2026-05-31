@@ -192,8 +192,36 @@ func TestHandshake_helloCapabilitiesIncludesW1CategoriesAndCommands(t *testing.T
 	}
 }
 
-func TestHandshake_helloCapabilitiesExcludesOutput(t *testing.T) {
-	// "output" ships in W2 — W1 must NOT advertise it.
+func TestHandshake_helloCapabilitiesIncludesOutput(t *testing.T) {
+	// W2: with the default liveCategories (output enabled), hello must advertise "output".
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+
+	hello, _ := readNext(t, conn)
+	data := mustDecodeData(t, hello)
+	rawCaps := data["capabilities"].([]any)
+	capSet := map[string]bool{}
+	for _, c := range rawCaps {
+		capSet[c.(string)] = true
+	}
+	if !capSet[CatOutput] {
+		t.Errorf("hello capabilities missing %q — W2 must advertise output by default", CatOutput)
+	}
+}
+
+func TestHandshake_helloCapabilitiesExcludesOutput_whenDisabled(t *testing.T) {
+	// When liveCategories is set without CatOutput (simulating
+	// MOTHER_BROKER_OUTPUT_ENABLED=0), hello must NOT advertise "output".
+	prev := liveCategories
+	live := make([]string, 0, len(w1Categories)-1)
+	for _, c := range w1Categories {
+		if c != CatOutput {
+			live = append(live, c)
+		}
+	}
+	liveCategories = live
+	defer func() { liveCategories = prev }()
+
 	th := newTestHub(t, 1024)
 	conn := th.connect(t)
 
@@ -202,7 +230,7 @@ func TestHandshake_helloCapabilitiesExcludesOutput(t *testing.T) {
 	rawCaps := data["capabilities"].([]any)
 	for _, c := range rawCaps {
 		if c.(string) == CatOutput {
-			t.Errorf("hello capabilities includes %q, which must be absent in W1", CatOutput)
+			t.Errorf("hello capabilities includes %q, which must be absent when output is disabled", CatOutput)
 		}
 	}
 }
@@ -721,8 +749,41 @@ func TestSubscribeValidation_emptyNameYieldsMalformedAck(t *testing.T) {
 	}
 }
 
-func TestSubscribeValidation_outputCategoryYieldsMalformedAck(t *testing.T) {
-	// "output" is a W2 category — W1 must reject subscriptions that request it.
+func TestSubscribeValidation_outputCategorySucceeds_whenEnabled(t *testing.T) {
+	// W2: with default liveCategories (output enabled), subscribing to "output"
+	// must return a successful ack (not malformed).
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+
+	sendCmd(t, conn, CmdSubscribe, "out1", map[string]any{
+		"sub":        "mysub",
+		"jobs":       []string{"all"},
+		"categories": []string{CatOutput},
+	})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	data := mustDecodeData(t, ack)
+	if data["ok"] != true {
+		t.Errorf("output subscribe ack ok=%v, want true; data=%v", data["ok"], data)
+	}
+}
+
+func TestSubscribeValidation_outputCategoryYieldsMalformedAck_whenDisabled(t *testing.T) {
+	// When liveCategories does not include CatOutput (simulating
+	// MOTHER_BROKER_OUTPUT_ENABLED=0), subscribing to "output" must fail.
+	prev := liveCategories
+	live := make([]string, 0, len(w1Categories)-1)
+	for _, c := range w1Categories {
+		if c != CatOutput {
+			live = append(live, c)
+		}
+	}
+	liveCategories = live
+	defer func() { liveCategories = prev }()
+
 	th := newTestHub(t, 1024)
 	conn := th.connect(t)
 	_, _ = readNext(t, conn) // hello
@@ -739,7 +800,7 @@ func TestSubscribeValidation_outputCategoryYieldsMalformedAck(t *testing.T) {
 	data := mustDecodeData(t, ack)
 	errObj, _ := data["error"].(map[string]any)
 	if errObj["code"] != ErrMalformed {
-		t.Errorf("error.code = %v, want %q (output is absent in W1)", errObj["code"], ErrMalformed)
+		t.Errorf("error.code = %v, want %q (output is disabled)", errObj["code"], ErrMalformed)
 	}
 }
 
@@ -1019,5 +1080,231 @@ func TestBackpressure_closingClientPipeDecreasesClientCount(t *testing.T) {
 	}, 3*time.Second)
 	if !dropped {
 		t.Errorf("client was not unregistered after pipe close; count=%d", th.hub.clientCount())
+	}
+}
+
+// =============================================================================
+// W2 — Output category: live fan-out, replay, per-job ordering
+// =============================================================================
+
+// appendLogLines writes stream-json lines to LOGS_DIR/<jobID>.log, appending
+// if the file already exists.
+func appendLogLines(t *testing.T, logsDir, jobID string, lines []string) {
+	t.Helper()
+	logPath := filepath.Join(logsDir, jobID+".log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("appendLogLines open: %v", err)
+	}
+	defer f.Close()
+	for _, line := range lines {
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			t.Fatalf("appendLogLines write: %v", err)
+		}
+	}
+}
+
+// newTestHubWithLogs creates a testHub and a logsDir under its tmpRoot.
+// It sets h.outputSrc and h.replayBytes so output replay is active.
+func newTestHubWithLogs(t *testing.T, clientBuf int) (*testHub, string) {
+	t.Helper()
+	th := newTestHub(t, clientBuf)
+	logsDir := filepath.Join(th.tmpRoot, "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	src := newOutputSource(th.store, logsDir, 0, th.hub.ingest, 10000)
+	th.hub.outputSrc = src
+	th.hub.replayBytes = 65536
+	return th, logsDir
+}
+
+func TestW2_liveOutputFanOut_clientReceivesStructuredOutputEvents(t *testing.T) {
+	// Inject a running job, write stream-json lines to the log, call tick(),
+	// assert that a subscribed client receives typed output events in order.
+	th, logsDir := newTestHubWithLogs(t, 1024)
+	jobID := "job-live-out"
+	th.injectJob(t, jobID, map[string]any{"state": "running"})
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	subscribeSimple(t, conn, "live-out", []string{"all"}, []string{CatOutput})
+
+	// Write stream-json lines to the log.
+	lines := []string{
+		`{"type":"system","subtype":"init","session_id":"ses42","model":"claude-opus-4-5"}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"starting work"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"main.go"}}]}}`,
+	}
+	appendLogLines(t, logsDir, jobID, lines)
+
+	// Tick synchronously — no polling needed.
+	th.hub.outputSrc.tick()
+
+	// Collect three output events.
+	wantSubtypes := []string{OutputSubtypeSystem, OutputSubtypeText, OutputSubtypeToolUse}
+	for i, wantSubtype := range wantSubtypes {
+		m, err := readNext(t, conn)
+		if err != nil {
+			t.Fatalf("event[%d]: %v", i, err)
+		}
+		if m.T != TypeOutput {
+			t.Errorf("event[%d]: t = %q, want %q", i, m.T, TypeOutput)
+		}
+		var d map[string]any
+		if err := json.Unmarshal(m.Data, &d); err != nil {
+			t.Fatalf("event[%d]: decode data: %v", err, i)
+		}
+		if d["category"] != CatOutput {
+			t.Errorf("event[%d]: category = %v, want %q", i, d["category"], CatOutput)
+		}
+		if d["job"] != jobID {
+			t.Errorf("event[%d]: job = %v, want %q", i, d["job"], jobID)
+		}
+		if d["subtype"] != wantSubtype {
+			t.Errorf("event[%d]: subtype = %v, want %q", i, d["subtype"], wantSubtype)
+		}
+	}
+}
+
+func TestW2_bestEffortReplay_lateSubscriberReceivesHistoricalEvents(t *testing.T) {
+	// Write N stream-json lines to a log, advance the outputSrc offset by
+	// calling drainJob with a discard emit, then connect a late subscriber
+	// and assert it receives the replayed events before any live events.
+	th, logsDir := newTestHubWithLogs(t, 1024)
+	jobID := "job-replay"
+	th.injectJob(t, jobID, map[string]any{"state": "running"})
+
+	lines := []string{
+		`{"type":"system","subtype":"init","session_id":"r1","model":"claude-opus-4-5"}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"replay text"}]}}`,
+	}
+	appendLogLines(t, logsDir, jobID, lines)
+
+	// Advance the committed offset by draining into a discard emit.
+	discard := func(rawEvent) {}
+	discardSrc := newOutputSource(th.store, logsDir, 0, discard, 10000)
+	discardSrc.drainJob(jobID)
+	// Copy the advanced offset into the hub's outputSrc so replay sees it.
+	discardSrc.mu.Lock()
+	off := discardSrc.offsets[jobID]
+	discardSrc.mu.Unlock()
+	th.hub.outputSrc.mu.Lock()
+	th.hub.outputSrc.offsets[jobID] = off
+	th.hub.outputSrc.mu.Unlock()
+
+	// Connect a new client AFTER the offset is advanced — this triggers replay.
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	subscribeSimple(t, conn, "replay-sub", []string{"all"}, []string{CatOutput})
+
+	// The replay should deliver the 2 historical lines in order.
+	wantSubtypes := []string{OutputSubtypeSystem, OutputSubtypeText}
+	for i, wantSubtype := range wantSubtypes {
+		m, err := readNext(t, conn)
+		if err != nil {
+			t.Fatalf("replay event[%d]: %v", i, err)
+		}
+		if m.T != TypeOutput {
+			t.Errorf("replay event[%d]: t = %q, want %q", i, m.T, TypeOutput)
+		}
+		var d map[string]any
+		if err := json.Unmarshal(m.Data, &d); err != nil {
+			t.Fatalf("replay event[%d]: decode: %v", i, err)
+		}
+		if d["subtype"] != wantSubtype {
+			t.Errorf("replay event[%d]: subtype = %v, want %q", i, d["subtype"], wantSubtype)
+		}
+	}
+}
+
+func TestW2_replayLiveBoundary_exactlyNReplayedPlusMLive(t *testing.T) {
+	// Write N lines, advance offset, subscribe (triggering N replay events),
+	// then append M more lines and tick(). Assert N+M total, no dups, no gaps.
+	th, logsDir := newTestHubWithLogs(t, 1024)
+	jobID := "job-boundary"
+	th.injectJob(t, jobID, map[string]any{"state": "running"})
+
+	// N = 2 historical lines.
+	historical := []string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"hist-1"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"hist-2"}]}}`,
+	}
+	appendLogLines(t, logsDir, jobID, historical)
+
+	// Advance the offset using the hub's own outputSrc (drainJob with ingest
+	// will try to deliver but no client is subscribed yet — events are ignored).
+	th.hub.outputSrc.drainJob(jobID)
+
+	// Connect client and subscribe — this triggers replay of N=2 historical events.
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	subscribeSimple(t, conn, "bnd-sub", []string{"all"}, []string{CatOutput})
+
+	// M = 3 live lines appended after subscribe.
+	live := []string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"live-1"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"live-2"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"live-3"}]}}`,
+	}
+	appendLogLines(t, logsDir, jobID, live)
+	th.hub.outputSrc.tick()
+
+	// Collect N+M = 5 events.
+	total := len(historical) + len(live)
+	wantTexts := []string{"hist-1", "hist-2", "live-1", "live-2", "live-3"}
+	got := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		m, err := readNext(t, conn)
+		if err != nil {
+			t.Fatalf("event[%d]: %v", i, err)
+		}
+		if m.T != TypeOutput {
+			t.Errorf("event[%d]: t = %q, want %q", i, m.T, TypeOutput)
+			continue
+		}
+		var d map[string]any
+		if err := json.Unmarshal(m.Data, &d); err != nil {
+			t.Fatalf("event[%d]: decode: %v", i, err)
+		}
+		text, _ := d["text"].(string)
+		got = append(got, text)
+	}
+
+	if len(got) != total {
+		t.Fatalf("got %d events, want %d", len(got), total)
+	}
+	for i, want := range wantTexts {
+		if got[i] != want {
+			t.Errorf("event[%d]: text = %q, want %q (ordering broken or dup/gap)", i, got[i], want)
+		}
+	}
+}
+
+func TestW2_helloAdvertisesOutput(t *testing.T) {
+	// With default liveCategories (output enabled), hello must include "output"
+	// in its capabilities list.
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+
+	hello, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading hello: %v", err)
+	}
+	if hello.T != TypeHello {
+		t.Fatalf("first message t = %q, want hello", hello.T)
+	}
+	data := mustDecodeData(t, hello)
+	rawCaps, ok := data["capabilities"]
+	if !ok {
+		t.Fatal("hello missing capabilities")
+	}
+	caps := rawCaps.([]any)
+	capSet := map[string]bool{}
+	for _, c := range caps {
+		capSet[c.(string)] = true
+	}
+	if !capSet[CatOutput] {
+		t.Errorf("hello capabilities does not contain %q — W2 must advertise output by default", CatOutput)
 	}
 }
