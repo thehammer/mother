@@ -159,6 +159,8 @@ Every terminal transition (succeeded or failed) appends a JSON line to
   "escalation_count": 1,
   "wall_time_seconds": 1234,
   "log_size_bytes": 56789,
+  "tokens_in": 850762,
+  "tokens_out": 5434,
   "pr_url": "https://github.com/..."
 }
 ```
@@ -217,6 +219,12 @@ escalated jobs are never pulled back down by `conservative` posture.
 **New metrics fields** on each `runs.jsonl` line (since this feature):
 - `posture_at_spawn` — posture level observed at Cody-spawn time.
 - `posture_bias_applied` — action taken: `clamp`, `up1`, or `none`.
+- `tokens_in` — total input tokens consumed by the worker transcript (sum of
+  `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` across
+  all assistant turns, de-duplicated by message id). JSON `null` when the
+  transcript is unavailable or contains no assistant events.
+- `tokens_out` — total output (generated) tokens across all assistant turns,
+  de-duplicated by message id. JSON `null` when the transcript is unavailable.
 
 ## Pipeline visibility (W5)
 

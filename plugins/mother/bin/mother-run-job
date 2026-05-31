@@ -1028,6 +1028,41 @@ METRICS_DIR="$MOTHER_ROOT/metrics"
 mkdir -p "$METRICS_DIR"
 _metrics_file="$METRICS_DIR/runs.jsonl"
 
+# Sum input/output tokens across the worker transcript. Echoes
+# "<tokens_in> <tokens_out>". Echoes "null null" if the log is
+# absent, empty, or yields no usage data. Never fails the caller.
+#
+# tokens_in  = sum of input_tokens + cache_creation_input_tokens
+#              + cache_read_input_tokens (all count against quota)
+# tokens_out = sum of output_tokens
+#
+# De-duplicates assistant events by .message.id — stream-json emits
+# multiple events per assistant message (content-block deltas), each
+# carrying the same final usage object, so naive summation would
+# double/triple-count. One usage object per distinct message.id.
+_sum_tokens() {
+    local lp="$1"
+    [ -n "$lp" ] && [ -s "$lp" ] || { echo "null null"; return 0; }
+    # Tolerate the plaintext banner lines: fromjson? // empty drops
+    # non-JSON. De-dup assistant events by message.id (stream-json
+    # repeats the same id with identical usage). Sum cached + uncached
+    # input; sum output.
+    local out
+    out=$(jq -rR 'fromjson? // empty
+              | select(.type == "assistant" and .message.usage != null)
+              | {id: .message.id, u: .message.usage}' "$lp" 2>/dev/null \
+        | jq -rs 'if length == 0 then "null null"
+              else group_by(.id) | map(.[0].u)
+                   | { ti: (map((.input_tokens//0)
+                              + (.cache_creation_input_tokens//0)
+                              + (.cache_read_input_tokens//0)) | add // 0),
+                       to: (map(.output_tokens//0) | add // 0) }
+                   | "\(.ti) \(.to)"
+              end' 2>/dev/null)
+    if [ -z "$out" ]; then echo "null null"; return 0; fi
+    echo "$out"
+}
+
 _append_metrics() {
     local outcome="$1"
     local now_epoch; now_epoch=$(date +%s)
@@ -1046,6 +1081,9 @@ _append_metrics() {
         || stat -c %s "$log_path" 2>/dev/null || echo 0)
     local retry_count; retry_count=$(jq -r '.retry_count // 0' "$job_file" 2>/dev/null)
     local esc_count_val; esc_count_val=$(jq -r '.escalation_count // 0' "$job_file" 2>/dev/null)
+    local tokens_in tokens_out
+    read -r tokens_in tokens_out <<< "$(_sum_tokens "${log_path:-}")"
+    : "${tokens_in:=null}" "${tokens_out:=null}"
     local line
     line=$(jq -nc \
         --arg ts "$(iso_now)" \
@@ -1059,6 +1097,8 @@ _append_metrics() {
         --argjson escalation_count "${esc_count_val:-0}" \
         --argjson wall_time_seconds "$wall_time" \
         --argjson log_size_bytes "${log_size:-0}" \
+        --argjson tokens_in "$tokens_in" \
+        --argjson tokens_out "$tokens_out" \
         --arg pr_url "${pr_url:-}" \
         --arg posture_at_spawn "${posture_at_spawn:-normal}" \
         --arg posture_bias_applied "${posture_bias_applied:-none}" \
@@ -1069,6 +1109,8 @@ _append_metrics() {
             escalation_count: $escalation_count,
             wall_time_seconds: $wall_time_seconds,
             log_size_bytes: $log_size_bytes,
+            tokens_in: $tokens_in,
+            tokens_out: $tokens_out,
             pr_url: $pr_url,
             posture_at_spawn: $posture_at_spawn,
             posture_bias_applied: $posture_bias_applied
