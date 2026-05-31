@@ -551,3 +551,71 @@ _write_review_event() {
     adv_summary=$(printf '%s' "$output" | jq -r '.job.pipeline.advisories[0].summary')
     [ "$adv_summary" = "Watch this" ]
 }
+
+# ---------------------------------------------------------------------------
+# _promote_ready: W5 phase_started emission for cycle-0 pipeline jobs
+
+@test "_promote_ready: emits phase_started for redd at cycle 0 on pipeline job" {
+    _source_state
+    # Create a queued pipeline job at redd/cycle-0 with no dependencies.
+    make_pipeline_job "p1" "redd" \
+        '.state = "queued"
+        | .depends_on = []
+        | .pipeline.review_cycle = 0'
+
+    _promote_ready
+
+    # Job should now be in ready state.
+    new_state=$(jq -r .state "$JOBS_DIR/p1.json")
+    [ "$new_state" = "ready" ]
+
+    # Events file must contain exactly one phase_started event.
+    evfile="$EVENTS_DIR/p1.jsonl"
+    [ -f "$evfile" ]
+    ps_count=$(jq -r 'select(.kind == "phase_started")' "$evfile" | jq -s 'length')
+    [ "$ps_count" = "1" ]
+
+    # The event detail must carry cycle=0 and agent="redd".
+    ps_cycle=$(jq -r 'select(.kind == "phase_started") | .detail.cycle' "$evfile")
+    [ "$ps_cycle" = "0" ]
+    ps_agent=$(jq -r 'select(.kind == "phase_started") | .detail.agent' "$evfile")
+    [ "$ps_agent" = "redd" ]
+    ps_rt=$(jq -r 'select(.kind == "phase_started") | .detail.request_type' "$evfile")
+    [ "$ps_rt" = "test" ]
+}
+
+@test "_promote_ready: phase_started yields non-empty redd.started_at in _pipeline_cycles_json" {
+    _source_state
+    make_pipeline_job "p2" "redd" \
+        '.state = "queued"
+        | .depends_on = []
+        | .pipeline.review_cycle = 0
+        | .pipeline.reviewers = ["perri"]
+        | .pipeline.pending_agents = []'
+
+    _promote_ready
+
+    # After promotion the event was emitted; now check _pipeline_cycles_json picks it up.
+    result=$(_pipeline_cycles_json "$JOBS_DIR/p2.json")
+    redd_started=$(printf '%s' "$result" | jq -r '.[0].phases[] | select(.agent=="redd") | .started_at // ""')
+    [ -n "$redd_started" ]
+}
+
+@test "_promote_ready: standard job promoted to ready produces no phase_started event" {
+    _source_state
+    make_job "s1" "queued" '. + {depends_on: []}'
+
+    _promote_ready
+
+    # Standard job should be ready.
+    new_state=$(jq -r .state "$JOBS_DIR/s1.json")
+    [ "$new_state" = "ready" ]
+
+    # No phase_started event should exist.
+    evfile="$EVENTS_DIR/s1.jsonl"
+    ps_count=0
+    if [ -f "$evfile" ]; then
+        ps_count=$(jq -r 'select(.kind == "phase_started")' "$evfile" | jq -s 'length')
+    fi
+    [ "$ps_count" = "0" ]
+}

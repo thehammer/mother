@@ -504,6 +504,30 @@ _promote_ready() {
             [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
             case "$dep_state" in succeeded) ;; *) blocked=1; break ;; esac
         done
-        [ "$blocked" -eq 0 ] && _job_transition "$id" ready '{}'
+        if [ "$blocked" -eq 0 ]; then
+            _job_transition "$id" ready '{}'
+            # W5: emit the cycle-0 phase_started for the first build agent. The runner
+            # only emits phase_started on phase *advance* (cycle >= the first advance)
+            # and on new review cycles, so without this the initial Redd phase has no
+            # started_at in the derived cycles array.
+            local kind; kind=$(jq -r '.kind // ""' "$f" 2>/dev/null) || kind=""
+            if [ "$kind" = "pipeline" ]; then
+                local ph cyc
+                ph=$(jq -r '.pipeline.phase // ""' "$f" 2>/dev/null) || ph=""
+                cyc=$(jq -r '.pipeline.review_cycle // 0' "$f" 2>/dev/null) || cyc=0
+                case "$ph" in
+                    redd|cody|marty)
+                        if [ "${cyc:-0}" = "0" ]; then
+                            _append_event "$id" "phase_started" \
+                                "$(jq -nc \
+                                    --argjson cycle 0 \
+                                    --arg agent "$ph" \
+                                    --arg rt "$(_agent_request_type "$ph")" \
+                                    '{cycle: $cycle, agent: $agent, request_type: $rt}')"
+                        fi
+                        ;;
+                esac
+            fi
+        fi
     done
 }
