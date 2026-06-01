@@ -78,8 +78,11 @@ _format_rows() {
                 else ((s / 86400 | floor) | tostring) + "d"
                 end;
         # Mother timestamps are millisecond-precision RFC 3339 (trailing
-        # .NNNZ). jq's fromdateiso8601 only understands second-precision,
-        # so strip the fractional seconds before parsing.
+        # .NNNZ). The jq fromdateiso8601 builtin only understands
+        # second-precision, so strip the fractional seconds before parsing.
+        # NOTE: no apostrophes in this jq program — it is wrapped in a bash
+        # single-quoted string, so an apostrophe here would terminate the
+        # quote and break the whole switcher (regression history: it did).
         def parse_ts: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
         def duration:
             (.started_at // null)  as $s
