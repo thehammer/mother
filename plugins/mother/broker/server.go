@@ -15,6 +15,7 @@ package main
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -64,6 +65,29 @@ func newHub(store *jobStore, runner *commandRunner, pingSeconds, clientBuf int) 
 func (h *hub) ingest(ev rawEvent) {
 	h.mu.Lock()
 	h.applyOverlayLocked(ev)
+
+	// For "queued" events, replace the detail with the full overlaid job
+	// snapshot so that subscribers already connected when this job was
+	// created can construct a complete MotherJob without a reconnect or
+	// round-trip. Without this, clients only receive {"title":"..."} and
+	// must ignore the event because they lack the fields to build a job.
+	//
+	// fsnotify delivery ordering: both the jobs/*.json write and the
+	// events/*.jsonl write trigger fsnotify callbacks, but the jobs watcher
+	// may not have fired yet when ingest runs. Call refresh synchronously
+	// under the hub mutex (different lock from store.mu — no deadlock) so
+	// the record is available before we embed it.
+	if ev.kind == "queued" {
+		raw, ok := h.store.get(ev.jobID)
+		if !ok {
+			h.store.refresh(filepath.Join(h.store.dir, ev.jobID+".json"))
+			raw, ok = h.store.get(ev.jobID)
+		}
+		if ok {
+			ev.detail = h.overlayJobLocked(ev.jobID, raw)
+		}
+	}
+
 	for cl := range h.clients {
 		if atomic.LoadInt32(&cl.dead) == 1 {
 			continue
