@@ -84,6 +84,7 @@ plan-adherence review. Here's what was added and how to work with it.
 | `adherence_notes` | string | Archie's notes from the last review (populated on fail). |
 | `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human) or `pipeline_phase` / `pipeline_review` / `pipeline_blocked` (pipeline jobs). Cleared on resume. |
 | `cost_model` | string | Account billing mode at enqueue time: `subscription`, `metered`, or `unknown`. Clients suppress dollar displays when `subscription`. |
+| `force_start` | bool | Per-job override flag. When `true`: job dispatches even over quota cap, is exempt from mid-flight quota pause, and posture bias is bypassed (runs at `suggested_config`-resolved tier; metrics record `posture_bias_applied="forced"`). Cleared on every terminal transition, escalation re-queue, and adherence-rework re-queue. Set via `mother force-start <id> [--yes]`. |
 
 ### State machine
 

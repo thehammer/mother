@@ -1140,6 +1140,88 @@ cmd_cancel() {
     echo "$id: $state -> cancelled"
 }
 
+# ---------- force-start ----------
+#
+# Set the force_start flag on a ready or queued job so the runner will dispatch
+# it even while over quota cap and without applying conservative posture bias.
+# The flag is NOT a state transition — the runner picks it up on its next tick.
+# It is cleared on every terminal transition, escalation, and adherence rework.
+#
+# Usage: mother force-start <id> [--yes]
+#   --yes  Skip the interactive confirmation prompt (required in non-interactive
+#          contexts such as the broker and tmux popup).
+
+cmd_force_start() {
+    local id="" yes=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes) yes=1; shift ;;
+            --) shift; break ;;
+            -*) _die "force-start: unknown flag: $1" ;;
+            *) [ -z "$id" ] && id="$1" || _die "force-start: unexpected argument: $1"; shift ;;
+        esac
+    done
+
+    [ -n "$id" ] || _die "force-start: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+
+    local job_file; job_file=$(_job_path "$id")
+    local state; state=$(jq -r .state "$job_file")
+    case "$state" in
+        ready|queued) ;;
+        *) _die "force-start: job must be ready or queued (state=$state)" ;;
+    esac
+
+    # Compute context-aware override summary for the confirm prompt.
+    local over_cap=0 posture="normal"
+    if ! _quota_check 2>/dev/null; then
+        over_cap=1
+    fi
+    # Shell out to bishop to get posture (mirrors _resolve_posture in mother-run-job
+    # but without depending on that script's functions being in scope here).
+    if command -v bishop >/dev/null 2>&1; then
+        posture=$(bishop get posture 2>/dev/null || echo "normal")
+        case "$posture" in conservative|normal|elevated|flush) ;; *) posture="normal" ;; esac
+    fi
+
+    # Confirmation gate.
+    if [ "$yes" -ne 1 ]; then
+        # Non-interactive context without --yes: refuse.
+        if [ ! -t 0 ]; then
+            _die "force-start: refusing to force without --yes in a non-interactive context"
+        fi
+
+        # Build a human-readable summary of what force-start will override.
+        local summary=""
+        if [ "$over_cap" -eq 1 ] && [ "$posture" = "conservative" ]; then
+            summary="Quota is over cap AND posture is conservative — forcing will dispatch this job immediately at full configured strength, bypassing both guards."
+        elif [ "$over_cap" -eq 1 ]; then
+            summary="Quota is over cap — forcing will dispatch this job immediately despite the quota gate."
+        elif [ "$posture" = "conservative" ]; then
+            summary="Posture is conservative — forcing will bypass the conservative clamp and run at configured tier."
+        else
+            summary="Quota is under cap and posture is normal — forcing has no effect right now, but the flag will be set."
+        fi
+
+        echo "$summary"
+        printf 'Force-start job %s? [y/N] ' "$id"
+        local answer
+        read -r answer </dev/tty || answer=""
+        case "${answer:-}" in
+            y|Y|yes|YES) ;;
+            *) echo "aborted"; return 0 ;;
+        esac
+    fi
+
+    _job_update "$id" '.force_start = true'
+    _append_event "$id" "force_start_requested" \
+        "$(jq -nc \
+            --argjson oc "$over_cap" \
+            --arg p "$posture" \
+            '{over_cap: $oc, posture: $p}')"
+    echo "$id: force_start set (over_cap=$over_cap, posture=$posture)"
+}
+
 # ---------- retry ----------
 
 cmd_retry() {
@@ -1284,6 +1366,7 @@ cmd_escalate() {
         | .adherence_status = null
         | .adherence_notes = null
         | .adherence_attempts = 0
+        | .force_start = null
     ' "$job_file") || _die "escalate: jq update failed"
     _atomic_write "$job_file" "$merged"
     _append_event "$id" "escalated" \
@@ -2205,6 +2288,7 @@ Usage:
   mother attach ID
   mother plan ID
   mother cancel ID
+  mother force-start ID [--yes]              (force dispatch even when over quota cap)
   mother retry ID
   mother escalate ID                         (bump failed job to next model tier)
   mother adherence-review ID                 (check PR diff against original plan)
@@ -2316,6 +2400,7 @@ main() {
         attach)            cmd_attach "$@" ;;
         plan)              cmd_plan "$@" ;;
         cancel)            cmd_cancel "$@" ;;
+        force-start)       cmd_force_start "$@" ;;
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;
         adherence-review)  cmd_adherence_review "$@" ;;

@@ -65,7 +65,8 @@ func mapCLIError(stderr string) string {
 		strings.Contains(s, "expected running"),
 		strings.Contains(s, "cannot cancel job in state"),
 		strings.Contains(s, "can only retry"),
-		strings.Contains(s, "is in state"):
+		strings.Contains(s, "is in state"),
+		strings.Contains(s, "must be ready or queued"):
 		return ErrInvalidState
 	default:
 		return ErrInternal
@@ -93,6 +94,18 @@ func (c *commandRunner) cancel(job string) cmdResult {
 		return fail(ErrMalformed, "cancel: job required")
 	}
 	_, stderr, code := c.runCLI("", "cancel", job)
+	if code != "" {
+		return fail(code, strings.TrimSpace(stderr))
+	}
+	return ok(map[string]any{"job": job})
+}
+
+// forceStart routes to `mother force-start <job> --yes`.
+func (c *commandRunner) forceStart(job string) cmdResult {
+	if job == "" {
+		return fail(ErrMalformed, "force-start: job required")
+	}
+	_, stderr, code := c.runCLI("", "force-start", job, "--yes")
 	if code != "" {
 		return fail(code, strings.TrimSpace(stderr))
 	}

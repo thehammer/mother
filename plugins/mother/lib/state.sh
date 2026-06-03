@@ -115,7 +115,8 @@ _job_transition() {
     case "$new" in
         running)    _job_update "$id" ".started_at = \"$(_iso_now)\"" ;;
         succeeded|failed|cancelled)
-                    _job_update "$id" ".finished_at = \"$(_iso_now)\"" ;;
+                    _job_update "$id" ".finished_at = \"$(_iso_now)\""
+                    _job_update "$id" ".force_start = null" ;;
     esac
     _append_event "$id" "$new" "$detail"
 }

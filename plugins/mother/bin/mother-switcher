@@ -11,6 +11,7 @@
 #               close the popup as usual. Selecting a different job in the
 #               list switches the tail to that job's log automatically.
 #   ctrl-x    → cancel a live job and reload the list
+#   ctrl-f    → force-start a ready/queued job (bypasses quota cap + conservative posture)
 #   ctrl-r    → retry a failed/cancelled job and reload the list
 #   ctrl-d    → archive a terminal-state job (immediate, regardless of age)
 #   ctrl-a    → archive ALL terminal-state jobs now
@@ -133,9 +134,10 @@ printf '%s\n' "$rows" | fzf \
     --with-nth '2..' \
     --preview "\"$MOTHER_BIN\" peek {1} --watch" \
     --preview-window 'up:60%:wrap:follow' \
-    --header 'ctrl-x: cancel  ctrl-r: retry  ctrl-d: archive  ctrl-a: archive all  ctrl-p: plan  esc/ctrl-q: quit' \
+    --header 'ctrl-x: cancel  ctrl-f: force  ctrl-r: retry  ctrl-d: archive  ctrl-a: archive all  ctrl-p: plan  esc/ctrl-q: quit' \
     --bind "enter:change-preview(\"$MOTHER_BIN\" logs {1} --follow)+change-preview-window(up:60%:wrap:follow)" \
     --bind "ctrl-x:execute-silent(\"$MOTHER_BIN\" cancel {1})+reload($reload_cmd)" \
+    --bind "ctrl-f:execute-silent(\"$MOTHER_BIN\" force-start {1} --yes)+reload($reload_cmd)" \
     --bind "ctrl-r:execute-silent(\"$MOTHER_BIN\" retry {1})+reload($reload_cmd)" \
     --bind "ctrl-d:execute-silent(\"$MOTHER_BIN\" archive {1})+reload($reload_cmd)" \
     --bind "ctrl-a:execute-silent(\"$MOTHER_BIN\" archive --older-than 0)+reload($reload_cmd)" \

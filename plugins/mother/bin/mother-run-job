@@ -192,7 +192,8 @@ _transition() {
     case "$new" in
         running)    _job_update ".started_at = \"$(iso_now)\"" ;;
         succeeded|failed|cancelled)
-                    _job_update ".finished_at = \"$(iso_now)\"" ;;
+                    _job_update ".finished_at = \"$(iso_now)\""
+                    _job_update ".force_start = null" ;;
     esac
     _append_event "$new" "$detail"
 }
@@ -464,9 +465,21 @@ fi
 # escalation logic before this script runs (it bumps current_tier on the job).
 # That means escalated jobs already have current_tier > tier_0 here, so the
 # guard below ensures escalation dominates: posture bias is a no-op for them.
+#
+# force_start bypasses posture bias entirely: the operator has explicitly
+# accepted the cost and quota impact, so we observe posture for the metrics
+# record but do not clamp or adjust the tier.
 posture_at_spawn="normal"
 posture_bias_applied="none"
-if [ "$current_tier" = "tier_0" ]; then
+force_start=$(jq -r '.force_start // false' "$job_file" 2>/dev/null)
+if [ "$force_start" = "true" ]; then
+    posture_at_spawn=$(_resolve_posture)
+    posture_bias_applied="forced"
+    _append_event "posture_bias_applied" \
+        "$(jq -nc --arg p "$posture_at_spawn" --arg a "forced" \
+            --arg t "$current_tier" --arg m "$worker_model" --arg e "$worker_effort" \
+            '{posture: $p, action: $a, new_tier: $t, model: $m, effort: $e}')"
+elif [ "$current_tier" = "tier_0" ]; then
     posture_at_spawn=$(_resolve_posture)
     # Inline the bias case rather than delegating to _apply_posture_bias via
     # command substitution — a subshell can't propagate variables back to the
