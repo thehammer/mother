@@ -524,6 +524,8 @@ func (cl *client) handleLine(line []byte) {
 		cl.handleCancel(m)
 	case CmdRetry:
 		cl.handleRetry(m)
+	case CmdForceStart:
+		cl.handleForceStart(m)
 	default:
 		cl.ack(errAck(m.T, m.ID, ErrMalformed, "unknown command: "+m.T))
 	}
@@ -606,6 +608,14 @@ func (cl *client) handleRetry(m Message) {
 	}
 	_ = json.Unmarshal(m.Data, &a)
 	cl.respond(m, cl.hub.runner.retry(a.Job))
+}
+
+func (cl *client) handleForceStart(m Message) {
+	var a struct {
+		Job string `json:"job"`
+	}
+	_ = json.Unmarshal(m.Data, &a)
+	cl.respond(m, cl.hub.runner.forceStart(a.Job))
 }
 
 // respond turns a cmdResult into the correlated ack.

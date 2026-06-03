@@ -1425,3 +1425,152 @@ func TestW2_helloAdvertisesOutput(t *testing.T) {
 		t.Errorf("hello capabilities does not contain %q — W2 must advertise output by default", CatOutput)
 	}
 }
+
+// =============================================================================
+// force-start command — broker dispatch, ack, error mapping
+// =============================================================================
+
+// newTestHubWithFakeCLI creates a testHub where the commandRunner uses a
+// temporary shell script as the `mother` CLI. The script accepts
+// `force-start <job> --yes` (exits 0) and returns a non-zero exit with a
+// "must be ready or queued" message for the sentinel job "job-bad-state".
+func newTestHubWithFakeCLI(t *testing.T) *testHub {
+	t.Helper()
+	th := newTestHub(t, 1024)
+
+	// Write a fake mother script.
+	fakeCLI := filepath.Join(th.tmpRoot, "fake-mother")
+	script := `#!/bin/sh
+cmd="$1"; shift
+case "$cmd" in
+  force-start)
+    job="$1"; shift
+    if [ "$job" = "job-bad-state" ]; then
+      echo "mother: force-start: job must be ready or queued (state=running)" >&2
+      exit 1
+    fi
+    if [ "$job" = "" ]; then
+      echo "mother: force-start: <id> required" >&2
+      exit 1
+    fi
+    echo "$job: force_start set (over_cap=0, posture=normal)"
+    exit 0
+    ;;
+  *)
+    echo "mother: unknown subcommand: $cmd" >&2
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeCLI, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake CLI: %v", err)
+	}
+	th.runner.cliPath = fakeCLI
+	return th
+}
+
+func TestForceStart_positiveAckForValidJob(t *testing.T) {
+	// A force-start command for an existing ready job returns ok:true with the job id.
+	th := newTestHubWithFakeCLI(t)
+	th.injectJob(t, "job-force-1", map[string]any{"state": "ready"})
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+
+	sendCmd(t, conn, CmdForceStart, "fs1", map[string]any{"job": "job-force-1"})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading ack: %v", err)
+	}
+	if ack.Dir != DirAck {
+		t.Errorf("ack.Dir = %q, want ack", ack.Dir)
+	}
+	if ack.T != CmdForceStart {
+		t.Errorf("ack.T = %q, want %q", ack.T, CmdForceStart)
+	}
+	data := mustDecodeData(t, ack)
+	if data["ok"] != true {
+		t.Errorf("force-start ack ok = %v, want true", data["ok"])
+	}
+	if data["job"] != "job-force-1" {
+		t.Errorf("force-start ack job = %v, want %q", data["job"], "job-force-1")
+	}
+}
+
+func TestForceStart_invalidStateAckForNonEligibleJob(t *testing.T) {
+	// A force-start on a job in a non-eligible state (running) returns invalid_state.
+	th := newTestHubWithFakeCLI(t)
+	th.injectJob(t, "job-bad-state", map[string]any{"state": "running"})
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+
+	sendCmd(t, conn, CmdForceStart, "fs2", map[string]any{"job": "job-bad-state"})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading ack: %v", err)
+	}
+	data := mustDecodeData(t, ack)
+	if data["ok"] != false {
+		t.Errorf("force-start ack ok = %v, want false", data["ok"])
+	}
+	errObj, ok := data["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object, got %v", data)
+	}
+	if errObj["code"] != ErrInvalidState {
+		t.Errorf("error.code = %v, want %q", errObj["code"], ErrInvalidState)
+	}
+}
+
+func TestForceStart_malformedAckForMissingJobField(t *testing.T) {
+	// A force-start command without a job field returns malformed.
+	th := newTestHubWithFakeCLI(t)
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+
+	sendCmd(t, conn, CmdForceStart, "fs3", map[string]any{})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading ack: %v", err)
+	}
+	data := mustDecodeData(t, ack)
+	errObj, ok := data["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object, got %v", data)
+	}
+	if errObj["code"] != ErrMalformed {
+		t.Errorf("error.code = %v, want %q", errObj["code"], ErrMalformed)
+	}
+}
+
+func TestForceStart_advertisedInHelloCapabilities(t *testing.T) {
+	// force-start must appear in the hello capabilities list.
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+
+	hello, _ := readNext(t, conn)
+	data := mustDecodeData(t, hello)
+	rawCaps := data["capabilities"].([]any)
+	capSet := map[string]bool{}
+	for _, c := range rawCaps {
+		capSet[c.(string)] = true
+	}
+	if !capSet[CmdForceStart] {
+		t.Errorf("hello capabilities missing %q — force-start must be advertised", CmdForceStart)
+	}
+}
+
+func TestMapCLIError_forceStartMustBeReadyOrQueuedMapsToInvalidState(t *testing.T) {
+	// The "must be ready or queued" message from cmd_force_start must map to ErrInvalidState.
+	cases := []string{
+		"mother: force-start: job must be ready or queued (state=running)",
+		"force-start: job must be ready or queued (state=succeeded)",
+	}
+	for _, stderr := range cases {
+		if got := mapCLIError(stderr); got != ErrInvalidState {
+			t.Errorf("mapCLIError(%q) = %q, want %q", stderr, got, ErrInvalidState)
+		}
+	}
+}

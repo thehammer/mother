@@ -53,6 +53,7 @@ const (
 	CmdAnswer      = "answer"
 	CmdCancel      = "cancel"
 	CmdRetry       = "retry"
+	CmdForceStart  = "force-start"
 )
 
 // Output event sub-types (data.subtype on TypeOutput events). These mirror
@@ -93,7 +94,7 @@ var liveCategories = w1Categories
 // w1Commands is the set of commands this W1 broker accepts.
 var w1Commands = []string{
 	CmdSubscribe, CmdUnsubscribe, CmdQueryList, CmdQueryGet,
-	CmdAnswer, CmdCancel, CmdRetry,
+	CmdAnswer, CmdCancel, CmdRetry, CmdForceStart,
 }
 
 // Message is the single envelope used in both directions.

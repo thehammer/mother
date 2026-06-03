@@ -206,6 +206,12 @@ _pick_next_ready() {
     done | sort | head -1 | cut -f2
 }
 
+_pick_next_forced_ready() {
+    find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | while read -r f; do
+        jq -r 'select(.state == "ready" and (.force_start == true)) | .created_at + "\t" + .id' "$f"
+    done | sort | head -1 | cut -f2
+}
+
 # ---------- spawning ----------
 
 _spawn_job() {
@@ -429,6 +435,8 @@ _maybe_pause_running() {
         [ "$cr" = "true" ] && continue
         pr=$(jq -r '.pause_requested // false'  "$job_file" 2>/dev/null)
         [ "$pr" = "true" ] && continue   # already requested
+        fs=$(jq -r '.force_start // false' "$job_file" 2>/dev/null)
+        [ "$fs" = "true" ] && continue   # forced — never pause for quota
 
         merged=$(jq --arg r "$reason" --argjson ts "$resume_at" '
             .pause_requested = true
@@ -524,6 +532,7 @@ _run_adherence_pending() {
                             | .cancel_requested = null
                             | .pause_requested = null
                             | .final_result_at = null
+                            | .force_start = null
                         ' "$JOBS_DIR/$id.json") && _atomic_write "$JOBS_DIR/$id.json" "$merged"
                         _append_event "$id" "adherence_rework_kicked" \
                             "$(jq -nc --arg id "$id" '{id: $id, note: "adherence failed first attempt; re-queuing with activity=cody_rework"}')"
@@ -922,8 +931,13 @@ _loop() {
                 _spawn_job "$next"
             done
         else
-            # Over cap — hold new dispatches and try to pause anything
-            # still running so headroom returns to interactive use.
+            # Over cap — only forced ready jobs may dispatch; pause the rest.
+            while [ "$(_count_running_children)" -lt "$MOTHER_CONCURRENCY" ]; do
+                local next
+                next=$(_pick_next_forced_ready)
+                [ -n "$next" ] || break
+                _spawn_job "$next"
+            done
             _maybe_pause_running
         fi
 
