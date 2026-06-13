@@ -492,22 +492,6 @@ PLAN
     local plan="$MOTHER_ROOT/plan.md"
     make_plan "$plan"
 
-# cost_model — billing-mode detection at enqueue time
-
-@test "mother add sets cost_model=subscription when bishop reports subscription" {
-    local plan="$MOTHER_ROOT/plan.md"
-    make_plan "$plan"
-
-    # Install a bishop shim that echoes "subscription" for "get billing_mode".
-    local mock_bin="$MOTHER_ROOT/mock-bin"
-    cat > "$mock_bin/bishop" <<'SHIM'
-#!/usr/bin/env bash
-if [ "$1" = "get" ] && [ "$2" = "billing_mode" ]; then
-    echo "subscription"
-fi
-SHIM
-    chmod +x "$mock_bin/bishop"
-
     run mother add \
         --plan-file "$plan" \
         --repo testrepo \
@@ -570,21 +554,6 @@ suggested_config:
     rationale: "Standard review."
 \`\`\`
 PLAN
-    run jq -r '.cost_model' "$JOBS_DIR/$id.json"
-    [ "$output" = "subscription" ]
-}
-
-@test "mother add sets cost_model=metered via posture file when bishop returns nothing" {
-    local plan="$MOTHER_ROOT/plan.md"
-    make_plan "$plan"
-
-    # Ensure no bishop shim is installed (mock-bin only has claude).
-    rm -f "$MOTHER_ROOT/mock-bin/bishop"
-
-    # Point the helper at a fixture file with billing_mode=metered.
-    local fixture="$MOTHER_ROOT/budget-posture.json"
-    printf '{"billing_mode":"metered"}' > "$fixture"
-    export BUDGET_POSTURE_FILE="$fixture"
 
     run mother add \
         --plan-file "$plan" \
@@ -594,11 +563,9 @@ PLAN
 
     [ "$status" -eq 0 ]
     local id="$output"
-
     # Length must be <= 500
     run jq -r '.plan_summary | length' "$JOBS_DIR/$id.json"
     [ "$output" -le 500 ]
-
     # Must end with ellipsis (truncation occurred)
     run jq -r '.plan_summary' "$JOBS_DIR/$id.json"
     [[ "$output" =~ \.\.\.$ ]]
@@ -629,19 +596,6 @@ suggested_config:
     rationale: "Standard review."
 ```
 PLAN
-    run jq -r '.cost_model' "$JOBS_DIR/$id.json"
-    [ "$output" = "metered" ]
-}
-
-@test "mother add sets cost_model=unknown when bishop is absent and posture file has no billing_mode" {
-    local plan="$MOTHER_ROOT/plan.md"
-    make_plan "$plan"
-
-    # No bishop shim.
-    rm -f "$MOTHER_ROOT/mock-bin/bishop"
-
-    # Point at a non-existent file so the fallback also fails.
-    export BUDGET_POSTURE_FILE="$MOTHER_ROOT/no-such-file.json"
 
     run mother add \
         --plan-file "$plan" \
@@ -653,6 +607,285 @@ PLAN
     local id="$output"
     run jq -r '.plan_summary' "$JOBS_DIR/$id.json"
     [ "$output" = "" ]
+}
+
+# ---------------------------------------------------------------------------
+# cost_model — billing-mode detection at enqueue time
+
+@test "mother add sets cost_model=subscription when bishop reports subscription" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # Install a bishop shim that echoes "subscription" for "get billing_mode".
+    local mock_bin="$MOTHER_ROOT/mock-bin"
+    cat > "$mock_bin/bishop" <<'SHIM'
+#!/usr/bin/env bash
+if [ "$1" = "get" ] && [ "$2" = "billing_mode" ]; then
+    echo "subscription"
+fi
+SHIM
+    chmod +x "$mock_bin/bishop"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    run jq -r '.cost_model' "$JOBS_DIR/$id.json"
+    [ "$output" = "subscription" ]
+}
+
+@test "mother add sets cost_model=metered via posture file when bishop returns nothing" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # Ensure no bishop shim is installed (mock-bin only has claude).
+    rm -f "$MOTHER_ROOT/mock-bin/bishop"
+
+    # Point the helper at a fixture file with billing_mode=metered.
+    local fixture="$MOTHER_ROOT/budget-posture.json"
+    printf '{"billing_mode":"metered"}' > "$fixture"
+    export BUDGET_POSTURE_FILE="$fixture"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    run jq -r '.cost_model' "$JOBS_DIR/$id.json"
+    [ "$output" = "metered" ]
+}
+
+@test "mother add sets cost_model=unknown when bishop is absent and posture file has no billing_mode" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # Install a failing bishop shim so the real bishop on PATH is shadowed.
+    local mock_bin="$MOTHER_ROOT/mock-bin"
+    cat > "$mock_bin/bishop" <<'SHIM'
+#!/usr/bin/env bash
+exit 1
+SHIM
+    chmod +x "$mock_bin/bishop"
+
+    # Point at a non-existent file so the posture-file fallback also fails.
+    export BUDGET_POSTURE_FILE="$MOTHER_ROOT/no-such-file.json"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
     run jq -r '.cost_model' "$JOBS_DIR/$id.json"
     [ "$output" = "unknown" ]
+}
+
+# ---------------------------------------------------------------------------
+# origin / provenance — record and filter
+
+@test "mother add records explicit origin label and project" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test \
+        --label "foo" \
+        --origin-project "bar"
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    run jq -r '.origin.label' "$JOBS_DIR/$id.json"
+    [ "$output" = "foo" ]
+
+    run jq -r '.origin.project' "$JOBS_DIR/$id.json"
+    [ "$output" = "bar" ]
+}
+
+@test "mother add auto-populates origin block when no origin flags given" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # Initialize FAKE_REPO as a real git repo so git rev-parse works.
+    git -C "$FAKE_REPO" init --quiet
+
+    # Run from inside the fake git repo so project is auto-detectable.
+    local saved_pwd="$PWD"
+    cd "$FAKE_REPO"
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+    cd "$saved_pwd"
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    # origin block must exist (non-null)
+    run jq -r '.origin' "$JOBS_DIR/$id.json"
+    [ "$output" != "null" ]
+
+    # cwd must be set to the directory we ran from
+    run jq -r '.origin.cwd' "$JOBS_DIR/$id.json"
+    [ "$output" = "$FAKE_REPO" ]
+
+    # project auto-detected from git toplevel (basename of FAKE_REPO = "testrepo")
+    run jq -r '.origin.project' "$JOBS_DIR/$id.json"
+    [ "$output" = "testrepo" ]
+
+    # enqueued_by is set to a non-empty user name
+    run jq -r '.origin.enqueued_by' "$JOBS_DIR/$id.json"
+    [ -n "$output" ]
+}
+
+@test "mother add records origin session from MOTHER_ORIGIN_SESSION env var" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    export MOTHER_ORIGIN_SESSION="sess-abc-123"
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    run jq -r '.origin.session' "$JOBS_DIR/$id.json"
+    [ "$output" = "sess-abc-123" ]
+}
+
+@test "mother add --origin-session flag overrides env var" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    export MOTHER_ORIGIN_SESSION="env-session"
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test \
+        --origin-session "flag-session"
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    run jq -r '.origin.session' "$JOBS_DIR/$id.json"
+    [ "$output" = "flag-session" ]
+}
+
+@test "mother list table renders ORIGIN column without error" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test \
+        --origin-project "myproject"
+
+    [ "$status" -eq 0 ]
+
+    run mother list
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "ORIGIN" ]]
+    [[ "$output" =~ "myproject" ]]
+}
+
+@test "mother list --project filters to matching origin.project" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # Add two jobs: one with origin-project=bar, one with origin-project=other.
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/bar \
+        --origin-project "bar"
+    local id_bar="$output"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/other \
+        --origin-project "other"
+    local id_other="$output"
+
+    run mother list --project bar
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$id_bar" ]]
+    [[ ! "$output" =~ "$id_other" ]]
+}
+
+@test "mother list --project with no matching project returns no jobs" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test \
+        --origin-project "bar"
+
+    run mother list --project zzz
+    [ "$status" -eq 0 ]
+    [ "$output" = "(no jobs)" ]
+}
+
+@test "mother list renders origin-less legacy record as dash without crashing" {
+    # Write a minimal legacy job JSON with no .origin field.
+    local legacy_id="20260101T000000Z-deadbeef"
+    jq -n \
+        --arg id "$legacy_id" \
+        --arg created_at "2026-01-01T00:00:00Z" \
+        '{
+            id: $id,
+            title: "legacy job",
+            repo: "oldrepo",
+            repo_path: "/tmp/old",
+            branch: "main",
+            base_ref: "origin/main",
+            isolation: "worktree",
+            executor: "local-tmux",
+            depends_on: [],
+            max_cost_usd: null,
+            plan_path: "",
+            log_path: "",
+            state: "queued",
+            created_at: $created_at,
+            started_at: null,
+            finished_at: null,
+            pr_url: null,
+            tmux_window: null,
+            worker_pid: null,
+            actual_cost_usd: null,
+            current_tier: "tier_0",
+            escalation_count: 0,
+            adherence_attempts: 0
+        }' > "$JOBS_DIR/$legacy_id.json"
+
+    run mother list
+    [ "$status" -eq 0 ]
+    # Legacy job must appear in the listing
+    [[ "$output" =~ "$legacy_id" ]]
+    # ORIGIN column renders "-" for the legacy record (no .origin field)
+    [[ "$output" =~ "-" ]]
 }
