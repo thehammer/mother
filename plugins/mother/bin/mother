@@ -409,20 +409,24 @@ cmd_add() {
     local plan_file="" repo="" repo_path="" branch="" base_ref="origin/main"
     local isolation="worktree" executor="local-tmux" max_cost="" depends_on=""
     local format="text" title=""
+    local origin_label="" origin_project_override="" origin_session=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --plan-file)   plan_file="$2"; shift 2 ;;
-            --repo)        repo="$2"; shift 2 ;;
-            --repo-path)   repo_path="$2"; shift 2 ;;
-            --branch)      branch="$2"; shift 2 ;;
-            --base)        base_ref="$2"; shift 2 ;;
-            --isolation)   isolation="$2"; shift 2 ;;
-            --executor)    executor="$2"; shift 2 ;;
-            --max-cost)    max_cost="$2"; shift 2 ;;
-            --depends-on)  depends_on="$2"; shift 2 ;;
-            --title)       title="$2"; shift 2 ;;
-            --format)      format="$2"; shift 2 ;;
+            --plan-file)        plan_file="$2"; shift 2 ;;
+            --repo)             repo="$2"; shift 2 ;;
+            --repo-path)        repo_path="$2"; shift 2 ;;
+            --branch)           branch="$2"; shift 2 ;;
+            --base)             base_ref="$2"; shift 2 ;;
+            --isolation)        isolation="$2"; shift 2 ;;
+            --executor)         executor="$2"; shift 2 ;;
+            --max-cost)         max_cost="$2"; shift 2 ;;
+            --depends-on)       depends_on="$2"; shift 2 ;;
+            --title)            title="$2"; shift 2 ;;
+            --format)           format="$2"; shift 2 ;;
+            --label)            origin_label="$2"; shift 2 ;;
+            --origin-project)   origin_project_override="$2"; shift 2 ;;
+            --origin-session)   origin_session="$2"; shift 2 ;;
             *) _die "unknown flag for add: $1" ;;
         esac
     done
@@ -463,6 +467,22 @@ cmd_add() {
     local cost_model
     cost_model=$(_resolve_cost_model)
 
+    # Compute origin for job provenance.
+    local origin_cwd origin_project enqueued_by _gitroot
+    origin_cwd="$PWD"
+    if [ -n "$origin_project_override" ]; then
+        origin_project="$origin_project_override"
+    else
+        _gitroot=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || _gitroot=""
+        if [ -n "$_gitroot" ]; then
+            origin_project=$(basename "$_gitroot")
+        else
+            origin_project=""
+        fi
+    fi
+    [ -z "$origin_session" ] && origin_session="${MOTHER_ORIGIN_SESSION:-}"
+    enqueued_by=$(whoami)
+
     local id deps_json job_json max_cost_json
     id=$(_gen_id)
     if [ -n "$depends_on" ]; then
@@ -498,6 +518,11 @@ cmd_add() {
         --argjson suggested_config "$suggested_config_json" \
         --argjson no_pr "$no_pr_json" \
         --arg cost_model "$cost_model" \
+        --arg origin_cwd "$origin_cwd" \
+        --arg origin_project "$origin_project" \
+        --arg origin_session "$origin_session" \
+        --arg enqueued_by "$enqueued_by" \
+        --arg origin_label "$origin_label" \
         '{
             id: $id, title: $title, repo: $repo, repo_path: $repo_path,
             branch: $branch, base_ref: $base_ref, isolation: $isolation,
@@ -505,6 +530,7 @@ cmd_add() {
             plan_path: $plan_path, log_path: $log_path,
             plan_summary: $plan_summary,
             state: "queued", created_at: $created_at,
+            origin: {project: $origin_project, cwd: $origin_cwd, session: $origin_session, enqueued_by: $enqueued_by, label: $origin_label},
             started_at: null, finished_at: null,
             pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null,
             suggested_config: $suggested_config,
@@ -545,12 +571,14 @@ cmd_add() {
 # ---------- list ----------
 
 cmd_list() {
-    local state_filter="" repo_filter="" format="table"
+    local state_filter="" repo_filter="" format="table" proj_filter="" label_filter=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --state)  state_filter="$2"; shift 2 ;;
-            --repo)   repo_filter="$2"; shift 2 ;;
-            --format) format="$2"; shift 2 ;;
+            --state)   state_filter="$2"; shift 2 ;;
+            --repo)    repo_filter="$2"; shift 2 ;;
+            --format)  format="$2"; shift 2 ;;
+            --project) proj_filter="$2"; shift 2 ;;
+            --label)   label_filter="$2"; shift 2 ;;
             *) _die "unknown flag for list: $1" ;;
         esac
     done
@@ -558,10 +586,12 @@ cmd_list() {
     local rows
     rows=$(find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | sort | while read -r f; do
         jq -c '.' "$f"
-    done | jq -cs --arg st "$state_filter" --arg repo "$repo_filter" '
+    done | jq -cs --arg st "$state_filter" --arg repo "$repo_filter" --arg proj "$proj_filter" --arg label "$label_filter" '
         map(select(
             (($st | length == 0) or (.state == $st))
             and (($repo | length == 0) or (.repo == $repo))
+            and (($proj | length == 0) or ((.origin.project // "") == $proj))
+            and (($label | length == 0) or ((.origin.label // "") == $label))
         ))
         | sort_by(.created_at)
     ')
@@ -593,7 +623,7 @@ cmd_list() {
             echo "(no jobs)"
             return 0
         fi
-        printf "%-28s  %-16s  %-18s  %-12s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "TITLE"
+        printf "%-28s  %-16s  %-18s  %-12s  %-16s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "ORIGIN" "TITLE"
         echo "$rows" | jq -r '.[] |
             [
                 .id,
@@ -602,10 +632,11 @@ cmd_list() {
                 (.current_tier // ""),
                 .repo,
                 .isolation,
+                ((.origin // {}) | if (.project != null and .project != "") then .project elif (.label != null and .label != "") then .label else "-" end),
                 .title,
                 (.kind // "")
             ] | @tsv' | \
-            while IFS=$'\t' read -r id st activity current_tier repo iso title kind; do
+            while IFS=$'\t' read -r id st activity current_tier repo iso origin title kind; do
                 # Compose the state display field with markers.
                 local state_display="$st"
                 if [ "${kind:-}" = "pipeline" ]; then
@@ -621,7 +652,7 @@ cmd_list() {
                     tier_2) state_display="$state_display tier:2" ;;
                     tier_3) state_display="$state_display tier:3" ;;
                 esac
-                printf "%-28s  %-16s  %-18s  %-12s  %s\n" "$id" "$state_display" "$repo" "$iso" "$title"
+                printf "%-28s  %-16s  %-18s  %-12s  %-16s  %s\n" "$id" "$state_display" "$repo" "$iso" "$origin" "$title"
             done
     fi
 }
@@ -2281,7 +2312,7 @@ mother — background work for Claude Code
 
 Usage:
   mother add --plan-file PATH --repo NAME --branch BRANCH [options]
-  mother list [--state STATE] [--repo REPO] [--format json|table]
+  mother list [--state STATE] [--repo REPO] [--project NAME] [--label LABEL] [--format json|table]
   mother status ID [--format json|text]
   mother logs ID [--follow]
   mother peek ID [--format json|text] [--tail N] [--watch]
@@ -2312,6 +2343,9 @@ Add options:
   --depends-on ID[,ID...]
   --title TEXT         (default: first heading of plan file)
   --format json|text   (default: text — prints job id only)
+  --label TEXT         free-text origin label for this job
+  --origin-project NAME  override auto-detected originating project name
+  --origin-session ID    originating session id (default: \$MOTHER_ORIGIN_SESSION)
 
 Plan file requirements:
   Every plan must include a ```yaml suggested_config: ... ``` block specifying
