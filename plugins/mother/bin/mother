@@ -1914,6 +1914,13 @@ cmd_events() {
         cursor_file="$CURSORS_DIR/$session_id.json"
         if [ -f "$cursor_file" ] && [ -z "$since_ts" ]; then
             since_ts=$(jq -r '.last_seen // ""' "$cursor_file" 2>/dev/null || echo "")
+        elif [ ! -f "$cursor_file" ] && [ -z "$since_ts" ]; then
+            # Brand-new session: bootstrap cursor to now so we don't replay
+            # the full event history on first call. Future calls will pick up
+            # only events emitted after this session started.
+            since_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            mkdir -p "$CURSORS_DIR"
+            _atomic_write "$cursor_file" "$(jq -n --arg ts "$since_ts" '{last_seen: $ts}')"
         fi
     fi
 
