@@ -26,10 +26,11 @@
   <true/>
 
   <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
+  <true/>
+
+  <!-- Throttle rapid-restart loops to 10s so a crashy runner doesn't spin. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
 
   <key>StandardOutPath</key>
   <string>__MOTHER_STATE_DIR__/runner/runner.log</string>
