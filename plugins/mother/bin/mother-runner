@@ -82,7 +82,37 @@ _write_pidfile() {
 }
 
 _remove_pidfile() {
-    rm -f "$PIDFILE"
+    # Only remove the pidfile if it still names us. Otherwise a second
+    # instance shutting down (e.g. one that lost the singleton race, or was
+    # killed directly) would delete the pidfile out from under whichever
+    # instance is still legitimately running, breaking `mother daemon
+    # status`/`stop` and defeating _singleton_guard for the next start.
+    # (Observed live: killing an orphaned duplicate runner deleted the
+    # supervised instance's pidfile even though that instance kept running.)
+    local current_pid
+    current_pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [ "$current_pid" = "$$" ]; then
+        rm -f "$PIDFILE"
+    fi
+}
+
+# Refuse to start a second runner against the same MOTHER_ROOT. Without this,
+# a stray manual invocation (or a launchd reload racing a leftover foreground
+# run) silently coexists with the supervised instance: both poll the same
+# jobs/ directory, both dispatch up to MOTHER_CONCURRENCY workers, and they
+# race on the same job state files (observed as spurious `jq: could not open
+# file <job>.json` errors in the log when one runner archives/moves a job
+# out from under the other mid-tick). A dead pid's stale pidfile is reclaimed
+# rather than treated as a lock.
+_singleton_guard() {
+    [ -f "$PIDFILE" ] || return 0
+    local existing_pid
+    existing_pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+        _log "refusing to start: mother-runner already running as pid $existing_pid ($PIDFILE). Stop it first (mother daemon stop) or remove the pidfile if it's stale."
+        exit 1
+    fi
+    [ -n "$existing_pid" ] && _log "reclaiming stale pidfile for dead pid $existing_pid"
 }
 
 _on_signal() {
@@ -972,6 +1002,7 @@ _drain() {
 # ---------- entrypoint ----------
 
 main() {
+    _singleton_guard
     _write_pidfile
     trap '_on_signal' TERM INT
     _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
