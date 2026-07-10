@@ -2085,14 +2085,26 @@ _daemon_stop() {
         elapsed=$((elapsed + 1))
     done
 
+    # Only remove the pidfile if it still names the pid we just stopped.
+    # A launchd KeepAlive-supervised runner can respawn within milliseconds
+    # of the old process dying and write its own (different) pid to this
+    # same file; blindly rm-ing here would delete that live respawn's
+    # pidfile instead, leaving it running untracked while `daemon start`
+    # (seeing no pidfile) launches an unrelated second instance alongside
+    # it. Reproduced live: this exact race produced two simultaneously
+    # running mother-runner processes after a single stop-then-start.
+    local still_ours; still_ours=$([ "$(cat "$pidfile" 2>/dev/null)" = "$pid" ] && echo 1 || echo 0)
+
     if kill -0 "$pid" 2>/dev/null; then
         echo "SIGTERM ignored after 15s — escalating to SIGKILL"
         kill -KILL "$pid" 2>/dev/null || true
-        rm -f "$pidfile"
+        [ "$still_ours" = "1" ] && rm -f "$pidfile"
         echo "killed (pid $pid)"
     else
-        # Daemon cleans up its own pidfile on graceful exit.
-        [ -f "$pidfile" ] && rm -f "$pidfile"
+        # Daemon cleans up its own pidfile on graceful exit; this is a
+        # belt-and-suspenders fallback for the case where it didn't (e.g.
+        # SIGKILL below skipped that cleanup path).
+        [ "$still_ours" = "1" ] && rm -f "$pidfile"
         echo "stopped (pid $pid)"
     fi
 }
