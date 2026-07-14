@@ -352,6 +352,19 @@ _recover_orphans() {
                 [ "$started_epoch" -eq 0 ] && continue
                 [ $((now_epoch - started_epoch)) -ge "$grace" ] || continue
             fi
+            # Past the grace window, this branch used to reap unconditionally —
+            # but a slow-to-persist supervisor (e.g. worktree creation + env
+            # setup contending with other concurrent jobs for disk/CPU) can
+            # easily outlast a fixed 60s grace under load. Unlike the `pid`
+            # branch above, this one never checked whether the supervisor
+            # (mother-run-job) was actually still alive before reaping — so a
+            # merely-slow spawn got misdiagnosed as `failed: runner_died`,
+            # auto-escalated, and re-spawned into the *same* worktree while
+            # the original, still-live supervisor kept working there too.
+            # Apply the same liveness guard the `pid` branch already uses.
+            if _supervisor_alive_for_job "$id"; then
+                continue
+            fi
             _log "marking $id $terminal_state (no worker_pid or tmux_window; cancel_requested=$cancel_req)"
             _job_transition "$id" "$terminal_state" "$terminal_reason"
         fi
@@ -1021,6 +1034,14 @@ main() {
 case "${1:-}" in
     --driver-tick)
         _run_pipeline_job
+        exit 0
+        ;;
+    --recover-orphans-tick)
+        # Test entry point: run one _recover_orphans pass (with the real
+        # grace window, or an override via $2) and exit without starting the
+        # daemon loop. Used by orphan_recovery.bats.
+        # Usage: mother-runner --recover-orphans-tick [grace_seconds]
+        _recover_orphans "${2:-$MOTHER_ORPHAN_GRACE}"
         exit 0
         ;;
 esac
