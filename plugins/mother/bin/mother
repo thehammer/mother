@@ -440,7 +440,14 @@ cmd_add() {
     case "$executor"  in local-tmux)        ;; *) _die "executor must be local-tmux (for now)" ;; esac
 
     [ -z "$repo_path" ] && repo_path="$HOME/Code/$repo"
-    [ -d "$repo_path/.git" ] || _die "add: repo path is not a git repo: $repo_path"
+    # A git worktree's .git is a FILE (a gitdir pointer back to the main
+    # repo's .git/worktrees/<name>), not a directory — `-d` alone rejects
+    # every legitimate worktree path (e.g. --repo-path pointed at another
+    # job's existing worktree, --isolation main-dir). Accept either shape,
+    # then confirm it's a real working tree rather than a stray .git file/dir.
+    { [ -d "$repo_path/.git" ] || [ -f "$repo_path/.git" ]; } \
+        && git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        || _die "add: repo path is not a git repo: $repo_path"
 
     [ -z "$title" ] && title=$(head -1 "$plan_file" | sed -E 's/^#+ *//;s/^[[:space:]]+//;s/[[:space:]]+$//')
     [ -z "$title" ] && title="(untitled)"
