@@ -1504,8 +1504,19 @@ cmd_review_phase() {
     fi
 
     # Determine work_dir and base_ref from job.
+    # NOTE: prefer the job's own .work_dir (the actual isolated worktree a
+    # worktree-isolated job's Cody/Redd/Marty ran in) over .repo_path (the
+    # logical/main-checkout path, which is ALWAYS ~/Code/<repo> regardless of
+    # isolation mode). Reading .repo_path here was the root cause of every
+    # reviewer (perri, archie via adherence-review) inspecting the wrong repo
+    # state: phase_render_input's diff/tests sections AND the reviewer's own
+    # ad hoc git/gh exploration (see the cd fix below) both consume this same
+    # local var, so getting the source field wrong broke both at once. A
+    # main-dir-isolation job has no separate worktree, so it has no .work_dir
+    # field — .repo_path is the correct (and only) answer there, hence the
+    # fallback.
     local work_dir base_ref prd_path
-    work_dir=$(jq -r '.repo_path // empty' "$job_file")
+    work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
     base_ref=$(jq -r '.base_ref // empty' "$job_file")
     prd_path=$(jq -r '.prd_path // empty' "$job_file")
 
@@ -1548,11 +1559,24 @@ EOF
         "$(jq -nc --arg r "$reviewer" --arg m "$reviewer_model" --arg p "$review_posture" \
             '{reviewer: $r, model: $m, posture: $p}')"
 
-    # Spawn the reviewer.
+    # Spawn the reviewer. Run from the job's own worktree (work_dir), not
+    # whatever directory `mother` itself was invoked from — the reviewer
+    # agent (e.g. perri) routinely runs its own ad hoc `git diff`/`git log`/
+    # `gh pr diff` to verify findings before flagging them, and without this
+    # it inspects the wrong repo state entirely (observed: identical bogus
+    # findings across two unrelated jobs, both times reflecting whatever
+    # was ambient in the invoking shell's cwd rather than the job's branch).
+    # phase_render_input already scopes its own git calls to work_dir; this
+    # brings the spawned agent's ambient cwd into line with that.
     local tmpfile
     tmpfile=$(mktemp)
-    claude --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" \
-        > "$tmpfile" 2>/dev/null || true
+    if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
+        ( cd "$work_dir" && claude --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" ) \
+            > "$tmpfile" 2>/dev/null || true
+    else
+        claude --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" \
+            > "$tmpfile" 2>/dev/null || true
+    fi
 
     # Extract findings block.
     local raw_findings
