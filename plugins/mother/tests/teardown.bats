@@ -155,8 +155,14 @@ _age_job() {
     jq --arg ts "$ts" '.finished_at = $ts' "$JOBS_DIR/$id.json" > "$tmp" && mv "$tmp" "$JOBS_DIR/$id.json"
 }
 
-# Count `gh pr view` invocations recorded by the gh mock.
-_gh_view_count() { grep -c "pr view" "$MOTHER_ROOT/mock-gh-calls" 2>/dev/null || echo 0; }
+# Count `gh pr view` invocations recorded by the gh mock. NB: `grep -c` exits
+# 1 on zero matches while still printing "0", so the missing-file case is
+# handled separately and the exit status is swallowed with `|| true` — a
+# `|| echo 0` here would print a second "0".
+_gh_view_count() {
+    [ -f "$MOTHER_ROOT/mock-gh-calls" ] || { echo 0; return 0; }
+    grep -c "pr view" "$MOTHER_ROOT/mock-gh-calls" 2>/dev/null || true
+}
 
 setup() {
     setup_mother_env
@@ -779,6 +785,174 @@ teardown() {
     run mother archive
     [ "$status" -eq 0 ]
     [ "$(_gh_view_count)" = "1" ]
+}
+
+# ---------------------------------------------------------------------------
+# One drain guard shared by both cmd_archive teardown call sites
+# ---------------------------------------------------------------------------
+
+@test "a sweep that ages a job with a pending record makes exactly one gh call and one deferral" {
+    export MOCK_GH_STATE="OPEN"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "one-shot-aged" "succeeded" '.pr_url = "https://github.com/x/y/pull/40"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-shot-aged.json")" = "1" ]
+
+    _age_job "one-shot-aged" "2020-01-01T00:00:00Z"
+    : > "$MOTHER_ROOT/mock-gh-calls"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "archived: 1" ]]
+
+    [ "$(_gh_view_count)" = "1" ]
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-shot-aged.json")" = "2" ]
+
+    [ ! -f "$JOBS_DIR/one-shot-aged.json" ]
+    [ -d "$wt_dir" ]
+}
+
+@test "stall_deferrals increments once per sweep even when a job ages into archive eligibility" {
+    export MOCK_GH_EXIT=1
+    _make_teardown_job "stall-across-boundary" "succeeded" '.pr_url = "https://github.com/x/y/pull/41"'
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/stall-across-boundary.json")" = "1" ]
+
+    _age_job "stall-across-boundary" "2020-01-01T00:00:00Z"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/stall-across-boundary.json")" = "2" ]
+}
+
+@test "when the drain resolves a teardown, the archived record reflects the resolved outcome" {
+    export MOCK_GH_STATE="OPEN"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "drain-resolves-then-archives" "succeeded" '.pr_url = "https://github.com/x/y/pull/42"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ -f "$TEARDOWN_DIR/drain-resolves-then-archives.json" ]
+    assert_job_field "drain-resolves-then-archives" '.teardown_status' "deferred"
+
+    export MOCK_GH_STATE="MERGED"
+    _age_job "drain-resolves-then-archives" "2020-01-01T00:00:00Z"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "archived: 1" ]]
+
+    [ ! -d "$wt_dir" ]
+    [ ! -f "$TEARDOWN_DIR/drain-resolves-then-archives.json" ]
+    [ ! -f "$JOBS_DIR/drain-resolves-then-archives.json" ]
+
+    local archived_file
+    archived_file=$(find "$ARCHIVE_DIR" -name 'drain-resolves-then-archives.json')
+    [ -n "$archived_file" ]
+    run jq -r '.teardown_status' "$archived_file"
+    [ "$output" = "torn_down" ]
+}
+
+@test "a pending record that survives its job's archive move is repointed at the archived events file" {
+    export MOCK_GH_STATE="OPEN"
+    _make_teardown_job "repoint-pending" "succeeded" '.pr_url = "https://github.com/x/y/pull/43"'
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ -f "$TEARDOWN_DIR/repoint-pending.json" ]
+
+    _age_job "repoint-pending" "2020-01-01T00:00:00Z"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "archived: 1" ]]
+    [ -f "$TEARDOWN_DIR/repoint-pending.json" ]
+
+    local recorded_events_path
+    recorded_events_path=$(jq -r '.events_path' "$TEARDOWN_DIR/repoint-pending.json")
+    [[ "$recorded_events_path" == */archive/*/repoint-pending.events.jsonl ]]
+}
+
+@test "_teardown_only short-circuits with zero gh calls once a young job is already torn down" {
+    export MOCK_GH_STATE="MERGED"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "already-torn-down" "succeeded" '.pr_url = "https://github.com/x/y/pull/44"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ ! -d "$wt_dir" ]
+    assert_job_field "already-torn-down" '.teardown_status' "torn_down"
+
+    : > "$MOTHER_ROOT/mock-gh-calls"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(_gh_view_count)" = "0" ]
+    [[ "$output" =~ "teardown-only: 0" ]]
+
+    run mother archive --dry-run
+    [ "$status" -eq 0 ]
+    [ "$(_gh_view_count)" = "0" ]
+}
+
+@test "_teardown_only still fully attempts a job whose worktree was recreated after teardown" {
+    export MOCK_GH_STATE="MERGED"
+    local wt_dir repo_dir branch
+    wt_dir=$(_make_teardown_job "retried-after-teardown" "succeeded" '.pr_url = "https://github.com/x/y/pull/45"')
+    repo_dir="$MOTHER_ROOT/repo-retried-after-teardown"
+    branch="feature/retried-after-teardown"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ ! -d "$wt_dir" ]
+    assert_job_field "retried-after-teardown" '.teardown_status' "torn_down"
+
+    git -C "$repo_dir" worktree add -q "$wt_dir" "$branch"
+    : > "$MOTHER_ROOT/mock-gh-calls"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(_gh_view_count)" = "1" ]
+    [ ! -d "$wt_dir" ]
+}
+
+@test "mother teardowns --drain updates a live job's teardown fields" {
+    export MOCK_GH_STATE="OPEN"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "drain-cli-live" "succeeded" '.pr_url = "https://github.com/x/y/pull/46"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    assert_job_field "drain-cli-live" '.teardown_status' "deferred"
+
+    export MOCK_GH_STATE="MERGED"
+    run mother teardowns --drain
+    [ "$status" -eq 0 ]
+
+    assert_job_field "drain-cli-live" '.teardown_status' "torn_down"
+    [ ! -d "$wt_dir" ]
+}
+
+@test "mother archive <id> still runs teardown itself for a young merged job" {
+    export MOCK_GH_STATE="MERGED"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "single-id-form" "succeeded" '.pr_url = "https://github.com/x/y/pull/47"')
+
+    run mother archive single-id-form
+    [ "$status" -eq 0 ]
+
+    [ ! -d "$wt_dir" ]
+    [ ! -f "$JOBS_DIR/single-id-form.json" ]
+
+    local archived_file
+    archived_file=$(find "$ARCHIVE_DIR" -name 'single-id-form.json')
+    [ -n "$archived_file" ]
+    run jq -r '.teardown_status' "$archived_file"
+    [ "$output" = "torn_down" ]
 }
 
 # ---- 6 ----

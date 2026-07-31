@@ -2233,25 +2233,17 @@ _archive_facts() {
         "$job_file"
 }
 
-# Record the outcome of a teardown attempt on a still-live job record.
-# `teardown_at` always advances (it means "last attempt"), but a recorded
-# `torn_down` is never downgraded: a job torn down by the teardown-only path
-# while young gets a second, no-op attempt when it finally crosses the archive
-# cutoff, and that pass legitimately reports skipped/already_absent. Letting it
-# overwrite would make the field claim Mother never removed a worktree it did.
-_teardown_record_fields() {
-    local id="$1" status="$2" reason="$3"
-    _job_update "$id" \
-        "(if (.teardown_status == \"torn_down\" and \"$status\" != \"torn_down\")
-          then . else (.teardown_status = \"$status\" | .teardown_reason = \"$reason\") end)
-         | .teardown_at = \"$(_iso_now)\""
-}
-
 # Move a single terminal-state job from JOBS_DIR to archive/YYYY-MM/, taking
 # its events jsonl, plan md, and log (gzipped) along. Shared by both the bulk
 # sweep and the single-id form. Returns 0 if moved, 1 if skipped/not eligible.
+#
+# skip_teardown: set by the bulk loop to 1 when _teardown_drain already ran a
+# full teardown attempt (including its _teardown_record_fields write) against
+# this exact job earlier in the same sweep — see TEARDOWN_DRAIN_IDS. Defaults
+# to 0 so the single-id form (`mother archive <id>`, which never calls
+# _teardown_drain) keeps running teardown itself, unchanged from before.
 _archive_one() {
-    local id="$1" dry_run="${2:-0}"
+    local id="$1" dry_run="${2:-0}" skip_teardown="${3:-0}"
     local job_file="$JOBS_DIR/$id.json"
     [ -f "$job_file" ] || { echo "archive: no such job: $id" >&2; return 1; }
 
@@ -2280,7 +2272,7 @@ _archive_one() {
     if [ "$dry_run" -eq 1 ]; then
         echo "[dry-run] would archive $id (finished $finished) → $dest_dir"
         # Report what teardown would do too, without mutating anything.
-        _teardown_execute "$facts" 1 || true
+        [ "$skip_teardown" -eq 1 ] || _teardown_attempt "$facts" 1 || true
         return 0
     fi
 
@@ -2290,8 +2282,11 @@ _archive_one() {
     # giving a complete audit trail in one place. Archiving must succeed
     # regardless of teardown's outcome (moved repo, missing gh, docker down,
     # deferred PR, etc.) — never let a teardown failure block the archive.
-    _teardown_execute "$facts" 0 || true
-    _teardown_record_fields "$id" "${TEARDOWN_LAST_STATUS:-unknown}" "${TEARDOWN_LAST_REASON:-}"
+    # skip_teardown=1 means _teardown_drain already did both this pass (ran
+    # the attempt AND recorded its outcome onto this still-live job) — running
+    # it again here would cost a second `gh pr view` and double-count this
+    # job's deferral counters for nothing.
+    [ "$skip_teardown" -eq 1 ] || _teardown_attempt "$facts" 0 || true
 
     mkdir -p "$dest_dir"
     mv "$job_file" "$dest_dir/$id.json" 2>/dev/null
@@ -2300,6 +2295,7 @@ _archive_one() {
     if [ -f "$LOGS_DIR/$id.log" ]; then
         gzip -c "$LOGS_DIR/$id.log" > "$dest_dir/$id.log.gz" && rm -f "$LOGS_DIR/$id.log"
     fi
+    _teardown_repoint_pending "$id" "$dest_dir/$id.events.jsonl"
     return 0
 }
 
@@ -2313,23 +2309,45 @@ _archive_one() {
 # Must be called bare (never in a command substitution): _teardown_execute
 # reports its outcome through the TEARDOWN_LAST_STATUS/REASON side-channel
 # globals, which a subshell would swallow.
+#
+# Return codes: 0 = attempted, 1 = job file vanished mid-sweep, 2 = nothing
+# left to do (already torn down, worktree absent, no pending record —
+# see the short-circuit below).
 _teardown_only() {
     local id="$1" dry_run="${2:-0}"
     local job_file="$JOBS_DIR/$id.json"
     [ -f "$job_file" ] || return 1
+
+    # Cheap idempotence short-circuit. A job already recorded torn_down, with
+    # no pending record and no worktree left on disk, has nothing to tear
+    # down — skip it instead of paying a live `gh pr view` on every hourly
+    # sweep until its record ages into the archive. The `[ ! -d "$work_dir" ]`
+    # half is load-bearing, not belt-and-braces: nothing ever resets
+    # teardown_status, so a job that was retried after teardown
+    # (mother-run-job re-creates work_dir) and went terminal again MUST still
+    # get a full attempt.
+    if [ "$(jq -r '.teardown_status // ""' "$job_file")" = "torn_down" ] \
+        && [ ! -f "$(_teardown_pending_path "$id")" ]; then
+        local sc_work_dir sc_isolation
+        sc_work_dir=$(jq -r '.work_dir // ""' "$job_file")
+        sc_isolation=$(jq -r '.isolation // "worktree"' "$job_file")
+        if [ "$sc_isolation" = "worktree" ] && [ -n "$sc_work_dir" ] \
+            && [ ! -d "$sc_work_dir" ]; then
+            return 2
+        fi
+    fi
 
     local facts
     facts=$(_archive_facts "$job_file" "$EVENTS_DIR/$id.jsonl")
 
     if [ "$dry_run" -eq 1 ]; then
         echo "[dry-run] would attempt teardown-only for $id (record stays in $JOBS_DIR)"
-        _teardown_execute "$facts" 1 || true
+        _teardown_attempt "$facts" 1 || true
         return 0
     fi
 
     # Same contract as _archive_one: never let a teardown outcome fail the sweep.
-    _teardown_execute "$facts" 0 || true
-    _teardown_record_fields "$id" "${TEARDOWN_LAST_STATUS:-unknown}" "${TEARDOWN_LAST_REASON:-}"
+    _teardown_attempt "$facts" 0 || true
     return 0
 }
 
@@ -2379,7 +2397,7 @@ cmd_archive() {
     cutoff_iso=$(date -u -r "$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ)
 
     local moved=0 teardown_only=0 skipped=0
-    local f state finished id
+    local f state finished id drained rc
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f")
@@ -2388,19 +2406,36 @@ cmd_archive() {
         [ -n "$id" ] || { skipped=$((skipped + 1)); continue; }
         finished=$(jq -r '.finished_at // ""' "$f")
         [ -n "$finished" ] || { skipped=$((skipped + 1)); continue; }
+
+        # Did _teardown_drain already attempt this exact job this pass?
+        # Computed once and consulted by BOTH branches below: the young-job
+        # path skips entirely, and the archive-eligible path still moves the
+        # record but tells _archive_one not to re-run teardown. Without this
+        # on the archive branch, a job with a pending record that has also
+        # aged past the cutoff gets two _teardown_execute calls (two
+        # `gh pr view`, two deferral increments) in a single sweep.
+        drained=0
+        case " ${TEARDOWN_DRAIN_IDS:-} " in
+            *" $id "*) drained=1 ;;
+        esac
+
         if [ "$finished" \> "$cutoff_iso" ]; then
             # Too young for the RECORD to move — but its worktree/docker state
             # may already be eligible. Attempt teardown only, then leave the
-            # record alone. Skipped if _teardown_drain above already attempted
-            # this exact job this pass (see TEARDOWN_DRAIN_IDS).
-            case " ${TEARDOWN_DRAIN_IDS:-} " in
-                *" $id "*) skipped=$((skipped + 1)); continue ;;
-            esac
+            # record alone.
+            if [ "$drained" -eq 1 ]; then
+                skipped=$((skipped + 1))
+                continue
+            fi
             _teardown_only "$id" "$dry_run"
-            teardown_only=$((teardown_only + 1))
+            rc=$?
+            case "$rc" in
+                0) teardown_only=$((teardown_only + 1)) ;;
+                *) skipped=$((skipped + 1)) ;;
+            esac
             continue
         fi
-        if _archive_one "$id" "$dry_run"; then
+        if _archive_one "$id" "$dry_run" "$drained"; then
             moved=$((moved + 1))
         else
             skipped=$((skipped + 1))

@@ -299,10 +299,22 @@ the job record still exists). Every bulk `mother archive` sweep drains this
 queue first, re-evaluating the same gate; `mother archive <id>` re-attempts a
 job's own record inline. `mother teardowns` lists pending records; `mother
 teardowns --drain` re-attempts them on demand. `_teardown_drain` publishes the
-ids it attempted this pass via the `TEARDOWN_DRAIN_IDS` side-channel global;
-`cmd_archive`'s teardown-only branch skips any id already in that list, so a
-job with a pending record never gets two `_teardown_execute` calls (and two
-`gh pr view` calls) in the same sweep.
+ids it attempted this pass via the `TEARDOWN_DRAIN_IDS` side-channel global,
+and `cmd_archive`'s bulk loop computes membership in that list **once per
+job** and consults it from **both** of its branches: the teardown-only branch
+skips the job entirely, and the archive-eligible branch still moves the
+record but passes `skip_teardown=1` to `_archive_one` so teardown itself is
+not re-run. Without both checks, a job with a pending record that has also
+aged past the archive cutoff would get two `_teardown_execute` calls (and two
+`gh pr view` calls) in the same sweep. `_teardown_attempt` (in
+`lib/teardown.sh`) is the single choke point every caller (drain,
+teardown-only, archive) routes through — it pairs each `_teardown_execute`
+call with exactly one `_teardown_record_fields` write, so one attempt always
+produces exactly one recorded outcome no matter which path drove it. A
+consequence: `_teardown_drain` now keeps a still-live job's `teardown_status`
+/ `teardown_reason` / `teardown_at` current too (previously only the archive
+and teardown-only paths wrote those fields), so `mother teardowns --drain`
+against a live job is no longer lossy.
 
 **Deferral counters:** each pending record tracks two counts. `deferrals` is
 the total number of attempts (what `mother teardowns` displays).
@@ -344,8 +356,13 @@ the full-archive path.
 
 **Summary line:** `cmd_archive`'s bulk sweep reports three mutually exclusive
 counters: `archived: N, teardown-only: M, skipped: K (cutoff: ...)`.
-`teardown-only` counts jobs given a teardown attempt without their record
-moving; `archived` counts jobs whose record moved into `archive/YYYY-MM/`.
+`teardown-only` counts jobs actually given a teardown attempt without their
+record moving; `archived` counts jobs whose record moved into
+`archive/YYYY-MM/`. A job short-circuited by `_teardown_only` (already
+`torn_down`, worktree absent, no pending record — nothing left to do) counts
+as `skipped`, not `teardown-only`, since no attempt was made. Likewise a job
+the drain already handled this sweep counts as `skipped` on the teardown-only
+branch (see the pending-queue section above) rather than double-counted.
 
 **Out of scope (deliberately):** git branch deletion, retroactive cleanup of
 worktrees/containers left behind by jobs archived before this feature shipped,

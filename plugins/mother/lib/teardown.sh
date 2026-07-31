@@ -7,7 +7,11 @@
 # "facts" JSON blob and never reads $JOBS_DIR for the job under teardown. By
 # the time a deferred teardown is retried from the pending queue, the job's
 # JSON may already be archived (or gone) — the facts blob is the durable,
-# self-contained snapshot teardown needs.
+# self-contained snapshot teardown needs. The one deliberate exception is
+# _teardown_record_fields: it WRITES the live job record (via _job_update) when
+# one still exists, and is a documented no-op when it doesn't. It never reads
+# job data to make a teardown decision, so it doesn't undermine the
+# facts-blob-only rule above.
 #
 # Facts blob shape:
 #   {"id":"...","repo":"...","repo_path":"...","branch":"...","work_dir":"...",
@@ -20,10 +24,16 @@
 # TEARDOWN_LAST_REASON in the caller's scope, in addition to its return code.
 # _teardown_worktree sets TEARDOWN_WORKTREE_SKIP_REASON (main_dir|already_absent)
 # when it returns 1. _teardown_drain sets TEARDOWN_DRAIN_IDS (space-delimited
-# job ids it attempted this pass) so cmd_archive's teardown-only branch can
-# skip a job the drain already handled in the same sweep. These only work
-# because callers invoke the functions directly (not via command
-# substitution) — see the comments at each call site.
+# job ids it attempted this pass) so cmd_archive's bulk loop can avoid a
+# second _teardown_execute for a job the drain already handled this sweep —
+# consulted by BOTH of that loop's branches: the teardown-only branch skips the
+# job entirely, and the archive branch still moves the record but tells
+# _archive_one not to re-run teardown. These only work because callers invoke
+# the functions directly (not via command substitution) — see the comments at
+# each call site. _teardown_attempt is the single choke point that pairs every
+# _teardown_execute call with exactly one _teardown_record_fields write, so no
+# caller can produce two recorded outcomes (or two gh/docker calls) for one
+# attempt.
 
 : "${MOTHER_TEARDOWN_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_DOCKER_ENABLED:=1}"
@@ -356,6 +366,40 @@ _teardown_clear_pending() {
     rm -f "$(_teardown_pending_path "$id")"
 }
 
+# Record the outcome of a teardown attempt on a still-live job record. No-op
+# when the job's record is gone (e.g. a drain pass re-attempting a job that
+# was archived earlier in the same sweep) — there's nothing to write and
+# _job_update would otherwise print "no such job" to stderr on every such
+# pass. `teardown_at` always advances (it means "last attempt"), but a
+# recorded `torn_down` is never downgraded: a job torn down by the
+# teardown-only path while young gets a second, no-op attempt when it finally
+# crosses the archive cutoff, and that pass legitimately reports
+# skipped/already_absent. Letting it overwrite would make the field claim
+# Mother never removed a worktree it did.
+_teardown_record_fields() {
+    local id="$1" status="$2" reason="$3"
+    [ -n "$id" ] || return 0
+    [ -f "$JOBS_DIR/$id.json" ] || return 0
+    _job_update "$id" \
+        "(if (.teardown_status == \"torn_down\" and \"$status\" != \"torn_down\")
+          then . else (.teardown_status = \"$status\" | .teardown_reason = \"$reason\") end)
+         | .teardown_at = \"$(_iso_now)\""
+}
+
+# _teardown_repoint_pending <id> <events_path> — after a job's record has moved
+# into archive/YYYY-MM/, re-point any SURVIVING pending-teardown record at the
+# archived events file, so later drain passes keep appending to the same audit
+# trail instead of falling back to the shared $EVENTS_DIR/teardown.jsonl. No-op
+# when the record is gone (the common case: teardown resolved and cleared it).
+_teardown_repoint_pending() {
+    local id="$1" events_path="$2"
+    local path; path=$(_teardown_pending_path "$id")
+    [ -f "$path" ] || return 0
+    local updated
+    updated=$(jq -c --arg ep "$events_path" '.events_path = $ep' "$path" 2>/dev/null) || return 0
+    _atomic_write "$path" "$updated"
+}
+
 # _teardown_park <facts_json> <status> <reason> <event_kind> [<detail_json>]
 # Shared tail for every non-dry-run "this job needs another pass" outcome in
 # _teardown_execute — deferred (waiting on something external: PR, gh,
@@ -485,8 +529,30 @@ _teardown_execute() {
     return 0
 }
 
-# _teardown_drain <dry_run> — sweep $TEARDOWN_DIR, re-running _teardown_execute
-# on each stored facts blob. Removes the record on success (handled by
+# _teardown_attempt <facts_json> <dry_run> -> same return code as
+# _teardown_execute. The ONLY way callers should invoke teardown: it runs the
+# orchestrator and then mirrors the outcome onto the job's live record, so one
+# _teardown_execute always produces exactly one recorded outcome no matter which
+# path (drain, teardown-only, archive) drove it. Dry runs record nothing.
+#
+# Like _teardown_execute, must be called bare — never in a command
+# substitution — because the outcome travels through the TEARDOWN_LAST_*
+# globals.
+_teardown_attempt() {
+    local facts="$1" dry_run="${2:-0}"
+    local rc=0
+    _teardown_execute "$facts" "$dry_run" || rc=$?
+    if [ "$dry_run" -ne 1 ]; then
+        local id; id=$(_facts_get "$facts" '.id // empty')
+        _teardown_record_fields "$id" "${TEARDOWN_LAST_STATUS:-unknown}" \
+            "${TEARDOWN_LAST_REASON:-}"
+    fi
+    return "$rc"
+}
+
+# _teardown_drain <dry_run> — sweep $TEARDOWN_DIR, re-running teardown (via
+# _teardown_attempt, so a live job's teardown_* fields stay current too) on
+# each stored facts blob. Removes the record on success (handled by
 # _teardown_execute itself via _teardown_clear_pending). Echoes a one-line
 # summary for callers to fold into their own output.
 _teardown_drain() {
@@ -494,9 +560,9 @@ _teardown_drain() {
     local completed=0 deferred=0
     local f facts drain_id
     # Side-channel out-param: space-delimited ids attempted this pass, so
-    # cmd_archive's teardown-only branch can skip jobs the drain just handled.
-    # Without it a job with a pending record gets TWO _teardown_execute calls per
-    # sweep, doubling the deferral accrual rate the attention cap is calibrated
+    # cmd_archive's bulk loop can skip jobs the drain just handled. Without it
+    # a job with a pending record gets TWO teardown attempts per sweep,
+    # doubling the deferral accrual rate the attention cap is calibrated
     # against (and doubling `gh pr view` calls).
     TEARDOWN_DRAIN_IDS=""
     for f in "$TEARDOWN_DIR"/*.json; do
@@ -504,7 +570,7 @@ _teardown_drain() {
         facts=$(jq -c '.' "$f" 2>/dev/null) || continue
         drain_id=$(_facts_get "$facts" '.id // empty')
         [ -n "$drain_id" ] && TEARDOWN_DRAIN_IDS="$TEARDOWN_DRAIN_IDS $drain_id"
-        if _teardown_execute "$facts" "$dry_run"; then
+        if _teardown_attempt "$facts" "$dry_run"; then
             completed=$((completed + 1))
         else
             deferred=$((deferred + 1))
