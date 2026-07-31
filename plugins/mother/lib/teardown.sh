@@ -19,8 +19,11 @@
 # sets TEARDOWN_LAST_STATUS (torn_down|deferred|skipped|failed) and
 # TEARDOWN_LAST_REASON in the caller's scope, in addition to its return code.
 # _teardown_worktree sets TEARDOWN_WORKTREE_SKIP_REASON (main_dir|already_absent)
-# when it returns 1. These only work because callers invoke the functions
-# directly (not via command substitution) — see the comments at each call site.
+# when it returns 1. _teardown_drain sets TEARDOWN_DRAIN_IDS (space-delimited
+# job ids it attempted this pass) so cmd_archive's teardown-only branch can
+# skip a job the drain already handled in the same sweep. These only work
+# because callers invoke the functions directly (not via command
+# substitution) — see the comments at each call site.
 
 : "${MOTHER_TEARDOWN_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_DOCKER_ENABLED:=1}"
@@ -301,34 +304,50 @@ _teardown_worktree() {
 # ---------- pending queue ----------
 
 # _teardown_defer_record <facts_json> <reason> — upsert the pending record,
-# incrementing its deferral count. Crossing MOTHER_TEARDOWN_MAX_DEFERRALS
-# emits teardown_needs_attention exactly once (on the crossing, not on every
+# incrementing its total deferral count (`deferrals`) and, unless the reason
+# is the healthy `pr_open` wait, its stall count (`stall_deferrals`). Crossing
+# MOTHER_TEARDOWN_MAX_DEFERRALS worth of `stall_deferrals` emits
+# teardown_needs_attention exactly once (on the crossing, not on every
 # subsequent pass) — it never triggers destruction, only makes the stall loud.
 _teardown_defer_record() {
     local facts="$1" reason="$2"
     local id; id=$(_facts_get "$facts" '.id')
     local path; path=$(_teardown_pending_path "$id")
 
-    local prev_deferrals=0
+    local prev_deferrals=0 prev_stalls=0
     if [ -f "$path" ]; then
         prev_deferrals=$(jq -r '.deferrals // 0' "$path" 2>/dev/null) || prev_deferrals=0
+        prev_stalls=$(jq -r '.stall_deferrals // 0' "$path" 2>/dev/null) || prev_stalls=0
     fi
     case "$prev_deferrals" in ''|*[!0-9]*) prev_deferrals=0 ;; esac
+    case "$prev_stalls"    in ''|*[!0-9]*) prev_stalls=0 ;; esac
     local deferrals=$((prev_deferrals + 1))
+
+    # `pr_open` is a healthy WAIT, not a stall — PRs legitimately stay open for
+    # days. Now that every young terminal job gets a teardown attempt on the
+    # hourly sweep, counting pr_open toward the attention cap would fire
+    # teardown_needs_attention for every PR still open after ~MAX_DEFERRALS
+    # hours. Only anomalous reasons (gh unreachable, docker down, a stuck racing
+    # job, a succeeded job with no captured PR url, worktree errors, the kill
+    # switch left off) mean something actually needs a human.
+    local stalls="$prev_stalls"
+    [ "$reason" = "pr_open" ] || stalls=$((prev_stalls + 1))
 
     local record
     record=$(printf '%s' "$facts" | jq \
         --arg reason "$reason" \
         --arg deferred_at "$(_iso_now)" \
         --argjson deferrals "$deferrals" \
-        '. + {last_reason: $reason, deferred_at: $deferred_at, deferrals: $deferrals}')
+        --argjson stalls "$stalls" \
+        '. + {last_reason: $reason, deferred_at: $deferred_at, deferrals: $deferrals, stall_deferrals: $stalls}')
     mkdir -p "$TEARDOWN_DIR"
     _atomic_write "$path" "$record"
 
     local cap="${MOTHER_TEARDOWN_MAX_DEFERRALS:-30}"
-    if [ "$deferrals" -gt "$cap" ] && [ "$prev_deferrals" -le "$cap" ]; then
+    if [ "$stalls" -gt "$cap" ] && [ "$prev_stalls" -le "$cap" ]; then
         _teardown_event "$facts" "teardown_needs_attention" \
-            "$(jq -nc --argjson d "$deferrals" --arg r "$reason" '{deferrals: $d, reason: $r}')"
+            "$(jq -nc --argjson s "$stalls" --argjson d "$deferrals" --arg r "$reason" \
+                '{deferrals: $d, stall_deferrals: $s, reason: $r}')"
     fi
 }
 
@@ -473,10 +492,18 @@ _teardown_execute() {
 _teardown_drain() {
     local dry_run="${1:-0}"
     local completed=0 deferred=0
-    local f facts
+    local f facts drain_id
+    # Side-channel out-param: space-delimited ids attempted this pass, so
+    # cmd_archive's teardown-only branch can skip jobs the drain just handled.
+    # Without it a job with a pending record gets TWO _teardown_execute calls per
+    # sweep, doubling the deferral accrual rate the attention cap is calibrated
+    # against (and doubling `gh pr view` calls).
+    TEARDOWN_DRAIN_IDS=""
     for f in "$TEARDOWN_DIR"/*.json; do
         [ -f "$f" ] || continue
         facts=$(jq -c '.' "$f" 2>/dev/null) || continue
+        drain_id=$(_facts_get "$facts" '.id // empty')
+        [ -n "$drain_id" ] && TEARDOWN_DRAIN_IDS="$TEARDOWN_DRAIN_IDS $drain_id"
         if _teardown_execute "$facts" "$dry_run"; then
             completed=$((completed + 1))
         else

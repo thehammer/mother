@@ -147,6 +147,17 @@ DOCKER
     chmod +x "$_MOCK_BIN/docker"
 }
 
+# Back-date a live job's finished_at so the bulk sweep's age gate passes it.
+# Usage: _age_job <id> <iso-timestamp>
+_age_job() {
+    local id="$1" ts="$2" tmp
+    tmp=$(mktemp)
+    jq --arg ts "$ts" '.finished_at = $ts' "$JOBS_DIR/$id.json" > "$tmp" && mv "$tmp" "$JOBS_DIR/$id.json"
+}
+
+# Count `gh pr view` invocations recorded by the gh mock.
+_gh_view_count() { grep -c "pr view" "$MOTHER_ROOT/mock-gh-calls" 2>/dev/null || echo 0; }
+
 setup() {
     setup_mother_env
     _install_mock_gh
@@ -642,4 +653,255 @@ teardown() {
     [ ! -f "$JOBS_DIR/e2e-missing-repo.json" ]
     run bash -c "find '$ARCHIVE_DIR' -name 'e2e-missing-repo.json' | grep -q ."
     [ "$status" -eq 0 ]
+}
+
+# ===========================================================================
+# Teardown decoupled from the archive age gate
+# ===========================================================================
+
+# ---- 1 ----
+
+@test "bulk sweep tears down a young merged job without archiving its record" {
+    export MOCK_GH_STATE="MERGED"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "young-merged" "succeeded" '.pr_url = "https://github.com/x/y/pull/20"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+
+    [ ! -d "$wt_dir" ]
+    [ -f "$JOBS_DIR/young-merged.json" ]
+    run bash -c "find '$ARCHIVE_DIR' -name 'young-merged.json' | grep -q ."
+    [ "$status" -ne 0 ]
+
+    assert_job_field "young-merged" '.teardown_status' "torn_down"
+
+    local events_file
+    events_file=$(_find_events_file "young-merged")
+    run grep -F '"kind":"teardown_completed"' "$events_file"
+    [ "$status" -eq 0 ]
+}
+
+@test "bulk sweep summary line reports teardown-only separately from archived" {
+    export MOCK_GH_STATE="MERGED"
+    _make_teardown_job "young-merged-2" "succeeded" '.pr_url = "https://github.com/x/y/pull/21"'
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "archived: 0" ]]
+    [[ "$output" =~ "teardown-only: 1" ]]
+}
+
+# ---- 2 ----
+
+@test "a job torn down while young later archives cleanly, teardown a no-op" {
+    export MOCK_GH_STATE="MERGED"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "age-into-archive" "succeeded" '.pr_url = "https://github.com/x/y/pull/22"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ ! -d "$wt_dir" ]
+    [ -f "$JOBS_DIR/age-into-archive.json" ]
+
+    _age_job "age-into-archive" "2020-01-01T00:00:00Z"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "archived: 1" ]]
+
+    [ ! -f "$JOBS_DIR/age-into-archive.json" ]
+    local archived_file
+    archived_file=$(find "$ARCHIVE_DIR" -name 'age-into-archive.json')
+    [ -n "$archived_file" ]
+
+    local events_file
+    events_file=$(_find_events_file "age-into-archive")
+    run grep -F '"kind":"teardown_failed"' "$events_file"
+    [ "$status" -ne 0 ]
+
+    run jq -r '.teardown_status' "$archived_file"
+    [ "$output" = "torn_down" ]
+}
+
+# ---- 3 ----
+
+@test "--older-than 0 archives and moves rather than taking the teardown-only path" {
+    export MOCK_GH_STATE="MERGED"
+    _make_teardown_job "older-than-zero" "succeeded" '.pr_url = "https://github.com/x/y/pull/23"'
+
+    run mother archive --older-than 0
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "archived: 1" ]]
+    [[ "$output" =~ "teardown-only: 0" ]]
+
+    [ ! -f "$JOBS_DIR/older-than-zero.json" ]
+    run bash -c "find '$ARCHIVE_DIR' -name 'older-than-zero.json' | grep -q ."
+    [ "$status" -eq 0 ]
+}
+
+# ---- 4 ----
+
+@test "teardown-only accrues exactly one deferral per sweep" {
+    export MOCK_GH_STATE="OPEN"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "one-deferral-per-sweep" "succeeded" '.pr_url = "https://github.com/x/y/pull/24"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "1" ]
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "2" ]
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "3" ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "0" ]
+
+    [ -d "$wt_dir" ]
+    [ -f "$JOBS_DIR/one-deferral-per-sweep.json" ]
+}
+
+# ---- 5 ----
+
+@test "the drain and the teardown-only path never both attempt the same job in one sweep" {
+    export MOCK_GH_STATE="OPEN"
+    _make_teardown_job "no-double-attempt" "succeeded" '.pr_url = "https://github.com/x/y/pull/25"'
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ -f "$TEARDOWN_DIR/no-double-attempt.json" ]
+
+    : > "$MOTHER_ROOT/mock-gh-calls"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(_gh_view_count)" = "1" ]
+}
+
+# ---- 6 ----
+
+@test "pr_open deferrals never fire teardown_needs_attention" {
+    export MOTHER_TEARDOWN_MAX_DEFERRALS=1
+    export MOCK_GH_STATE="OPEN"
+    _make_teardown_job "pr-open-never-stalls" "succeeded" '.pr_url = "https://github.com/x/y/pull/26"'
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    run mother archive
+    [ "$status" -eq 0 ]
+    run mother archive
+    [ "$status" -eq 0 ]
+
+    local events_file
+    events_file=$(_find_events_file "pr-open-never-stalls")
+    run grep -F '"kind":"teardown_needs_attention"' "$events_file"
+    [ "$status" -ne 0 ]
+
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/pr-open-never-stalls.json")" = "3" ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/pr-open-never-stalls.json")" = "0" ]
+}
+
+# ---- 7 ----
+
+@test "a genuinely stalled teardown still fires teardown_needs_attention exactly once" {
+    export MOTHER_TEARDOWN_MAX_DEFERRALS=1
+    export MOCK_GH_EXIT=1
+    _make_teardown_job "genuinely-stalled" "succeeded" '.pr_url = "https://github.com/x/y/pull/27"'
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    run mother archive
+    [ "$status" -eq 0 ]
+    run mother archive
+    [ "$status" -eq 0 ]
+    run mother archive
+    [ "$status" -eq 0 ]
+
+    local stalls
+    stalls=$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/genuinely-stalled.json")
+    [ "$stalls" -gt 1 ]
+
+    local events_file
+    events_file=$(_find_events_file "genuinely-stalled")
+    local count
+    count=$(grep -c '"kind":"teardown_needs_attention"' "$events_file")
+    [ "$count" -eq 1 ]
+}
+
+# ---- 8 ----
+
+@test "MOTHER_TEARDOWN_ENABLED=0 leaves a young job's worktree alone on the teardown-only path" {
+    export MOCK_GH_STATE="MERGED"
+    export MOTHER_TEARDOWN_ENABLED=0
+    local wt_dir
+    wt_dir=$(_make_teardown_job "disabled-young" "succeeded" '.pr_url = "https://github.com/x/y/pull/28"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+
+    [ -d "$wt_dir" ]
+    [ -f "$TEARDOWN_DIR/disabled-young.json" ]
+    [ -f "$JOBS_DIR/disabled-young.json" ]
+
+    local events_file
+    events_file=$(_find_events_file "disabled-young")
+    run grep -F '"kind":"teardown_skipped"' "$events_file"
+    [ "$status" -eq 0 ]
+    run grep -F '"reason":"disabled"' "$events_file"
+    [ "$status" -eq 0 ]
+}
+
+# ---- 9 ----
+
+@test "MOTHER_TEARDOWN_DOCKER_ENABLED=0 on the teardown-only path skips docker but removes the worktree" {
+    export MOCK_GH_STATE="MERGED"
+    export MOTHER_TEARDOWN_DOCKER_ENABLED=0
+    local wt_dir
+    wt_dir=$(_make_teardown_job "docker-disabled-young" "succeeded" '.pr_url = "https://github.com/x/y/pull/29"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+
+    [ ! -d "$wt_dir" ]
+    run bash -c "[ -s '$MOTHER_ROOT/mock-docker-args' ]"
+    [ "$status" -ne 0 ]
+}
+
+# ---- 10 ----
+
+@test "_teardown_execute is idempotent across two lifetime calls" {
+    export MOCK_GH_STATE="MERGED"
+    local repo_dir="$MOTHER_ROOT/repo-idempotent"
+    local wt_dir="$MOTHER_ROOT/wt-idempotent"
+    _make_teardown_repo "$repo_dir"
+    _make_teardown_worktree "$repo_dir" "$wt_dir" "feature/idempotent"
+    facts=$(_facts_json "job-idempotent" "$repo_dir" "feature/idempotent" "$wt_dir" "worktree" \
+        "https://github.com/x/y/pull/30" "succeeded" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        rc1=\$?
+        s1=\"\$TEARDOWN_LAST_STATUS\"; r1=\"\$TEARDOWN_LAST_REASON\"
+        _teardown_execute '$facts' 0
+        rc2=\$?
+        s2=\"\$TEARDOWN_LAST_STATUS\"; r2=\"\$TEARDOWN_LAST_REASON\"
+        echo \"rc1=\$rc1 s1=\$s1 r1=\$r1 rc2=\$rc2 s2=\$s2 r2=\$r2\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rc1=0"* ]]
+    [[ "$output" == *"s1=torn_down"* ]]
+    [[ "$output" == *"r1=pr_merged"* ]]
+    [[ "$output" == *"rc2=0"* ]]
+    [[ "$output" == *"s2=skipped"* ]]
+    [[ "$output" == *"r2=already_absent"* ]]
+
+    [ ! -d "$wt_dir" ]
+
+    local events_file
+    events_file=$(_find_events_file "job-idempotent")
+    run grep -F '"kind":"teardown_failed"' "$events_file"
+    [ "$status" -ne 0 ]
 }

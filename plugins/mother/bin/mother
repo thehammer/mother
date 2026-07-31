@@ -2218,6 +2218,35 @@ _daemon_uninstall() {
 
 # ---------- archive ----------
 
+# Build the self-contained facts snapshot lib/teardown.sh needs for a job.
+# `events_path` is where teardown should append events IF the live per-job
+# events file is gone by the time it runs: the archive destination for
+# _archive_one (the move happens right after), the still-live events file for
+# the teardown-only path (no move happens at all).
+_archive_facts() {
+    local job_file="$1" events_path="$2"
+    jq -c --arg ep "$events_path" \
+        '{id: .id, repo: (.repo // ""), repo_path: (.repo_path // ""),
+          branch: (.branch // ""), work_dir: (.work_dir // ""),
+          isolation: (.isolation // "worktree"), pr_url: (.pr_url // null),
+          state: (.state // ""), no_pr: (.no_pr // false), events_path: $ep}' \
+        "$job_file"
+}
+
+# Record the outcome of a teardown attempt on a still-live job record.
+# `teardown_at` always advances (it means "last attempt"), but a recorded
+# `torn_down` is never downgraded: a job torn down by the teardown-only path
+# while young gets a second, no-op attempt when it finally crosses the archive
+# cutoff, and that pass legitimately reports skipped/already_absent. Letting it
+# overwrite would make the field claim Mother never removed a worktree it did.
+_teardown_record_fields() {
+    local id="$1" status="$2" reason="$3"
+    _job_update "$id" \
+        "(if (.teardown_status == \"torn_down\" and \"$status\" != \"torn_down\")
+          then . else (.teardown_status = \"$status\" | .teardown_reason = \"$reason\") end)
+         | .teardown_at = \"$(_iso_now)\""
+}
+
 # Move a single terminal-state job from JOBS_DIR to archive/YYYY-MM/, taking
 # its events jsonl, plan md, and log (gzipped) along. Shared by both the bulk
 # sweep and the single-id form. Returns 0 if moved, 1 if skipped/not eligible.
@@ -2246,12 +2275,7 @@ _archive_one() {
     # destination) since teardown may run again later (drain) once that move
     # has already happened.
     local facts
-    facts=$(jq -c --arg ep "$dest_dir/$id.events.jsonl" \
-        '{id: .id, repo: (.repo // ""), repo_path: (.repo_path // ""),
-          branch: (.branch // ""), work_dir: (.work_dir // ""),
-          isolation: (.isolation // "worktree"), pr_url: (.pr_url // null),
-          state: (.state // ""), no_pr: (.no_pr // false), events_path: $ep}' \
-        "$job_file")
+    facts=$(_archive_facts "$job_file" "$dest_dir/$id.events.jsonl")
 
     if [ "$dry_run" -eq 1 ]; then
         echo "[dry-run] would archive $id (finished $finished) → $dest_dir"
@@ -2267,8 +2291,7 @@ _archive_one() {
     # regardless of teardown's outcome (moved repo, missing gh, docker down,
     # deferred PR, etc.) — never let a teardown failure block the archive.
     _teardown_execute "$facts" 0 || true
-    local t_status="${TEARDOWN_LAST_STATUS:-unknown}" t_reason="${TEARDOWN_LAST_REASON:-}"
-    _job_update "$id" ".teardown_status = \"$t_status\" | .teardown_reason = \"$t_reason\" | .teardown_at = \"$(_iso_now)\""
+    _teardown_record_fields "$id" "${TEARDOWN_LAST_STATUS:-unknown}" "${TEARDOWN_LAST_REASON:-}"
 
     mkdir -p "$dest_dir"
     mv "$job_file" "$dest_dir/$id.json" 2>/dev/null
@@ -2277,6 +2300,36 @@ _archive_one() {
     if [ -f "$LOGS_DIR/$id.log" ]; then
         gzip -c "$LOGS_DIR/$id.log" > "$dest_dir/$id.log.gz" && rm -f "$LOGS_DIR/$id.log"
     fi
+    return 0
+}
+
+# Give a terminal job a teardown attempt WITHOUT archiving its record: its
+# worktree and docker resources may be eligible for cleanup long before its
+# JSON record is old enough to move into archive/YYYY-MM/. Called from
+# cmd_archive's bulk loop for jobs that fail the age cutoff, so teardown rides
+# the daemon's existing hourly sweep instead of waiting up to
+# MOTHER_ARCHIVE_OLDER_THAN days for its first look.
+#
+# Must be called bare (never in a command substitution): _teardown_execute
+# reports its outcome through the TEARDOWN_LAST_STATUS/REASON side-channel
+# globals, which a subshell would swallow.
+_teardown_only() {
+    local id="$1" dry_run="${2:-0}"
+    local job_file="$JOBS_DIR/$id.json"
+    [ -f "$job_file" ] || return 1
+
+    local facts
+    facts=$(_archive_facts "$job_file" "$EVENTS_DIR/$id.jsonl")
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "[dry-run] would attempt teardown-only for $id (record stays in $JOBS_DIR)"
+        _teardown_execute "$facts" 1 || true
+        return 0
+    fi
+
+    # Same contract as _archive_one: never let a teardown outcome fail the sweep.
+    _teardown_execute "$facts" 0 || true
+    _teardown_record_fields "$id" "${TEARDOWN_LAST_STATUS:-unknown}" "${TEARDOWN_LAST_REASON:-}"
     return 0
 }
 
@@ -2325,26 +2378,35 @@ cmd_archive() {
     cutoff_epoch=$(( $(date +%s) - older_than * 86400 ))
     cutoff_iso=$(date -u -r "$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ)
 
-    local moved=0 skipped=0
+    local moved=0 teardown_only=0 skipped=0
     local f state finished id
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f")
         case "$state" in succeeded|failed|cancelled) ;; *) skipped=$((skipped + 1)); continue ;; esac
+        id=$(jq -r '.id // ""' "$f")
+        [ -n "$id" ] || { skipped=$((skipped + 1)); continue; }
         finished=$(jq -r '.finished_at // ""' "$f")
         [ -n "$finished" ] || { skipped=$((skipped + 1)); continue; }
         if [ "$finished" \> "$cutoff_iso" ]; then
-            skipped=$((skipped + 1))
+            # Too young for the RECORD to move — but its worktree/docker state
+            # may already be eligible. Attempt teardown only, then leave the
+            # record alone. Skipped if _teardown_drain above already attempted
+            # this exact job this pass (see TEARDOWN_DRAIN_IDS).
+            case " ${TEARDOWN_DRAIN_IDS:-} " in
+                *" $id "*) skipped=$((skipped + 1)); continue ;;
+            esac
+            _teardown_only "$id" "$dry_run"
+            teardown_only=$((teardown_only + 1))
             continue
         fi
-        id=$(jq -r '.id' "$f")
         if _archive_one "$id" "$dry_run"; then
             moved=$((moved + 1))
         else
             skipped=$((skipped + 1))
         fi
     done
-    echo "archived: $moved, skipped: $skipped (cutoff: $cutoff_iso)"
+    echo "archived: $moved, teardown-only: $teardown_only, skipped: $skipped (cutoff: $cutoff_iso)"
 }
 
 # ---------- teardowns ----------
@@ -2488,14 +2550,18 @@ Daemon env vars:
   MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
   MOTHER_BROKER_ENABLED        (default: 1)    supervise the IPC broker sidecar (0 to disable)
 
-Teardown env vars (worktree + docker cleanup, rides along with `mother archive`):
+Teardown env vars (worktree + docker cleanup, rides along with `mother archive`
+on every sweep — independent of the record-archiving age cutoff):
   MOTHER_TEARDOWN_ENABLED         (default: 1)  tear down worktrees/containers
                                                  once a job's PR is merged/closed
   MOTHER_TEARDOWN_DOCKER_ENABLED  (default: 1)  include the job-scoped docker
                                                  sweep in teardown
-  MOTHER_TEARDOWN_MAX_DEFERRALS   (default: 30) deferrals before a stalled
-                                                 teardown is flagged for
-                                                 attention (never auto-deleted)
+  MOTHER_TEARDOWN_MAX_DEFERRALS   (default: 30) STALLED deferrals (gh/docker
+                                                 unreachable, races, worktree
+                                                 errors — a still-open PR does
+                                                 not count) before a teardown
+                                                 is flagged for attention
+                                                 (never auto-deleted)
 
 IPC broker env vars (the long-lived sidecar that pushes events to clients):
   MOTHER_BROKER_SOCK           (default: ~/.mother/broker.sock)  Unix socket path
