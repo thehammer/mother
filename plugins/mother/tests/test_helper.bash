@@ -21,8 +21,9 @@ setup_mother_env() {
     export CURSORS_DIR="$MOTHER_ROOT/cursors"
     export RUNNER_DIR="$MOTHER_ROOT/runner"
     export ARCHIVE_DIR="$MOTHER_ROOT/archive"
+    export TEARDOWN_DIR="$MOTHER_ROOT/teardown-pending"
     mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" \
-             "$CURSORS_DIR" "$RUNNER_DIR" "$ARCHIVE_DIR"
+             "$CURSORS_DIR" "$RUNNER_DIR" "$ARCHIVE_DIR" "$TEARDOWN_DIR"
 
     # Put the mock shims FIRST on PATH so they override real tools.
     _MOCK_BIN="$MOTHER_ROOT/mock-bin"

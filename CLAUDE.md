@@ -141,6 +141,9 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_MAX_CONTINUATIONS=N` — cap continuation attempts (default: 3).
 - `MOTHER_PIPELINE_ENABLED=0` — disable the pipeline driver entirely; `kind: "pipeline"` jobs are left untouched by the driver.
 - `MOTHER_PIPELINE_CYCLE_CAP=N` — override the default cycle cap (default: 3) for pipeline jobs that do not set `pipeline.cycle_cap` themselves.
+- `MOTHER_TEARDOWN_ENABLED=0` — disable worktree/container teardown entirely.
+- `MOTHER_TEARDOWN_DOCKER_ENABLED=0` — skip the docker sweep, still tear down worktrees.
+- `MOTHER_TEARDOWN_MAX_DEFERRALS=N` — deferrals before a stalled teardown is flagged for attention (default: 30; never triggers deletion).
 
 ### Metrics file
 
@@ -226,6 +229,145 @@ escalated jobs are never pulled back down by `conservative` posture.
   transcript is unavailable or contains no assistant events.
 - `tokens_out` — total output (generated) tokens across all assistant turns,
   de-duplicated by message id. JSON `null` when the transcript is unavailable.
+
+## Resource teardown (worktrees + containers)
+
+Mother creates two kinds of Mother-owned resources per job — a git worktree
+(`mother-run-job:272-290`) and, potentially, docker containers a job's worker
+starts for testing — and until this feature never cleaned up either. Both are
+torn down automatically once the underlying work is *settled*, via
+`plugins/mother/lib/teardown.sh`.
+
+**Why gate on PR settlement, not "job reached a terminal state":** worktrees
+are legitimately *reused* by follow-up jobs against the same branch (e.g. "fix
+CI on PR #3845" runs after the original job for that branch already
+succeeded). Tearing down as soon as a job goes `succeeded`/`failed` would
+delete a worktree a follow-up job is about to reuse, or is actively running
+in. The safe signal is "the PR is merged or closed", or "the job is terminal
+and never produced a PR at all." Teardown rides along with the existing
+`mother archive` path (the daemon's periodic sweep, and the manual `mother
+archive <id>` used by the fzf switcher's ctrl-d) rather than introducing a new
+sweep mechanism.
+
+**The gate** (`_teardown_gate` in `lib/teardown.sh`), evaluated per job:
+
+| Condition | Result |
+|---|---|
+| No `pr_url`, state `failed`/`cancelled` | proceed — nothing was ever shippable |
+| No `pr_url`, state `succeeded`, `no_pr: true` | proceed — a `no_pr` job never opens a PR |
+| No `pr_url`, state `succeeded`, not `no_pr` | defer — a PR may exist but was never captured; never guess |
+| `pr_url` set, PR merged | proceed |
+| `pr_url` set, PR closed | proceed |
+| `pr_url` set, PR still open | defer |
+| `pr_url` set, `gh` unreachable/inconclusive | defer |
+
+A race guard additionally defers when another non-terminal job shares the
+same `repo_path` + `branch` (escalation re-queue, adherence rework, or a
+distinct job queued against the same branch mid-flight).
+
+**Container convention:** `mother-run-job` exports `COMPOSE_PROJECT_NAME`
+(job-scoped, derived by `mother_compose_project` in `lib/state.sh`) into
+every worker, so a plain `docker compose up` needs zero convention-following
+to be teardown-safe. Anything started outside compose must carry the label
+`mother.job_id=$MOTHER_JOB_ID` (see `templates/preamble.md`) or Mother can't
+find it. Every docker mutation in the teardown path carries either the
+`-p <project>` compose flag or one of these label filters — never an
+unfiltered `docker system/volume/container prune`.
+
+Teardown eligibility is decoupled from the record-archiving age cutoff
+(`MOTHER_ARCHIVE_OLDER_THAN`, default 30 days). `cmd_archive`'s bulk sweep
+gives every terminal job younger than the cutoff a **teardown-only** attempt
+(`_teardown_only`) — same `_teardown_execute` call as the archive path, but
+the job's JSON record stays in `$JOBS_DIR`; only the worktree/docker state is
+touched. Once a job's `finished_at` crosses the cutoff it takes the normal
+`_archive_one` path and its record moves. A job can legitimately get a
+teardown attempt while young (e.g. torn down the hour its PR merges) and a
+second, no-op attempt when it's later archived — `_teardown_record_fields`
+guards against that second pass downgrading a recorded `torn_down` back to
+`skipped`/`already_absent` in the job JSON (the events trail still records
+both attempts truthfully). `mother archive <id>` (single-id form) and
+`mother archive --older-than 0` are unaffected — both still archive-and-move
+unconditionally, same as before this decoupling.
+
+**The pending queue:** archiving moves a job's JSON out of `$JOBS_DIR`, so
+"skip teardown this round, retry next sweep" can't be keyed off the job
+record — after the move there's no live record to revisit. Deferred
+teardowns instead get a self-contained facts snapshot at
+`$MOTHER_ROOT/teardown-pending/<id>.json` (repo path, branch, work dir,
+isolation, PR url, state — everything teardown needs, independent of whether
+the job record still exists). Every bulk `mother archive` sweep drains this
+queue first, re-evaluating the same gate; `mother archive <id>` re-attempts a
+job's own record inline. `mother teardowns` lists pending records; `mother
+teardowns --drain` re-attempts them on demand. `_teardown_drain` publishes the
+ids it attempted this pass via the `TEARDOWN_DRAIN_IDS` side-channel global,
+and `cmd_archive`'s bulk loop computes membership in that list **once per
+job** and consults it from **both** of its branches: the teardown-only branch
+skips the job entirely, and the archive-eligible branch still moves the
+record but passes `skip_teardown=1` to `_archive_one` so teardown itself is
+not re-run. Without both checks, a job with a pending record that has also
+aged past the archive cutoff would get two `_teardown_execute` calls (and two
+`gh pr view` calls) in the same sweep. `_teardown_attempt` (in
+`lib/teardown.sh`) is the single choke point every caller (drain,
+teardown-only, archive) routes through — it pairs each `_teardown_execute`
+call with exactly one `_teardown_record_fields` write, so one attempt always
+produces exactly one recorded outcome no matter which path drove it. A
+consequence: `_teardown_drain` now keeps a still-live job's `teardown_status`
+/ `teardown_reason` / `teardown_at` current too (previously only the archive
+and teardown-only paths wrote those fields), so `mother teardowns --drain`
+against a live job is no longer lossy.
+
+**Deferral counters:** each pending record tracks two counts. `deferrals` is
+the total number of attempts (what `mother teardowns` displays).
+`stall_deferrals` excludes the healthy `pr_open` wait — a PR staying open for
+days is normal, not a stall — and is what `MOTHER_TEARDOWN_MAX_DEFERRALS`
+actually gates on. Crossing the cap in `stall_deferrals` emits
+`teardown_needs_attention` exactly once (on the crossing, not every
+subsequent pass); it only makes a genuine stall (gh/docker unreachable, a
+racing job, a missing PR url, a worktree error, the kill switch left off)
+loud, it never triggers destruction. Records written before this counter
+existed default `stall_deferrals` to 0 via `// 0` — no backfill needed.
+
+**Events** (see `_teardown_event` in `lib/teardown.sh`):
+
+| Event | Detail | When |
+|---|---|---|
+| `teardown_started` | `{gate_reason, pr_url}` | Gate passed, about to remove |
+| `teardown_completed` | `{worktree_path, worktree_removed, compose_project, containers, volumes, networks}` | Teardown finished |
+| `teardown_deferred` | `{reason, pr_url, conflicting_job_id, deferrals}` | Retryable skip; record queued |
+| `teardown_skipped` | `{reason}` | `disabled` / `main_dir` / `already_absent` |
+| `teardown_failed` | `{stage, note}` | Docker or worktree step errored |
+| `teardown_needs_attention` | `{deferrals, stall_deferrals, reason}` | Stall cap crossed (once) |
+
+**Job fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `teardown_status` | string | `torn_down` / `deferred` / `skipped` / `failed` |
+| `teardown_reason` | string | Gate or skip reason from the last attempt |
+| `teardown_at` | string | ISO timestamp of the last teardown attempt |
+
+**Kill switches:** `MOTHER_TEARDOWN_ENABLED=0` disables teardown entirely
+(worktree/containers are left alone, but a pending record is still queued so
+nothing is lost if the switch is flipped back on). `MOTHER_TEARDOWN_DOCKER_ENABLED=0`
+skips only the docker sweep. `MOTHER_TEARDOWN_MAX_DEFERRALS` (default 30) tunes
+the stall-attention threshold above (counted in `stall_deferrals`, not raw
+`deferrals`). Both switches behave identically on the teardown-only path and
+the full-archive path.
+
+**Summary line:** `cmd_archive`'s bulk sweep reports three mutually exclusive
+counters: `archived: N, teardown-only: M, skipped: K (cutoff: ...)`.
+`teardown-only` counts jobs actually given a teardown attempt without their
+record moving; `archived` counts jobs whose record moved into
+`archive/YYYY-MM/`. A job short-circuited by `_teardown_only` (already
+`torn_down`, worktree absent, no pending record — nothing left to do) counts
+as `skipped`, not `teardown-only`, since no attempt was made. Likewise a job
+the drain already handled this sweep counts as `skipped` on the teardown-only
+branch (see the pending-queue section above) rather than double-counted.
+
+**Out of scope (deliberately):** git branch deletion, retroactive cleanup of
+worktrees/containers left behind by jobs archived before this feature shipped,
+and the operator's personal `/prune-worktrees` slash command (a separate,
+Mother-unaware, manual tool for worktrees Mother did not create).
 
 ## Pipeline visibility (W5)
 

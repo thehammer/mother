@@ -313,9 +313,28 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_IDLE_REAP_SECONDS` | `1800` | Reap workers whose log hasn't moved in this long |
 | `MOTHER_ARCHIVE_INTERVAL` | `3600` | Seconds between automatic archive sweeps |
 | `MOTHER_ARCHIVE_OLDER_THAN` | `30` | Days before terminal-state jobs are archived |
+| `MOTHER_TEARDOWN_ENABLED` | `1` | Remove Mother-created worktrees/containers when a job's PR is merged or closed |
+| `MOTHER_TEARDOWN_DOCKER_ENABLED` | `1` | Include the job-scoped docker sweep in teardown |
+| `MOTHER_TEARDOWN_MAX_DEFERRALS` | `30` | Stalled deferrals (gh/docker unreachable, races, worktree errors — a still-open PR doesn't count) before a teardown is flagged for attention (never auto-deleted) |
 | `MOTHER_RATE_LIMIT_CACHE` | `$MOTHER_ROOT/rate-limits.json` | Where the statusline writes 5h/7d quota state |
 | `MOTHER_QUOTA_CAP_5H_PCT` | `90` | Refuse new dispatches when the 5h window is at or over this percentage |
 | `MOTHER_QUOTA_CAP_7D_PCT` | `90` | Same for the 7d window |
+
+Resource teardown rides along with the archive sweep (`mother archive`,
+whether the daemon's periodic sweep or a one-off `mother archive <id>`):
+once a job's PR is merged or closed (or the job never opened one), Mother
+removes its worktree and any docker resources scoped to it. While the PR is
+still open — or its disposition can't be determined — teardown defers and
+queues a retryable record under `$MOTHER_ROOT/teardown-pending/`, surfaced
+by `mother teardowns`. Archiving itself is never blocked by a deferred
+teardown.
+
+Teardown eligibility is independent of `MOTHER_ARCHIVE_OLDER_THAN`: the
+bulk sweep gives every terminal job a teardown attempt on every pass,
+regardless of age, and only its JSON *record* waits for the age cutoff
+before moving into `archive/YYYY-MM/`. A job's worktree can be gone within
+the hour its PR merges even though the record it belongs to won't archive
+for another 30 days.
 
 ## Design
 
