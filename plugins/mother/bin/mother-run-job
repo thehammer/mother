@@ -668,6 +668,10 @@ fi
 
 marker_file="$RUNNER_DIR/$id.exit"
 wrapper="$RUNNER_DIR/$id.wrap"
+# Job-scoped Docker Compose project name (see mother_compose_project in
+# state.sh). Computed here, not inside the heredoc, so it interpolates at
+# generation time like $branch/$worker_agent below.
+compose_project=$(mother_compose_project "$id")
 cat > "$wrapper" <<WRAP
 #!/usr/bin/env bash
 cd "$work_dir"
@@ -676,6 +680,11 @@ exec > >(tee -a "$log_path") 2>&1
 # "..."\` without bookkeeping. Without this, the agent has no clean way to
 # discover which job it belongs to.
 export MOTHER_JOB_ID="$id"
+# Docker Compose reads COMPOSE_PROJECT_NAME automatically, so any
+# `docker compose up` the worker runs lands in a job-scoped project with
+# zero convention-following required by the plan or the agent. Mother tears
+# this project down once the job's PR is merged/closed (see lib/teardown.sh).
+export COMPOSE_PROJECT_NAME="$compose_project"
 # Export effort for agents that honor MOTHER_EFFORT (e.g. to set thinking budgets).
 export MOTHER_EFFORT="$worker_effort"
 echo "=== mother job $id starting at \$(date) ==="
@@ -686,6 +695,7 @@ echo "=== model:       $worker_model ==="
 echo "=== effort:      $worker_effort ==="
 echo "=== tier:        $current_tier ==="
 echo "=== session-id:  $session_id ==="
+echo "=== compose:     $compose_project ==="
 echo "=== plan:        $resolved_plan_path ==="
 echo
 # stream-json + verbose gives us a live per-event log (one JSON object per

@@ -17,8 +17,9 @@
 : "${CURSORS_DIR:=$MOTHER_ROOT/cursors}"
 : "${RUNNER_DIR:=$MOTHER_ROOT/runner}"
 : "${ARCHIVE_DIR:=$MOTHER_ROOT/archive}"
+: "${TEARDOWN_DIR:=$MOTHER_ROOT/teardown-pending}"
 
-mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" "$CURSORS_DIR" "$RUNNER_DIR" "$ARCHIVE_DIR"
+mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" "$CURSORS_DIR" "$RUNNER_DIR" "$ARCHIVE_DIR" "$TEARDOWN_DIR"
 
 # ---------- primitives ----------
 
@@ -119,6 +120,22 @@ _job_transition() {
                     _job_update "$id" ".force_start = null" ;;
     esac
     _append_event "$id" "$new" "$detail"
+}
+
+# mother_compose_project: derive a job-scoped Docker Compose project name
+# from a job id. Compose project names must match [a-z0-9][a-z0-9_-]*, but
+# job ids look like `20260730T114600Z-a1b2c3d4` — uppercase T/Z must be
+# lowercased or Compose rejects/normalizes the name and the two sides
+# disagree. Lives here (not lib/teardown.sh) because both the producer
+# (mother-run-job, exporting COMPOSE_PROJECT_NAME) and the consumer
+# (lib/teardown.sh, sweeping by the same project name) need identical
+# derivation, and state.sh is the one lib sourced unconditionally by
+# mother, mother-runner, AND mother-run-job.
+mother_compose_project() {
+    local id="$1"
+    printf 'mother-%s' "$(printf '%s' "$id" \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr -cd '[:alnum:]_-')"
 }
 
 # ---------- quota awareness ----------

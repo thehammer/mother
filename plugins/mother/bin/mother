@@ -49,6 +49,10 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/findings.sh" ]      && source "$MOTHER_LIB_DIR/findings.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ]  && source "$MOTHER_LIB_DIR/phase-prompt.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/worktree.sh" ]      && source "$MOTHER_LIB_DIR/worktree.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/teardown.sh" ]      && source "$MOTHER_LIB_DIR/teardown.sh"
 
 # ---------- CLI-only helpers ----------
 
@@ -2235,10 +2239,36 @@ _archive_one() {
     year_month=$(printf '%s' "$finished" | cut -c1-7)
     dest_dir="$ARCHIVE_DIR/$year_month"
 
+    # Self-contained facts snapshot for lib/teardown.sh: teardown must never
+    # read $JOBS_DIR for this job once it's been archived, so this is built
+    # once, up front, from the still-live job file. events_path points at
+    # where this job's events will land AFTER the move below (the archive
+    # destination) since teardown may run again later (drain) once that move
+    # has already happened.
+    local facts
+    facts=$(jq -c --arg ep "$dest_dir/$id.events.jsonl" \
+        '{id: .id, repo: (.repo // ""), repo_path: (.repo_path // ""),
+          branch: (.branch // ""), work_dir: (.work_dir // ""),
+          isolation: (.isolation // "worktree"), pr_url: (.pr_url // null),
+          state: (.state // ""), no_pr: (.no_pr // false), events_path: $ep}' \
+        "$job_file")
+
     if [ "$dry_run" -eq 1 ]; then
         echo "[dry-run] would archive $id (finished $finished) → $dest_dir"
+        # Report what teardown would do too, without mutating anything.
+        _teardown_execute "$facts" 1 || true
         return 0
     fi
+
+    # Teardown runs BEFORE the move below so its events land in the live
+    # $EVENTS_DIR/<id>.jsonl and its job-field writes land in the live job
+    # JSON — both then get carried into the archive by the existing moves,
+    # giving a complete audit trail in one place. Archiving must succeed
+    # regardless of teardown's outcome (moved repo, missing gh, docker down,
+    # deferred PR, etc.) — never let a teardown failure block the archive.
+    _teardown_execute "$facts" 0 || true
+    local t_status="${TEARDOWN_LAST_STATUS:-unknown}" t_reason="${TEARDOWN_LAST_REASON:-}"
+    _job_update "$id" ".teardown_status = \"$t_status\" | .teardown_reason = \"$t_reason\" | .teardown_at = \"$(_iso_now)\""
 
     mkdir -p "$dest_dir"
     mv "$job_file" "$dest_dir/$id.json" 2>/dev/null
@@ -2286,6 +2316,11 @@ cmd_archive() {
         esac
     done
 
+    # Drain the pending-teardown queue first, so records deferred during this
+    # same run are not immediately re-checked below. Archiving proceeds
+    # unconditionally regardless of what the drain finds.
+    _teardown_drain "$dry_run"
+
     local cutoff_epoch cutoff_iso
     cutoff_epoch=$(( $(date +%s) - older_than * 86400 ))
     cutoff_iso=$(date -u -r "$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ)
@@ -2310,6 +2345,43 @@ cmd_archive() {
         fi
     done
     echo "archived: $moved, skipped: $skipped (cutoff: $cutoff_iso)"
+}
+
+# ---------- teardowns ----------
+#
+# Surfaces the pending-teardown queue that _archive_one/cmd_archive populate
+# when a teardown gate defers (PR still open, gh unreachable, docker down,
+# a racing job on the same branch, etc). No new sweep mechanism — this only
+# lists the queue and, on --drain, re-runs the same gate against it.
+cmd_teardowns() {
+    local drain=0 dry_run=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --drain)   drain=1; shift ;;
+            --dry-run) dry_run=1; shift ;;
+            *) _die "unknown flag for teardowns: $1" ;;
+        esac
+    done
+
+    if [ "$drain" -eq 1 ]; then
+        _teardown_drain "$dry_run"
+        return 0
+    fi
+
+    local f count=0 id branch reason deferrals deferred_at
+    for f in "$TEARDOWN_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        count=$((count + 1))
+        id=$(jq -r '.id // ""' "$f")
+        branch=$(jq -r '.branch // ""' "$f")
+        reason=$(jq -r '.last_reason // ""' "$f")
+        deferrals=$(jq -r '.deferrals // 0' "$f")
+        deferred_at=$(jq -r '.deferred_at // ""' "$f")
+        printf '%-40s %-30s reason=%-24s deferrals=%-4s deferred_at=%s\n' \
+            "$id" "$branch" "$reason" "$deferrals" "$deferred_at"
+    done
+    [ "$count" -eq 0 ] && echo "no pending teardowns"
+    return 0
 }
 
 cmd_daemon() {
@@ -2382,6 +2454,7 @@ Usage:
   mother daemon start [--foreground] | stop | status | install | uninstall
   mother broker status | path                (IPC broker diagnostics)
   mother archive [--older-than DAYS] [--dry-run]
+  mother teardowns [--drain] [--dry-run]      (list/retry pending worktree+docker teardowns)
   mother run --once
 
 Add options:
@@ -2414,6 +2487,15 @@ Daemon env vars:
   MOTHER_ESCALATION_ENABLED    (default: 1)    auto-escalate failed jobs (0 to disable)
   MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
   MOTHER_BROKER_ENABLED        (default: 1)    supervise the IPC broker sidecar (0 to disable)
+
+Teardown env vars (worktree + docker cleanup, rides along with `mother archive`):
+  MOTHER_TEARDOWN_ENABLED         (default: 1)  tear down worktrees/containers
+                                                 once a job's PR is merged/closed
+  MOTHER_TEARDOWN_DOCKER_ENABLED  (default: 1)  include the job-scoped docker
+                                                 sweep in teardown
+  MOTHER_TEARDOWN_MAX_DEFERRALS   (default: 30) deferrals before a stalled
+                                                 teardown is flagged for
+                                                 attention (never auto-deleted)
 
 IPC broker env vars (the long-lived sidecar that pushes events to clients):
   MOTHER_BROKER_SOCK           (default: ~/.mother/broker.sock)  Unix socket path
@@ -2497,6 +2579,7 @@ main() {
         daemon)            cmd_daemon "$@" ;;
         broker)            cmd_broker "$@" ;;
         archive)           cmd_archive "$@" ;;
+        teardowns)         cmd_teardowns "$@" ;;
         run)               cmd_run "$@" ;;
         help|-h|--help)    cmd_help ;;
         *) _die "unknown subcommand: $sub (try: mother help)" ;;

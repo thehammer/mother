@@ -92,6 +92,25 @@ pause that preserves your worktree and resumes you with the operator's
 answer in your next prompt. Yielding without finishing is an accidental
 "I'm done" signal that has no resume mechanism.
 
+## Containers and test infrastructure
+
+`COMPOSE_PROJECT_NAME` is already exported into your environment, scoped to
+this job. Docker Compose reads that variable automatically, so a plain
+`docker compose up` needs no special handling on your part — Mother tears
+the project down on its own once your PR is merged or closed.
+
+Anything you start **outside** compose (a raw `docker run`, a named volume,
+a network) must carry the label `mother.job_id=$MOTHER_JOB_ID` or Mother has
+no way to find it later, and it leaks:
+
+```bash
+docker run -d --label mother.job_id=$MOTHER_JOB_ID postgres:16
+```
+
+Do not tear containers down yourself at the end of the job, and do not run
+`docker system prune` or anything like it — other Mother jobs and the
+operator's own interactive containers share this daemon.
+
 ---
 
 The rest of this prompt is your actual plan. Read on.
