@@ -1582,10 +1582,10 @@ EOF
     local tmpfile
     tmpfile=$(mktemp)
     if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
-        ( cd "$work_dir" && claude --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" ) \
+        ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" ) \
             > "$tmpfile" 2>/dev/null || true
     else
-        claude --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" \
+        claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" \
             > "$tmpfile" 2>/dev/null || true
     fi
 
@@ -1735,7 +1735,7 @@ cmd_adherence_review() {
         "$(jq -nc --arg m "$archie_model" --arg p "$review_posture" \
             '{model: $m, posture: $p}')"
     local raw_verdict
-    raw_verdict=$(claude --agent archie --model "$archie_model" -p "$review_prompt" 2>/dev/null || true)
+    raw_verdict=$(claude --dangerously-skip-permissions --agent archie --model "$archie_model" -p "$review_prompt" 2>/dev/null || true)
 
     # Parse the verdict.
     local verdict notes
