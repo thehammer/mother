@@ -1189,6 +1189,13 @@ cmd_cancel() {
 # The flag is NOT a state transition — the runner picks it up on its next tick.
 # It is cleared on every terminal transition, escalation, and adherence rework.
 #
+# A job that's mid-flight when the quota cap trips is parked in `awaiting`
+# with `paused_reason: quota_*` by `_maybe_pause_running` (mother-runner) —
+# not `ready`/`queued` — so it needs its own path: un-pause it the same way
+# `_auto_resume_check` does (state -> ready, clear paused_reason/
+# pause_requested/auto_resume_at) and THEN set force_start=true so the
+# runner's next tick dispatches it immediately and doesn't just re-pause it.
+#
 # Usage: mother force-start <id> [--yes]
 #   --yes  Skip the interactive confirmation prompt (required in non-interactive
 #          contexts such as the broker and tmux popup).
@@ -1209,7 +1216,15 @@ cmd_force_start() {
 
     local job_file; job_file=$(_job_path "$id")
     local state; state=$(jq -r .state "$job_file")
+    local paused_reason=""; paused_reason=$(jq -r '.paused_reason // ""' "$job_file")
+    local quota_paused=0
     case "$state" in
+        awaiting)
+            case "$paused_reason" in
+                quota_*) quota_paused=1 ;;
+                *) _die "force-start: job must be ready or queued (state=$state)" ;;
+            esac
+            ;;
         ready|queued) ;;
         *) _die "force-start: job must be ready or queued (state=$state)" ;;
     esac
@@ -1235,7 +1250,9 @@ cmd_force_start() {
 
         # Build a human-readable summary of what force-start will override.
         local summary=""
-        if [ "$over_cap" -eq 1 ] && [ "$posture" = "conservative" ]; then
+        if [ "$quota_paused" -eq 1 ]; then
+            summary="Job is paused for quota (awaiting, paused_reason=$paused_reason) — forcing will resume it immediately and dispatch despite the quota gate."
+        elif [ "$over_cap" -eq 1 ] && [ "$posture" = "conservative" ]; then
             summary="Quota is over cap AND posture is conservative — forcing will dispatch this job immediately at full configured strength, bypassing both guards."
         elif [ "$over_cap" -eq 1 ]; then
             summary="Quota is over cap — forcing will dispatch this job immediately despite the quota gate."
@@ -1253,6 +1270,24 @@ cmd_force_start() {
             y|Y|yes|YES) ;;
             *) echo "aborted"; return 0 ;;
         esac
+    fi
+
+    if [ "$quota_paused" -eq 1 ]; then
+        # Mirror _auto_resume_check's un-pause merge in mother-runner. _job_update
+        # only takes a bare jq filter (no extra --arg passthrough), so build the
+        # merged doc directly here, same as mother-runner does.
+        local merged
+        merged=$(jq --arg ts "$(_iso_now)" '
+            .state = "ready"
+            | .pending_answer = "Force-started by operator — continuing despite quota."
+            | .resumed_at = $ts
+            | .resume_count = ((.resume_count // 0) + 1)
+            | .auto_resume_at = null
+            | .paused_reason = null
+            | .pause_requested = null
+        ' "$job_file") && _atomic_write "$job_file" "$merged"
+        _append_event "$id" "auto_resumed" \
+            "$(jq -nc --arg r "$paused_reason" '{from_paused_reason: $r, forced: true}')"
     fi
 
     _job_update "$id" '.force_start = true'

@@ -74,6 +74,64 @@ teardown() {
     [[ "$output" =~ "no such job" ]]
 }
 
+@test "force-start: rejects awaiting job with non-quota paused_reason" {
+    make_job "job-fs-awaiting-other" "awaiting" '.paused_reason = "answer_needed"'
+
+    run mother force-start "job-fs-awaiting-other" --yes
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "must be ready or queued" ]]
+
+    run jq -r '.force_start // "absent"' "$JOBS_DIR/job-fs-awaiting-other.json"
+    [ "$output" = "absent" ]
+}
+
+# ---------------------------------------------------------------------------
+# 2b. Force-start un-pauses an awaiting job parked for quota (mirrors
+#     _auto_resume_check's un-pause merge, then sets force_start).
+
+@test "force-start: resumes and forces an awaiting job paused for quota (5h window)" {
+    make_job "job-fs-quota5h" "awaiting" '
+        .paused_reason = "quota_5h"
+        | .pause_requested = true
+        | .auto_resume_at = 9999999999
+    '
+
+    run mother force-start "job-fs-quota5h" --yes
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "force_start set" ]]
+
+    run jq -r '.state' "$JOBS_DIR/job-fs-quota5h.json"
+    [ "$output" = "ready" ]
+
+    run jq -r '.force_start' "$JOBS_DIR/job-fs-quota5h.json"
+    [ "$output" = "true" ]
+
+    run jq -r '.paused_reason // "absent"' "$JOBS_DIR/job-fs-quota5h.json"
+    [ "$output" = "absent" ]
+
+    run jq -r '.pause_requested // "absent"' "$JOBS_DIR/job-fs-quota5h.json"
+    [ "$output" = "absent" ]
+
+    run jq -r '.auto_resume_at // "absent"' "$JOBS_DIR/job-fs-quota5h.json"
+    [ "$output" = "absent" ]
+
+    run jq -r '.resume_count' "$JOBS_DIR/job-fs-quota5h.json"
+    [ "$output" = "1" ]
+
+    assert_event_kind "job-fs-quota5h" "auto_resumed"
+    assert_event_kind "job-fs-quota5h" "force_start_requested"
+}
+
+@test "force-start: resumes an awaiting job paused for quota (7d window)" {
+    make_job "job-fs-quota7d" "awaiting" '.paused_reason = "quota_7d"'
+
+    run mother force-start "job-fs-quota7d" --yes
+    [ "$status" -eq 0 ]
+
+    run jq -r '.state' "$JOBS_DIR/job-fs-quota7d.json"
+    [ "$output" = "ready" ]
+}
+
 # ---------------------------------------------------------------------------
 # 3. Force-start on a queued job is accepted (flag set, state stays queued)
 
