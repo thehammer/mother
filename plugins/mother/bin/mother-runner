@@ -50,6 +50,7 @@ MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
 MOTHER_SHUTDOWN_GRACE="${MOTHER_SHUTDOWN_GRACE:-30}"
 MOTHER_ARCHIVE_INTERVAL="${MOTHER_ARCHIVE_INTERVAL:-3600}"   # seconds between retention sweeps
 MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
+MOTHER_ARCHIVE_TIMEOUT="${MOTHER_ARCHIVE_TIMEOUT:-300}"      # seconds before a stuck sweep is killed
 
 # Kill switches: set to 0 to disable without redeploying.
 MOTHER_ESCALATION_ENABLED="${MOTHER_ESCALATION_ENABLED:-1}"
@@ -389,8 +390,47 @@ _maybe_archive() {
     [ -f "$marker" ] && last=$(cat "$marker" 2>/dev/null || echo 0)
     if [ $((now - last)) -ge "$MOTHER_ARCHIVE_INTERVAL" ]; then
         _log "running archive sweep (older-than=${MOTHER_ARCHIVE_OLDER_THAN}d)"
-        "$MOTHER_BIN_DIR/mother" archive --older-than "$MOTHER_ARCHIVE_OLDER_THAN" 2>&1 | while read -r line; do _log "archive: $line"; done
+        # Write the marker BEFORE running, not after. `_loop` is single-threaded
+        # and every tick after this one is blocked on this call returning, so a
+        # sweep that hangs (gh/docker/git wedged, TCC prompt with no UI session
+        # to answer it, whatever) must not also get retried every tick once the
+        # watchdog below frees the loop — see the 2026-08-12 bug report on this
+        # function for the incident that motivated the timeout.
         echo "$now" > "$marker"
+        # Bound the sweep with a watchdog instead of trusting it to return: a
+        # wedged `mother archive` (gh/docker/git stuck, a TCC prompt with no
+        # UI session to answer it, whatever) used to block this loop — and
+        # therefore all job dispatch — forever, silently, since the daemon's
+        # stderr is discarded. The pipe into the logging loop is still here,
+        # just run in the background so it can be raced against a timer.
+        # Caveat: killing $sweep_pid frees the loop but does not reach any
+        # grandchild (a stuck `gh`/`docker`/`git` call) it may have spawned —
+        # bash without job control puts pipeline members in the script's own
+        # process group, so there is no safe "kill the whole tree" short of
+        # enabling monitor mode daemon-wide. That's an acceptable trade for
+        # now: the daemon staying responsive matters more than reaping an
+        # orphaned, already-wedged grandchild. See the 2026-08-12 bug report
+        # for the incident that motivated this.
+        local timeout_flag="$RUNNER_DIR/archive-sweep-timed-out.flag"
+        rm -f "$timeout_flag"
+        (
+            "$MOTHER_BIN_DIR/mother" archive --older-than "$MOTHER_ARCHIVE_OLDER_THAN" 2>&1 | while read -r line; do _log "archive: $line"; done
+        ) &
+        local sweep_pid=$!
+        (
+            sleep "$MOTHER_ARCHIVE_TIMEOUT"
+            kill -9 "$sweep_pid" 2>/dev/null && : > "$timeout_flag"
+        ) &
+        local watchdog_pid=$!
+        wait "$sweep_pid" 2>/dev/null
+        # Sweep is done either way (finished or killed) — the race is over,
+        # so reap the watchdog too instead of leaving it to fire uselessly.
+        kill "$watchdog_pid" 2>/dev/null
+        wait "$watchdog_pid" 2>/dev/null
+        if [ -f "$timeout_flag" ]; then
+            _log "archive: sweep exceeded ${MOTHER_ARCHIVE_TIMEOUT}s, killed pid $sweep_pid — dispatch resumes; it will retry next interval"
+            rm -f "$timeout_flag"
+        fi
     fi
 }
 
@@ -1042,6 +1082,15 @@ case "${1:-}" in
         # daemon loop. Used by orphan_recovery.bats.
         # Usage: mother-runner --recover-orphans-tick [grace_seconds]
         _recover_orphans "${2:-$MOTHER_ORPHAN_GRACE}"
+        exit 0
+        ;;
+    --archive-tick)
+        # Test entry point: run one _maybe_archive pass and exit without
+        # starting the daemon loop. Callers control whether the interval gate
+        # actually fires via MOTHER_ARCHIVE_INTERVAL / the last-archive.ts
+        # marker. Used by archive_watchdog.bats.
+        # Usage: mother-runner --archive-tick
+        _maybe_archive
         exit 0
         ;;
 esac

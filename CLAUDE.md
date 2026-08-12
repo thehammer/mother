@@ -144,6 +144,7 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_TEARDOWN_ENABLED=0` — disable worktree/container teardown entirely.
 - `MOTHER_TEARDOWN_DOCKER_ENABLED=0` — skip the docker sweep, still tear down worktrees.
 - `MOTHER_TEARDOWN_MAX_DEFERRALS=N` — deferrals before a stalled teardown is flagged for attention (default: 30; never triggers deletion).
+- `MOTHER_ARCHIVE_TIMEOUT=N` — seconds the hourly archive sweep gets before `_maybe_archive` kills it and moves on (default: 300). Not a behaviour toggle like the others above — it's a watchdog bound. `_loop` is single-threaded, so a wedged sweep (gh/docker/git stuck, a TCC prompt with no UI session to answer it, a shell-level pipe deadlock — see the resolved 2026-08-12 bug report) used to block every subsequent tick — dispatch, auto-resume, escalation, adherence, pipeline advancement, everything — forever, silently. Raise this if legitimate sweeps (many jobs, many `gh pr view` calls) routinely take longer than the default.
 
 ### Metrics file
 
