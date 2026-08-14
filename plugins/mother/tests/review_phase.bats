@@ -407,3 +407,73 @@ _make_pipeline_succeeded_job() {
     run mother review-phase "job-bad-rev" --reviewer cody
     [ "$status" -ne 0 ]
 }
+
+# ---------------------------------------------------------------------------
+# phase_render_input: base_ref freshness
+#
+# Regression test for a real bug found 2026-08-14: base_ref (e.g.
+# origin/main) is a remote-tracking ref, which is only as current as the
+# last fetch run *in that specific worktree*. Worktrees are reused as-is
+# across chained jobs on the same branch (see worktree_create — an
+# existing worktree directory is returned unchanged, no refresh). If
+# nothing fetches in between, origin/main can sit arbitrarily stale while
+# the real remote branch moves on — and diffing against it doesn't error,
+# it just silently includes unrelated commits that landed on the real
+# branch after the worktree's cached ref was last updated. This is exactly
+# what happened to a real PR review: the rendered "Work already on this
+# branch" section included ~200 commits and several files' worth of
+# changes from a completely unrelated PR.
+
+@test "phase_render_input diff: refreshes a stale origin/main before diffing" {
+    local remote_dir="$MOTHER_ROOT/fake-remote"
+    git init -q -b main "$remote_dir"
+    git -C "$remote_dir" config user.email "test@test.com"
+    git -C "$remote_dir" config user.name "Test"
+    echo "v1" > "$remote_dir/README.md"
+    git -C "$remote_dir" add -A
+    git -C "$remote_dir" commit -q -m "ancient commit"
+
+    # work_dir clones the remote long ago, at the ancient commit. Its
+    # cached origin/main is pinned there and nothing will touch it again —
+    # matching a worktree that's reused as-is across chained jobs
+    # (worktree_create returns an existing directory unchanged).
+    local work_dir="$MOTHER_ROOT/fake-worktree"
+    git clone -q "$remote_dir" "$work_dir"
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+
+    # Time passes. The real remote main advances with commits that have
+    # nothing to do with the PR this test is about.
+    echo "unrelated change" > "$remote_dir/unrelated.txt"
+    git -C "$remote_dir" add -A
+    git -C "$remote_dir" commit -q -m "UNRELATED_COMMIT_landed_on_real_main"
+
+    # A brand-new feature branch is created off the *current* real main
+    # (as GitHub/a fresh checkout would do) and fetched into the same old
+    # work_dir by branch name only — exactly how a job's own commits get
+    # in, without ever touching origin/main. The feature branch's own
+    # history therefore already contains the unrelated commit; it's real
+    # upstream history, not this PR's work.
+    git -C "$remote_dir" checkout -q -b feature
+    echo "feature work" > "$remote_dir/feature.txt"
+    git -C "$remote_dir" add -A
+    git -C "$remote_dir" commit -q -m "add feature work"
+    git -C "$work_dir" fetch -q origin feature:feature
+    git -C "$work_dir" checkout -q feature
+
+    # Sanity check: work_dir's cached origin/main really is stale here —
+    # it never saw the unrelated commit — before phase_render_input runs.
+    run git -C "$work_dir" log --oneline origin/main
+    [[ ! "$output" =~ "UNRELATED_COMMIT" ]]
+
+    source "$MOTHER_LIB_DIR/phase-prompt.sh"
+    run phase_render_input diff "$work_dir" "" "" "origin/main" "" ""
+
+    [ "$status" -eq 0 ]
+    # Must NOT attribute the unrelated commit to "work already on this
+    # branch" — it's real main history, not this PR's own work. Showing
+    # it is exactly the phantom-diff bug.
+    [[ ! "$output" =~ "UNRELATED_COMMIT" ]]
+    # Must still show the branch's own real commit.
+    [[ "$output" =~ "add feature work" ]]
+}

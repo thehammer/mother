@@ -61,6 +61,18 @@ phase_render_input() {
             printf '## Tests on this branch\n\n'
             local _test_stat=""
             if [ -n "$work_dir" ] && [ -d "$work_dir" ] && [ -n "$base_ref" ]; then
+                # base_ref is a remote-tracking ref (e.g. origin/main). It's
+                # whatever this worktree last fetched — which can be
+                # arbitrarily stale if nothing has fetched here since the
+                # worktree was created (worktrees are reused as-is across
+                # chained jobs on the same branch, see worktree_create).
+                # A stale base_ref doesn't error — it silently diffs
+                # against the wrong point in history, inflating this
+                # section with unrelated commits that landed on the real
+                # remote branch since. Best-effort refresh before reading
+                # it; never hard-fail (offline, no remote, etc. all fall
+                # through to the existing stale-but-present value).
+                (cd "$work_dir" && git fetch --quiet origin 2>/dev/null || true)
                 _test_stat=$(cd "$work_dir" \
                     && git diff --stat "${base_ref}..HEAD" -- '*test*' '*spec*' 'tests/*' \
                     2>/dev/null || true)
@@ -77,6 +89,10 @@ phase_render_input() {
             printf '## Work already on this branch\n\n'
             local _diff_log="" _diff_stat=""
             if [ -n "$work_dir" ] && [ -d "$work_dir" ] && [ -n "$base_ref" ]; then
+                # See the matching comment in the 'tests' case above: refresh
+                # the possibly-stale remote-tracking ref before diffing
+                # against it. Best-effort, never hard-fail.
+                (cd "$work_dir" && git fetch --quiet origin 2>/dev/null || true)
                 _diff_log=$(cd "$work_dir" \
                     && git log --oneline "${base_ref}..HEAD" 2>/dev/null || true)
             fi
