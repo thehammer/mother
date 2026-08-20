@@ -267,6 +267,92 @@ _make_succeeded_pipeline_job() {
     [ "$status" -ne 0 ]
 }
 
+# ---------------------------------------------------------------------------
+# mother-runner's automatic loop (as opposed to calling `mother
+# adherence-review` directly, which the tests above exercise).
+#
+# Regression coverage for two bugs found 2026-08-20:
+#
+# 1. `adherence-review.lockdir` is a bare mkdir lock with no owner/TTL. If
+#    mother-runner dies between mkdir and rmdir (crash, kill -9, machine
+#    sleep), the lockdir is left behind and every future `mkdir` in
+#    `_run_adherence_pending` fails forever — silently disabling all
+#    automatic adherence review with no error anywhere. This happened in
+#    production from 2026-05-20 to 2026-08-20: every "automatic" adherence
+#    review in that window was actually a human running `mother
+#    adherence-review <id>` by hand. Fix: `_recover_stale_locks`, run once
+#    at daemon startup after `_singleton_guard` confirms we're the only
+#    instance alive.
+#
+# 2. `if "$MOTHER_BIN_DIR/mother" adherence-review "$id" 2>&1 | while read
+#    ...; then` tests the exit status of the `while read` loop (last
+#    command in the pipeline), not `mother adherence-review`'s, because
+#    mother-runner does not set `pipefail`. The loop's body (`_log`)
+#    virtually always succeeds, so the `if` almost always took the pass
+#    branch regardless of the real verdict — meaning even on the one
+#    occasion the lock wasn't stuck, a `failed_first` verdict would never
+#    have triggered the cody_rework requeue. Fix: branch on
+#    `${PIPESTATUS[0]}` instead of the pipeline's own exit status.
+
+@test "adherence loop: stale lockdir from a dead instance is cleared at startup" {
+    mkdir -p "$RUNNER_DIR/adherence-review.lockdir"
+
+    run mother-runner --recover-stale-locks-tick
+    [ "$status" -eq 0 ]
+
+    [ ! -d "$RUNNER_DIR/adherence-review.lockdir" ]
+}
+
+@test "adherence loop: stale pipeline-driver lockdir is also cleared at startup" {
+    mkdir -p "$RUNNER_DIR/pipeline-driver.lockdir"
+
+    run mother-runner --recover-stale-locks-tick
+    [ "$status" -eq 0 ]
+
+    [ ! -d "$RUNNER_DIR/pipeline-driver.lockdir" ]
+}
+
+@test "adherence loop: marks a succeeded PR job pending, then reviews and requeues on fail" {
+    _make_succeeded_job "job-loop-fail"
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
+NOTES:
+Drifted from the plan."
+
+    # A single _run_adherence_pending call both marks newly-succeeded PR jobs
+    # pending and (lock permitting) reviews one of them, so one tick here
+    # covers the full mark -> review -> requeue path.
+    run mother-runner --adherence-tick
+    [ "$status" -eq 0 ]
+
+    run jq -r '.adherence_status' "$JOBS_DIR/job-loop-fail.json"
+    [ "$output" = "failed_first" ]
+    run jq -r '.state' "$JOBS_DIR/job-loop-fail.json"
+    [ "$output" = "ready" ]
+    run jq -r '.activity' "$JOBS_DIR/job-loop-fail.json"
+    [ "$output" = "cody_rework" ]
+
+    assert_event_kind "job-loop-fail" "adherence_rework_kicked"
+}
+
+@test "adherence loop: reviews and leaves state alone on pass" {
+    _make_succeeded_job "job-loop-pass"
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: pass
+NOTES:
+All good."
+
+    run mother-runner --adherence-tick
+    [ "$status" -eq 0 ]
+
+    run jq -r '.adherence_status' "$JOBS_DIR/job-loop-pass.json"
+    [ "$output" = "passed" ]
+    run jq -r '.state' "$JOBS_DIR/job-loop-pass.json"
+    [ "$output" = "succeeded" ]
+
+    local events_file="$EVENTS_DIR/job-loop-pass.jsonl"
+    run grep '"adherence_rework_kicked"' "$events_file"
+    [ "$status" -ne 0 ]
+}
+
 @test "adherence-review: pipeline job persists findings under reviewer_findings.archie" {
     _make_succeeded_pipeline_job "job-pipe-adh2"
 

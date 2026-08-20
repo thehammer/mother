@@ -266,6 +266,31 @@ _spawn_job() {
 
 # ---------- crash recovery ----------
 
+_recover_stale_locks() {
+    # The adherence-review and pipeline-driver locks are plain mkdir-based
+    # mutexes with no owner-pid or TTL recorded in them. They exist only to
+    # serialize work within a single running daemon instance across ticks of
+    # _loop; nothing else in the codebase acquires them. _singleton_guard has
+    # already established that we are the only mother-runner process alive
+    # (any prior instance is confirmed dead), so any lockdir found here was
+    # left behind by a previous instance that died between mkdir and rmdir
+    # (crash, kill -9, machine sleep/reboot) and can never self-heal — mkdir
+    # will keep failing on every subsequent tick forever. Clear them
+    # unconditionally on startup.
+    #
+    # (Bug: from 2026-05-20 until this fix, a leaked adherence-review.lockdir
+    # silently disabled all automatic adherence review for three months;
+    # jobs were only ever reviewed when someone ran `mother adherence-review
+    # <id>` by hand. See .claude/bug-reports/.)
+    local lock
+    for lock in "$RUNNER_DIR/adherence-review.lockdir" "$RUNNER_DIR/pipeline-driver.lockdir"; do
+        if [ -d "$lock" ]; then
+            _log "clearing stale lock left by a previous instance: $lock"
+            rmdir "$lock" 2>/dev/null || rm -rf "$lock"
+        fi
+    done
+}
+
 _recover_orphans() {
     # Primary check: `worker_pid` + `kill -0`. Falls back to a tmux-window
     # match for legacy job records (created before the headless-worker
@@ -597,7 +622,16 @@ _run_adherence_pending() {
             case "$state" in succeeded) ;; *) continue ;; esac
             id=$(jq -r '.id' "$f")
             _log "running adherence review for $id (attempt=$adherence_attempts)"
-            if "$MOTHER_BIN_DIR/mother" adherence-review "$id" 2>&1 | while read -r line; do _log "adherence: $line"; done; then
+            # NOTE: without `pipefail`, `if cmd | while read ...; then` tests the
+            # exit status of the `while read` loop (the last command in the
+            # pipeline), not `mother adherence-review`'s — and the loop's body
+            # (_log) virtually always succeeds, so the `if` would almost always
+            # take the pass branch regardless of the real verdict, silently
+            # skipping the failed_first requeue below. Use PIPESTATUS instead of
+            # relying on the pipeline's own exit status (bash 3.2-compatible;
+            # macOS ships 3.2.57 per repo convention).
+            "$MOTHER_BIN_DIR/mother" adherence-review "$id" 2>&1 | while read -r line; do _log "adherence: $line"; done
+            if [ "${PIPESTATUS[0]}" -eq 0 ]; then
                 _log "adherence review passed for $id"
             else
                 local post_status; post_status=$(jq -r '.adherence_status // ""' "$JOBS_DIR/$id.json" 2>/dev/null)
@@ -1059,6 +1093,7 @@ main() {
     _write_pidfile
     trap '_on_signal' TERM INT
     _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
+    _recover_stale_locks
     _recover_orphans
     _start_broker
     _loop
@@ -1091,6 +1126,26 @@ case "${1:-}" in
         # marker. Used by archive_watchdog.bats.
         # Usage: mother-runner --archive-tick
         _maybe_archive
+        exit 0
+        ;;
+    --adherence-tick)
+        # Test entry point: run one _run_adherence_pending pass and exit
+        # without starting the daemon loop. Used by adherence.bats to cover
+        # the mark-pending / run-one-review / requeue-on-fail behavior that
+        # cmd_adherence_review alone (invoked directly) never exercises.
+        # Usage: mother-runner --adherence-tick
+        _run_adherence_pending
+        exit 0
+        ;;
+    --recover-stale-locks-tick)
+        # Test entry point: run one _recover_stale_locks pass and exit
+        # without starting the daemon loop. Used by adherence.bats to cover
+        # the leaked-lockdir regression (a lockdir left behind by a killed
+        # instance previously disabled all automatic adherence review
+        # forever, since mkdir-based locks have no owner/TTL and nothing
+        # else ever cleared them).
+        # Usage: mother-runner --recover-stale-locks-tick
+        _recover_stale_locks
         exit 0
         ;;
 esac
