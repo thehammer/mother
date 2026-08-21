@@ -645,3 +645,76 @@ EOF
     run jq -r '.pipeline.review_cycle' "$JOBS_DIR/rc-1.json"
     [ "$output" = "1" ]  # Not incremented again
 }
+
+# ===========================================================================
+# B4 continue: PR already merged out-of-band
+#
+# Regression test for a real incident, 2026-08-13: the pipeline kept
+# operating on a job's branch after a human had already merged its PR
+# out-of-band (the pipeline doesn't wait for its own "ship" verdict before
+# a human can just merge). It dispatched another build cycle, pushing a
+# commit onto a now-dead branch, which GitHub opened as a brand-new PR
+# (the original was closed by the merge) — a stale duplicate containing
+# nothing that wasn't already on main, and flagged CONFLICTING besides.
+# ===========================================================================
+
+@test "B4 continue: PR already merged → blocks instead of continuing the cycle" {
+    _make_review_job "merged-1" '.pr_url = "https://github.com/fake/repo/pull/1"'
+    export MOCK_CLAUDE_STDOUT="$(_cody_finding_stdout)"
+
+    # Override the default no-op gh mock: this PR is merged.
+    cat > "$_MOCK_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+    echo "MERGED"
+    exit 0
+fi
+exit 0
+GH
+    chmod +x "$_MOCK_BIN/gh"
+
+    _driver_tick
+    [ "$status" -eq 0 ]
+
+    # Must block for human, not continue the cycle onto a dead branch.
+    run jq -r '.state' "$JOBS_DIR/merged-1.json"
+    [ "$output" = "awaiting" ]
+    run jq -r '.activity' "$JOBS_DIR/merged-1.json"
+    [ "$output" = "pipeline_blocked" ]
+    run jq -r '.pipeline.phase' "$JOBS_DIR/merged-1.json"
+    [ "$output" = "blocked" ]
+
+    # review_cycle must NOT have incremented — no cycle was dispatched.
+    run jq -r '.pipeline.review_cycle' "$JOBS_DIR/merged-1.json"
+    [ "$output" = "0" ]
+
+    assert_event_kind "merged-1" "pipeline_blocked"
+    run grep '"pipeline_blocked"' "$EVENTS_DIR/merged-1.jsonl"
+    [[ "$output" =~ '"reason":"pr_already_merged"' ]]
+}
+
+@test "B4 continue: PR not merged (gh mock returns OPEN) → continues the cycle as normal" {
+    _make_review_job "open-1" '.pr_url = "https://github.com/fake/repo/pull/2"'
+    export MOCK_CLAUDE_STDOUT="$(_cody_finding_stdout)"
+
+    cat > "$_MOCK_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+    echo "OPEN"
+    exit 0
+fi
+exit 0
+GH
+    chmod +x "$_MOCK_BIN/gh"
+
+    _driver_tick
+    [ "$status" -eq 0 ]
+
+    # Unaffected by the merged-PR check: normal continue behavior.
+    run jq -r '.state' "$JOBS_DIR/open-1.json"
+    [ "$output" = "ready" ]
+    run jq -r '.pipeline.phase' "$JOBS_DIR/open-1.json"
+    [ "$output" = "cody" ]
+    run jq -r '.pipeline.review_cycle' "$JOBS_DIR/open-1.json"
+    [ "$output" = "1" ]
+}

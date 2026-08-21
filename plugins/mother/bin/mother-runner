@@ -861,7 +861,35 @@ _run_pipeline_review() {
             ;;
 
         continue)
-            # Agent-actionable findings remain. Check cap first.
+            # Agent-actionable findings remain — but if a human has already
+            # merged this job's PR out-of-band (they don't wait for the
+            # pipeline to say "ship"), dispatching another build cycle onto
+            # a dead branch is pointless: it produces a second PR racing an
+            # already-closed one, which GitHub opens fresh since the first
+            # is no longer accepting pushes as open. Confirmed by a real
+            # case: infrastructure#60, a stale duplicate of already-merged
+            # infrastructure#59, containing nothing that wasn't already on
+            # main. Check merge state before continuing; best-effort, and
+            # fails open (proceeds with the cycle) if `gh` is unavailable —
+            # this check is a guard, not a new hard dependency.
+            local pr_url_check pr_state
+            pr_url_check=$(jq -r '.pr_url // empty' "$jf" 2>/dev/null) || pr_url_check=""
+            pr_state=""
+            if [ -n "$pr_url_check" ] && command -v gh >/dev/null 2>&1; then
+                pr_state=$(gh pr view "$pr_url_check" --json state -q .state 2>/dev/null) \
+                    || pr_state=""
+            fi
+            if [ "$pr_state" = "MERGED" ]; then
+                _log "pipeline: $id: PR already merged ($pr_url_check) — not continuing cycle, blocking for human"
+                _job_update "$id" \
+                    ".state = \"awaiting\" | .activity = \"pipeline_blocked\" | .pipeline.phase = \"blocked\" | .paused_at = \"$now\""
+                _append_event "$id" "pipeline_blocked" \
+                    "$(jq -nc --arg pr_url "$pr_url_check" --argjson findings "$merged_findings" \
+                        '{reason: "pr_already_merged", pr_url: $pr_url, findings: $findings}')"
+                return 0
+            fi
+
+            # Check cap.
             local next_cycle
             next_cycle=$(( ${review_cycle:-0} + 1 ))
             if [ "$next_cycle" -gt "${cap:-3}" ]; then
