@@ -380,3 +380,78 @@ All good."
     run jq -r '.pipeline.reviewer_findings.archie[0].reviewer' "$JOBS_DIR/job-pipe-adh2.json"
     [ "$output" = "archie" ]
 }
+
+# ---------------------------------------------------------------------------
+# Merged PR — skip instead of requeuing rework onto a dead branch
+#
+# Regression test for a real incident, 2026-08-31: U4's PR (admin-portal
+# #4398) was merged by a human before this automatic loop's next tick
+# reviewed it. The loop doesn't run continuously — one review per tick,
+# serialized by lock — so a human merging faster than the next tick is the
+# normal case, not an edge case. Adherence review found real problems and
+# (on the code path this test guards) would have re-queued Cody for rework,
+# pushing more commits onto a branch that no longer accepts them: exactly
+# the mechanism that produced the admin-portal#60 duplicate-PR mess.
+
+@test "adherence loop: PR already merged → skips review, does not requeue rework" {
+    _make_succeeded_job "job-loop-merged"
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
+NOTES:
+Drifted from the plan."
+
+    # Override the default no-op gh mock: this PR is merged.
+    cat > "$_MOCK_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+    echo "MERGED"
+    exit 0
+fi
+exit 0
+GH
+    chmod +x "$_MOCK_BIN/gh"
+
+    run mother-runner --adherence-tick
+    [ "$status" -eq 0 ]
+
+    # Must NOT requeue rework onto the dead branch.
+    run jq -r '.state' "$JOBS_DIR/job-loop-merged.json"
+    [ "$output" = "succeeded" ]
+    run jq -r '.activity' "$JOBS_DIR/job-loop-merged.json"
+    [ "$output" != "cody_rework" ]
+    run jq -r '.adherence_status' "$JOBS_DIR/job-loop-merged.json"
+    [ "$output" = "skipped_pr_merged" ]
+    run jq -r '.adherence_pending' "$JOBS_DIR/job-loop-merged.json"
+    [ "$output" = "false" ]
+
+    local events_file="$EVENTS_DIR/job-loop-merged.jsonl"
+    run grep '"adherence_rework_kicked"' "$events_file"
+    [ "$status" -ne 0 ]
+    assert_event_kind "job-loop-merged" "adherence_skipped"
+}
+
+@test "adherence loop: PR not merged (gh mock returns OPEN) → reviews as normal" {
+    _make_succeeded_job "job-loop-open"
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
+NOTES:
+Drifted from the plan."
+
+    cat > "$_MOCK_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+    echo "OPEN"
+    exit 0
+fi
+exit 0
+GH
+    chmod +x "$_MOCK_BIN/gh"
+
+    run mother-runner --adherence-tick
+    [ "$status" -eq 0 ]
+
+    # Unaffected by the merged-PR check: normal fail-first behavior.
+    run jq -r '.adherence_status' "$JOBS_DIR/job-loop-open.json"
+    [ "$output" = "failed_first" ]
+    run jq -r '.activity' "$JOBS_DIR/job-loop-open.json"
+    [ "$output" = "cody_rework" ]
+    assert_event_kind "job-loop-open" "adherence_rework_kicked"
+}

@@ -621,6 +621,39 @@ _run_adherence_pending() {
             # succeeded again on their second pass, so this covers both passes).
             case "$state" in succeeded) ;; *) continue ;; esac
             id=$(jq -r '.id' "$f")
+
+            # A human can merge a PR before this automatic loop ever reviews
+            # it — the loop only runs once per tick, serialized by lock, so a
+            # fast human merge routinely wins the race. If the PR is already
+            # merged, running adherence review and (on failure) re-queuing
+            # Cody for rework onto the branch is worse than a no-op: the
+            # branch is dead, so a rework push either fails outright or
+            # opens a stale duplicate PR — exactly what happened to
+            # admin-portal#60 and admin-portal#4398/U4. Best-effort check;
+            # fails open (runs the review as before) if `gh` is unavailable
+            # or the job has no pr_url — this is a guard, not a new hard
+            # dependency, matching this file's existing never-hard-fail
+            # posture.
+            local adherence_pr_url adherence_pr_state
+            adherence_pr_url=$(jq -r '.pr_url // empty' "$f" 2>/dev/null) || adherence_pr_url=""
+            adherence_pr_state=""
+            if [ -n "$adherence_pr_url" ] && command -v gh >/dev/null 2>&1; then
+                adherence_pr_state=$(gh pr view "$adherence_pr_url" --json state -q .state 2>/dev/null) \
+                    || adherence_pr_state=""
+            fi
+            if [ "$adherence_pr_state" = "MERGED" ]; then
+                _log "pipeline: $id: PR already merged ($adherence_pr_url) — skipping adherence review, not re-queuing rework onto a dead branch"
+                local skipped
+                skipped=$(jq \
+                    '.adherence_pending = false
+                    | .adherence_status = "skipped_pr_merged"' \
+                    "$f") && _atomic_write "$f" "$skipped"
+                _append_event "$id" "adherence_skipped" \
+                    "$(jq -nc --arg pr_url "$adherence_pr_url" \
+                        '{reason: "pr_already_merged", pr_url: $pr_url}')"
+                break  # one review-or-skip decision per tick, same as the review path
+            fi
+
             _log "running adherence review for $id (attempt=$adherence_attempts)"
             # NOTE: without `pipefail`, `if cmd | while read ...; then` tests the
             # exit status of the `while read` loop (the last command in the
