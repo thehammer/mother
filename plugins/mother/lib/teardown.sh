@@ -38,6 +38,7 @@
 : "${MOTHER_TEARDOWN_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_DOCKER_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_MAX_DEFERRALS:=30}"
+: "${MOTHER_DOCKER_PROBE_TIMEOUT:=5}"  # seconds before a wedged `docker info` probe is killed
 
 _teardown_pending_path() { echo "$TEARDOWN_DIR/$1.json"; }
 
@@ -180,6 +181,35 @@ _teardown_race_check() {
 
 # ---------- docker ----------
 
+# _docker_reachable -> 0 reachable, 1 not reachable (failed OR timed out).
+#
+# `docker info` is normally fast whether Docker is up or down — but when
+# Docker Desktop's backend is running yet wedged (socket alive, daemon
+# unresponsive), the call can block forever instead of failing fast. Bound
+# it with the same background-race watchdog pattern `_maybe_archive` uses
+# in mother-runner for its hourly sweep: race the probe against a
+# `sleep N; kill` watchdog and `wait` on whichever settles first.
+#
+# Caveat (same tradeoff `_maybe_archive` documents, at ~60x smaller blast
+# radius — 5s default here vs. 300s at the sweep level): killing the probe
+# frees this caller, but cannot reach a stuck `docker info` grandchild the
+# probe itself spawned. Reaping that grandchild is out of scope here.
+_docker_reachable() {
+    ( docker info --format '{{.ServerVersion}}' >/dev/null 2>&1 ) &
+    local probe_pid=$!
+    ( sleep "${MOTHER_DOCKER_PROBE_TIMEOUT:-5}"; kill -9 "$probe_pid" 2>/dev/null ) &
+    local watchdog_pid=$!
+    local result=1
+    if wait "$probe_pid" 2>/dev/null; then
+        result=0
+    fi
+    # Probe settled (finished or was killed) — the race is over, so reap the
+    # watchdog too instead of leaving it to fire uselessly later.
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    return "$result"
+}
+
 # _teardown_docker <facts_json> <dry_run> -> 0 clean, 1 skipped, 2 defer.
 # Every docker mutation carries either the job-scoped `-p <project>` compose
 # flag or a `label=mother.job_id=…` / `label=com.docker.compose.project=…`
@@ -193,7 +223,7 @@ _teardown_docker() {
     fi
     command -v docker >/dev/null 2>&1 || return 1
 
-    if ! docker info --format '{{.ServerVersion}}' >/dev/null 2>&1; then
+    if ! _docker_reachable; then
         return 2
     fi
 
