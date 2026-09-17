@@ -2386,6 +2386,85 @@ _teardown_only() {
     return 0
 }
 
+# Sweep orphaned atomic-write temp files (*.tmp.*) and stray backups
+# (*.bak.*) out of Mother's state directories. `_atomic_write` (lib/state.sh)
+# and `mother_capture_rate_limits` (statusline/segment.sh) both write to
+# `<target>.tmp.$$` then `mv` into place; if the writing process dies between
+# the write and the `mv` (killed mid-render, SIGKILL, crash), the temp file
+# is orphaned and nothing else ever removes it. This has no owner, so it
+# accumulates forever in a state directory that's already large.
+#
+# The age gate (MOTHER_TEMP_ORPHAN_MINUTES) is the entire safety story: it is
+# what guarantees an in-flight write's temp file is never deleted out from
+# under its own writer. Never lower the default without understanding that
+# tradeoff.
+#
+# `-type f` is load-bearing, not decorative: `_with_lock` (lib/state.sh)
+# creates `<target>.lockdir` DIRECTORIES as its mutex primitive, and
+# `_recover_stale_locks` (mother-runner) owns reaping those. A directory
+# that happens to match `*.tmp.*` in name (extremely unlikely, but the glob
+# doesn't know the difference) must also survive — only regular files are
+# ever candidates.
+#
+# Usage: _prune_orphan_temps <dry_run>
+# Always returns 0. Prints exactly one summary line to stdout.
+_prune_orphan_temps() {
+    local dry_run="${1:-0}"
+
+    if [ "${MOTHER_RETENTION_SWEEP_ENABLED:-1}" = "0" ]; then
+        echo "temp sweep: disabled (MOTHER_RETENTION_SWEEP_ENABLED=0)"
+        return 0
+    fi
+
+    local minutes="${MOTHER_TEMP_ORPHAN_MINUTES:-60}"
+    local dirs="${MOTHER_ROOT:-} ${JOBS_DIR:-} ${EVENTS_DIR:-} ${DRAFTS_DIR:-} ${CURSORS_DIR:-} ${RUNNER_DIR:-} ${TEARDOWN_DIR:-}"
+    local count_file
+    count_file=$(mktemp)
+    printf '0' > "$count_file"
+
+    local dir f
+    for dir in $dirs; do
+        [ -n "$dir" ] || continue
+        [ -d "$dir" ] || continue
+        find "$dir" -maxdepth 1 -type f \( -name '*.tmp.*' -o -name '*.bak.*' \) -mmin "+$minutes" \
+            2>/dev/null | while read -r f; do
+                [ -n "$f" ] || continue
+                local n; n=$(cat "$count_file")
+                n=$((n + 1))
+                printf '%s' "$n" > "$count_file"
+                if [ "$dry_run" -eq 1 ]; then
+                    :
+                else
+                    rm -f "$f"
+                fi
+            done
+    done
+
+    local removed; removed=$(cat "$count_file")
+    rm -f "$count_file"
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "temp sweep: would remove $removed orphaned temp file(s) older than ${minutes}m"
+    else
+        echo "temp sweep: removed $removed orphaned temp file(s) older than ${minutes}m"
+    fi
+    return 0
+}
+
+# `mother prune-temps [--dry-run]` — standalone entry point so the daemon can
+# sweep at startup without paying for a full `mother archive` sweep, and so
+# an operator can run it by hand.
+cmd_prune_temps() {
+    local dry_run=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) dry_run=1; shift ;;
+            *) _die "unknown flag for prune-temps: $1" ;;
+        esac
+    done
+    _prune_orphan_temps "$dry_run"
+}
+
 # Archive terminal-state jobs. Two modes:
 #   mother archive <id>                    — archive one specific job now
 #   mother archive [--older-than DAYS] [--dry-run]  — bulk sweep by age
@@ -2476,6 +2555,7 @@ cmd_archive() {
             skipped=$((skipped + 1))
         fi
     done
+    _prune_orphan_temps "$dry_run"
     echo "archived: $moved, teardown-only: $teardown_only, skipped: $skipped (cutoff: $cutoff_iso)"
 }
 
@@ -2586,6 +2666,7 @@ Usage:
   mother daemon start [--foreground] | stop | status | install | uninstall
   mother broker status | path                (IPC broker diagnostics)
   mother archive [--older-than DAYS] [--dry-run]
+  mother prune-temps [--dry-run]              (remove orphaned *.tmp.*/*.bak.* state files)
   mother teardowns [--drain] [--dry-run]      (list/retry pending worktree+docker teardowns)
   mother run --once
 
@@ -2632,6 +2713,19 @@ on every sweep — independent of the record-archiving age cutoff):
                                                  not count) before a teardown
                                                  is flagged for attention
                                                  (never auto-deleted)
+
+Retention env vars (orphaned atomic-write temp file sweep, rides along with
+`mother archive` on every bulk sweep plus once at daemon startup):
+  MOTHER_RETENTION_SWEEP_ENABLED  (default: 1)  sweep orphaned *.tmp.*/*.bak.*
+                                                 state files (0 to disable;
+                                                 reserved as the shared gate
+                                                 for future retention steps)
+  MOTHER_TEMP_ORPHAN_MINUTES      (default: 60) age in minutes before an
+                                                 orphaned temp/backup file is
+                                                 removed — the gate that
+                                                 guarantees an in-flight
+                                                 write's temp file is never
+                                                 deleted out from under it
 
 IPC broker env vars (the long-lived sidecar that pushes events to clients):
   MOTHER_BROKER_SOCK           (default: ~/.mother/broker.sock)  Unix socket path
@@ -2715,6 +2809,7 @@ main() {
         daemon)            cmd_daemon "$@" ;;
         broker)            cmd_broker "$@" ;;
         archive)           cmd_archive "$@" ;;
+        prune-temps)       cmd_prune_temps "$@" ;;
         teardowns)         cmd_teardowns "$@" ;;
         run)               cmd_run "$@" ;;
         help|-h|--help)    cmd_help ;;

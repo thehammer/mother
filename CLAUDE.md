@@ -145,6 +145,25 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_TEARDOWN_DOCKER_ENABLED=0` — skip the docker sweep, still tear down worktrees.
 - `MOTHER_TEARDOWN_MAX_DEFERRALS=N` — deferrals before a stalled teardown is flagged for attention (default: 30; never triggers deletion).
 - `MOTHER_ARCHIVE_TIMEOUT=N` — seconds the hourly archive sweep gets before `_maybe_archive` kills it and moves on (default: 300). Not a behaviour toggle like the others above — it's a watchdog bound. `_loop` is single-threaded, so a wedged sweep (gh/docker/git stuck, a TCC prompt with no UI session to answer it, a shell-level pipe deadlock — see the resolved 2026-08-12 bug report) used to block every subsequent tick — dispatch, auto-resume, escalation, adherence, pipeline advancement, everything — forever, silently. Raise this if legitimate sweeps (many jobs, many `gh pr view` calls) routinely take longer than the default.
+- `MOTHER_RETENTION_SWEEP_ENABLED=0` — disable the orphaned atomic-write temp file sweep (reserved as the shared gate for future retention steps — see "Orphaned temp file sweep" below).
+- `MOTHER_TEMP_ORPHAN_MINUTES=N` — age threshold in minutes before an orphaned `*.tmp.*` / `*.bak.*` state file is removed (default: 60). This gate is what prevents deleting an in-flight write's temp file out from under its own writer.
+
+### Orphaned temp file sweep
+
+`_atomic_write` (`lib/state.sh`) and `mother_capture_rate_limits`
+(`statusline/segment.sh`) both write state as `<target>.tmp.$$` then `mv` it
+into place. If the writing process dies between the write and the `mv`
+(killed mid-render, SIGKILL, crash), the temp file is orphaned — nothing else
+ever removes it, and `~/.mother/` accumulates them indefinitely. `mother
+prune-temps [--dry-run]` sweeps `$MOTHER_ROOT`, `$JOBS_DIR`, `$EVENTS_DIR`,
+`$DRAFTS_DIR`, `$CURSORS_DIR`, `$RUNNER_DIR`, and `$TEARDOWN_DIR` (each
+`-maxdepth 1`) for regular files matching `*.tmp.*` or `*.bak.*` older than
+`MOTHER_TEMP_ORPHAN_MINUTES`. It never touches directories — `<target>.lockdir`
+mutex directories (`_with_lock` in `lib/state.sh`) are a live concurrency
+primitive owned by `_recover_stale_locks`, not this sweep. Both the bulk
+`mother archive` sweep (every hourly run, just before its summary line) and
+`mother-runner`'s daemon startup call `mother prune-temps`, so a
+long-running daemon and a frequently-restarted one are both covered.
 
 ### Metrics file
 
