@@ -130,6 +130,7 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `no_pr` | bool | Set by `no_pr: true` in the plan YAML block. Skips the `no_pr_no_push` failure check. Success condition becomes "worker exited cleanly with commits on the branch." |
 | `continuation_count` | int | Number of auto-continuation attempts so far. Incremented each time an `idle_timeout` triggers a re-queue. |
 | `pipeline.review_cycle` | int | Number of review cycles completed so far (0-indexed). Incremented once per continue-cycle. Surfaced by W5 as `review_cycle_count`. |
+| `origin` | object | Provenance captured at `mother add` time: `{project, cwd, session, enqueued_by, label}`. `project` = basename of the enqueuing cwd's git toplevel, or the `--origin-project` override; `session` = `--origin-session` → `$MOTHER_ORIGIN_SESSION` → `$CLAUDE_SESSION_ID` → `""`. Surfaced as `mother list`'s ORIGIN column, filtered by `mother list --project`/`--label`, and rendered by `mother status`'s `=== origin ===` block. |
 
 ### Kill switches
 

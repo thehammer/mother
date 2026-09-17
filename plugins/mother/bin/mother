@@ -492,6 +492,7 @@ cmd_add() {
         fi
     fi
     [ -z "$origin_session" ] && origin_session="${MOTHER_ORIGIN_SESSION:-}"
+    [ -z "$origin_session" ] && origin_session="${CLAUDE_SESSION_ID:-}"
     enqueued_by=$(whoami)
 
     local id deps_json job_json max_cost_json
@@ -828,6 +829,17 @@ cmd_status() {
             fi
             echo ""
         fi
+
+        echo "=== origin ==="
+        jq -r '
+            (.origin // {}) as $o |
+            "  Project:     \($o.project // "" | if . == "" then "-" else . end)",
+            "  Label:       \($o.label // "" | if . == "" then "-" else . end)",
+            "  Enqueued by: \($o.enqueued_by // "" | if . == "" then "-" else . end)",
+            "  Session:     \($o.session // "" | if . == "" then "-" else . end)",
+            "  Cwd:         \($o.cwd // "" | if . == "" then "-" else . end)"
+        ' "$job_file"
+        echo
 
         echo "=== job ==="
         jq . "$job_file"
@@ -2681,7 +2693,8 @@ Add options:
   --format json|text   (default: text — prints job id only)
   --label TEXT         free-text origin label for this job
   --origin-project NAME  override auto-detected originating project name
-  --origin-session ID    originating session id (default: \$MOTHER_ORIGIN_SESSION)
+  --origin-session ID    originating session id
+                          (default: \$MOTHER_ORIGIN_SESSION, then \$CLAUDE_SESSION_ID)
 
 Plan file requirements:
   Every plan must include a ```yaml suggested_config: ... ``` block specifying

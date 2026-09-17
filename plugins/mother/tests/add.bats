@@ -5,9 +5,13 @@ load 'test_helper'
 
 setup() {
     setup_mother_env
-    # We need a fake git repo for mother add --repo-path
+    # We need a fake git repo for mother add --repo-path. Must be a real repo
+    # (not just a `.git` directory shell): `mother add` validates --repo-path
+    # via `git rev-parse --is-inside-work-tree` (added so a git worktree's
+    # .git *file* — not directory — is accepted too; see bin/mother's
+    # cmd_add), and that check fails against an empty/incomplete .git dir.
     export FAKE_REPO="$MOTHER_ROOT/testrepo"
-    mkdir -p "$FAKE_REPO/.git"
+    git init -q "$FAKE_REPO"
 }
 
 teardown() {
@@ -888,4 +892,138 @@ SHIM
     [[ "$output" =~ "$legacy_id" ]]
     # ORIGIN column renders "-" for the legacy record (no .origin field)
     [[ "$output" =~ "-" ]]
+}
+
+# ---------------------------------------------------------------------------
+# origin.session — CLAUDE_SESSION_ID fallback (third link in the chain:
+# --origin-session > $MOTHER_ORIGIN_SESSION > $CLAUDE_SESSION_ID > "")
+# ---------------------------------------------------------------------------
+
+@test "mother add falls back to CLAUDE_SESSION_ID when no flag or MOTHER_ORIGIN_SESSION is set" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # Explicitly unset MOTHER_ORIGIN_SESSION: bats can leak exports across
+    # tests within the same run (e.g. an earlier test in this file exports
+    # it), and this test's whole point is isolating the CLAUDE_SESSION_ID
+    # fallback, so a leaked value would silently make this test meaningless.
+    unset MOTHER_ORIGIN_SESSION
+    export CLAUDE_SESSION_ID="claude-sess-1"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    run jq -r '.origin.session' "$JOBS_DIR/$id.json"
+    [ "$output" = "claude-sess-1" ]
+}
+
+@test "mother add: MOTHER_ORIGIN_SESSION still takes precedence over CLAUDE_SESSION_ID" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    export CLAUDE_SESSION_ID="claude-sess-should-lose"
+    export MOTHER_ORIGIN_SESSION="env-session-should-win"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    run jq -r '.origin.session' "$JOBS_DIR/$id.json"
+    [ "$output" = "env-session-should-win" ]
+}
+
+@test "mother add records empty origin.session when flag, env var, and CLAUDE_SESSION_ID are all unset" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    # The outer Claude Code session running this very test suite may have
+    # exported a real CLAUDE_SESSION_ID into the environment bats inherited;
+    # without this explicit unset, this test would silently pick that up
+    # instead of exercising the true "nothing set" path.
+    unset CLAUDE_SESSION_ID
+    unset MOTHER_ORIGIN_SESSION
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    run jq -r '.origin.session' "$JOBS_DIR/$id.json"
+    [ "$output" = "" ]
+}
+
+# ---------------------------------------------------------------------------
+# `mother status <id>` plain-text origin block
+# ---------------------------------------------------------------------------
+
+@test "mother status renders an === origin === block with project and label" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test \
+        --origin-project foo \
+        --label bar
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    run mother status "$id"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"=== origin ==="* ]]
+    [[ "$output" == *"foo"* ]]
+    [[ "$output" == *"bar"* ]]
+}
+
+@test "mother status renders dash placeholders for a legacy job with no origin key at all" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+
+    # Simulate a legacy pre-provenance job record by stripping .origin
+    # entirely, by hand (no _atomic_write helper — this is a test fixture
+    # edit, not something Mother itself would ever do at runtime).
+    local tmp
+    tmp=$(mktemp)
+    jq 'del(.origin)' "$JOBS_DIR/$id.json" > "$tmp" && mv "$tmp" "$JOBS_DIR/$id.json"
+
+    run mother status "$id"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"=== origin ==="* ]]
+
+    # Isolate just the origin block (between its header and the next
+    # "=== job ===" section) before checking for "null" — the raw job JSON
+    # dumped further down legitimately contains "null" for unrelated fields
+    # like started_at/pr_url, so checking the whole $output would be a
+    # false failure unrelated to what this test is actually verifying.
+    local origin_block
+    origin_block=$(printf '%s\n' "$output" | awk '/=== origin ===/,/=== job ===/')
+    [[ "$origin_block" == *"-"* ]]
+    [[ "$origin_block" != *"null"* ]]
 }
