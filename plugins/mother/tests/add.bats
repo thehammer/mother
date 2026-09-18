@@ -5,9 +5,15 @@ load 'test_helper'
 
 setup() {
     setup_mother_env
-    # We need a fake git repo for mother add --repo-path
+    # We need a fake git repo for mother add --repo-path. A bare `mkdir -p
+    # .git` used to be enough for `git rev-parse --is-inside-work-tree` to
+    # accept, but that's not reliable across git versions/environments (see
+    # the individual `git -C "$FAKE_REPO" init --quiet` calls a few tests
+    # below, added for exactly this reason) — do a real (if minimal) `git
+    # init` for every test in this file instead of leaving it inconsistent.
     export FAKE_REPO="$MOTHER_ROOT/testrepo"
-    mkdir -p "$FAKE_REPO/.git"
+    mkdir -p "$FAKE_REPO"
+    git -C "$FAKE_REPO" init --quiet
 }
 
 teardown() {
@@ -812,11 +818,15 @@ SHIM
     make_plan "$plan"
 
     # Add two jobs: one with origin-project=bar, one with origin-project=other.
+    # Branch intentionally matches the plan's Target Branch (feature/test) on
+    # both adds — this test is about --origin-project filtering, not branch
+    # handling, and a mismatched --branch would now trigger the (unrelated)
+    # Target-branch stderr warning, polluting $output.
     run mother add \
         --plan-file "$plan" \
         --repo testrepo \
         --repo-path "$FAKE_REPO" \
-        --branch feature/bar \
+        --branch feature/test \
         --origin-project "bar"
     local id_bar="$output"
 
@@ -824,7 +834,7 @@ SHIM
         --plan-file "$plan" \
         --repo testrepo \
         --repo-path "$FAKE_REPO" \
-        --branch feature/other \
+        --branch feature/test \
         --origin-project "other"
     local id_other="$output"
 
@@ -848,6 +858,279 @@ SHIM
     run mother list --project zzz
     [ "$status" -eq 0 ]
     [ "$output" = "(no jobs)" ]
+}
+
+# ---------------------------------------------------------------------------
+# _parse_expect_branch_mismatch — unit tests (source bin/mother directly;
+# sourcing it is safe because `main "$@"` at the bottom just runs `cmd_help`
+# on empty args when there's nothing else on the command line, per the
+# established pattern already used to source lib files directly elsewhere in
+# this suite).
+
+@test "_parse_expect_branch_mismatch: true when suggested_config block sets it" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan_with_config "$plan" \
+'expect_branch_mismatch: true
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."'
+
+    run bash -c "source '$_BIN_DIR/mother' >/dev/null 2>&1; _parse_expect_branch_mismatch '$plan'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "true" ]
+}
+
+@test "_parse_expect_branch_mismatch: false when the key is absent" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run bash -c "source '$_BIN_DIR/mother' >/dev/null 2>&1; _parse_expect_branch_mismatch '$plan'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "false" ]
+}
+
+@test "_parse_expect_branch_mismatch: false when explicitly set to false" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan_with_config "$plan" \
+'expect_branch_mismatch: false
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."'
+
+    run bash -c "source '$_BIN_DIR/mother' >/dev/null 2>&1; _parse_expect_branch_mismatch '$plan'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "false" ]
+}
+
+# ---------------------------------------------------------------------------
+# expect_branch_mismatch — job field round-trip via `mother add`
+
+@test "mother add defaults expect_branch_mismatch to false" {
+    git -C "$FAKE_REPO" init --quiet
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    run jq -r '.expect_branch_mismatch' "$JOBS_DIR/$id.json"
+    [ "$output" = "false" ]
+}
+
+@test "mother add --expect-branch-mismatch sets the job field to true" {
+    git -C "$FAKE_REPO" init --quiet
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test \
+        --expect-branch-mismatch
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    run jq -r '.expect_branch_mismatch' "$JOBS_DIR/$id.json"
+    [ "$output" = "true" ]
+}
+
+@test "mother add sets expect_branch_mismatch true from the plan's suggested_config block alone" {
+    git -C "$FAKE_REPO" init --quiet
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan_with_config "$plan" \
+'expect_branch_mismatch: true
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard."'
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    local id="$output"
+    run jq -r '.expect_branch_mismatch' "$JOBS_DIR/$id.json"
+    [ "$output" = "true" ]
+}
+
+# ---------------------------------------------------------------------------
+# Target-branch warning — `mother add` warns (not fails) on stderr when the
+# plan's ## Target **Branch:** line disagrees with --branch.
+#
+# bats `run` merges stdout+stderr into $output by default (confirmed by the
+# existing suite: _die's messages, which go to stderr, are asserted against
+# $output throughout add.bats, e.g. "mother add with missing suggested_config
+# fails with clear error" above).
+
+@test "mother add warns on stderr when --branch disagrees with the plan's Target Branch" {
+    git -C "$FAKE_REPO" init --quiet
+    local plan="$MOTHER_ROOT/plan.md"
+    cat > "$plan" <<'PLAN'
+# Test plan
+
+## Context
+A test plan.
+
+## Target
+- **Repo:** testrepo
+- **Branch:** feature/plan-says-this
+- **Base:** origin/main
+
+## Files to change
+- `foo.sh` — add something
+
+## Approach
+1. Do the thing.
+
+## Acceptance criteria
+- It works.
+
+## Out of scope
+- Nothing.
+
+```yaml
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard work."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard tests."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard review."
+```
+PLAN
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/cli-says-this
+
+    # Warns, does not fail. The warning is extra output alongside the job id
+    # (asserted as a line-count check rather than guessing exact wording
+    # beyond "names both branches" — see the no-warning tests below for the
+    # complementary, wording-independent assertion).
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "feature/plan-says-this" ]]
+    [[ "$output" =~ "feature/cli-says-this" ]]
+    [ "${#lines[@]}" -gt 1 ]
+}
+
+@test "mother add does not warn when --branch matches the plan's Target Branch" {
+    git -C "$FAKE_REPO" init --quiet
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"   # Target Branch is feature/test
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/test
+
+    [ "$status" -eq 0 ]
+    # No warning printed: output is exactly the job id, one line.
+    [ "${#lines[@]}" -eq 1 ]
+    [ "$output" = "${lines[0]}" ]
+}
+
+@test "mother add does not warn when the plan has no Target Branch line" {
+    git -C "$FAKE_REPO" init --quiet
+    local plan="$MOTHER_ROOT/plan.md"
+    cat > "$plan" <<'PLAN'
+# Test plan
+
+## Context
+A test plan with no Target section at all.
+
+```yaml
+suggested_config:
+  cody:
+    model: sonnet
+    effort: medium
+    rationale: "Standard work."
+  redd:
+    model: sonnet
+    effort: medium
+    rationale: "Standard tests."
+  marty:
+    model: sonnet
+    effort: medium
+    rationale: "Standard refactor."
+  perri:
+    model: sonnet
+    effort: medium
+    rationale: "Standard review."
+```
+PLAN
+
+    run mother add \
+        --plan-file "$plan" \
+        --repo testrepo \
+        --repo-path "$FAKE_REPO" \
+        --branch feature/whatever
+
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 1 ]
+    [ "$output" = "${lines[0]}" ]
 }
 
 @test "mother list renders origin-less legacy record as dash without crashing" {
