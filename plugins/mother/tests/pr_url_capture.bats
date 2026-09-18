@@ -412,6 +412,42 @@ _va_bind_context() {
     [[ "$output" =~ '"reason":"no_pr_no_push"' ]]
 }
 
+@test "_verify_artifact_or_fail: a no-op HEAD (zero commits ahead of base) is NOT accepted as shipped work via prd_sha_on_origin" {
+    local repo_dir="$MOTHER_ROOT/va-repo3"
+    local bare_dir="$MOTHER_ROOT/va-bare3.git"
+    local wt_dir="$MOTHER_ROOT/va-wt3"
+    _va_make_repo_and_worktree "$repo_dir" "$bare_dir" "$wt_dir" "feature/assigned3" "main"
+
+    # No commits at all in the worktree — HEAD is identical to "main", which
+    # _va_make_repo_and_worktree already pushed to origin. This is the exact
+    # shape of the live incident: a worker that "ships" nothing still has a
+    # HEAD that is trivially reachable from origin. An uncommitted edit is
+    # left in place to mirror the real incident (real edits that were never
+    # committed) — it must not change the outcome.
+    echo "uncommitted edit" > "$wt_dir/scratch.txt"
+
+    make_job "va-job3" "running" \
+        ".branch = \"feature/assigned3\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$wt_dir\""
+
+    _va_bind_context "va-job3" "feature/assigned3" "main" "worktree" "$wt_dir"
+    pr_url=""
+
+    run _verify_artifact_or_fail
+    [ "$status" -eq 1 ]
+
+    run jq -r '.state' "$job_file"
+    [ "$output" = "failed" ]
+
+    assert_event_kind "va-job3" "failed"
+    run grep '"failed"' "$EVENTS_DIR/va-job3.jsonl"
+    [[ "$output" =~ '"reason":"no_pr_no_push"' ]]
+
+    # The escape hatch must NOT fire for a no-op HEAD — it must never be
+    # accepted as "pushed under some other branch name".
+    run bash -c "grep -F 'pushed_to_other_branch' '$EVENTS_DIR/va-job3.jsonl' 2>/dev/null; true"
+    [ -z "$output" ]
+}
+
 # ---------------------------------------------------------------------------
 # _finalize_pr_url — authoritative post-run PR URL capture, stale-URL
 # re-derivation, and branch-mismatch validation. This is the biggest single

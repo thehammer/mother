@@ -445,7 +445,7 @@ when `gh` is missing, offline, or unauthenticated):
 | `prd_pr_for_commit` | A PR (preferring OPEN, else most recently updated) containing a given commit. |
 | `prd_pr_contains_sha` | 0/1/2 (contains / clean miss / indeterminate) — whether a PR's commit list contains a given SHA. |
 | `prd_detect_pr` | The entry point: branch match first, then commit match over `prd_candidate_shas`, else empty. |
-| `prd_sha_on_origin` | Whether HEAD has reached origin under *any* branch name at all. |
+| `prd_sha_on_origin` | Whether HEAD has reached origin under *any* branch name — and, when a base ref is supplied, is genuinely ahead of it. |
 
 **mother-run-job's post-run capture** (`_finalize_pr_url`) re-derives rather
 than trusts: a stored `pr_url` that's no longer `OPEN` is replaced by whatever
@@ -460,7 +460,11 @@ pointer over a network wobble (`pr_branch_mismatch_unverified`).
 `_verify_artifact_or_fail`'s `no_pr_no_push` failure gets one more escape
 hatch: if `prd_sha_on_origin` finds HEAD on origin under a *different* branch
 name, the job succeeds anyway (event `pushed_to_other_branch`) instead of
-failing over a branch-naming miss when the work genuinely shipped.
+failing over a branch-naming miss when the work genuinely shipped. That hatch
+requires HEAD to be strictly ahead of `base_ref` (passed as `prd_sha_on_origin`'s
+second argument) — a HEAD identical to base is already on origin by
+construction, so without this precondition a worker that committed nothing
+would pass the check vacuously and report `succeeded` for no work at all.
 
 **`mother add`** gained `--expect-branch-mismatch` (also settable via the
 plan's `suggested_config` YAML block) for the deliberate cross-branch case,
