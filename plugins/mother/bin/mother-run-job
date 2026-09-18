@@ -1317,28 +1317,32 @@ _attempt_continuation() {
     fi
     [ -z "$git_log_summary" ] && git_log_summary="(no commits ahead of base yet)"
 
+    # Detect "operator resumed, but no commit postdates the resume" — a
+    # strong signal the previous worker ran out of time before acting on
+    # the operator's answer. See lib/state.sh's resume-continuity section.
+    local not_acted=0
+    local last_commit_epoch=0 last_commit_sha=""
+    local _rnyao_out
+    if _rnyao_out=$(_resume_not_yet_acted_on "$id" "${work_dir:-}"); then
+        not_acted=1
+        last_commit_epoch="${_rnyao_out%% *}"
+        last_commit_sha="${_rnyao_out#* }"
+    fi
+    case "$last_commit_epoch" in ''|*[!0-9]*) last_commit_epoch=0 ;; esac
+
+    local resumed_at; resumed_at=$(jq -r '.resumed_at // empty' "$job_file" 2>/dev/null)
+
     local preamble
-    preamble=$(printf '%s\n%s\n\n%s\n\n%s\n\n%s\n\n%s\n' \
-        "# Continuation (attempt ${new_count} of ${max_cont})" \
-        "" \
-        "A previous worker on this job was interrupted before it could finish (reason: ${reason})." \
-        "The following commits are already on branch \`${branch}\` — **do not redo this work**:" \
-        "\`\`\`" \
-        "${git_log_summary}" \
-    )
-    preamble="${preamble}
-\`\`\`
+    preamble=$(_continuation_preamble "$id" "$new_count" "$max_cont" "$reason" "$git_log_summary" "$not_acted")
 
-Resume from the first uncommitted step in the original plan below. Skip any steps whose work is already committed above. Run \`git log --oneline\` first to orient yourself.
-
-## Original Plan
-
-"
+    # Sticky: never write false over an existing true.
+    local was_flagged; was_flagged=$(jq -r '.resume_not_yet_acted_on // false' "$job_file" 2>/dev/null)
 
     local merged
-    merged=$(jq --arg pa "$preamble" --argjson c "$new_count" '
+    merged=$(jq --arg pa "$preamble" --argjson c "$new_count" --argjson notacted "$([ "$not_acted" = "1" ] && echo true || echo false)" '
         .pending_answer = $pa
         | .continuation_count = $c
+        | .resume_not_yet_acted_on = ((.resume_not_yet_acted_on == true) or $notacted)
         | .state = "ready"
         | .finished_at = null
         | .worker_pid = null
@@ -1353,7 +1357,21 @@ Resume from the first uncommitted step in the original plan below. Skip any step
         "$(jq -nc --arg reason "$reason" --argjson count "$new_count" --argjson max "$max_cont" \
             '{reason: $reason, continuation_count: $count, max_continuations: $max}')"
 
-    echo "job $id: idle_timeout — queuing continuation ${new_count}/${max_cont}"
+    if [ "$not_acted" = "1" ] && [ "$was_flagged" != "true" ]; then
+        _append_event "resume_not_yet_acted_on" \
+            "$(jq -nc --arg resumed_at "${resumed_at:-}" \
+                      --argjson last_commit_epoch "$last_commit_epoch" \
+                      --arg last_commit_sha "$last_commit_sha" \
+                      --argjson continuation_count "$new_count" \
+                      '{resumed_at: $resumed_at, last_commit_epoch: $last_commit_epoch,
+                        last_commit_sha: $last_commit_sha,
+                        continuation_count: $continuation_count,
+                        note: "operator answer may not have been implemented; carried into continuation prompt"}')"
+    fi
+
+    local _extra_log_note=""
+    [ "$not_acted" = "1" ] && _extra_log_note=" (resume answer may be unapplied)"
+    echo "job $id: idle_timeout — queuing continuation ${new_count}/${max_cont}${_extra_log_note}"
     return 0
 }
 

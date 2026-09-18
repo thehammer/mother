@@ -43,6 +43,19 @@ _iso_now() {
     '
 }
 
+# Second-precision RFC 3339 timestamp N hours in the past (UTC). Used as an
+# age floor for the hook's event feed. Second precision is deliberate and
+# safe: every consumer compares timestamps lexicographically, and a floor
+# measured in hours never needs to discriminate within a single second.
+# Uses /usr/bin/perl for the same reasons _iso_now does (universal on macOS,
+# absolute path so subshells with a restricted PATH still work).
+_iso_hours_ago() {
+    /usr/bin/perl -MPOSIX=strftime -e '
+        my @t = gmtime(time() - ($ARGV[0] * 3600));
+        printf "%sT%sZ\n", strftime("%Y-%m-%d", @t), strftime("%H:%M:%S", @t);
+    ' "$1"
+}
+
 _job_path()   { echo "$JOBS_DIR/$1.json"; }
 _events_path(){ echo "$EVENTS_DIR/$1.jsonl"; }
 _log_path()   { echo "$LOGS_DIR/$1.log"; }
@@ -507,6 +520,180 @@ _pipeline_cycles_json() {
         {cycle: ($icycle + 1), phases: ($build_phases + $review_phases)}
       )
     ' 2>/dev/null
+}
+
+# ---------- resume continuity ----------
+#
+# An operator's `mother resume <id> "<answer>"` reply to a `mother await`
+# question is a live amendment to the plan document. These helpers are the
+# single source of truth for surfacing that amendment to the two downstream
+# consumers that otherwise never see it: the idle-timeout auto-continuation
+# preamble (mother-run-job's _attempt_continuation) and the adherence-review
+# prompt (mother's cmd_adherence_review). See the resolved bug report for the
+# full failure mode this closes.
+
+# _iso_to_epoch <iso8601>
+# Parses Mother's millisecond RFC 3339 timestamps (e.g.
+# 2026-09-09T21:05:31.456Z) or second-precision ones (2026-09-09T21:05:31Z)
+# to a Unix epoch. Echoes 0 if empty/unparseable. Same idiom as the
+# started_epoch conversion in mother-run-job's _append_metrics.
+_iso_to_epoch() {
+    local iso="${1:-}"
+    [ -n "$iso" ] || { echo 0; return 0; }
+    local sec="${iso%%.*}"
+    case "$sec" in *Z) ;; *) sec="${sec}Z" ;; esac
+    local epoch
+    epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$sec" +%s 2>/dev/null \
+        || date -u -d "$sec" +%s 2>/dev/null || echo 0)
+    case "$epoch" in ''|*[!0-9]*) epoch=0 ;; esac
+    echo "$epoch"
+}
+
+# _resume_qa_history <job-id>
+# Renders every operator awaiting_input/resumed Q&A pair from a job's event
+# log, in chronological order, as a markdown block. Deliberately ignores
+# resumed_from_input events (fired on every spawn that consumes a
+# pending_answer, including machine-generated continuation preambles —
+# not operator-authored text).
+#
+# stdout: the markdown block, or nothing.
+# Exit 0 when at least one pair was rendered; exit 1 (no output) otherwise.
+_resume_qa_history() {
+    local id="$1"
+    local events_file; events_file=$(_events_path "$id")
+    [ -s "$events_file" ] || return 1
+
+    local out
+    out=$(jq -s -r '
+        (reduce .[] as $ev (
+            {pending: null, pairs: []};
+            if $ev.kind == "awaiting_input" then
+                .pending = {
+                    question: ($ev.detail.question // $ev.detail.notes // ""),
+                    asked_at: $ev.ts
+                }
+            elif $ev.kind == "resumed" then
+                .pairs += [{
+                    question: ((.pending.question) // "_(no question recorded)_"),
+                    asked_at: ((.pending.asked_at) // ""),
+                    answer: ($ev.detail.answer // ""),
+                    answered_at: $ev.ts
+                }]
+                | .pending = null
+            else
+                .
+            end
+        ) | .pairs) as $pairs |
+        if ($pairs | length) == 0 then "" else
+            "## Operator Answers (live amendments to the plan)\n\n" +
+            "The operator answered one or more questions on this job while it was running.\n" +
+            "Each answer below is an authoritative amendment to the plan document: where an\n" +
+            "answer conflicts with the plan, THE ANSWER WINS. Do not assume an answer has\n" +
+            "already been acted on — verify against the actual code before concluding it\n" +
+            "was. This is a verbatim excerpt of this job\u0027s own event history, not a new\n" +
+            "question being asked of you now.\n\n" +
+            (
+                $pairs | length as $total |
+                to_entries | map(
+                    (.key + 1) as $n |
+                    (if $n == $total then "Q&A \($n) (most recent)" else "Q&A \($n)" end) as $label |
+                    "### \($label) — asked \(.value.asked_at), answered \(.value.answered_at)\n\n" +
+                    "**Question:**\n\n\(.value.question)\n\n" +
+                    "**Operator\u0027s answer:**\n\n\(.value.answer)\n\n"
+                ) | join("")
+            )
+        end
+    ' "$events_file" 2>/dev/null)
+
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+}
+
+# _resume_not_yet_acted_on <job-id> <work_dir>
+# Detects "operator resumed, but no commit postdates the resume" — a strong
+# signal the previous worker ran out of time before acting on the answer.
+#
+# exit 0 = detected (a resume answer is probably unapplied)
+# exit 1 = not detected (or the job was never resumed — never guess)
+# stdout: "<last_commit_epoch> <last_commit_sha>" (0 and empty sha when there
+#         are no commits or work_dir is unusable)
+_resume_not_yet_acted_on() {
+    local id="$1" work_dir="${2:-}"
+    local job_file; job_file=$(_job_path "$id")
+    [ -f "$job_file" ] || return 1
+
+    local resumed_at; resumed_at=$(jq -r '.resumed_at // empty' "$job_file" 2>/dev/null)
+    [ -n "$resumed_at" ] || return 1
+
+    local resumed_epoch; resumed_epoch=$(_iso_to_epoch "$resumed_at")
+    [ "${resumed_epoch:-0}" -gt 0 ] || return 1
+
+    if [ ! -d "$work_dir" ]; then
+        echo "0 "
+        return 0
+    fi
+
+    local last_epoch
+    last_epoch=$(git -C "$work_dir" log -1 --format=%ct 2>/dev/null)
+    if [ -z "$last_epoch" ]; then
+        echo "0 "
+        return 0
+    fi
+    local last_sha; last_sha=$(git -C "$work_dir" log -1 --format=%h 2>/dev/null)
+
+    echo "$last_epoch $last_sha"
+    [ "$last_epoch" -le "$resumed_epoch" ]
+}
+
+# _continuation_preamble <job-id> <attempt> <max> <reason> <git_log_summary> <not_acted_flag>
+# Builds the idle-timeout continuation prompt preamble. Extracted out of
+# mother-run-job's _attempt_continuation so it's unit-testable via `source`.
+# <not_acted_flag> is "1" or "0" — see _resume_not_yet_acted_on.
+_continuation_preamble() {
+    local id="$1" attempt="$2" max="$3" reason="$4" git_log_summary="$5" not_acted="${6:-0}"
+
+    local job_file; job_file=$(_job_path "$id")
+    local branch=""
+    [ -f "$job_file" ] && branch=$(jq -r '.branch // ""' "$job_file" 2>/dev/null)
+
+    local preamble
+    preamble=$(printf '%s\n%s\n\n%s\n\n%s\n\n%s\n\n%s\n' \
+        "# Continuation (attempt ${attempt} of ${max})" \
+        "" \
+        "A previous worker on this job was interrupted before it could finish (reason: ${reason})." \
+        "The following commits are already on branch \`${branch}\` — **do not redo this work**:" \
+        "\`\`\`" \
+        "${git_log_summary}" \
+    )
+    preamble="${preamble}
+\`\`\`
+"
+
+    local qa_history
+    if qa_history=$(_resume_qa_history "$id"); then
+        preamble="${preamble}
+${qa_history}
+"
+        if [ "$not_acted" = "1" ]; then
+            preamble="${preamble}
+### ⚠️ The operator's answer may not have been implemented yet
+
+No commit on this branch postdates the operator's answer above. The previous
+worker very likely ran out of time before acting on it. **Before continuing
+with anything else, read the current code and determine whether that answer
+is actually reflected in it. If it is not, implementing it is your first
+task** — it takes precedence over any remaining step in the plan below.
+"
+        fi
+    fi
+
+    preamble="${preamble}
+Resume from the first uncommitted step in the original plan below. Skip any steps whose work is already committed above. Run \`git log --oneline\` first to orient yourself.
+
+## Original Plan
+
+"
+    printf '%s' "$preamble"
 }
 
 # Promote queued jobs whose dependencies are all succeeded to ready.
