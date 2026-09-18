@@ -36,6 +36,7 @@ setup_mother_env() {
     # Point mother at the test MOTHER_ROOT
     export MOTHER_BIN_DIR="$_BIN_DIR"
     export MOTHER_LIB_DIR="$_LIB_DIR"
+    export MOTHER_PLUGIN_DIR="$_PLUGIN_DIR"
 
     # Default: mock_claude exits 0
     export MOCK_CLAUDE_EXIT=0
