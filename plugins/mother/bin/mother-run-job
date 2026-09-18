@@ -219,6 +219,212 @@ _verify_artifact_or_fail() {
     return 1
 }
 
+# Parses a "<url>\t<kind>\t<sha>" triple (prd_detect_pr's output shape) into
+# the caller's hit_url/hit_kind/hit_sha variables — used by _finalize_pr_url,
+# which declares those three `local` before calling this. Clears all three
+# first, so an empty/no-hit input leaves them empty rather than stale from a
+# previous call.
+#
+# Defined here (before the SOURCE_ONLY guard), same rationale as
+# _verify_artifact_or_fail above: bats needs to reach it via
+# SOURCE_ONLY=1 sourcing, and it only touches globals/helpers resolved at
+# call time, so moving the definition earlier changes nothing about real
+# execution.
+_split_pr_hit() {
+    hit_url=""; hit_kind=""; hit_sha=""
+    [ -n "${1:-}" ] || return 0
+    IFS=$'\t' read -r hit_url hit_kind hit_sha <<PRHIT_EOF
+$1
+PRHIT_EOF
+}
+
+# Emits the pr_opened event, but only on first capture — re-emitting it for a
+# pr_url that was already recorded (stale re-derivation, branch-mismatch
+# acceptance of an already-stored URL) would double-count in the events
+# trail. Reads first_capture/pr_url from _finalize_pr_url's local scope.
+_maybe_emit_pr_opened() {
+    [ "$first_capture" -eq 1 ] || return 0
+    _append_event "pr_opened" "$(jq -nc --arg url "$pr_url" '{url: $url}')"
+}
+
+# _finalize_pr_url — authoritative post-run PR URL capture, stale-URL
+# re-derivation, and branch-mismatch validation. Sets the global `pr_url`
+# (read by _verify_artifact_or_fail and the terminal-transition detail blobs
+# below). Evidence-based: uses lib/prdetect.sh to match on commit content, not
+# just branch name, so a worker that pushed to a differently-named branch (or
+# landed on top of an existing open PR) is still recognised — see
+# .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md and
+# .claude/bugs/*/2026-08-14-review-phase-silently-reviews-wrong-repo-*.md.
+#
+# Resolution order:
+#   1. A stored pr_url that's still OPEN is trusted as-is (cheap, common case).
+#   2. A stored pr_url that's NOT open gets re-derived via prd_detect_pr; a
+#      different, better URL replaces it (pr_url_updated).
+#   3. No stored pr_url: prd_detect_pr (branch match, then commit match),
+#      falling back to the repo-filtered log scrape as a last resort.
+#   4. Whatever pr_url survives #1-3 gets branch-mismatch validation: an exact
+#      branch match is accepted outright; a mismatch is accepted when
+#      expect_branch_mismatch is set on the job, or when one of the job's
+#      candidate commits is confirmed present on the PR (pr_branch_mismatch_
+#      accepted, recording .actual_branch); a confirmed miss clears pr_url
+#      (pr_url_branch_mismatch, unchanged from before); an indeterminate gh
+#      failure during the commit check leaves the URL untouched
+#      (pr_branch_mismatch_unverified) — never destroy a pointer because the
+#      network wobbled.
+#
+# Defined here (before the SOURCE_ONLY guard) for the same reason as
+# _verify_artifact_or_fail and the two helpers above: it only references
+# globals (job_file, work_dir, branch, base_ref, log_path,
+# log_offset_at_spawn, pr_url) and helper functions (_append_event,
+# _job_update, _job_owner_repo, _scrape_pr_url_filtered, and the prd_*
+# functions) that are resolved at CALL time, so bats can source and invoke it
+# directly with SOURCE_ONLY=1, with those globals/helpers stubbed or set up
+# by the test itself.
+_finalize_pr_url() {
+    local stored_url pv pv_state pv_head hit hit_url hit_kind hit_sha
+    local first_capture=0 expect_mismatch cands sha rc accepted indeterminate matched_sha
+
+    expect_mismatch=$(jq -r '.expect_branch_mismatch // false' "$job_file" 2>/dev/null)
+    stored_url=$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)
+    pr_url="$stored_url"
+    pv_head=""
+
+    # --- stale-URL re-derivation (only when a pr_url is already stored) ---
+    if [ -n "$pr_url" ]; then
+        pv=$(gh pr view "$pr_url" --json state,headRefName --jq '(.state)+"\t"+(.headRefName)' 2>/dev/null)
+        pv_state=""; pv_head=""
+        if [ -n "$pv" ]; then
+            IFS=$'\t' read -r pv_state pv_head <<PV_EOF
+$pv
+PV_EOF
+        fi
+
+        if [ -n "$pv_state" ] && [ "$pv_state" != "OPEN" ]; then
+            hit=$(prd_detect_pr "$work_dir" "$branch" "$base_ref" 2>/dev/null)
+            _split_pr_hit "$hit"
+            if [ -n "$hit_url" ] && [ "$hit_url" != "$pr_url" ]; then
+                _append_event "pr_url_updated" "$(jq -nc \
+                    --arg prev "$pr_url" --arg url "$hit_url" --arg pstate "$pv_state" \
+                    --arg mk "$hit_kind" --arg msha "${hit_sha:-}" \
+                    '{previous_url: $prev, url: $url, previous_state: $pstate, reason: "stale_pr_replaced",
+                      match_kind: $mk, matched_sha: (if ($msha|length) > 0 then $msha else null end)}')"
+                _job_update ".pr_url = \"$hit_url\""
+                pr_url="$hit_url"
+                if [ "$hit_kind" = "branch" ]; then
+                    pv_head="$branch"
+                else
+                    pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
+                fi
+            fi
+        fi
+    fi
+
+    # --- first capture (nothing usable was stored) ---
+    if [ -z "$pr_url" ]; then
+        hit=$(prd_detect_pr "$work_dir" "$branch" "$base_ref" 2>/dev/null)
+        _split_pr_hit "$hit"
+        if [ -z "$hit_url" ] && [ -f "$log_path" ]; then
+            hit_url=$(_scrape_pr_url_filtered "$log_path" "$(_job_owner_repo)" "$log_offset_at_spawn")
+            hit_kind="scrape"
+        fi
+        if [ -n "$hit_url" ]; then
+            pr_url="$hit_url"
+            first_capture=1
+            if [ "$hit_kind" = "branch" ]; then
+                pv_head="$branch"
+            elif [ "$hit_kind" = "commit" ]; then
+                pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
+            fi
+        fi
+    fi
+
+    [ -n "${pr_url:-}" ] || return 0
+
+    if [ -z "$pv_head" ]; then
+        pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
+    fi
+
+    if [ "$first_capture" -eq 1 ]; then
+        _job_update ".pr_url = \"$pr_url\""
+    fi
+
+    if [ -z "$pv_head" ]; then
+        # URL did not resolve (wrong repo, nonexistent PR, network error, etc.)
+        _append_event "pr_url_unresolved" \
+            "$(jq -nc --arg url "$pr_url" --arg job_branch "$branch" \
+                '{note: "pr_url could not be resolved by gh pr view; clearing",
+                  pr_url: $url, job_branch: $job_branch}')"
+        _job_update ".pr_url = null"
+        pr_url=""
+        return 0
+    fi
+
+    if [ "$pv_head" = "$branch" ]; then
+        _maybe_emit_pr_opened
+        return 0
+    fi
+
+    # --- branch mismatch ---
+    if [ "$expect_mismatch" = "true" ]; then
+        _job_update ".actual_branch = \"$pv_head\""
+        _append_event "pr_branch_mismatch_accepted" \
+            "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
+                '{pr_url: $url, pr_branch: $prb, job_branch: $jb, matched_sha: null, expected: true}')"
+        _maybe_emit_pr_opened
+        return 0
+    fi
+
+    cands=$(prd_candidate_shas "$work_dir" "$branch" "$base_ref" 2>/dev/null)
+    accepted=0; indeterminate=0; matched_sha=""
+    if [ -n "$cands" ]; then
+        while IFS= read -r sha; do
+            [ -n "$sha" ] || continue
+            prd_pr_contains_sha "$pr_url" "$sha"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+                accepted=1; matched_sha="$sha"; break
+            elif [ "$rc" -eq 2 ]; then
+                indeterminate=1
+            fi
+        done <<CAND_EOF
+$cands
+CAND_EOF
+    fi
+
+    if [ "$accepted" -eq 1 ]; then
+        _job_update ".actual_branch = \"$pv_head\""
+        _append_event "pr_branch_mismatch_accepted" \
+            "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" --arg sha "$matched_sha" \
+                '{pr_url: $url, pr_branch: $prb, job_branch: $jb, matched_sha: $sha}')"
+        _maybe_emit_pr_opened
+        return 0
+    fi
+
+    if [ "$indeterminate" -eq 1 ]; then
+        _append_event "pr_branch_mismatch_unverified" \
+            "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
+                '{pr_url: $url, pr_branch: $prb, job_branch: $jb}')"
+        _maybe_emit_pr_opened
+        return 0
+    fi
+
+    # Confirmed miss: no candidate commit is on this PR at all.
+    _append_event "pr_url_branch_mismatch" \
+        "$(jq -nc --arg url "$pr_url" --arg pr_branch "$pv_head" --arg job_branch "$branch" \
+            '{note: "pr_url headRefName does not match job branch; clearing stale URL",
+              pr_url: $url, pr_branch: $pr_branch, job_branch: $job_branch}')"
+    _job_update ".pr_url = null"
+    pr_url=""
+    # One more authoritative re-derivation attempt before giving up — the
+    # worker may have opened the (correct) PR moments before we checked.
+    hit_url=$(prd_pr_for_branch "$(_job_owner_repo)" "$branch" 2>/dev/null)
+    if [ -n "$hit_url" ]; then
+        _job_update ".pr_url = \"$hit_url\""
+        pr_url="$hit_url"
+    fi
+    return 0
+}
+
 # Allow sourcing helpers without running job logic (used by bats tests).
 [ "${SOURCE_ONLY:-}" = "1" ] && return 0
 
@@ -1021,199 +1227,13 @@ done
 exit_code=0
 [ -f "$marker_file" ] && exit_code=$(cat "$marker_file")
 
-# Parses a "<url>\t<kind>\t<sha>" triple (prd_detect_pr's output shape) into
-# the caller's hit_url/hit_kind/hit_sha variables — used by _finalize_pr_url,
-# which declares those three `local` before calling this. Clears all three
-# first, so an empty/no-hit input leaves them empty rather than stale from a
-# previous call.
-_split_pr_hit() {
-    hit_url=""; hit_kind=""; hit_sha=""
-    [ -n "${1:-}" ] || return 0
-    IFS=$'\t' read -r hit_url hit_kind hit_sha <<PRHIT_EOF
-$1
-PRHIT_EOF
-}
-
-# Emits the pr_opened event, but only on first capture — re-emitting it for a
-# pr_url that was already recorded (stale re-derivation, branch-mismatch
-# acceptance of an already-stored URL) would double-count in the events
-# trail. Reads first_capture/pr_url from _finalize_pr_url's local scope.
-_maybe_emit_pr_opened() {
-    [ "$first_capture" -eq 1 ] || return 0
-    _append_event "pr_opened" "$(jq -nc --arg url "$pr_url" '{url: $url}')"
-}
-
-# _finalize_pr_url — authoritative post-run PR URL capture, stale-URL
-# re-derivation, and branch-mismatch validation. Sets the global `pr_url`
-# (read by _verify_artifact_or_fail and the terminal-transition detail blobs
-# below). Evidence-based: uses lib/prdetect.sh to match on commit content, not
-# just branch name, so a worker that pushed to a differently-named branch (or
-# landed on top of an existing open PR) is still recognised — see
-# .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md and
-# .claude/bugs/*/2026-08-14-review-phase-silently-reviews-wrong-repo-*.md.
-#
-# Resolution order:
-#   1. A stored pr_url that's still OPEN is trusted as-is (cheap, common case).
-#   2. A stored pr_url that's NOT open gets re-derived via prd_detect_pr; a
-#      different, better URL replaces it (pr_url_updated).
-#   3. No stored pr_url: prd_detect_pr (branch match, then commit match),
-#      falling back to the repo-filtered log scrape as a last resort.
-#   4. Whatever pr_url survives #1-3 gets branch-mismatch validation: an exact
-#      branch match is accepted outright; a mismatch is accepted when
-#      expect_branch_mismatch is set on the job, or when one of the job's
-#      candidate commits is confirmed present on the PR (pr_branch_mismatch_
-#      accepted, recording .actual_branch); a confirmed miss clears pr_url
-#      (pr_url_branch_mismatch, unchanged from before); an indeterminate gh
-#      failure during the commit check leaves the URL untouched
-#      (pr_branch_mismatch_unverified) — never destroy a pointer because the
-#      network wobbled.
-_finalize_pr_url() {
-    local stored_url pv pv_state pv_head hit hit_url hit_kind hit_sha
-    local first_capture=0 expect_mismatch cands sha rc accepted indeterminate matched_sha
-
-    expect_mismatch=$(jq -r '.expect_branch_mismatch // false' "$job_file" 2>/dev/null)
-    stored_url=$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)
-    pr_url="$stored_url"
-    pv_head=""
-
-    # --- stale-URL re-derivation (only when a pr_url is already stored) ---
-    if [ -n "$pr_url" ]; then
-        pv=$(gh pr view "$pr_url" --json state,headRefName --jq '(.state)+"\t"+(.headRefName)' 2>/dev/null)
-        pv_state=""; pv_head=""
-        if [ -n "$pv" ]; then
-            IFS=$'\t' read -r pv_state pv_head <<PV_EOF
-$pv
-PV_EOF
-        fi
-
-        if [ -n "$pv_state" ] && [ "$pv_state" != "OPEN" ]; then
-            hit=$(prd_detect_pr "$work_dir" "$branch" "$base_ref" 2>/dev/null)
-            _split_pr_hit "$hit"
-            if [ -n "$hit_url" ] && [ "$hit_url" != "$pr_url" ]; then
-                _append_event "pr_url_updated" "$(jq -nc \
-                    --arg prev "$pr_url" --arg url "$hit_url" --arg pstate "$pv_state" \
-                    --arg mk "$hit_kind" --arg msha "${hit_sha:-}" \
-                    '{previous_url: $prev, url: $url, previous_state: $pstate, reason: "stale_pr_replaced",
-                      match_kind: $mk, matched_sha: (if ($msha|length) > 0 then $msha else null end)}')"
-                _job_update ".pr_url = \"$hit_url\""
-                pr_url="$hit_url"
-                if [ "$hit_kind" = "branch" ]; then
-                    pv_head="$branch"
-                else
-                    pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
-                fi
-            fi
-        fi
-    fi
-
-    # --- first capture (nothing usable was stored) ---
-    if [ -z "$pr_url" ]; then
-        hit=$(prd_detect_pr "$work_dir" "$branch" "$base_ref" 2>/dev/null)
-        _split_pr_hit "$hit"
-        if [ -z "$hit_url" ] && [ -f "$log_path" ]; then
-            hit_url=$(_scrape_pr_url_filtered "$log_path" "$(_job_owner_repo)" "$log_offset_at_spawn")
-            hit_kind="scrape"
-        fi
-        if [ -n "$hit_url" ]; then
-            pr_url="$hit_url"
-            first_capture=1
-            if [ "$hit_kind" = "branch" ]; then
-                pv_head="$branch"
-            elif [ "$hit_kind" = "commit" ]; then
-                pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
-            fi
-        fi
-    fi
-
-    [ -n "${pr_url:-}" ] || return 0
-
-    if [ -z "$pv_head" ]; then
-        pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
-    fi
-
-    if [ "$first_capture" -eq 1 ]; then
-        _job_update ".pr_url = \"$pr_url\""
-    fi
-
-    if [ -z "$pv_head" ]; then
-        # URL did not resolve (wrong repo, nonexistent PR, network error, etc.)
-        _append_event "pr_url_unresolved" \
-            "$(jq -nc --arg url "$pr_url" --arg job_branch "$branch" \
-                '{note: "pr_url could not be resolved by gh pr view; clearing", \
-                  pr_url: $url, job_branch: $job_branch}')"
-        _job_update ".pr_url = null"
-        pr_url=""
-        return 0
-    fi
-
-    if [ "$pv_head" = "$branch" ]; then
-        _maybe_emit_pr_opened
-        return 0
-    fi
-
-    # --- branch mismatch ---
-    if [ "$expect_mismatch" = "true" ]; then
-        _job_update ".actual_branch = \"$pv_head\""
-        _append_event "pr_branch_mismatch_accepted" \
-            "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
-                '{pr_url: $url, pr_branch: $prb, job_branch: $jb, matched_sha: null, expected: true}')"
-        _maybe_emit_pr_opened
-        return 0
-    fi
-
-    cands=$(prd_candidate_shas "$work_dir" "$branch" "$base_ref" 2>/dev/null)
-    accepted=0; indeterminate=0; matched_sha=""
-    if [ -n "$cands" ]; then
-        while IFS= read -r sha; do
-            [ -n "$sha" ] || continue
-            prd_pr_contains_sha "$pr_url" "$sha"
-            rc=$?
-            if [ "$rc" -eq 0 ]; then
-                accepted=1; matched_sha="$sha"; break
-            elif [ "$rc" -eq 2 ]; then
-                indeterminate=1
-            fi
-        done <<CAND_EOF
-$cands
-CAND_EOF
-    fi
-
-    if [ "$accepted" -eq 1 ]; then
-        _job_update ".actual_branch = \"$pv_head\""
-        _append_event "pr_branch_mismatch_accepted" \
-            "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" --arg sha "$matched_sha" \
-                '{pr_url: $url, pr_branch: $prb, job_branch: $jb, matched_sha: $sha}')"
-        _maybe_emit_pr_opened
-        return 0
-    fi
-
-    if [ "$indeterminate" -eq 1 ]; then
-        _append_event "pr_branch_mismatch_unverified" \
-            "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
-                '{pr_url: $url, pr_branch: $prb, job_branch: $jb}')"
-        _maybe_emit_pr_opened
-        return 0
-    fi
-
-    # Confirmed miss: no candidate commit is on this PR at all.
-    _append_event "pr_url_branch_mismatch" \
-        "$(jq -nc --arg url "$pr_url" --arg pr_branch "$pv_head" --arg job_branch "$branch" \
-            '{note: "pr_url headRefName does not match job branch; clearing stale URL", \
-              pr_url: $url, pr_branch: $pr_branch, job_branch: $job_branch}')"
-    _job_update ".pr_url = null"
-    pr_url=""
-    # One more authoritative re-derivation attempt before giving up — the
-    # worker may have opened the (correct) PR moments before we checked.
-    hit_url=$(prd_pr_for_branch "$(_job_owner_repo)" "$branch" 2>/dev/null)
-    if [ -n "$hit_url" ]; then
-        _job_update ".pr_url = \"$hit_url\""
-        pr_url="$hit_url"
-    fi
-    return 0
-}
+# _split_pr_hit, _maybe_emit_pr_opened, and _finalize_pr_url are defined up
+# near _verify_artifact_or_fail (before the SOURCE_ONLY guard) so bats can
+# unit-test them directly via SOURCE_ONLY=1 sourcing. See the comment there.
 
 # Authoritative PR URL capture + re-derivation + branch-mismatch validation.
-# See _finalize_pr_url above for the full contract. Sets the global `pr_url`.
+# See _finalize_pr_url's definition (above the SOURCE_ONLY guard) for the
+# full contract. Sets the global `pr_url`.
 _finalize_pr_url
 
 # Release main-dir lock if we took one. Before releasing, restore any

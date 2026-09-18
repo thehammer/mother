@@ -1264,12 +1264,15 @@ cmd_cancel() {
 #
 # _guard_existing_pr <id> <subcommand> -> 0 clear to proceed, 1 refuse.
 #
-# Refuses re-dispatch (retry/escalate/force-start) when the job's branch
-# already has a verified OPEN pull request: re-dispatching would risk a
-# second worker opening a duplicate, conflicting PR against work that's
-# already shippable — the 2026-09-17 `force-start` hazard described in
-# .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md. Prints a
-# message naming the PR and pointing at `mother reconcile` instead.
+# Refuses re-dispatch (retry/escalate/force-start) when the job's branch OR
+# commits already have a verified OPEN pull request: re-dispatching would
+# risk a second worker opening a duplicate, conflicting PR against work
+# that's already shippable — the 2026-09-17 `force-start` hazard described in
+# .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md. Uses
+# prd_detect_pr (branch match, then commit match) rather than a bare branch
+# query so a job whose worker pushed real commits to a differently-named
+# branch is still caught. Prints a message naming the PR and pointing at
+# `mother reconcile` instead.
 #
 # Degrades to "clear" (never blocks) whenever detection can't confidently
 # answer: no branch/repo_path on the job, no owner/repo derivable, gh
@@ -1280,24 +1283,27 @@ _guard_existing_pr() {
     local id="$1" subcommand="$2"
     local job_file; job_file=$(_job_path "$id")
     [ -f "$job_file" ] || return 0
-    type prd_pr_for_branch >/dev/null 2>&1 || return 0
+    type prd_detect_pr >/dev/null 2>&1 || return 0
 
-    local branch repo_path owner_repo url disp
+    local branch repo_path base_ref hit hit_url hit_kind hit_sha disp
     branch=$(jq -r '.branch // empty' "$job_file" 2>/dev/null)
     repo_path=$(jq -r '.work_dir // .repo_path // empty' "$job_file" 2>/dev/null)
+    base_ref=$(jq -r '.base_ref // empty' "$job_file" 2>/dev/null)
     [ -n "$branch" ] && [ -n "$repo_path" ] || return 0
 
-    owner_repo=$(prd_owner_repo_from_dir "$repo_path")
-    [ -n "$owner_repo" ] || return 0
+    hit=$(prd_detect_pr "$repo_path" "$branch" "$base_ref" 2>/dev/null)
+    [ -n "$hit" ] || return 0
+    hit_url=""; hit_kind=""; hit_sha=""
+    IFS=$'\t' read -r hit_url hit_kind hit_sha <<HITEOF
+$hit
+HITEOF
+    [ -n "$hit_url" ] || return 0
 
-    url=$(prd_pr_for_branch "$owner_repo" "$branch")
-    [ -n "$url" ] || return 0
-
-    disp=$(gh pr view "$url" --json state -q '.state' 2>/dev/null)
+    disp=$(gh pr view "$hit_url" --json state -q '.state' 2>/dev/null)
     [ "$disp" = "OPEN" ] || return 0
 
-    echo "mother: $subcommand: refusing — job $id's branch '$branch' already has an open pull request: $url" >&2
-    echo "mother: $subcommand: use 'mother reconcile $id --pr-url $url' to adopt it, or pass --yes to override" >&2
+    echo "mother: $subcommand: refusing — job $id's branch '$branch' already has an open pull request: $hit_url" >&2
+    echo "mother: $subcommand: use 'mother reconcile $id --pr-url $hit_url' to adopt it, or pass --yes to override" >&2
     return 1
 }
 
@@ -1688,11 +1694,20 @@ HITEOF
             else
                 hit_branch=$(gh pr view "$hit_url" --json headRefName -q '.headRefName' 2>/dev/null)
             fi
-            # prd_detect_pr's own resolution order only ever returns a
-            # branch or commit hit — that's inherently "verified" for both
-            # the manual and --auto paths; a branch hit is additionally
-            # always OPEN by construction (prd_pr_for_branch queries
-            # --state open).
+            # A branch hit is always OPEN by construction (prd_pr_for_branch
+            # queries --state open). A commit hit is not: prd_pr_for_commit
+            # prefers an OPEN PR but falls back to the most recently updated
+            # PR (which may be closed/merged) when none is open. --auto's
+            # non-interactive contract must only ever adopt a verified OPEN
+            # PR — a merged/closed fallback needs a human to look at it
+            # (via --pr-url and/or --yes), never an unattended reconcile.
+            if [ "$hit_kind" = "commit" ] && [ "$auto" -eq 1 ]; then
+                local hit_state
+                hit_state=$(gh pr view "$hit_url" --json state -q '.state' 2>/dev/null)
+                [ "$hit_state" = "OPEN" ] || hit_url=""
+            fi
+        fi
+        if [ -n "$hit_url" ]; then
             url="$hit_url"; match_kind="$hit_kind"; matched_sha="${hit_sha:-}"
             pr_branch="$hit_branch"; verified=1
         fi

@@ -411,3 +411,331 @@ _va_bind_context() {
     run grep '"failed"' "$EVENTS_DIR/va-job2.jsonl"
     [[ "$output" =~ '"reason":"no_pr_no_push"' ]]
 }
+
+# ---------------------------------------------------------------------------
+# _finalize_pr_url — authoritative post-run PR URL capture, stale-URL
+# re-derivation, and branch-mismatch validation. This is the biggest single
+# change in the PR-detection rework and previously had zero coverage in this
+# file (only _job_owner_repo_from_url / _scrape_pr_url_filtered /
+# _derive_pr_url_from_branch / _verify_artifact_or_fail were exercised).
+#
+# Reuses _va_bind_context (above) for the outer globals/helper functions
+# _finalize_pr_url depends on (job_file, _append_event, _job_update, etc.) —
+# same rationale: it only touches globals/helpers resolved at call time.
+# Additionally sets log_path/log_offset_at_spawn (unused by these scenarios,
+# but referenced under `set -u`) and clears the global `pr_url` before each
+# call so a prior test's value can't leak in.
+# ---------------------------------------------------------------------------
+
+# A plain (non-worktree) repo is enough for _finalize_pr_url's git calls
+# (rev-parse, rev-list) — no real push to origin is needed since every gh
+# call is mocked. Usage: _fin_make_repo <dir> <branch> <base_branch>
+_fin_make_repo() {
+    local dir="$1" branch="$2" base_branch="${3:-main}"
+    git init -q "$dir"
+    git -C "$dir" config user.email "test@test.com"
+    git -C "$dir" config user.name "Test"
+    git -C "$dir" commit -q --allow-empty -m init
+    git -C "$dir" branch -M "$base_branch"
+    git -C "$dir" checkout -q -b "$branch"
+    git -C "$dir" commit -q --allow-empty -m "work"
+    git -C "$dir" remote add origin "https://github.com/thehammer/mother.git"
+}
+
+@test "_finalize_pr_url captures a PR via prd_detect_pr's commit-match fallback when no pr_url is stored and the branch query finds nothing" {
+    local repo="$MOTHER_ROOT/fin-repo-1"
+    _fin_make_repo "$repo" "feature/fin-1" "main"
+    local head_sha; head_sha=$(git -C "$repo" rev-parse HEAD)
+    local pr="https://github.com/thehammer/mother/pull/701"
+
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr list"*)
+        exit 0
+        ;;
+    *"commits/$head_sha/pulls"*)
+        printf '[{"state":"open","updated_at":"2026-01-01T00:00:00Z","html_url":"$pr"}]\n'
+        ;;
+    *"pr view $pr --json headRefName"*)
+        echo "feature/fin-1"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    make_job "fin-job-1" "running" \
+        ".branch = \"feature/fin-1\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$repo\""
+    _va_bind_context "fin-job-1" "feature/fin-1" "main" "worktree" "$repo"
+    pr_url=""; log_path=""; log_offset_at_spawn=0
+
+    _finalize_pr_url
+
+    [ "$pr_url" = "$pr" ]
+    run jq -r '.pr_url' "$job_file"
+    [ "$output" = "$pr" ]
+    assert_event_kind "fin-job-1" "pr_opened"
+}
+
+@test "_finalize_pr_url replaces a stale non-OPEN pr_url with the live open PR on the branch (pr_url_updated)" {
+    local repo="$MOTHER_ROOT/fin-repo-2"
+    _fin_make_repo "$repo" "feature/fin-2" "main"
+    local old_pr="https://github.com/thehammer/mother/pull/59"
+    local new_pr="https://github.com/thehammer/mother/pull/60"
+
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr view $old_pr --json state,headRefName"*)
+        printf 'MERGED\tfeature/fin-2-old\n'
+        ;;
+    *"pr list"*"feature/fin-2"*)
+        printf '{"url":"$new_pr"}\n'
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    make_job "fin-job-2" "running" \
+        ".branch = \"feature/fin-2\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$repo\" | .pr_url = \"$old_pr\""
+    _va_bind_context "fin-job-2" "feature/fin-2" "main" "worktree" "$repo"
+    pr_url=""; log_path=""; log_offset_at_spawn=0
+
+    _finalize_pr_url
+
+    [ "$pr_url" = "$new_pr" ]
+    run jq -r '.pr_url' "$job_file"
+    [ "$output" = "$new_pr" ]
+    assert_event_kind "fin-job-2" "pr_url_updated"
+    run grep '"pr_url_updated"' "$EVENTS_DIR/fin-job-2.jsonl"
+    [[ "$output" =~ "\"previous_url\":\"$old_pr\"" ]]
+    [[ "$output" =~ "\"url\":\"$new_pr\"" ]]
+}
+
+@test "_finalize_pr_url accepts a branch-mismatched PR that contains the job's HEAD commit (pr_branch_mismatch_accepted, actual_branch recorded)" {
+    local repo="$MOTHER_ROOT/fin-repo-3"
+    _fin_make_repo "$repo" "feature/fin-3" "main"
+    local head_sha; head_sha=$(git -C "$repo" rev-parse HEAD)
+    local pr="https://github.com/thehammer/mother/pull/703"
+
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr list"*)
+        exit 0
+        ;;
+    *"commits/$head_sha/pulls"*)
+        printf '[{"state":"open","updated_at":"2026-01-01T00:00:00Z","html_url":"$pr"}]\n'
+        ;;
+    *"pr view $pr --json headRefName"*)
+        echo "some-other-branch"
+        ;;
+    *"pr view $pr --json commits"*)
+        echo "$head_sha"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    make_job "fin-job-3" "running" \
+        ".branch = \"feature/fin-3\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$repo\""
+    _va_bind_context "fin-job-3" "feature/fin-3" "main" "worktree" "$repo"
+    pr_url=""; log_path=""; log_offset_at_spawn=0
+
+    _finalize_pr_url
+
+    [ "$pr_url" = "$pr" ]
+    run jq -r '.actual_branch' "$job_file"
+    [ "$output" = "some-other-branch" ]
+    assert_event_kind "fin-job-3" "pr_branch_mismatch_accepted"
+    run grep '"pr_branch_mismatch_accepted"' "$EVENTS_DIR/fin-job-3.jsonl"
+    [[ "$output" =~ "\"matched_sha\":\"$head_sha\"" ]]
+    assert_event_kind "fin-job-3" "pr_opened"
+}
+
+@test "_finalize_pr_url clears a stored pr_url when the mismatched PR shares no commits with the job (pr_url_branch_mismatch)" {
+    local repo="$MOTHER_ROOT/fin-repo-4"
+    _fin_make_repo "$repo" "feature/fin-4" "main"
+    local pr="https://github.com/thehammer/mother/pull/704"
+
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr view $pr --json state,headRefName"*)
+        printf 'OPEN\tsome-other-branch\n'
+        ;;
+    *"pr view $pr --json commits"*)
+        echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        ;;
+    *"pr list"*)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    make_job "fin-job-4" "running" \
+        ".branch = \"feature/fin-4\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$repo\" | .pr_url = \"$pr\""
+    _va_bind_context "fin-job-4" "feature/fin-4" "main" "worktree" "$repo"
+    pr_url=""; log_path=""; log_offset_at_spawn=0
+
+    # run (not a bare call): the candidate-SHA loop inside _finalize_pr_url
+    # invokes prd_pr_contains_sha directly (capturing $? on the next line),
+    # which is exactly the shape bats' errexit-under-test treats as a fatal
+    # nonzero command if called bare — `run` disables that for the duration.
+    run _finalize_pr_url
+    [ "$status" -eq 0 ]
+
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
+    assert_event_kind "fin-job-4" "pr_url_branch_mismatch"
+
+    # Regression guard: the jq filter for this event previously had a
+    # backslash line-continuation INSIDE a single-quoted jq program, which
+    # bash preserves literally there (it is not a shell line continuation
+    # inside single quotes) — invalid jq syntax. jq errored and
+    # _append_event recorded an empty `{}` detail, so the event kind landed
+    # but every field silently vanished. Assert the actual fields.
+    run grep '"pr_url_branch_mismatch"' "$EVENTS_DIR/fin-job-4.jsonl"
+    [[ "$output" =~ "\"pr_url\":\"$pr\"" ]]
+    [[ "$output" =~ "\"pr_branch\":\"some-other-branch\"" ]]
+    [[ "$output" =~ "\"job_branch\":\"feature/fin-4\"" ]]
+}
+
+@test "_finalize_pr_url clears a stored pr_url that never resolves at all (pr_url_unresolved), with detail fields intact" {
+    local repo="$MOTHER_ROOT/fin-repo-7"
+    _fin_make_repo "$repo" "feature/fin-7" "main"
+    local pr="https://github.com/thehammer/mother/pull/707"
+
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr view $pr"*)
+        echo "gh: could not resolve to a PullRequest" >&2
+        exit 1
+        ;;
+    *"pr list"*)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    make_job "fin-job-7" "running" \
+        ".branch = \"feature/fin-7\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$repo\" | .pr_url = \"$pr\""
+    _va_bind_context "fin-job-7" "feature/fin-7" "main" "worktree" "$repo"
+    pr_url=""; log_path=""; log_offset_at_spawn=0
+
+    run _finalize_pr_url
+    [ "$status" -eq 0 ]
+
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
+
+    # Same jq-syntax regression as pr_url_branch_mismatch above, in the
+    # sibling pr_url_unresolved event — assert fields, not just the kind.
+    assert_event_kind "fin-job-7" "pr_url_unresolved"
+    run grep '"pr_url_unresolved"' "$EVENTS_DIR/fin-job-7.jsonl"
+    [[ "$output" =~ "\"pr_url\":\"$pr\"" ]]
+    [[ "$output" =~ "\"job_branch\":\"feature/fin-7\"" ]]
+}
+
+@test "_finalize_pr_url leaves a stored pr_url intact when the commit-containment check is indeterminate (pr_branch_mismatch_unverified)" {
+    local repo="$MOTHER_ROOT/fin-repo-5"
+    _fin_make_repo "$repo" "feature/fin-5" "main"
+    local pr="https://github.com/thehammer/mother/pull/705"
+
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr view $pr --json state,headRefName"*)
+        printf 'OPEN\tsome-other-branch\n'
+        ;;
+    *"pr view $pr --json commits"*)
+        echo "gh: network error" >&2
+        exit 1
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    make_job "fin-job-5" "running" \
+        ".branch = \"feature/fin-5\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$repo\" | .pr_url = \"$pr\""
+    _va_bind_context "fin-job-5" "feature/fin-5" "main" "worktree" "$repo"
+    pr_url=""; log_path=""; log_offset_at_spawn=0
+
+    # run (not a bare call): see the comment on the pr_url_branch_mismatch
+    # test above — prd_pr_contains_sha's indeterminate (rc=2) return from a
+    # bare call inside the candidate loop trips bats' errexit-under-test.
+    run _finalize_pr_url
+    [ "$status" -eq 0 ]
+
+    run jq -r '.pr_url' "$job_file"
+    [ "$output" = "$pr" ]
+    assert_event_kind "fin-job-5" "pr_branch_mismatch_unverified"
+}
+
+@test "_finalize_pr_url accepts a mismatched branch without the SHA check when expect_branch_mismatch is true" {
+    local repo="$MOTHER_ROOT/fin-repo-6"
+    _fin_make_repo "$repo" "feature/fin-6" "main"
+    local pr="https://github.com/thehammer/mother/pull/706"
+    local sha_check_marker="$MOTHER_ROOT/fin-6-sha-check-called"
+
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr view $pr --json state,headRefName"*)
+        printf 'OPEN\tsome-other-branch\n'
+        ;;
+    *"pr view $pr --json commits"*)
+        touch "$sha_check_marker"
+        echo "deadbeef"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    make_job "fin-job-6" "running" \
+        ".branch = \"feature/fin-6\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$repo\" | .pr_url = \"$pr\" | .expect_branch_mismatch = true"
+    _va_bind_context "fin-job-6" "feature/fin-6" "main" "worktree" "$repo"
+    pr_url=""; log_path=""; log_offset_at_spawn=0
+
+    _finalize_pr_url
+
+    [ "$pr_url" = "$pr" ]
+    [ ! -f "$sha_check_marker" ]
+    run jq -r '.actual_branch' "$job_file"
+    [ "$output" = "some-other-branch" ]
+    assert_event_kind "fin-job-6" "pr_branch_mismatch_accepted"
+    run grep '"pr_branch_mismatch_accepted"' "$EVENTS_DIR/fin-job-6.jsonl"
+    [[ "$output" =~ '"matched_sha":null' ]]
+    [[ "$output" =~ '"expected":true' ]]
+}

@@ -246,6 +246,65 @@ GHEOF
     [[ "$output" =~ '"source":"auto"' ]]
 }
 
+@test "--auto does not adopt a commit-matched PR that prd_pr_for_commit only found via its closed/merged fallback" {
+    # prd_pr_for_commit prefers an OPEN PR but falls back to the most
+    # recently updated PR (open or not) when none is open. A branch hit is
+    # always OPEN by construction (prd_pr_for_branch queries --state open),
+    # but a commit hit is not -- --auto's non-interactive contract must
+    # never unattendedly adopt a merged/closed PR just because it was the
+    # only thing prd_pr_for_commit's fallback returned.
+    local repo_dir="$MOTHER_ROOT/rc-repo-auto-commit-closed"
+    git init -q "$repo_dir"
+    git -C "$repo_dir" config user.email "test@test.com"
+    git -C "$repo_dir" config user.name "Test"
+    git -C "$repo_dir" commit -q --allow-empty -m init
+    git -C "$repo_dir" branch -M main
+    git -C "$repo_dir" checkout -q -b "feature/job-rc-auto-commit-closed"
+    git -C "$repo_dir" commit -q --allow-empty -m "work"
+    git -C "$repo_dir" remote add origin "https://github.com/thehammer/mother.git"
+    local head_sha
+    head_sha=$(git -C "$repo_dir" rev-parse HEAD)
+
+    local pr_url="https://github.com/thehammer/mother/pull/82"
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${MOTHER_ROOT:?}/mock-gh-calls"
+case "\$*" in
+    *"pr list"*)
+        echo ""
+        ;;
+    *"commits/$head_sha/pulls"*)
+        printf '[{"state":"closed","updated_at":"2026-01-01T00:00:00Z","html_url":"$pr_url"}]\n'
+        ;;
+    *"pr view $pr_url --json state"*)
+        echo "CLOSED"
+        ;;
+    *)
+        echo ""
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+    _rc_make_job "job-rc-auto-commit-closed" ".branch = \"feature/job-rc-auto-commit-closed\" | .base_ref = \"main\" | .work_dir = \"$repo_dir\""
+
+    local before_json
+    before_json=$(cat "$JOBS_DIR/job-rc-auto-commit-closed.json")
+
+    run mother reconcile "job-rc-auto-commit-closed" --auto
+    [ "$status" -eq 3 ]
+
+    local after_json
+    after_json=$(cat "$JOBS_DIR/job-rc-auto-commit-closed.json")
+    [ "$before_json" = "$after_json" ]
+
+    run bash -c "[ -f '$EVENTS_DIR/job-rc-auto-commit-closed.jsonl' ]"
+    if [ "$status" -eq 0 ]; then
+        run grep -c '"reconciled"' "$EVENTS_DIR/job-rc-auto-commit-closed.jsonl"
+        [ "$output" -eq 0 ]
+    fi
+}
+
 @test "--auto exits 3 and mutates nothing when nothing is detected" {
     local repo_dir="$MOTHER_ROOT/rc-repo-auto-nothing"
     git init -q "$repo_dir"
