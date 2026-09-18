@@ -127,7 +127,7 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 
 | Field | Type | Description |
 |---|---|---|
-| `no_pr` | bool | Set by `no_pr: true` in the plan YAML block. Skips the `no_pr_no_push` failure check. Success condition becomes "worker exited cleanly with commits on the branch." |
+| `no_pr` | bool | Set by `no_pr: true` in the plan YAML block. Swaps the `no_pr_no_push` push/PR check for an enforced commits-on-branch check: at least one commit must exist ahead of `base_ref` (`HEAD` for `worktree` isolation, `refs/heads/<branch>` for `main-dir`, since main-dir jobs restore the operator's original branch to `HEAD` before verification runs). Zero commits fails with `reason: no_commits_on_branch`; an unresolvable base_ref or branch ref fails closed with `reason: commit_check_indeterminate`. A captured `pr_url` still short-circuits the check either way. |
 | `continuation_count` | int | Number of auto-continuation attempts so far. Incremented each time an `idle_timeout` triggers a re-queue. |
 | `pipeline.review_cycle` | int | Number of review cycles completed so far (0-indexed). Incremented once per continue-cycle. Surfaced by W5 as `review_cycle_count`. |
 | `expect_branch_mismatch` | bool | Set by `expect_branch_mismatch: true` in the plan YAML block, or `mother add --expect-branch-mismatch`. Declares that the worker is deliberately targeting a branch other than the assigned one (e.g. landing more commits on an existing open PR) — a mismatching PR head branch is accepted without the commit-containment check. Default `false`. |
@@ -470,6 +470,25 @@ requires HEAD to be strictly ahead of `base_ref` (passed as `prd_sha_on_origin`'
 second argument) — a HEAD identical to base is already on origin by
 construction, so without this precondition a worker that committed nothing
 would pass the check vacuously and report `succeeded` for no work at all.
+
+**`no_pr: true` jobs get their own, separate verification**
+(`_verify_no_pr_commits_or_fail`, called from `_verify_artifact_or_fail`
+instead of the push/PR logic above): a captured `pr_url` still short-circuits
+to success, but otherwise the job must have at least one commit ahead of
+`base_ref` on a ref that depends on isolation — `HEAD` for `worktree` jobs
+(a dedicated workspace, safe to trust), or `refs/heads/<branch>` for
+`main-dir` jobs, because a main-dir workspace's `HEAD` may have already been
+restored to the operator's original branch by the stash-restore block that
+runs before verification. Zero commits fails with `reason:
+no_commits_on_branch`; an unresolvable `base_ref` or missing branch ref fails
+closed with `reason: commit_check_indeterminate` (same fail-closed precedent
+as `prd_sha_on_origin` above — a false `succeeded` is worse than a false
+`failed`). A successful check appends a `no_pr_commits_verified` event
+(`{branch, base_ref, tip_ref, commits_ahead}`). The count is cumulative
+commits on the branch, not commits attributed to this specific worker run —
+in a pipeline job, earlier phases' commits already on the branch satisfy a
+later phase (e.g. marty finding nothing to refactor) that makes none of its
+own.
 
 **`mother add`** gained `--expect-branch-mismatch` (also settable via the
 plan's `suggested_config` YAML block) for the deliberate cross-branch case,

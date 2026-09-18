@@ -205,7 +205,8 @@ except yaml.YAMLError as e:
 
 # _parse_no_pr <plan_file>
 # Returns "true" if the plan's YAML block contains `no_pr: true`, else "false".
-# The flag opts the job out of the `no_pr_no_push` failure check, for plans
+# The flag swaps mother-run-job's `no_pr_no_push` push/PR check for an
+# enforced commits-on-branch check (_verify_no_pr_commits_or_fail), for plans
 # that explicitly instruct the worker not to push or open a PR.
 _parse_no_pr() {
     local plan_file="$1"

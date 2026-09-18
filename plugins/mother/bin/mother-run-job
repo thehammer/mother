@@ -156,11 +156,124 @@ _validate_and_clear_pr_url() {
 # Returns 0 to allow the caller to transition to succeeded; returns 1
 # after having transitioned to failed itself, in which case the caller
 # must NOT also transition.
+
+# _verify_no_pr_commits_or_fail — the no_pr:true counterpart to the push/PR
+# checks in _verify_artifact_or_fail below. A no_pr job opts out of "the
+# branch must be on origin", but must still prove it actually did something:
+# at least one commit ahead of base_ref. The ref counted differs by
+# isolation:
+#   - worktree: HEAD is a dedicated workspace and reliably reflects this
+#     job's own work, even across a branch rename (see
+#     .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md).
+#     Same measure _verify_artifact_or_fail's no_pr_no_push path already
+#     uses below.
+#   - main-dir: HEAD is NOT reliable at verification time. The main-dir
+#     teardown block (search this file for "auto-stash to the operator's
+#     original branch") runs BEFORE both call sites of
+#     _verify_artifact_or_fail, and when a stash marker exists it checks out
+#     the operator's ORIGINAL branch — so by the time this runs, HEAD may no
+#     longer point at this job's branch at all. refs/heads/$branch is the
+#     only trustworthy handle in that isolation.
+#
+# The contract is cumulative commits on the branch, not commits made by this
+# specific worker run — deliberately not attributed by author/timestamp. In
+# a pipeline, earlier phases' commits are already on the branch by the time
+# a later phase (e.g. marty finding nothing to refactor) runs; that phase
+# must still pass.
+#
+# An indeterminate count (unresolvable base_ref, missing/non-git work_dir, or
+# a main-dir branch ref that no longer exists) fails closed with
+# commit_check_indeterminate — a false succeeded is worse than a false
+# failed, which at least escalates. Mirrors the precedent set in
+# lib/prdetect.sh's prd_sha_on_origin (see the comment there).
+#
+# Defined here, before _verify_artifact_or_fail (which calls it), for the
+# same SOURCE_ONLY bats-visibility reason documented on that function below:
+# it only references globals (job_file, branch, base_ref, isolation,
+# work_dir, pr_url) and helpers (_transition, _append_event) resolved at
+# CALL time.
+#
+# Returns 0 to allow the caller to report success; returns 1 after having
+# transitioned to failed itself, in which case the caller must NOT also
+# transition.
+_verify_no_pr_commits_or_fail() {
+    # A captured pr_url means the artifact is already real regardless of
+    # commit count; nothing further to prove.
+    [ -z "${pr_url:-}" ] || return 0
+
+    local tip_ref=""
+    if [ -n "${work_dir:-}" ] && [ -d "$work_dir" ] \
+        && (cd "$work_dir" && git rev-parse --is-inside-work-tree >/dev/null 2>&1); then
+        if [ "$isolation" = "worktree" ]; then
+            tip_ref="HEAD"
+        elif (cd "$work_dir" && git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1); then
+            tip_ref="refs/heads/$branch"
+        fi
+    fi
+
+    local commits_ahead=""
+    if [ -n "$tip_ref" ]; then
+        commits_ahead=$(cd "$work_dir" && git rev-list --count "$base_ref..$tip_ref" 2>/dev/null)
+        case "${commits_ahead:-}" in ''|*[!0-9]*) commits_ahead="" ;; esac
+    fi
+
+    if [ -z "$commits_ahead" ]; then
+        _transition failed "$(jq -nc \
+            --arg b "$branch" \
+            --arg base "$base_ref" \
+            --arg iso "$isolation" \
+            --arg tip "${tip_ref:-}" \
+            '{
+                reason: "commit_check_indeterminate",
+                branch: $b,
+                base_ref: $base,
+                isolation: $iso,
+                tip_ref: (if ($tip | length) > 0 then $tip else null end),
+                note: "could not determine commits ahead of base_ref for a no_pr job; failing closed rather than guessing success"
+            }')"
+        return 1
+    fi
+
+    if [ "$commits_ahead" -eq 0 ]; then
+        local uncommitted=0
+        uncommitted=$(cd "$work_dir" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        _transition failed "$(jq -nc \
+            --arg b "$branch" \
+            --arg base "$base_ref" \
+            --arg iso "$isolation" \
+            --arg tip "$tip_ref" \
+            --argjson uncommitted "${uncommitted:-0}" \
+            '{
+                reason: "no_commits_on_branch",
+                branch: $b,
+                base_ref: $base,
+                isolation: $iso,
+                tip_ref: $tip,
+                commits_ahead: 0,
+                uncommitted_files: $uncommitted,
+                note: "no_pr job reported success but the branch has no commits ahead of base_ref"
+            }')"
+        return 1
+    fi
+
+    _append_event "no_pr_commits_verified" "$(jq -nc \
+        --arg b "$branch" \
+        --arg base "$base_ref" \
+        --arg tip "$tip_ref" \
+        --argjson commits "$commits_ahead" \
+        '{branch: $b, base_ref: $base, tip_ref: $tip, commits_ahead: $commits}')"
+    return 0
+}
+
 _verify_artifact_or_fail() {
-    # Plans with no_pr:true explicitly opt out of the push/PR contract.
-    # The success condition is "worker exited cleanly with commits on the branch."
+    # Plans with no_pr:true opt out of the push/PR contract below, but the
+    # commits-on-branch contract is enforced, not skipped — see
+    # _verify_no_pr_commits_or_fail above.
     local job_no_pr; job_no_pr=$(jq -r '.no_pr // false' "$job_file" 2>/dev/null)
-    [ "$job_no_pr" = "true" ] && return 0
+    if [ "$job_no_pr" = "true" ]; then
+        _verify_no_pr_commits_or_fail
+        return $?
+    fi
 
     # If a pr_url was captured (live or post-loop), the artifact is real.
     [ -z "${pr_url:-}" ] || return 0

@@ -56,6 +56,18 @@ teardown() {
 # bats `run` captures stdout/stderr; we need the files it writes.
 _run_job() {
     local id="$1"
+    local branch="feature/test-$id"
+    # Seed one real commit on the job's branch so the no_pr commit-verification
+    # check (added alongside this helper) sees shipped work, exactly like a
+    # real worker that committed something would. Always return to main
+    # afterward — mother-run-job's own main-dir setup checks out the assigned
+    # branch itself.
+    (
+        cd "$TEST_REPO_DIR"
+        git checkout -q -B "$branch" main
+        git commit -q --allow-empty -m "seed for $id"
+        git checkout -q main
+    ) >/dev/null 2>&1
     # Clear the args file so each test starts fresh.
     rm -f "$MOCK_CLAUDE_ARGS_FILE"
     run mother-run-job "$id"
@@ -380,4 +392,27 @@ _run_job() {
     [[ "$prompt" == *"# Request type: cody:implement"* ]]
     # Verify the redd-targeted finding does NOT appear (it targets redd, not cody)
     [[ "$prompt" != *"Test coverage low"* ]]
+}
+
+# ===========================================================================
+# no_pr commit verification (bypasses _run_job's branch seeding on purpose)
+# ===========================================================================
+
+@test "redd phase with zero commits: job fails with no_commits_on_branch" {
+    make_pipeline_job "redd-zero" "redd"
+
+    # Do NOT go through _run_job — it seeds a commit on the job's branch.
+    # This test wants the branch left exactly as make_pipeline_job's repo
+    # starts: zero commits ahead of main. The mock claude never commits
+    # anything either, so if _verify_artifact_or_fail's commit check isn't
+    # wired up, the job will wrongly report success.
+    rm -f "$MOCK_CLAUDE_ARGS_FILE"
+    run mother-run-job "redd-zero"
+
+    state=$(jq -r '.state' "$JOBS_DIR/redd-zero.json")
+    [ "$state" = "failed" ]
+
+    failed_reason=$(jq -r 'select(.kind=="failed") | .detail.reason' \
+        "$EVENTS_DIR/redd-zero.jsonl" 2>/dev/null | head -1)
+    [ "$failed_reason" = "no_commits_on_branch" ]
 }
