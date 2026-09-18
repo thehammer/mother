@@ -1968,6 +1968,22 @@ cmd_resume() {
 
 # ---------- events (for the hook) ----------
 
+# Write a session cursor atomically, refusing to leave an unreadable file
+# behind. _atomic_write will happily persist an empty string if the jq that
+# produced it failed, and an empty/garbage cursor is exactly what makes
+# cmd_events fall back to replaying all history — so build the JSON, verify
+# it parses, and only then write. Returns 1 without touching the file if the
+# payload could not be built.
+_cursor_write() {
+    local cursor_file="$1" ts="$2" payload
+    [ -n "$ts" ] || return 1
+    payload=$(jq -nc --arg ts "$ts" '{last_seen: $ts}' 2>/dev/null) || return 1
+    [ -n "$payload" ] || return 1
+    printf '%s' "$payload" | jq -e '.last_seen | type == "string"' >/dev/null 2>&1 || return 1
+    mkdir -p "$(dirname "$cursor_file")"
+    _atomic_write "$cursor_file" "$payload"
+}
+
 cmd_events() {
     local session_id="" since_ts=""
     while [ $# -gt 0 ]; do
@@ -1979,18 +1995,33 @@ cmd_events() {
     done
 
     # If session cursor provided, load its last-seen ts.
+    #
+    # Critical: an unreadable cursor must NEVER fall through to an empty
+    # $since_ts. The aggregation filter below treats empty as "no floor at
+    # all", so a zero-byte / truncated / non-JSON cursor file, a missing or
+    # null .last_seen, or any jq failure would silently turn this call into a
+    # full replay of every event file still sitting in $EVENTS_DIR — which
+    # includes months of history for jobs whose records were archived long
+    # ago. That is the 2026-07-14 "hook replays stale archived-job events"
+    # bug. Treat every unusable cursor as a brand-new session instead.
     local cursor_file=""
     if [ -n "$session_id" ]; then
         cursor_file="$CURSORS_DIR/$session_id.json"
-        if [ -f "$cursor_file" ] && [ -z "$since_ts" ]; then
-            since_ts=$(jq -r '.last_seen // ""' "$cursor_file" 2>/dev/null || echo "")
-        elif [ ! -f "$cursor_file" ] && [ -z "$since_ts" ]; then
-            # Brand-new session: bootstrap cursor to now so we don't replay
-            # the full event history on first call. Future calls will pick up
-            # only events emitted after this session started.
-            since_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-            mkdir -p "$CURSORS_DIR"
-            _atomic_write "$cursor_file" "$(jq -n --arg ts "$since_ts" '{last_seen: $ts}')"
+        if [ -z "$since_ts" ]; then
+            if [ -f "$cursor_file" ]; then
+                since_ts=$(jq -r '.last_seen // empty' "$cursor_file" 2>/dev/null || true)
+            fi
+            case "$since_ts" in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z) ;;
+                *) since_ts="" ;;
+            esac
+            if [ -z "$since_ts" ]; then
+                # Brand-new (or unusable) cursor: bootstrap to now so we don't
+                # replay history. Future calls pick up only events emitted
+                # after this point.
+                since_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+                _cursor_write "$cursor_file" "$since_ts" || true
+            fi
         fi
     fi
 
@@ -2009,14 +2040,38 @@ cmd_events() {
         | sort_by(.ts)
     ')
 
-    echo "$all"
+    # Age floor, cursor path only. $EVENTS_DIR retains .jsonl files for jobs
+    # whose records were archived months ago (older archive code did not carry
+    # the events file along; adherence/teardown appends recreate it via >>),
+    # so a stale-but-valid cursor can still surface ancient terminal events as
+    # if they were fresh. Nothing older than the floor is ever "news" for a
+    # between-turns banner. Set MOTHER_EVENTS_MAX_AGE_HOURS=0 to disable.
+    # Only the --since-cursor path is floored: plain `mother events` and
+    # `mother events --since <ts>` remain full-history queries.
+    local visible="$all"
+    if [ -n "$session_id" ]; then
+        local max_age floor
+        max_age="${MOTHER_EVENTS_MAX_AGE_HOURS:-6}"
+        if [ "$max_age" != "0" ]; then
+            floor=$(_iso_hours_ago "$max_age" 2>/dev/null || echo "")
+            if [ -n "$floor" ]; then
+                visible=$(printf '%s' "$all" | jq -c --arg floor "$floor" \
+                    'map(select(.ts > $floor))')
+            fi
+        fi
+    fi
 
-    # Advance cursor to the newest event seen, if session_id given.
-    if [ -n "$session_id" ] && [ "$(echo "$all" | jq 'length')" -gt 0 ]; then
+    echo "$visible"
+
+    # Advance the cursor past everything the cursor filter admitted — floored
+    # or not. Computing max_ts from $all (not $visible) is deliberate: events
+    # suppressed by the floor must not be re-examined on every subsequent
+    # call, or a single ancient orphan file would keep the cursor pinned in
+    # the past forever.
+    if [ -n "$session_id" ] && [ "$(printf '%s' "$all" | jq 'length')" -gt 0 ]; then
         local max_ts
-        max_ts=$(echo "$all" | jq -r 'map(.ts) | max')
-        mkdir -p "$CURSORS_DIR"
-        _atomic_write "$cursor_file" "$(jq -n --arg ts "$max_ts" '{last_seen: $ts}')"
+        max_ts=$(printf '%s' "$all" | jq -r 'map(.ts) | max')
+        _cursor_write "$cursor_file" "$max_ts" || true
     fi
 }
 
@@ -2619,6 +2674,15 @@ Daemon env vars:
   MOTHER_ESCALATION_ENABLED    (default: 1)    auto-escalate failed jobs (0 to disable)
   MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
   MOTHER_BROKER_ENABLED        (default: 1)    supervise the IPC broker sidecar (0 to disable)
+
+Hook / events env vars:
+  MOTHER_EVENTS_MAX_AGE_HOURS  (default: 6)    age floor for
+                                                `events --since-cursor`;
+                                                events older than this are
+                                                never surfaced to the
+                                                UserPromptSubmit hook even if
+                                                a session cursor is stale.
+                                                0 disables the floor.
 
 Teardown env vars (worktree + docker cleanup, rides along with `mother archive`
 on every sweep — independent of the record-archiving age cutoff):
