@@ -347,3 +347,45 @@ teardown() {
     [[ "$output" =~ "force-start" ]]
     [[ "$output" =~ "--yes" ]]
 }
+
+# ---------------------------------------------------------------------------
+# _guard_existing_pr — force-start must ALSO respect the pre-dispatch
+# existing-open-PR guard (shared with retry/escalate; see escalation.bats).
+# --yes already exists on force-start for the interactive-confirmation gate;
+# the spec requires it to ALSO bypass this specific guard, not just the
+# confirmation prompt.
+
+@test "force-start --yes dispatches successfully even when the job's branch already has a verified open PR" {
+    local repo_dir="$MOTHER_ROOT/guard-repo-force-start"
+    local branch="feature/guarded-force-start"
+    local pr_url="https://github.com/thehammer/mother/pull/601"
+    git init -q "$repo_dir"
+    git -C "$repo_dir" config user.email "test@test.com"
+    git -C "$repo_dir" config user.name "Test"
+    git -C "$repo_dir" commit -q --allow-empty -m init
+    git -C "$repo_dir" remote add origin "https://github.com/thehammer/mother.git"
+
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr list"*)
+        printf '{"url":"$pr_url"}\n'
+        ;;
+    *"pr view"*state*)
+        echo "OPEN"
+        ;;
+    *)
+        echo ""
+        ;;
+esac
+exit 0
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    make_job "job-fs-guard" "ready" ".branch = \"$branch\" | .repo_path = \"$repo_dir\""
+
+    run mother force-start "job-fs-guard" --yes
+    [ "$status" -eq 0 ]
+    run jq -r '.force_start' "$JOBS_DIR/job-fs-guard.json"
+    [ "$output" = "true" ]
+}

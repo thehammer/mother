@@ -40,12 +40,31 @@ load 'test_helper'
 
 # Real git repo (never mocked — these are the safety net for destructive
 # filesystem ops). Usage: _make_teardown_repo <repo_dir>
+#
+# Gives every fixture a real (local, bare) "origin" with the initial commit
+# already pushed. This matters once _teardown_worktree_unsafe is wired in:
+# its unpushed-commit check (`git rev-list HEAD --not --remotes`) treats ANY
+# commit unreachable from a remote-tracking ref as unpushed work — with no
+# remote configured at all (the old behavior here), that literally means
+# EVERY commit, including this shared baseline "init" commit that every
+# other test in this file inherits and never touches. Without a real push,
+# every existing teardown/archive test in this file that reaches the
+# worktree-removal step (i.e. isn't already short-circuited by a pr_merged
+# gate) would spuriously trip the new safety probe once it lands. Individual
+# tests that need a DIFFERENT origin URL (e.g. a fake github.com remote for
+# gh-based owner/repo derivation) retarget it via `git remote set-url` — see
+# _add_origin_remote — which doesn't disturb the remote-tracking refs this
+# push already created.
 _make_teardown_repo() {
     local repo_dir="$1"
     git init -q "$repo_dir"
     git -C "$repo_dir" config user.email "test@test.com"
     git -C "$repo_dir" config user.name "Test"
     git -C "$repo_dir" commit -q --allow-empty -m init
+    local _origin_bare="${repo_dir}.origin.git"
+    git init -q --bare "$_origin_bare"
+    git -C "$repo_dir" remote add origin "$_origin_bare"
+    git -C "$repo_dir" push -q origin HEAD:refs/heads/main
 }
 
 # Real git worktree off a real repo. Usage: _make_teardown_worktree <repo_dir> <wt_dir> <branch>
@@ -94,10 +113,14 @@ _find_events_file() {
 }
 
 # Shell snippet that sources the libs needed to call lib/teardown.sh
-# functions directly, in the order bin/mother would.
+# functions directly, in the order bin/mother would. prdetect.sh is sourced
+# optionally (guarded, like bin/mother's own optional-source convention for
+# request-types.sh/findings.sh/etc.) since the pr_open_live gate needs
+# prd_pr_for_branch/prd_owner_repo_from_dir, but this file's many pre-existing
+# tests must keep passing before lib/prdetect.sh exists at all.
 _source_teardown_libs() {
-    printf "source '%s/state.sh'; source '%s/worktree.sh'; source '%s/teardown.sh';" \
-        "$_LIB_DIR" "$_LIB_DIR" "$_LIB_DIR"
+    printf "source '%s/state.sh'; source '%s/worktree.sh'; [ -r '%s/prdetect.sh' ] && source '%s/prdetect.sh'; source '%s/teardown.sh';" \
+        "$_LIB_DIR" "$_LIB_DIR" "$_LIB_DIR" "$_LIB_DIR" "$_LIB_DIR"
 }
 
 # Mock `gh`: records every invocation to $MOTHER_ROOT/mock-gh-calls, then
@@ -153,6 +176,72 @@ _age_job() {
     local id="$1" ts="$2" tmp
     tmp=$(mktemp)
     jq --arg ts "$ts" '.finished_at = $ts' "$JOBS_DIR/$id.json" > "$tmp" && mv "$tmp" "$JOBS_DIR/$id.json"
+}
+
+# Retarget (or add, if absent) a repo's "origin" remote to a fake GitHub URL,
+# so prd_owner_repo_from_dir (used by the pr_open_live gate) has something to
+# read. Uses set-url when origin already exists (every _make_teardown_repo
+# fixture has one now, pointed at a local bare repo — see its comment) so the
+# remote-tracking refs that real push already created survive the retarget.
+# Usage: _add_origin_remote <repo_dir> <owner/repo>
+_add_origin_remote() {
+    local repo_dir="$1" owner_repo="$2"
+    if git -C "$repo_dir" remote get-url origin >/dev/null 2>&1; then
+        git -C "$repo_dir" remote set-url origin "https://github.com/$owner_repo.git"
+    else
+        git -C "$repo_dir" remote add origin "https://github.com/$owner_repo.git"
+    fi
+}
+
+# gh mock for the pr_open_live gate: the STORED pr_url resolves (via `pr view
+# <url> ... state`) to $stored_state (e.g. MERGED/CLOSED), but a live query
+# for the job's own branch (`pr list --head <branch> --state open ...`)
+# reports a DIFFERENT, still-open PR at $live_url. Records every call like
+# the other gh mocks in this file.
+_install_mock_gh_pr_open_live() {
+    local stored_state="$1" branch="$2" live_url="$3"
+    cat > "$_MOCK_BIN/gh" <<GH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${MOTHER_ROOT:?}/mock-gh-calls"
+if [ "\${MOCK_GH_EXIT:-0}" != "0" ]; then
+    exit "\${MOCK_GH_EXIT}"
+fi
+case "\$*" in
+    *"pr view"*state*)
+        printf '%s\n' "$stored_state"
+        ;;
+    *"pr list"*"$branch"*)
+        printf '{"url":"$live_url"}\n'
+        ;;
+    *)
+        echo ""
+        ;;
+esac
+exit 0
+GH
+    chmod +x "$_MOCK_BIN/gh"
+}
+
+# Real repo + real bare "origin" + a worktree branched off a PUSHED base, so
+# _teardown_worktree_unsafe's unpushed-commit check (git rev-list HEAD --not
+# --remotes) has real remote-tracking refs to compare against. Deliberately
+# NOT reusing _make_teardown_job/_make_teardown_repo here: those never
+# configure a remote at all, which would make every commit look "unpushed"
+# under a literal reading of the contract (see the note on
+# _teardown_worktree_unsafe's tests below) — a real fixture needs a pushed
+# base to test the safe/unsafe distinction meaningfully.
+# Usage: _tw_repo_with_pushed_base <repo_dir> <bare_dir> <wt_dir> <branch>
+_tw_repo_with_pushed_base() {
+    local repo_dir="$1" bare_dir="$2" wt_dir="$3" branch="$4"
+    git init -q --bare "$bare_dir"
+    git init -q "$repo_dir"
+    git -C "$repo_dir" config user.email "test@test.com"
+    git -C "$repo_dir" config user.name "Test"
+    git -C "$repo_dir" remote add origin "$bare_dir"
+    git -C "$repo_dir" commit -q --allow-empty -m init
+    git -C "$repo_dir" branch -M main
+    git -C "$repo_dir" push -q origin main
+    git -C "$repo_dir" worktree add -q -b "$branch" "$wt_dir" main
 }
 
 # Count `gh pr view` invocations recorded by the gh mock. NB: `grep -c` exits
@@ -1078,4 +1167,243 @@ teardown() {
     events_file=$(_find_events_file "job-idempotent")
     run grep -F '"kind":"teardown_failed"' "$events_file"
     [ "$status" -ne 0 ]
+}
+
+# ===========================================================================
+# pr_open_live gate: a live open PR on the job's OWN BRANCH defers teardown
+# even when the job's STORED pr_url resolves to merged/closed. Guards against
+# tearing down a worktree whose branch was reused for a fresh PR after the
+# original PR (the one Mother happened to record) was closed/merged out from
+# under it.
+# ===========================================================================
+
+@test "_teardown_gate: branch has its own live open PR even though the stored pr_url is merged -> defer:pr_open_live" {
+    local repo_dir="$MOTHER_ROOT/repo-live-gate"
+    _make_teardown_repo "$repo_dir"
+    _add_origin_remote "$repo_dir" "thehammer/mother"
+    _install_mock_gh_pr_open_live "MERGED" "feature/live-gate" "https://github.com/thehammer/mother/pull/199"
+
+    facts=$(_facts_json "job-live-gate" "$repo_dir" "feature/live-gate" "$repo_dir" "worktree" \
+        "https://github.com/x/y/pull/1" "succeeded" false)
+    run bash -c "$(_source_teardown_libs) _teardown_gate '$facts'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "defer:pr_open_live" ]
+}
+
+@test "pr_open_live: mother archive defers and preserves the worktree" {
+    local wt_dir
+    wt_dir=$(_make_teardown_job "e2e-live1" "succeeded" '.pr_url = "https://github.com/x/y/pull/60"')
+    local repo_dir="$MOTHER_ROOT/repo-e2e-live1"
+    _add_origin_remote "$repo_dir" "thehammer/mother"
+    _install_mock_gh_pr_open_live "MERGED" "feature/e2e-live1" "https://github.com/thehammer/mother/pull/61"
+
+    run mother archive "e2e-live1"
+    [ "$status" -eq 0 ]
+    [ -d "$wt_dir" ]
+
+    local events_file
+    events_file=$(_find_events_file "e2e-live1")
+    run grep -F '"reason":"pr_open_live"' "$events_file"
+    [ "$status" -eq 0 ]
+}
+
+@test "pr_open_live deferrals never increment stall_deferrals, unlike unrelated stalls" {
+    # Uses the bulk sweep (bare `mother archive`), not the single-id form:
+    # `mother archive <id>` archives-and-moves unconditionally on its very
+    # first call (see the "PR open on a succeeded job defers teardown" test
+    # above), so the job record wouldn't survive to be attempted a second
+    # time. The bulk sweep gives every terminal job younger than the archive
+    # cutoff a teardown-ONLY attempt each pass without moving its record —
+    # see "teardown-only accrues exactly one deferral per sweep" for the
+    # established pattern this mirrors.
+    local wt_dir
+    wt_dir=$(_make_teardown_job "e2e-live2" "succeeded" '.pr_url = "https://github.com/x/y/pull/62"')
+    local repo_dir="$MOTHER_ROOT/repo-e2e-live2"
+    _add_origin_remote "$repo_dir" "thehammer/mother"
+    _install_mock_gh_pr_open_live "CLOSED" "feature/e2e-live2" "https://github.com/thehammer/mother/pull/63"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/e2e-live2.json")" = "1" ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/e2e-live2.json")" = "0" ]
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/e2e-live2.json")" = "2" ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/e2e-live2.json")" = "0" ]
+
+    [ -d "$wt_dir" ]
+    [ -f "$JOBS_DIR/e2e-live2.json" ]
+}
+
+# ===========================================================================
+# _teardown_worktree_unsafe <facts_json> -> 0 safe / 1 unsafe (echoes
+# {"uncommitted_files":N,"unpushed_commits":N}) / 2 indeterminate.
+# ===========================================================================
+
+@test "_teardown_worktree_unsafe: clean worktree with commits pushed to origin is safe" {
+    local repo_dir="$MOTHER_ROOT/tw-repo-a" bare_dir="$MOTHER_ROOT/tw-bare-a.git" wt_dir="$MOTHER_ROOT/tw-wt-a"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-a"
+    facts=$(_facts_json "job-tw-a" "$repo_dir" "feature/tw-a" "$wt_dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 0 ]
+}
+
+@test "_teardown_worktree_unsafe: an uncommitted file makes the worktree unsafe" {
+    local repo_dir="$MOTHER_ROOT/tw-repo-b" bare_dir="$MOTHER_ROOT/tw-bare-b.git" wt_dir="$MOTHER_ROOT/tw-wt-b"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-b"
+    echo "dirty" > "$wt_dir/dirty.txt"
+    facts=$(_facts_json "job-tw-b" "$repo_dir" "feature/tw-b" "$wt_dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 1 ]
+    local uncommitted
+    uncommitted=$(printf '%s' "$output" | jq -r '.uncommitted_files')
+    [ "$uncommitted" -gt 0 ]
+}
+
+@test "_teardown_worktree_unsafe: a committed-but-unpushed commit makes the worktree unsafe" {
+    local repo_dir="$MOTHER_ROOT/tw-repo-c" bare_dir="$MOTHER_ROOT/tw-bare-c.git" wt_dir="$MOTHER_ROOT/tw-wt-c"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-c"
+    git -C "$wt_dir" commit -q --allow-empty -m "unpushed work"
+    facts=$(_facts_json "job-tw-c" "$repo_dir" "feature/tw-c" "$wt_dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 1 ]
+    local unpushed
+    unpushed=$(printf '%s' "$output" | jq -r '.unpushed_commits')
+    [ "$unpushed" -gt 0 ]
+}
+
+@test "_teardown_worktree_unsafe: a work_dir that is not a git repo is indeterminate" {
+    local dir="$MOTHER_ROOT/tw-not-a-repo"
+    mkdir -p "$dir"
+    facts=$(_facts_json "job-tw-d" "$dir" "somebranch" "$dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 2 ]
+}
+
+# ===========================================================================
+# Wiring: _teardown_execute defers on an unsafe/indeterminate worktree for a
+# terminal job with no PR (the proceed:no_pr_terminal gate path), and both
+# reasons count as STALL deferrals (unlike pr_open/pr_open_live).
+# ===========================================================================
+
+@test "_teardown_execute defers unsafe_worktree and keeps the worktree when uncommitted changes exist" {
+    local repo_dir="$MOTHER_ROOT/tw-exec-repo1" bare_dir="$MOTHER_ROOT/tw-exec-bare1.git" wt_dir="$MOTHER_ROOT/tw-exec-wt1"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-exec1"
+    echo "dirty" > "$wt_dir/dirty.txt"
+    facts=$(_facts_json "job-tw-exec1" "$repo_dir" "feature/tw-exec1" "$wt_dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=deferred"* ]]
+    [[ "$output" == *"reason=unsafe_worktree"* ]]
+    [ -d "$wt_dir" ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/job-tw-exec1.json")" = "1" ]
+}
+
+@test "_teardown_execute defers unsafe_worktree and keeps the worktree when there's an unpushed commit" {
+    local repo_dir="$MOTHER_ROOT/tw-exec-repo1b" bare_dir="$MOTHER_ROOT/tw-exec-bare1b.git" wt_dir="$MOTHER_ROOT/tw-exec-wt1b"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-exec1b"
+    git -C "$wt_dir" commit -q --allow-empty -m "unpushed"
+    facts=$(_facts_json "job-tw-exec1b" "$repo_dir" "feature/tw-exec1b" "$wt_dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=deferred"* ]]
+    [[ "$output" == *"reason=unsafe_worktree"* ]]
+    [ -d "$wt_dir" ]
+}
+
+@test "_teardown_execute defers worktree_probe_failed when the safety probe is indeterminate, and it counts as a stall" {
+    local repo_dir="$MOTHER_ROOT/tw-exec-repo2"
+    _make_teardown_repo "$repo_dir"
+    local not_repo_dir="$MOTHER_ROOT/tw-exec-notrepo2"
+    mkdir -p "$not_repo_dir"
+    facts=$(_facts_json "job-tw-exec2" "$repo_dir" "feature/tw-exec2" "$not_repo_dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=deferred"* ]]
+    [[ "$output" == *"reason=worktree_probe_failed"* ]]
+    [ -d "$not_repo_dir" ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/job-tw-exec2.json")" = "1" ]
+}
+
+@test "_teardown_execute skips the safety probe entirely when the gate reason is pr_merged" {
+    export MOCK_GH_STATE="MERGED"
+    local repo_dir="$MOTHER_ROOT/tw-skip-repo1" bare_dir="$MOTHER_ROOT/tw-skip-bare1.git" wt_dir="$MOTHER_ROOT/tw-skip-wt1"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-skip1"
+    echo "dirty" > "$wt_dir/dirty.txt"   # deliberately unsafe — must not matter here
+    facts=$(_facts_json "job-tw-skip1" "$repo_dir" "feature/tw-skip1" "$wt_dir" "worktree" \
+        "https://github.com/x/y/pull/1" "succeeded" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=torn_down"* ]]
+    [ ! -d "$wt_dir" ]
+}
+
+@test "_teardown_execute skips the safety probe when MOTHER_TEARDOWN_ALLOW_UNSAFE=1, even on an unsafe worktree" {
+    local repo_dir="$MOTHER_ROOT/tw-skip-repo2" bare_dir="$MOTHER_ROOT/tw-skip-bare2.git" wt_dir="$MOTHER_ROOT/tw-skip-wt2"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-skip2"
+    echo "dirty" > "$wt_dir/dirty.txt"
+    facts=$(_facts_json "job-tw-skip2" "$repo_dir" "feature/tw-skip2" "$wt_dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs)
+        MOTHER_TEARDOWN_ALLOW_UNSAFE=1 _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=torn_down"* ]]
+    [ ! -d "$wt_dir" ]
+}
+
+@test "_teardown_execute regression: a safe worktree (clean, pushed, no PR) still tears down normally" {
+    local repo_dir="$MOTHER_ROOT/tw-safe-repo" bare_dir="$MOTHER_ROOT/tw-safe-bare.git" wt_dir="$MOTHER_ROOT/tw-safe-wt"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-safe"
+    facts=$(_facts_json "job-tw-safe" "$repo_dir" "feature/tw-safe" "$wt_dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=torn_down"* ]]
+    [[ "$output" == *"reason=no_pr_terminal"* ]]
+    [ ! -d "$wt_dir" ]
+}
+
+@test "_teardown_execute regression: the safety probe never fires for isolation=main-dir" {
+    # A main-dir job has no separate worktree to protect and no .work_dir
+    # field at all — a probe that doesn't scope itself to isolation=worktree
+    # would see an empty/missing work_dir as indeterminate and defer a job
+    # that should hit _teardown_worktree's own main_dir skip untouched.
+    local repo_dir="$MOTHER_ROOT/tw-maindir-repo"
+    _make_teardown_repo "$repo_dir"
+    facts=$(_facts_json "job-tw-maindir" "$repo_dir" "main" "" "main-dir" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=skipped"* ]]
+    [[ "$output" == *"reason=main_dir"* ]]
+    [ -d "$repo_dir" ]
 }

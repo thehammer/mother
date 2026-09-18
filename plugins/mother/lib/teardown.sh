@@ -39,6 +39,7 @@
 : "${MOTHER_TEARDOWN_DOCKER_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_MAX_DEFERRALS:=30}"
 : "${MOTHER_DOCKER_PROBE_TIMEOUT:=5}"  # seconds before a wedged `docker info` probe is killed
+: "${MOTHER_TEARDOWN_ALLOW_UNSAFE:=0}" # 1 restores unconditional force-removal, bypassing the unsafe-worktree probe
 
 _teardown_pending_path() { echo "$TEARDOWN_DIR/$1.json"; }
 
@@ -111,6 +112,32 @@ _teardown_gate() {
     pr_url=$(_facts_get "$facts" '.pr_url // empty')
     state=$(_facts_get "$facts" '.state // ""')
     no_pr=$(_facts_get "$facts" '.no_pr // false')
+
+    # Live-branch probe: regardless of what the STORED pr_url says, check
+    # whether the job's branch currently has ITS OWN open PR. A branch can
+    # be reused for a fresh PR after the one Mother recorded was
+    # merged/closed out from under it — stored #59 merged doesn't mean the
+    # branch is idle if #60 (never captured) is now open on it. See
+    # .claude/bugs/*/2026-08-14-review-phase-silently-reviews-wrong-repo-when-worktree-is-torn-down.md.
+    # Skipped (falls through to the stored-pr_url logic below) whenever it
+    # can't run confidently: no repo_path/branch on the facts blob, or
+    # prdetect.sh isn't sourced. This is belt-and-braces on top of the
+    # stored-URL check below, never a replacement for it.
+    if type prd_pr_for_branch >/dev/null 2>&1 && type prd_owner_repo_from_dir >/dev/null 2>&1; then
+        local live_repo_path live_branch live_owner_repo live_url
+        live_repo_path=$(_facts_get "$facts" '.repo_path // ""')
+        live_branch=$(_facts_get "$facts" '.branch // ""')
+        if [ -n "$live_repo_path" ] && [ -d "$live_repo_path" ] && [ -n "$live_branch" ]; then
+            live_owner_repo=$(prd_owner_repo_from_dir "$live_repo_path")
+            if [ -n "$live_owner_repo" ]; then
+                live_url=$(prd_pr_for_branch "$live_owner_repo" "$live_branch")
+                if [ -n "$live_url" ]; then
+                    echo "defer:pr_open_live"
+                    return 0
+                fi
+            fi
+        fi
+    fi
 
     if [ -z "$pr_url" ]; then
         case "$state" in
@@ -341,6 +368,41 @@ _teardown_worktree() {
     return 0
 }
 
+# _teardown_worktree_unsafe <facts_json> -> 0 safe / 1 unsafe / 2 indeterminate.
+# On unsafe (1), echoes a one-line detail object:
+#   {"uncommitted_files": N, "unpushed_commits": N}
+#
+# Unsafe means the worktree holds work that would be genuinely unrecoverable
+# if force-removed: uncommitted/untracked changes (`git status --porcelain`
+# non-empty), or commits reachable from HEAD but from no remote-tracking ref
+# at all (`git rev-list HEAD --not --remotes` non-empty) — i.e. never pushed
+# anywhere. Indeterminate (2) covers a work_dir that's missing, not a git
+# repo, or any git error: never guess "safe" when the answer is unclear.
+#
+# See .claude/bugs/*/2026-06-13-merged-job-worktrees-never-gc-d-target-dirs-exhaust-disk.md:
+# "Whatever GC lands MUST NOT remove a worktree that is ahead-of-base or has
+# uncommitted changes; those represent unrecovered work."
+_teardown_worktree_unsafe() {
+    local facts="$1"
+    local work_dir; work_dir=$(_facts_get "$facts" '.work_dir // ""')
+    [ -n "$work_dir" ] && [ -d "$work_dir" ] || return 2
+    (cd "$work_dir" && git rev-parse --is-inside-work-tree >/dev/null 2>&1) || return 2
+
+    local uncommitted unpushed
+    uncommitted=$(cd "$work_dir" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    case "${uncommitted:-}" in ''|*[!0-9]*) return 2 ;; esac
+
+    unpushed=$(cd "$work_dir" && git rev-list --count HEAD --not --remotes 2>/dev/null)
+    case "${unpushed:-}" in ''|*[!0-9]*) return 2 ;; esac
+
+    if [ "$uncommitted" -gt 0 ] || [ "$unpushed" -gt 0 ]; then
+        jq -nc --argjson u "$uncommitted" --argjson p "$unpushed" \
+            '{uncommitted_files: $u, unpushed_commits: $p}'
+        return 1
+    fi
+    return 0
+}
+
 # ---------- pending queue ----------
 
 # _teardown_defer_record <facts_json> <reason> — upsert the pending record,
@@ -363,15 +425,20 @@ _teardown_defer_record() {
     case "$prev_stalls"    in ''|*[!0-9]*) prev_stalls=0 ;; esac
     local deferrals=$((prev_deferrals + 1))
 
-    # `pr_open` is a healthy WAIT, not a stall — PRs legitimately stay open for
-    # days. Now that every young terminal job gets a teardown attempt on the
-    # hourly sweep, counting pr_open toward the attention cap would fire
-    # teardown_needs_attention for every PR still open after ~MAX_DEFERRALS
-    # hours. Only anomalous reasons (gh unreachable, docker down, a stuck racing
-    # job, a succeeded job with no captured PR url, worktree errors, the kill
-    # switch left off) mean something actually needs a human.
+    # `pr_open` (and `pr_open_live`, its live-branch-derived twin — see
+    # _teardown_gate) is a healthy WAIT, not a stall — PRs legitimately stay
+    # open for days. Now that every young terminal job gets a teardown
+    # attempt on the hourly sweep, counting either toward the attention cap
+    # would fire teardown_needs_attention for every PR still open after
+    # ~MAX_DEFERRALS hours. Only anomalous reasons (gh unreachable, docker
+    # down, a stuck racing job, a succeeded job with no captured PR url, an
+    # unsafe/unprobeable worktree, the kill switch left off) mean something
+    # actually needs a human.
     local stalls="$prev_stalls"
-    [ "$reason" = "pr_open" ] || stalls=$((prev_stalls + 1))
+    case "$reason" in
+        pr_open|pr_open_live) ;;
+        *) stalls=$((prev_stalls + 1)) ;;
+    esac
 
     local record
     record=$(printf '%s' "$facts" | jq \
@@ -499,6 +566,43 @@ _teardown_execute() {
         race_detail=$(jq -nc --arg cid "$conflict" '{reason:"race", conflicting_job_id: $cid}')
         _teardown_park "$facts" "deferred" "race" "teardown_deferred" "$race_detail"
         return 1
+    fi
+
+    # Unrecovered-work guard: a terminal job's worktree may hold uncommitted
+    # changes or commits that exist on no remote — tearing it down would
+    # destroy work nobody can get back (see
+    # .claude/bugs/*/2026-06-13-merged-job-worktrees-never-gc-d-target-dirs-exhaust-disk.md,
+    # "MUST NOT remove a worktree that is ahead-of-base or has uncommitted
+    # changes"). Skipped when the gate reason is pr_merged (content
+    # demonstrably reached upstream already) or when the operator has
+    # explicitly opted out via MOTHER_TEARDOWN_ALLOW_UNSAFE=1, and scoped to
+    # isolation=worktree only — a main-dir job has no separate worktree to
+    # protect and no .work_dir field at all, so it always hits
+    # _teardown_worktree's own main_dir skip untouched.
+    local isolation; isolation=$(_facts_get "$facts" '.isolation // ""')
+    if [ "$isolation" = "worktree" ] \
+        && [ "$reason" != "pr_merged" ] \
+        && [ "${MOTHER_TEARDOWN_ALLOW_UNSAFE:-0}" != "1" ]; then
+        local unsafe_detail unsafe_status
+        unsafe_detail=$(_teardown_worktree_unsafe "$facts")
+        unsafe_status=$?
+        if [ "$unsafe_status" -ne 0 ]; then
+            local probe_reason probe_detail
+            if [ "$unsafe_status" -eq 1 ]; then
+                probe_reason="unsafe_worktree"
+                probe_detail="$unsafe_detail"
+            else
+                probe_reason="worktree_probe_failed"
+                probe_detail='{}'
+            fi
+            if [ "$dry_run" -eq 1 ]; then
+                TEARDOWN_LAST_STATUS="deferred"; TEARDOWN_LAST_REASON="$probe_reason"
+                echo "[dry-run] would defer teardown for $id ($probe_reason)"
+                return 1
+            fi
+            _teardown_park "$facts" "deferred" "$probe_reason" "teardown_deferred" "$probe_detail"
+            return 1
+        fi
     fi
 
     if [ "$dry_run" -eq 1 ]; then

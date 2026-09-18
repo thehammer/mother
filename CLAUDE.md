@@ -130,6 +130,8 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `no_pr` | bool | Set by `no_pr: true` in the plan YAML block. Skips the `no_pr_no_push` failure check. Success condition becomes "worker exited cleanly with commits on the branch." |
 | `continuation_count` | int | Number of auto-continuation attempts so far. Incremented each time an `idle_timeout` triggers a re-queue. |
 | `pipeline.review_cycle` | int | Number of review cycles completed so far (0-indexed). Incremented once per continue-cycle. Surfaced by W5 as `review_cycle_count`. |
+| `expect_branch_mismatch` | bool | Set by `expect_branch_mismatch: true` in the plan YAML block, or `mother add --expect-branch-mismatch`. Declares that the worker is deliberately targeting a branch other than the assigned one (e.g. landing more commits on an existing open PR) — a mismatching PR head branch is accepted without the commit-containment check. Default `false`. |
+| `actual_branch` | string | Set when the captured/accepted PR's head branch differs from the job's assigned `branch` (a branch-name mismatch that PR detection accepted via `expect_branch_mismatch` or commit-containment, or that `mother reconcile` adopted). Absent when the PR's head branch matches `branch`. |
 | `resume_not_yet_acted_on` | bool | Sticky audit flag. Set when an idle-timeout continuation is queued for a job that was resumed with an operator answer but has no commit postdating that resume. Never cleared automatically; surfaced by `mother status` as `[RESUME-MAY-BE-UNAPPLIED]`. |
 | `origin` | object | Provenance captured at `mother add` time: `{project, cwd, session, enqueued_by, label}`. `project` = basename of the enqueuing cwd's git toplevel, or the `--origin-project` override; `session` = `--origin-session` → `$MOTHER_ORIGIN_SESSION` → `$CLAUDE_SESSION_ID` → `""`. Surfaced as `mother list`'s ORIGIN column, filtered by `mother list --project`/`--label`, and rendered by `mother status`'s `=== origin ===` block. |
 
@@ -138,6 +140,7 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 All background behaviours can be disabled without redeploying:
 
 - `MOTHER_ESCALATION_ENABLED=0` — disable auto-escalation of failed jobs.
+- `MOTHER_RECONCILE_ENABLED=0` — disable `mother-runner`'s pre-escalation `mother reconcile --auto` attempt (default: `1`). Independent of `MOTHER_ESCALATION_ENABLED`: with reconcile disabled, a failed job goes straight to escalation as before this feature.
 - `MOTHER_ADHERENCE_ENABLED=0` — disable adherence review of succeeded jobs.
 - `MOTHER_CONTINUATIONS_ENABLED=0` — disable auto-continuation on idle_timeout.
 - `MOTHER_MAX_CONTINUATIONS=N` — cap continuation attempts (default: 3).
@@ -276,17 +279,42 @@ sweep mechanism.
 
 | Condition | Result |
 |---|---|
+| Job's branch has its own **live** open PR (checked first, regardless of the stored `pr_url`) | defer — `pr_open_live` |
 | No `pr_url`, state `failed`/`cancelled` | proceed — nothing was ever shippable |
 | No `pr_url`, state `succeeded`, `no_pr: true` | proceed — a `no_pr` job never opens a PR |
 | No `pr_url`, state `succeeded`, not `no_pr` | defer — a PR may exist but was never captured; never guess |
 | `pr_url` set, PR merged | proceed |
 | `pr_url` set, PR closed | proceed |
-| `pr_url` set, PR still open | defer |
+| `pr_url` set, PR still open | defer — `pr_open` |
 | `pr_url` set, `gh` unreachable/inconclusive | defer |
+
+The live-branch check (`pr_open_live`, via `lib/prdetect.sh`'s
+`prd_pr_for_branch`) exists because a job's stored `pr_url` is a set-once
+field: if a job resumed and opened a *second*, different PR, or a branch was
+reused for a fresh PR after the one Mother recorded was merged/closed, the
+stored URL alone would say "safe to remove" while the branch itself still has
+live, un-shipped-to-upstream work sitting on it. See
+`.claude/bugs/resolved/2026-08-14-review-phase-silently-reviews-wrong-repo-when-worktree-is-torn-down.md`.
+`pr_open_live` is treated exactly like `pr_open` for stall accounting (see
+Deferral counters below) — it's a healthy wait, not a stall.
 
 A race guard additionally defers when another non-terminal job shares the
 same `repo_path` + `branch` (escalation re-queue, adherence rework, or a
 distinct job queued against the same branch mid-flight).
+
+**The unrecovered-work guard** (`_teardown_worktree_unsafe`, wired into
+`_teardown_execute` after the gate/race checks): for a worktree-isolated job
+about to be torn down, probes whether the worktree holds uncommitted/untracked
+changes or commits that exist on no remote at all. Either makes the worktree
+**unsafe** — force-removing it would destroy genuinely unrecoverable work —
+and teardown defers instead, with reason `unsafe_worktree` (detail:
+`{uncommitted_files, unpushed_commits}`). A work_dir that's missing, not a git
+repo, or errors during the probe defers as `worktree_probe_failed`
+(indeterminate — never guess "safe"). Both count as **stall** deferrals. The
+probe is skipped (worktree removed exactly as before this guard) when the
+gate reason is `pr_merged` (content demonstrably reached upstream already) or
+when `MOTHER_TEARDOWN_ALLOW_UNSAFE=1` is set. See
+`.claude/bugs/resolved/2026-06-13-merged-job-worktrees-never-gc-d-target-dirs-exhaust-disk.md`.
 
 **Container convention:** `mother-run-job` exports `COMPOSE_PROJECT_NAME`
 (job-scoped, derived by `mother_compose_project` in `lib/state.sh`) into
@@ -356,7 +384,7 @@ existed default `stall_deferrals` to 0 via `// 0` — no backfill needed.
 |---|---|---|
 | `teardown_started` | `{gate_reason, pr_url}` | Gate passed, about to remove |
 | `teardown_completed` | `{worktree_path, worktree_removed, compose_project, containers, volumes, networks}` | Teardown finished |
-| `teardown_deferred` | `{reason, pr_url, conflicting_job_id, deferrals}` | Retryable skip; record queued |
+| `teardown_deferred` | `{reason, pr_url, conflicting_job_id, deferrals}` — `reason` includes `pr_open_live`, `unsafe_worktree` (detail merged in), `worktree_probe_failed` | Retryable skip; record queued |
 | `teardown_skipped` | `{reason}` | `disabled` / `main_dir` / `already_absent` |
 | `teardown_failed` | `{stage, note}` | Docker or worktree step errored |
 | `teardown_needs_attention` | `{deferrals, stall_deferrals, reason}` | Stall cap crossed (once) |
@@ -374,8 +402,11 @@ existed default `stall_deferrals` to 0 via `// 0` — no backfill needed.
 nothing is lost if the switch is flipped back on). `MOTHER_TEARDOWN_DOCKER_ENABLED=0`
 skips only the docker sweep. `MOTHER_TEARDOWN_MAX_DEFERRALS` (default 30) tunes
 the stall-attention threshold above (counted in `stall_deferrals`, not raw
-`deferrals`). Both switches behave identically on the teardown-only path and
-the full-archive path.
+`deferrals`). `MOTHER_TEARDOWN_ALLOW_UNSAFE=1` (default `0`) restores
+unconditional force-removal, bypassing the unrecovered-work guard above —
+an explicit opt-out for an operator who has already confirmed a worktree's
+"unsafe" state is fine to discard. All switches behave identically on the
+teardown-only path and the full-archive path.
 
 **Summary line:** `cmd_archive`'s bulk sweep reports three mutually exclusive
 counters: `archived: N, teardown-only: M, skipped: K (cutoff: ...)`.
@@ -391,6 +422,78 @@ branch (see the pending-queue section above) rather than double-counted.
 worktrees/containers left behind by jobs archived before this feature shipped,
 and the operator's personal `/prune-worktrees` slash command (a separate,
 Mother-unaware, manual tool for worktrees Mother did not create).
+
+## PR detection (evidence-based, not branch-name-based)
+
+`plugins/mother/lib/prdetect.sh` is the shared library behind "did this job
+produce a PR?" — sourced by `bin/mother`, `bin/mother-run-job`, and
+`lib/teardown.sh`. It replaced a weaker pair of proxies (the assigned branch
+name, and a set-once `pr_url` field trusted as-is) with live evidence: which
+commits exist, which PR actually contains them, what GitHub says right now.
+See `.claude/bugs/resolved/2026-06-15-worker-ignores-assigned-branch-name.md`
+and `.claude/bugs/resolved/2026-08-14-review-phase-silently-reviews-wrong-repo-when-worktree-is-torn-down.md`
+for the incidents that drove this.
+
+Key functions (all read-only, all degrade to empty/non-zero — never crash —
+when `gh` is missing, offline, or unauthenticated):
+
+| Function | Purpose |
+|---|---|
+| `prd_owner_repo_from_url` / `prd_owner_repo_from_dir` | Resolve a `owner/repo` slug from a remote URL or a working directory's `origin` remote. |
+| `prd_candidate_shas` | Up to 12 candidate commit SHAs identifying "what this job produced" (HEAD, the assigned branch's own tip, and recent commits ahead of base), most specific first. |
+| `prd_pr_for_branch` | The open PR (if any) whose head is a given branch — the cheap, common-case path. |
+| `prd_pr_for_commit` | A PR (preferring OPEN, else most recently updated) containing a given commit. |
+| `prd_pr_contains_sha` | 0/1/2 (contains / clean miss / indeterminate) — whether a PR's commit list contains a given SHA. |
+| `prd_detect_pr` | The entry point: branch match first, then commit match over `prd_candidate_shas`, else empty. |
+| `prd_sha_on_origin` | Whether HEAD has reached origin under *any* branch name at all. |
+
+**mother-run-job's post-run capture** (`_finalize_pr_url`) re-derives rather
+than trusts: a stored `pr_url` that's no longer `OPEN` is replaced by whatever
+`prd_detect_pr` finds now (event `pr_url_updated`); a PR whose head branch
+doesn't match the job's assigned branch is no longer automatically cleared —
+it's accepted when the job's `expect_branch_mismatch` field is set, or when
+`prd_pr_contains_sha` confirms the PR actually contains one of the job's
+commits (event `pr_branch_mismatch_accepted`, `.actual_branch` recorded); a
+confirmed miss still clears it (`pr_url_branch_mismatch`, unchanged); a `gh`
+failure during the check leaves the URL untouched rather than destroying a
+pointer over a network wobble (`pr_branch_mismatch_unverified`).
+`_verify_artifact_or_fail`'s `no_pr_no_push` failure gets one more escape
+hatch: if `prd_sha_on_origin` finds HEAD on origin under a *different* branch
+name, the job succeeds anyway (event `pushed_to_other_branch`) instead of
+failing over a branch-naming miss when the work genuinely shipped.
+
+**`mother add`** gained `--expect-branch-mismatch` (also settable via the
+plan's `suggested_config` YAML block) for the deliberate cross-branch case,
+and warns (stderr, does not fail) when the plan's own `## Target` `**Branch:**`
+line disagrees with `--branch`.
+
+**`mother reconcile <id> [--pr-url URL] [--auto] [--yes] [--dry-run]`** gives a
+job that failed detection (but may have real, shippable work on GitHub
+already) a route straight to `succeeded` with the real `pr_url` attached,
+without spawning a worker. Applies to `failed`/`cancelled`/`succeeded` jobs.
+Resolves the PR from `--pr-url` or auto-detection via `prd_detect_pr`;
+requires verification (branch or commit match) unless `--yes` is passed.
+Never touches `current_tier`/`escalation_count` — the cost audit trail stays
+truthful. Emits `reconciled` (`{pr_url, previous_state, match_kind,
+matched_sha, source}`) then `succeeded`. Exit codes: `0` adopted, `1`
+refused/error, `3` (only with `--auto`) nothing detected/verified — the
+non-interactive contract `mother-runner`'s `_auto_escalate_failed` uses to
+try reconciliation before escalating a failed job (gated by
+`MOTHER_RECONCILE_ENABLED`, see Kill switches above).
+
+**`mother retry` / `mother escalate` / `mother force-start`** all run
+`_guard_existing_pr` before dispatching: when the job's branch already has a
+verified open PR, they refuse (naming the PR and pointing at `mother
+reconcile`) unless `--yes` is passed (new flag on `retry`/`escalate`;
+`force-start`'s existing `--yes` now also bypasses this guard, not just its
+interactive confirmation prompt).
+
+**`mother review-phase`** hard-fails (event `review_workdir_missing`, no
+reviewer spawned, no findings written) when the job's resolved `work_dir`
+doesn't exist, instead of falling back to rendering artifacts and spawning
+the reviewer against the operator's ambient cwd — the exact failure mode in
+the 2026-08-14 bug doc above, including a fabricated finding about a
+completely unrelated repo.
 
 ## Pipeline visibility (W5)
 

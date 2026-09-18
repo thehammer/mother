@@ -79,6 +79,8 @@ phase_render_input() {
             fi
             if [ -n "$_test_stat" ]; then
                 printf '%s\n' "$_test_stat"
+            elif [ -n "$work_dir" ] && [ ! -d "$work_dir" ]; then
+                printf '_(work dir missing: %s)_\n' "$work_dir"
             else
                 printf '_(no test files on this branch yet)_\n'
             fi
@@ -103,6 +105,8 @@ phase_render_input() {
                         && git diff --stat "${base_ref}..HEAD" 2>/dev/null || true)
                 fi
                 [ -n "$_diff_stat" ] && printf '%s\n' "$_diff_stat"
+            elif [ -n "$work_dir" ] && [ ! -d "$work_dir" ]; then
+                printf '_(work dir missing: %s)_\n' "$work_dir"
             else
                 printf '_(branch has no commits yet)_\n'
             fi

@@ -52,6 +52,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/worktree.sh" ]      && source "$MOTHER_LIB_DIR/worktree.sh"
 # shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/prdetect.sh" ]      && source "$MOTHER_LIB_DIR/prdetect.sh"
+# shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/teardown.sh" ]      && source "$MOTHER_LIB_DIR/teardown.sh"
 
 # ---------- CLI-only helpers ----------
@@ -225,6 +227,57 @@ for block in blocks:
         sys.exit(0)
 print("false")
 PYEOF
+}
+
+# _parse_expect_branch_mismatch <plan_file>
+# Returns "true" if the plan's YAML block contains `expect_branch_mismatch:
+# true`, else "false". Set when the operator/plan deliberately targets an
+# existing branch other than the one `mother add --branch` was given (e.g.
+# landing more commits on an already-open PR) — it suppresses the
+# pr_url_branch_mismatch clear-and-fail path for that specific, intentional
+# case (see .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md).
+_parse_expect_branch_mismatch() {
+    local plan_file="$1"
+    python3 - "$plan_file" <<'PYEOF' 2>/dev/null || echo "false"
+import sys, re
+try:
+    import yaml
+except ImportError:
+    print("false"); sys.exit(0)
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    content = f.read()
+
+blocks = re.findall(r'```yaml\n(.*?)```', content, re.DOTALL)
+for block in blocks:
+    if 'suggested_config' in block:
+        data = yaml.safe_load(block.strip()) or {}
+        print("true" if data.get("expect_branch_mismatch", False) is True else "false")
+        sys.exit(0)
+print("false")
+PYEOF
+}
+
+# _plan_target_branch <plan_file>
+# Extracts the branch named on a "- **Branch:** ..." line inside the plan's
+# `## Target` section, or empty if there is no Target section or no Branch
+# line within it. Used by cmd_add to warn (not fail) when the plan and
+# --branch disagree — see the 2026-09-04 update to
+# .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md.
+_plan_target_branch() {
+    local plan_file="$1"
+    awk '
+        /^## / { in_target = ($0 ~ /^## Target[[:space:]]*$/) ? 1 : 0; next }
+        in_target && /\*\*Branch:\*\*/ {
+            line = $0
+            sub(/.*\*\*Branch:\*\*[[:space:]]*/, "", line)
+            gsub(/`/, "", line)
+            gsub(/^[[:space:]]+/, "", line)
+            gsub(/[[:space:]]+$/, "", line)
+            print line
+            exit
+        }
+    ' "$plan_file" 2>/dev/null
 }
 
 # _extract_plan_summary <plan_file>
@@ -414,6 +467,7 @@ cmd_add() {
     local isolation="worktree" executor="local-tmux" max_cost="" depends_on=""
     local format="text" title=""
     local origin_label="" origin_project_override="" origin_session=""
+    local expect_branch_mismatch_flag=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -431,6 +485,7 @@ cmd_add() {
             --label)            origin_label="$2"; shift 2 ;;
             --origin-project)   origin_project_override="$2"; shift 2 ;;
             --origin-session)   origin_session="$2"; shift 2 ;;
+            --expect-branch-mismatch) expect_branch_mismatch_flag=1; shift ;;
             *) _die "unknown flag for add: $1" ;;
         esac
     done
@@ -453,6 +508,17 @@ cmd_add() {
         && git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
         || _die "add: repo path is not a git repo: $repo_path"
 
+    # Warn (never fail — --branch stays authoritative) when the plan's own
+    # ## Target Branch line disagrees with --branch. Catches the case where
+    # Archie's plan and the operator's `mother add` invocation drifted apart
+    # (see the 2026-09-04 update to
+    # .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md).
+    local plan_target_branch
+    plan_target_branch=$(_plan_target_branch "$plan_file")
+    if [ -n "$plan_target_branch" ] && [ "$plan_target_branch" != "$branch" ]; then
+        echo "mother: add: warning: plan's Target branch ('$plan_target_branch') differs from --branch ('$branch') — using --branch" >&2
+    fi
+
     [ -z "$title" ] && title=$(head -1 "$plan_file" | sed -E 's/^#+ *//;s/^[[:space:]]+//;s/[[:space:]]+$//')
     [ -z "$title" ] && title="(untitled)"
 
@@ -464,6 +530,16 @@ cmd_add() {
     # Parse the no_pr flag (opt-out of the no_pr_no_push failure check).
     local no_pr_flag
     no_pr_flag=$(_parse_no_pr "$plan_file")
+
+    # expect_branch_mismatch: true from either --expect-branch-mismatch or the
+    # plan's suggested_config block (either source sets the job field).
+    local expect_branch_mismatch_from_plan expect_branch_mismatch_flag_str
+    expect_branch_mismatch_from_plan=$(_parse_expect_branch_mismatch "$plan_file")
+    if [ "$expect_branch_mismatch_flag" -eq 1 ] || [ "$expect_branch_mismatch_from_plan" = "true" ]; then
+        expect_branch_mismatch_flag_str="true"
+    else
+        expect_branch_mismatch_flag_str="false"
+    fi
 
     # Parse the pipeline config (optional; absent -> non-pipeline job).
     local pipeline_config_json is_pipeline
@@ -529,6 +605,7 @@ cmd_add() {
         --arg created_at "$(_iso_now)" \
         --argjson suggested_config "$suggested_config_json" \
         --argjson no_pr "$no_pr_json" \
+        --argjson expect_branch_mismatch "$expect_branch_mismatch_flag_str" \
         --arg cost_model "$cost_model" \
         --arg origin_cwd "$origin_cwd" \
         --arg origin_project "$origin_project" \
@@ -547,6 +624,7 @@ cmd_add() {
             pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null,
             suggested_config: $suggested_config,
             no_pr: $no_pr,
+            expect_branch_mismatch: $expect_branch_mismatch,
             cost_model: $cost_model,
             current_tier: "tier_0",
             escalation_count: 0,
@@ -1204,6 +1282,53 @@ cmd_cancel() {
     echo "$id: $state -> cancelled"
 }
 
+# ---------- pre-dispatch existing-PR guard ----------
+#
+# _guard_existing_pr <id> <subcommand> -> 0 clear to proceed, 1 refuse.
+#
+# Refuses re-dispatch (retry/escalate/force-start) when the job's branch OR
+# commits already have a verified OPEN pull request: re-dispatching would
+# risk a second worker opening a duplicate, conflicting PR against work
+# that's already shippable — the 2026-09-17 `force-start` hazard described in
+# .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md. Uses
+# prd_detect_pr (branch match, then commit match) rather than a bare branch
+# query so a job whose worker pushed real commits to a differently-named
+# branch is still caught. Prints a message naming the PR and pointing at
+# `mother reconcile` instead.
+#
+# Degrades to "clear" (never blocks) whenever detection can't confidently
+# answer: no branch/repo_path on the job, no owner/repo derivable, gh
+# unavailable, or the PR it found isn't actually OPEN right now. This guard's
+# job is to catch the confident, costly-to-ignore case — not to second-guess
+# every dispatch when the evidence is thin.
+_guard_existing_pr() {
+    local id="$1" subcommand="$2"
+    local job_file; job_file=$(_job_path "$id")
+    [ -f "$job_file" ] || return 0
+    type prd_detect_pr >/dev/null 2>&1 || return 0
+
+    local branch repo_path base_ref hit hit_url hit_kind hit_sha disp
+    branch=$(jq -r '.branch // empty' "$job_file" 2>/dev/null)
+    repo_path=$(jq -r '.work_dir // .repo_path // empty' "$job_file" 2>/dev/null)
+    base_ref=$(jq -r '.base_ref // empty' "$job_file" 2>/dev/null)
+    [ -n "$branch" ] && [ -n "$repo_path" ] || return 0
+
+    hit=$(prd_detect_pr "$repo_path" "$branch" "$base_ref" 2>/dev/null)
+    [ -n "$hit" ] || return 0
+    hit_url=""; hit_kind=""; hit_sha=""
+    IFS=$'\t' read -r hit_url hit_kind hit_sha <<HITEOF
+$hit
+HITEOF
+    [ -n "$hit_url" ] || return 0
+
+    disp=$(gh pr view "$hit_url" --json state -q '.state' 2>/dev/null)
+    [ "$disp" = "OPEN" ] || return 0
+
+    echo "mother: $subcommand: refusing — job $id's branch '$branch' already has an open pull request: $hit_url" >&2
+    echo "mother: $subcommand: use 'mother reconcile $id --pr-url $hit_url' to adopt it, or pass --yes to override" >&2
+    return 1
+}
+
 # ---------- force-start ----------
 #
 # Set the force_start flag on a ready or queued job so the runner will dispatch
@@ -1250,6 +1375,13 @@ cmd_force_start() {
         ready|queued) ;;
         *) _die "force-start: job must be ready or queued (state=$state)" ;;
     esac
+
+    # Pre-dispatch existing-PR guard. --yes bypasses this too, not just the
+    # interactive confirmation below — an operator who already knows a PR
+    # exists and wants to force anyway is allowed to.
+    if [ "$yes" -ne 1 ]; then
+        _guard_existing_pr "$id" "force-start" || exit 1
+    fi
 
     # Compute context-aware override summary for the confirm prompt.
     local over_cap=0 posture="normal"
@@ -1324,12 +1456,23 @@ cmd_force_start() {
 # ---------- retry ----------
 
 cmd_retry() {
-    local id="${1:-}"
+    local id="" yes=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes) yes=1; shift ;;
+            -*) _die "retry: unknown flag: $1" ;;
+            *) [ -z "$id" ] && id="$1" || _die "retry: unexpected argument: $1"; shift ;;
+        esac
+    done
     [ -n "$id" ] || _die "retry: <id> required"
     _job_exists "$id" || _die "no such job: $id"
     local job_file; job_file=$(_job_path "$id")
     local state; state=$(jq -r .state "$job_file")
     case "$state" in failed|cancelled) ;; *) _die "can only retry failed/cancelled jobs (state=$state)" ;; esac
+
+    if [ "$yes" -ne 1 ]; then
+        _guard_existing_pr "$id" "retry" || exit 1
+    fi
 
     # In-place retry: reset state on the SAME job_id rather than creating a
     # new one. Three reasons:
@@ -1406,7 +1549,14 @@ cmd_retry() {
 # `suggested_config` is preserved so routing hints survive escalation.
 
 cmd_escalate() {
-    local id="${1:-}"
+    local id="" yes=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes) yes=1; shift ;;
+            -*) _die "escalate: unknown flag: $1" ;;
+            *) [ -z "$id" ] && id="$1" || _die "escalate: unexpected argument: $1"; shift ;;
+        esac
+    done
     [ -n "$id" ] || _die "escalate: <id> required"
     _job_exists "$id" || _die "no such job: $id"
     local job_file; job_file=$(_job_path "$id")
@@ -1415,6 +1565,10 @@ cmd_escalate() {
         failed) ;;
         *) _die "escalate: can only escalate failed jobs (state=$state)" ;;
     esac
+
+    if [ "$yes" -ne 1 ]; then
+        _guard_existing_pr "$id" "escalate" || exit 1
+    fi
 
     local esc_count; esc_count=$(jq -r '.escalation_count // 0' "$job_file")
     if [ "$esc_count" -ge 2 ]; then
@@ -1475,6 +1629,166 @@ cmd_escalate() {
             --argjson esc "$((esc_count + 1))" \
             '{from_tier: $from, to_tier: $to, from_state: $from_state, to_state: $to_state, escalation_count: $esc}')"
     echo "$id: escalated $current_tier -> $next_tier (escalation_count=$((esc_count + 1)))"
+}
+
+# ---------- reconcile ----------
+#
+# mother reconcile <id> [--pr-url URL] [--auto] [--yes] [--dry-run]
+#
+# Give a job that failed detection (but may have real, shippable work sitting
+# on GitHub already) a legitimate route to `succeeded` with the REAL pr_url
+# attached — without spawning a worker. See
+# .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md: a worker
+# that ships real work under a branch name Mother didn't expect used to be
+# unrecoverable except by hand-editing job JSON; `mother reconcile` is that
+# recovery path, gated on real evidence (gh-verified branch or commit match)
+# rather than an operator's unverified assertion — unless --yes is given.
+#
+# Exit codes: 0 adopted, 1 refused/error, 3 (only with --auto) nothing
+# detected/verified — the non-interactive contract mother-runner's
+# pre-escalation check relies on to distinguish "reconciled" from "nothing
+# to reconcile, proceed to escalate".
+cmd_reconcile() {
+    local id="" pr_url_flag="" auto=0 yes=0 dry_run=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --pr-url)  pr_url_flag="$2"; shift 2 ;;
+            --auto)    auto=1; shift ;;
+            --yes)     yes=1; shift ;;
+            --dry-run) dry_run=1; shift ;;
+            -*) _die "reconcile: unknown flag: $1" ;;
+            *) [ -z "$id" ] && id="$1" || _die "reconcile: unexpected argument: $1"; shift ;;
+        esac
+    done
+    [ -n "$id" ] || _die "reconcile: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+
+    local job_file; job_file=$(_job_path "$id")
+    local state; state=$(jq -r '.state // ""' "$job_file")
+    case "$state" in
+        failed|cancelled|succeeded) ;;
+        *)
+            echo "mother: reconcile: job $id is $state; reconcile only applies to failed/cancelled/succeeded jobs" >&2
+            exit 1
+            ;;
+    esac
+
+    local branch base_ref work_dir
+    branch=$(jq -r '.branch // empty' "$job_file")
+    base_ref=$(jq -r '.base_ref // empty' "$job_file")
+    work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
+
+    local url="" match_kind="" matched_sha="" pr_branch="" verified=0
+
+    if [ -n "$pr_url_flag" ]; then
+        url="$pr_url_flag"
+        pr_branch=$(gh pr view "$url" --json headRefName -q '.headRefName' 2>/dev/null)
+        if [ -n "$pr_branch" ] && [ "$pr_branch" = "$branch" ]; then
+            match_kind="branch"; verified=1
+        elif [ -n "$pr_branch" ]; then
+            local cands sha rc
+            cands=$(prd_candidate_shas "$work_dir" "$branch" "$base_ref" 2>/dev/null)
+            if [ -n "$cands" ]; then
+                while IFS= read -r sha; do
+                    [ -n "$sha" ] || continue
+                    prd_pr_contains_sha "$url" "$sha"
+                    rc=$?
+                    if [ "$rc" -eq 0 ]; then
+                        match_kind="commit"; matched_sha="$sha"; verified=1; break
+                    fi
+                done <<CANDEOF
+$cands
+CANDEOF
+            fi
+        fi
+    else
+        local hit hit_url="" hit_kind="" hit_sha=""
+        hit=$(prd_detect_pr "$work_dir" "$branch" "$base_ref" 2>/dev/null)
+        if [ -n "$hit" ]; then
+            IFS=$'\t' read -r hit_url hit_kind hit_sha <<HITEOF
+$hit
+HITEOF
+        fi
+        if [ -n "$hit_url" ]; then
+            local hit_branch
+            if [ "$hit_kind" = "branch" ]; then
+                hit_branch="$branch"
+            else
+                hit_branch=$(gh pr view "$hit_url" --json headRefName -q '.headRefName' 2>/dev/null)
+            fi
+            # A branch hit is always OPEN by construction (prd_pr_for_branch
+            # queries --state open). A commit hit is not: prd_pr_for_commit
+            # prefers an OPEN PR but falls back to the most recently updated
+            # PR (which may be closed/merged) when none is open. --auto's
+            # non-interactive contract must only ever adopt a verified OPEN
+            # PR — a merged/closed fallback needs a human to look at it
+            # (via --pr-url and/or --yes), never an unattended reconcile.
+            if [ "$hit_kind" = "commit" ] && [ "$auto" -eq 1 ]; then
+                local hit_state
+                hit_state=$(gh pr view "$hit_url" --json state -q '.state' 2>/dev/null)
+                [ "$hit_state" = "OPEN" ] || hit_url=""
+            fi
+        fi
+        if [ -n "$hit_url" ]; then
+            url="$hit_url"; match_kind="$hit_kind"; matched_sha="${hit_sha:-}"
+            pr_branch="$hit_branch"; verified=1
+        fi
+    fi
+
+    if [ "$verified" -ne 1 ]; then
+        if [ "$auto" -eq 1 ]; then
+            # Non-interactive contract: nothing found/verified -> exit 3,
+            # mutate nothing, emit nothing.
+            exit 3
+        fi
+        if [ "$yes" -ne 1 ]; then
+            if [ -n "$url" ]; then
+                echo "mother: reconcile: could not verify that $url belongs to job $id (branch/commit mismatch, or gh lookup failed); pass --yes to adopt it anyway" >&2
+            else
+                echo "mother: reconcile: could not find or verify a pull request for job $id; pass --pr-url and/or --yes" >&2
+            fi
+            exit 1
+        fi
+        [ -n "$url" ] || { echo "mother: reconcile: --yes given but no --pr-url and nothing was auto-detected" >&2; exit 1; }
+        match_kind="asserted"; matched_sha=""
+    fi
+
+    local source_val
+    [ "$auto" -eq 1 ] && source_val="auto" || source_val="manual"
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "[dry-run] would reconcile $id: $state -> succeeded with pr_url=$url (match_kind=$match_kind, source=$source_val)"
+        exit 0
+    fi
+
+    local previous_state="$state"
+    local merged
+    merged=$(jq \
+        --arg url "$url" \
+        --arg ts "$(_iso_now)" \
+        '
+        .pr_url = $url
+        | .state = "succeeded"
+        | (if ((.finished_at // "") == "") then .finished_at = $ts else . end)
+        | .force_start = null
+        | .adherence_pending = null
+        | .adherence_status = null
+        | .adherence_notes = null
+        | .adherence_attempts = 0
+        ' "$job_file") || _die "reconcile: jq update failed"
+    if [ -n "$pr_branch" ] && [ "$pr_branch" != "$branch" ]; then
+        merged=$(printf '%s' "$merged" | jq --arg pb "$pr_branch" '.actual_branch = $pb')
+    fi
+    _atomic_write "$job_file" "$merged"
+
+    _append_event "$id" "reconciled" \
+        "$(jq -nc --arg url "$url" --arg prev "$previous_state" --arg mk "$match_kind" \
+            --arg sha "$matched_sha" --arg src "$source_val" \
+            '{pr_url: $url, previous_state: $prev, match_kind: $mk,
+              matched_sha: (if ($sha|length) > 0 then $sha else null end), source: $src}')"
+    _append_event "$id" "succeeded" "$(jq -nc --arg pr "$url" '{pr_url: $pr}')"
+
+    echo "$id: $previous_state -> succeeded (pr_url=$url)"
 }
 
 # ---------- review-phase ----------
@@ -1588,6 +1902,22 @@ cmd_review_phase() {
     base_ref=$(jq -r '.base_ref // empty' "$job_file")
     prd_path=$(jq -r '.prd_path // empty' "$job_file")
 
+    # Hard-fail BEFORE any artifact rendering or reviewer spawn when the
+    # resolved work_dir doesn't exist. Without this guard, a torn-down
+    # worktree (or one moved/renamed since the job ran) fell through to
+    # rendering artifacts and spawning the reviewer against whatever the
+    # ambient cwd happened to be — silently reviewing the wrong repo instead
+    # of failing loudly. See
+    # .claude/bugs/*/2026-08-14-review-phase-silently-reviews-wrong-repo-when-worktree-is-torn-down.md.
+    if [ -z "$work_dir" ] || [ ! -d "$work_dir" ]; then
+        local wd_job_branch
+        wd_job_branch=$(jq -r '.branch // empty' "$job_file")
+        _append_event "$id" "review_workdir_missing" \
+            "$(jq -nc --arg wd "$work_dir" --arg jb "$wd_job_branch" --arg pr "${pr_url:-}" \
+                '{work_dir: $wd, job_branch: $jb, pr_url: $pr}')"
+        _die "review-phase: work_dir is missing ($work_dir) — restore the worktree (e.g. re-run the job or re-create it) before a review can run"
+    fi
+
     # Render each declared input section (plan/prd/tests/diff via phase_render_input;
     # pr_comments gathered inline).
     artifacts_section=""
@@ -1635,16 +1965,13 @@ EOF
     # findings across two unrelated jobs, both times reflecting whatever
     # was ambient in the invoking shell's cwd rather than the job's branch).
     # phase_render_input already scopes its own git calls to work_dir; this
-    # brings the spawned agent's ambient cwd into line with that.
+    # brings the spawned agent's ambient cwd into line with that. No ambient-
+    # cwd fallback: the work_dir guard above already `_die`d if work_dir
+    # were missing, so reaching here means it exists.
     local tmpfile
     tmpfile=$(mktemp)
-    if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
-        ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" ) \
-            > "$tmpfile" 2>/dev/null || true
-    else
-        claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" \
-            > "$tmpfile" 2>/dev/null || true
-    fi
+    ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" ) \
+        > "$tmpfile" 2>/dev/null || true
 
     # Extract findings block.
     local raw_findings
@@ -2743,8 +3070,10 @@ Usage:
   mother plan ID
   mother cancel ID
   mother force-start ID [--yes]              (force dispatch even when over quota cap)
-  mother retry ID
-  mother escalate ID                         (bump failed job to next model tier)
+  mother retry ID [--yes]
+  mother escalate ID [--yes]                 (bump failed job to next model tier)
+  mother reconcile ID [--pr-url URL] [--auto] [--yes] [--dry-run]
+                                              (adopt a real PR without re-running the worker)
   mother adherence-review ID                 (check PR diff against original plan)
   mother review-phase ID --reviewer AGENT    (run one pipeline reviewer: ada|archie|perri)
   mother merge-findings ID                   (merge per-reviewer findings into one array; stdout only)
@@ -2772,6 +3101,14 @@ Add options:
   --origin-project NAME  override auto-detected originating project name
   --origin-session ID    originating session id
                           (default: \$MOTHER_ORIGIN_SESSION, then \$CLAUDE_SESSION_ID)
+  --expect-branch-mismatch  the worker is deliberately targeting a branch
+                            other than --branch (e.g. landing on an existing
+                            PR); also settable via the plan's suggested_config
+                            block (expect_branch_mismatch: true)
+
+retry / escalate / force-start: all refuse (unless --yes is given) when the
+job's branch already has a verified open pull request — use
+`mother reconcile ID` to adopt it instead of re-dispatching a worker.
 
 Plan file requirements:
   Every plan must include a ```yaml suggested_config: ... ``` block specifying
@@ -2788,6 +3125,8 @@ Daemon env vars:
   MOTHER_POLL_INTERVAL         (default: 2)    seconds between ticks
   MOTHER_SHUTDOWN_GRACE        (default: 30)   seconds to wait for children on stop
   MOTHER_ESCALATION_ENABLED    (default: 1)    auto-escalate failed jobs (0 to disable)
+  MOTHER_RECONCILE_ENABLED     (default: 1)    try `mother reconcile --auto` on a
+                                                 failed job before escalating it
   MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
   MOTHER_BROKER_ENABLED        (default: 1)    supervise the IPC broker sidecar (0 to disable)
 
@@ -2812,6 +3151,9 @@ on every sweep — independent of the record-archiving age cutoff):
                                                  not count) before a teardown
                                                  is flagged for attention
                                                  (never auto-deleted)
+  MOTHER_TEARDOWN_ALLOW_UNSAFE    (default: 0)  restore unconditional
+                                                 force-removal, bypassing the
+                                                 uncommitted/unpushed-work guard
 
 Retention env vars (orphaned atomic-write temp file sweep, rides along with
 `mother archive` on every bulk sweep plus once at daemon startup):
@@ -2898,6 +3240,7 @@ main() {
         force-start)       cmd_force_start "$@" ;;
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;
+        reconcile)         cmd_reconcile "$@" ;;
         adherence-review)  cmd_adherence_review "$@" ;;
         review-phase)      cmd_review_phase "$@" ;;
         merge-findings)    _merge_reviewer_findings "${1:-}" ;;

@@ -316,6 +316,8 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_TEARDOWN_ENABLED` | `1` | Remove Mother-created worktrees/containers when a job's PR is merged or closed |
 | `MOTHER_TEARDOWN_DOCKER_ENABLED` | `1` | Include the job-scoped docker sweep in teardown |
 | `MOTHER_TEARDOWN_MAX_DEFERRALS` | `30` | Stalled deferrals (gh/docker unreachable, races, worktree errors — a still-open PR doesn't count) before a teardown is flagged for attention (never auto-deleted) |
+| `MOTHER_TEARDOWN_ALLOW_UNSAFE` | `0` | Restore unconditional force-removal, bypassing the unrecovered-work guard (uncommitted changes or commits on no remote) below |
+| `MOTHER_RECONCILE_ENABLED` | `1` | Let the daemon try `mother reconcile --auto` on a failed job before escalating it |
 | `MOTHER_RATE_LIMIT_CACHE` | `$MOTHER_ROOT/rate-limits.json` | Where the statusline writes 5h/7d quota state |
 | `MOTHER_QUOTA_CAP_5H_PCT` | `90` | Refuse new dispatches when the 5h window is at or over this percentage |
 | `MOTHER_QUOTA_CAP_7D_PCT` | `90` | Same for the 7d window |
@@ -328,6 +330,16 @@ still open — or its disposition can't be determined — teardown defers and
 queues a retryable record under `$MOTHER_ROOT/teardown-pending/`, surfaced
 by `mother teardowns`. Archiving itself is never blocked by a deferred
 teardown.
+
+Before removing a worktree, teardown also checks whether it's actually safe
+to: uncommitted/untracked changes, or commits that exist on no remote at all,
+defer teardown with reason `unsafe_worktree` instead of destroying work that
+can't be recovered. A job whose branch has picked up a *new* open PR since
+Mother last looked (even if the `pr_url` it originally recorded has since
+been merged or closed) similarly defers as `pr_open_live`. A job whose worker
+shipped real work that Mother failed to detect can be recovered without a
+re-run via `mother reconcile <id> [--pr-url URL] [--auto] [--yes]` — see
+`CLAUDE.md`'s "PR detection" section for the full contract.
 
 Teardown eligibility is independent of `MOTHER_ARCHIVE_OLDER_THAN`: the
 bulk sweep gives every terminal job a teardown attempt on every pass,

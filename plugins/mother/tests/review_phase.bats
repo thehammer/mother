@@ -409,6 +409,92 @@ _make_pipeline_succeeded_job() {
 }
 
 # ---------------------------------------------------------------------------
+# work_dir guard — regression coverage.
+#
+# Bug: cmd_review_phase used to resolve work_dir and then plow ahead into
+# artifact rendering and spawning the reviewer even when work_dir didn't
+# exist, producing garbage findings against whatever the ambient cwd
+# happened to be (or a confusing phase_render_input failure) instead of a
+# clear, early error. The guard must fire BEFORE any artifact rendering or
+# reviewer spawn — the load-bearing assertion here is that `claude` is never
+# invoked at all, not just that the command exits non-zero.
+
+@test "review-phase: exits non-zero when work_dir does not exist, before spawning the reviewer" {
+    _make_pipeline_succeeded_job "job-nowd1"
+    local merged
+    merged=$(jq '.work_dir = "/nonexistent/path/does-not-exist-xyz"' "$JOBS_DIR/job-nowd1.json")
+    printf '%s' "$merged" > "$JOBS_DIR/job-nowd1.json"
+    export MOCK_CLAUDE_STDOUT="$(_empty_findings_stdout)"
+
+    run mother review-phase "job-nowd1" --reviewer perri
+    [ "$status" -ne 0 ]
+}
+
+@test "review-phase: work_dir guard emits review_workdir_missing with work_dir/job_branch/pr_url" {
+    _make_pipeline_succeeded_job "job-nowd2"
+    local merged
+    merged=$(jq '.work_dir = "/nonexistent/path/does-not-exist-xyz" | .pr_url = "https://github.com/x/y/pull/9"' \
+        "$JOBS_DIR/job-nowd2.json")
+    printf '%s' "$merged" > "$JOBS_DIR/job-nowd2.json"
+    export MOCK_CLAUDE_STDOUT="$(_empty_findings_stdout)"
+
+    run mother review-phase "job-nowd2" --reviewer perri
+    [ "$status" -ne 0 ]
+
+    assert_event_kind "job-nowd2" "review_workdir_missing"
+    local events_file="$EVENTS_DIR/job-nowd2.jsonl"
+    run grep '"review_workdir_missing"' "$events_file"
+    [[ "$output" =~ '"work_dir":"/nonexistent/path/does-not-exist-xyz"' ]]
+    [[ "$output" =~ '"job_branch"' ]]
+    [[ "$output" =~ '"pr_url":"https://github.com/x/y/pull/9"' ]]
+}
+
+@test "review-phase: work_dir guard never writes pipeline.reviewer_findings" {
+    _make_pipeline_succeeded_job "job-nowd3"
+    local merged
+    merged=$(jq '.work_dir = "/nonexistent/path/does-not-exist-xyz"' "$JOBS_DIR/job-nowd3.json")
+    printf '%s' "$merged" > "$JOBS_DIR/job-nowd3.json"
+    export MOCK_CLAUDE_STDOUT="$(_empty_findings_stdout)"
+
+    run mother review-phase "job-nowd3" --reviewer perri
+    [ "$status" -ne 0 ]
+
+    run jq -r '.pipeline.reviewer_findings.perri // "absent"' "$JOBS_DIR/job-nowd3.json"
+    [ "$output" = "absent" ]
+}
+
+@test "review-phase: work_dir guard means claude is never invoked" {
+    _make_pipeline_succeeded_job "job-nowd4"
+    local merged
+    merged=$(jq '.work_dir = "/nonexistent/path/does-not-exist-xyz"' "$JOBS_DIR/job-nowd4.json")
+    printf '%s' "$merged" > "$JOBS_DIR/job-nowd4.json"
+    export MOCK_CLAUDE_STDOUT="$(_empty_findings_stdout)"
+
+    run mother review-phase "job-nowd4" --reviewer perri
+    [ "$status" -ne 0 ]
+
+    # Load-bearing assertion: the mock records every invocation's argv to
+    # MOCK_CLAUDE_ARGS_FILE (see test_helper.bash / mock_claude). If the
+    # guard didn't short-circuit before the spawn, this file would exist
+    # and be non-empty.
+    [ ! -s "$MOCK_CLAUDE_ARGS_FILE" ]
+}
+
+@test "review-phase: work_dir guard also fires when work_dir is absent and repo_path fallback is missing too" {
+    _make_pipeline_succeeded_job "job-nowd5"
+    local merged
+    merged=$(jq 'del(.work_dir) | .repo_path = "/nonexistent/repo-path-xyz"' "$JOBS_DIR/job-nowd5.json")
+    printf '%s' "$merged" > "$JOBS_DIR/job-nowd5.json"
+    export MOCK_CLAUDE_STDOUT="$(_empty_findings_stdout)"
+
+    run mother review-phase "job-nowd5" --reviewer perri
+    [ "$status" -ne 0 ]
+
+    assert_event_kind "job-nowd5" "review_workdir_missing"
+    [ ! -s "$MOCK_CLAUDE_ARGS_FILE" ]
+}
+
+# ---------------------------------------------------------------------------
 # phase_render_input: base_ref freshness
 #
 # Regression test for a real bug found 2026-08-14: base_ref (e.g.
