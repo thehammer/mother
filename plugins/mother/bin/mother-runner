@@ -54,6 +54,7 @@ MOTHER_ARCHIVE_TIMEOUT="${MOTHER_ARCHIVE_TIMEOUT:-300}"      # seconds before a 
 
 # Kill switches: set to 0 to disable without redeploying.
 MOTHER_ESCALATION_ENABLED="${MOTHER_ESCALATION_ENABLED:-1}"
+MOTHER_RECONCILE_ENABLED="${MOTHER_RECONCILE_ENABLED:-1}"
 MOTHER_ADHERENCE_ENABLED="${MOTHER_ADHERENCE_ENABLED:-1}"
 MOTHER_BROKER_ENABLED="${MOTHER_BROKER_ENABLED:-1}"
 MOTHER_PIPELINE_ENABLED="${MOTHER_PIPELINE_ENABLED:-1}"
@@ -560,11 +561,17 @@ _maybe_pause_running() {
 
 # ---------- auto-escalation ----------
 
-# After a job transitions to `failed`, auto-escalate it if escalation is
-# enabled and the escalation cap hasn't been reached.
+# After a job transitions to `failed`, first try `mother reconcile --auto` —
+# the job may in fact have real, shippable work sitting on GitHub already
+# (see .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md), in
+# which case escalating would burn a costly re-dispatch to rebuild a PR that
+# already exists. Only escalate when reconcile finds nothing to adopt (exit
+# 3) or is disabled. Gated independently of MOTHER_ESCALATION_ENABLED by
+# MOTHER_RECONCILE_ENABLED so auto-reconciliation can be turned off on its
+# own without disabling escalation.
 _auto_escalate_failed() {
     [ "$MOTHER_ESCALATION_ENABLED" = "1" ] || return 0
-    local f state esc_count id
+    local f state esc_count id reconcile_rc
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
@@ -573,6 +580,16 @@ _auto_escalate_failed() {
         [ "$esc_count" -lt 2 ] || continue
         # Only auto-escalate jobs that haven't been manually cancelled/archived.
         id=$(jq -r '.id' "$f")
+
+        if [ "${MOTHER_RECONCILE_ENABLED:-1}" = "1" ]; then
+            "$MOTHER_BIN_DIR/mother" reconcile "$id" --auto >/dev/null 2>&1
+            reconcile_rc=$?
+            if [ "$reconcile_rc" -eq 0 ]; then
+                _log "reconciled $id instead of escalating (mother reconcile --auto found a verified PR)"
+                continue
+            fi
+        fi
+
         _log "auto-escalating $id (escalation_count=$esc_count)"
         "$MOTHER_BIN_DIR/mother" escalate "$id" 2>&1 | while read -r line; do _log "escalate: $line"; done
     done
