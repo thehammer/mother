@@ -529,3 +529,69 @@ JSON
     run bash -c "source '$PRDETECT_LIB'; prd_sha_on_origin '$dir'"
     [ "$status" -eq 1 ]
 }
+
+# ---------------------------------------------------------------------------
+# prd_sha_on_origin — optional base_ref parameter (commits-ahead requirement).
+#
+# The bug: prd_sha_on_origin only ever checked reachability from origin. A
+# no-op HEAD (zero commits ahead of base_ref) has HEAD == base_ref, which is
+# trivially already on origin whenever base_ref itself has been pushed, so a
+# worker that ships nothing was accepted as "shipped work". The fix adds an
+# optional second base_ref argument: when given, HEAD must be genuinely ahead
+# of base_ref (via `git rev-list --count base_ref..HEAD` > 0) *and* reachable
+# from origin. An unresolvable base_ref must fail closed, never silently fall
+# back to the no-base_ref (reachability-only) behavior.
+# ---------------------------------------------------------------------------
+
+@test "prd_sha_on_origin: exit 1 when HEAD is on origin but has zero commits ahead of base_ref (no-op HEAD)" {
+    source "$PRDETECT_LIB"
+    local bare="$MOTHER_ROOT/bare-origin3.git"
+    local dir="$MOTHER_ROOT/repo-sha-on-origin3"
+    _pd_repo_with_bare_origin "$dir" "$bare"
+    # Push the single base commit to origin under some branch name, then mark
+    # that exact commit as base-marker. No further commits are made, so HEAD
+    # is identical to base-marker — zero commits ahead.
+    git -C "$dir" push -q origin HEAD:refs/heads/base-pushed
+    git -C "$dir" branch base-marker HEAD
+
+    run bash -c "source '$PRDETECT_LIB'; prd_sha_on_origin '$dir' 'base-marker'"
+    [ "$status" -eq 1 ]
+}
+
+@test "prd_sha_on_origin: exit 0 when HEAD is both ahead of base_ref and reachable from origin" {
+    source "$PRDETECT_LIB"
+    local bare="$MOTHER_ROOT/bare-origin4.git"
+    local dir="$MOTHER_ROOT/repo-sha-on-origin4"
+    _pd_repo_with_bare_origin "$dir" "$bare"
+    git -C "$dir" branch base-marker HEAD
+    git -C "$dir" commit -q --allow-empty -m work
+    git -C "$dir" push -q origin HEAD:refs/heads/some-other-branch-name
+
+    run bash -c "source '$PRDETECT_LIB'; prd_sha_on_origin '$dir' 'base-marker'"
+    [ "$status" -eq 0 ]
+}
+
+@test "prd_sha_on_origin: exit 1 when HEAD is ahead of base_ref but was never pushed to origin" {
+    source "$PRDETECT_LIB"
+    local bare="$MOTHER_ROOT/bare-origin5.git"
+    local dir="$MOTHER_ROOT/repo-sha-on-origin5"
+    _pd_repo_with_bare_origin "$dir" "$bare"
+    git -C "$dir" branch base-marker HEAD
+    git -C "$dir" commit -q --allow-empty -m work
+    # Never pushed — fetch so the remote-tracking namespace exists but is empty.
+    git -C "$dir" fetch -q origin || true
+
+    run bash -c "source '$PRDETECT_LIB'; prd_sha_on_origin '$dir' 'base-marker'"
+    [ "$status" -eq 1 ]
+}
+
+@test "prd_sha_on_origin: exit 1 (fails closed) when base_ref does not resolve, even though HEAD is on origin" {
+    source "$PRDETECT_LIB"
+    local bare="$MOTHER_ROOT/bare-origin6.git"
+    local dir="$MOTHER_ROOT/repo-sha-on-origin6"
+    _pd_repo_with_bare_origin "$dir" "$bare"
+    git -C "$dir" push -q origin HEAD:refs/heads/some-other-branch-name
+
+    run bash -c "source '$PRDETECT_LIB'; prd_sha_on_origin '$dir' 'no-such-ref'"
+    [ "$status" -eq 1 ]
+}

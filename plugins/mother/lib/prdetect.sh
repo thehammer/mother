@@ -174,11 +174,26 @@ PRD_SHAS
     return 0
 }
 
-# prd_sha_on_origin <work_dir> -> 0 when HEAD has been pushed to origin under
-# ANY ref name, 1 otherwise (never pushed, or work_dir missing/not a repo).
+# prd_sha_on_origin <work_dir> [base_ref] -> 0 when HEAD has been pushed to
+# origin under ANY ref name, 1 otherwise (never pushed, or work_dir
+# missing/not a repo).
+#
+# When base_ref is given, HEAD must ALSO be strictly ahead of it. Without
+# that precondition the check is vacuously true for a worker that made zero
+# commits: its HEAD is still the base commit, which is already on origin by
+# definition, so "HEAD reached origin" proves nothing about shipped work.
+# See .claude/bugs/*/2026-09-18-prd-sha-on-origin-accepts-a-no-op-head-*.md.
+# An unresolvable base_ref fails closed (returns 1) — a false `succeeded`
+# is worse than a false `no_pr_no_push`, which at least escalates.
 prd_sha_on_origin() {
-    local work_dir="${1:-}"
+    local work_dir="${1:-}" base_ref="${2:-}"
     [ -n "$work_dir" ] && [ -d "$work_dir" ] || return 1
+    if [ -n "$base_ref" ]; then
+        local ahead
+        ahead=$(cd "$work_dir" && git rev-list --count "${base_ref}..HEAD" 2>/dev/null)
+        case "${ahead:-0}" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$ahead" -gt 0 ] || return 1
+    fi
     local refs
     refs=$(cd "$work_dir" && git branch -r --contains HEAD 2>/dev/null | grep -c 'origin/')
     case "${refs:-0}" in ''|*[!0-9]*) refs=0 ;; esac

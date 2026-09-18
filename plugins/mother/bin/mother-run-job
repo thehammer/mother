@@ -186,7 +186,7 @@ _verify_artifact_or_fail() {
     # branch). That is still real, shipped work; only the branch-naming
     # contract was missed, not the actual delivery. See
     # .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md.
-    if prd_sha_on_origin "$work_dir"; then
+    if prd_sha_on_origin "$work_dir" "$base_ref"; then
         local origin_refs
         origin_refs=$(cd "$work_dir" && git branch -r --contains HEAD 2>/dev/null \
             | sed 's/^[* ]*//' | tr '\n' ',' | sed 's/,$//')
