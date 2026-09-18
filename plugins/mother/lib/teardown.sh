@@ -376,8 +376,14 @@ _teardown_worktree() {
 # if force-removed: uncommitted/untracked changes (`git status --porcelain`
 # non-empty), or commits reachable from HEAD but from no remote-tracking ref
 # at all (`git rev-list HEAD --not --remotes` non-empty) — i.e. never pushed
-# anywhere. Indeterminate (2) covers a work_dir that's missing, not a git
-# repo, or any git error: never guess "safe" when the answer is unclear.
+# anywhere. Indeterminate (2) covers an empty/unset work_dir field (we don't
+# know which directory the job used, so we can't say anything about what's in
+# it), a work_dir that exists but isn't a git repo, or any unexpected git
+# error: never guess "safe" when the answer is unclear. A work_dir that is SET
+# but simply absent from disk is NOT indeterminate — there is categorically
+# nothing left in it to lose, so that case returns safe (0) and falls through
+# to the caller's _teardown_worktree, whose own already_absent handling treats
+# it as a clean skip.
 #
 # See .claude/bugs/*/2026-06-13-merged-job-worktrees-never-gc-d-target-dirs-exhaust-disk.md:
 # "Whatever GC lands MUST NOT remove a worktree that is ahead-of-base or has
@@ -385,7 +391,17 @@ _teardown_worktree() {
 _teardown_worktree_unsafe() {
     local facts="$1"
     local work_dir; work_dir=$(_facts_get "$facts" '.work_dir // ""')
-    [ -n "$work_dir" ] && [ -d "$work_dir" ] || return 2
+    # An empty/unset work_dir field genuinely IS ambiguous: we don't know
+    # which directory the job used, so we can't say anything about what's
+    # in it.
+    [ -n "$work_dir" ] || return 2
+    # A work_dir that is SET but absent from disk is NOT ambiguous. There is
+    # categorically nothing left in it to lose — "the directory is gone" and
+    # "there's unrecovered work at risk" are mutually exclusive. Returning 2
+    # here parked such jobs in the pending queue forever (782 deferrals
+    # observed). Return safe and let _teardown_worktree's own already_absent
+    # skip handle it.
+    [ -d "$work_dir" ] || return 0
     (cd "$work_dir" && git rev-parse --is-inside-work-tree >/dev/null 2>&1) || return 2
 
     local uncommitted unpushed

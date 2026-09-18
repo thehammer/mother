@@ -308,9 +308,14 @@ about to be torn down, probes whether the worktree holds uncommitted/untracked
 changes or commits that exist on no remote at all. Either makes the worktree
 **unsafe** — force-removing it would destroy genuinely unrecoverable work —
 and teardown defers instead, with reason `unsafe_worktree` (detail:
-`{uncommitted_files, unpushed_commits}`). A work_dir that's missing, not a git
-repo, or errors during the probe defers as `worktree_probe_failed`
-(indeterminate — never guess "safe"). Both count as **stall** deferrals. The
+`{uncommitted_files, unpushed_commits}`). An **empty/unset** `work_dir`, a
+`work_dir` that exists but isn't a git repo, or an unexpected git error while
+probing all defer as `worktree_probe_failed` (indeterminate — never guess
+"safe"). A `work_dir` that is *set* but simply absent from disk is **not**
+indeterminate — there is categorically nothing left in it to lose, so that
+case is treated as safe and falls through to the ordinary `already_absent`
+skip below. Both `unsafe_worktree` and `worktree_probe_failed` count as
+**stall** deferrals. The
 probe is skipped (worktree removed exactly as before this guard) when the
 gate reason is `pr_merged` (content demonstrably reached upstream already) or
 when `MOTHER_TEARDOWN_ALLOW_UNSAFE=1` is set. See
