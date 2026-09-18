@@ -1285,6 +1285,29 @@ teardown() {
     [ "$status" -eq 2 ]
 }
 
+@test "_teardown_worktree_unsafe: a work_dir that no longer exists on disk is safe, not indeterminate" {
+    # A missing directory has categorically nothing left in it to lose — it's
+    # the opposite of ambiguous. "the directory is gone" and "there's
+    # unrecovered work at risk" are mutually exclusive, so this must NOT be
+    # lumped in with the not-a-git-repo/empty-work_dir indeterminate cases.
+    local dir="$MOTHER_ROOT/tw-missing-dir"
+    facts=$(_facts_json "job-tw-missing" "$dir" "somebranch" "$dir" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 0 ]
+}
+
+@test "_teardown_worktree_unsafe: an empty work_dir is still indeterminate, not safe" {
+    # Pins the boundary against the missing-directory fix above: an EMPTY
+    # work_dir means we genuinely don't know which directory the job used —
+    # that ambiguity must keep returning indeterminate, not get swept into
+    # the new "safe" path meant only for a set-but-absent directory.
+    facts=$(_facts_json "job-tw-empty" "$MOTHER_ROOT/tw-empty-repo" "somebranch" "" "worktree" "" "failed" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 2 ]
+}
+
 # ===========================================================================
 # Wiring: _teardown_execute defers on an unsafe/indeterminate worktree for a
 # terminal job with no PR (the proceed:no_pr_terminal gate path), and both
@@ -1340,6 +1363,26 @@ teardown() {
     [[ "$output" == *"reason=worktree_probe_failed"* ]]
     [ -d "$not_repo_dir" ]
     [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/job-tw-exec2.json")" = "1" ]
+}
+
+@test "a job whose worktree directory is already gone tears down cleanly instead of parking forever" {
+    # CLOSED (not MERGED) deliberately: the pr_merged gate reason skips the
+    # safety probe entirely, so only a closed/no-PR gate actually exercises
+    # the probe — and closed PRs are exactly what the two real jobs in the
+    # bug report had. Uses the bulk sweep (bare `mother archive`), which
+    # gives a young terminal job a teardown-ONLY attempt that leaves its JSON
+    # record in $JOBS_DIR — see "bulk sweep tears down a young merged job
+    # without archiving its record" above for the established pattern.
+    export MOCK_GH_STATE="CLOSED"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "e2e-gone-wt" "succeeded" '.pr_url = "https://github.com/x/y/pull/99"')
+    rm -rf "$wt_dir"
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ ! -f "$TEARDOWN_DIR/e2e-gone-wt.json" ]
+    assert_job_field "e2e-gone-wt" '.teardown_status' "skipped"
+    assert_job_field "e2e-gone-wt" '.teardown_reason' "already_absent"
 }
 
 @test "_teardown_execute skips the safety probe entirely when the gate reason is pr_merged" {
