@@ -58,6 +58,8 @@ MOTHER_ADHERENCE_ENABLED="${MOTHER_ADHERENCE_ENABLED:-1}"
 MOTHER_BROKER_ENABLED="${MOTHER_BROKER_ENABLED:-1}"
 MOTHER_PIPELINE_ENABLED="${MOTHER_PIPELINE_ENABLED:-1}"
 MOTHER_PIPELINE_CYCLE_CAP="${MOTHER_PIPELINE_CYCLE_CAP:-3}"
+export MOTHER_RETENTION_SWEEP_ENABLED="${MOTHER_RETENTION_SWEEP_ENABLED:-1}"
+export MOTHER_TEMP_ORPHAN_MINUTES="${MOTHER_TEMP_ORPHAN_MINUTES:-60}"
 
 PIDFILE="$RUNNER_DIR/runner.pid"
 CHILDREN_DIR="$RUNNER_DIR/children"
@@ -404,6 +406,15 @@ _recover_orphans() {
 MOTHER_ORPHAN_GRACE="${MOTHER_ORPHAN_GRACE:-60}"
 
 # ---------- main loop ----------
+
+# Sweep orphaned atomic-write temp files once at daemon startup, in addition
+# to the hourly ride-along in `mother archive` (see _maybe_archive below).
+# Together these cover a daemon that runs for weeks (hourly sweep) as well as
+# one that restarts often (startup sweep). No watchdog needed here, unlike
+# the archive sweep: this has no gh/docker/git dependency to wedge on.
+_prune_temps_startup() {
+    "$MOTHER_BIN_DIR/mother" prune-temps 2>&1 | while read -r line; do _log "prune-temps: $line"; done
+}
 
 _maybe_archive() {
     # Run retention at most once per MOTHER_ARCHIVE_INTERVAL seconds, keyed off
@@ -1155,6 +1166,7 @@ main() {
     trap '_on_signal' TERM INT
     _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
     _recover_stale_locks
+    _prune_temps_startup
     _recover_orphans
     _start_broker
     _loop
@@ -1196,6 +1208,15 @@ case "${1:-}" in
         # cmd_adherence_review alone (invoked directly) never exercises.
         # Usage: mother-runner --adherence-tick
         _run_adherence_pending
+        exit 0
+        ;;
+    --prune-temps-tick)
+        # Test entry point: run one _prune_temps_startup pass and exit
+        # without starting the daemon loop. Used by temp_sweep.bats to cover
+        # the runner's startup wiring (the hourly ride-along in
+        # `mother archive` is covered separately, via cmd_archive directly).
+        # Usage: mother-runner --prune-temps-tick
+        _prune_temps_startup
         exit 0
         ;;
     --recover-stale-locks-tick)
