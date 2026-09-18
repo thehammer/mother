@@ -734,6 +734,16 @@ cmd_status() {
             echo "     mother cancel $id                   — abandon the job"
             echo ""
         fi
+        if [ "$(jq -r '.resume_not_yet_acted_on // false' "$job_file")" = "true" ]; then
+            echo ""
+            echo "⚠️  [RESUME-MAY-BE-UNAPPLIED] An operator answer may not have shipped."
+            echo "   This job was resumed with an operator answer, then idle-timed-out"
+            echo "   before any commit postdated that answer. The continuation worker was"
+            echo "   given the answer verbatim, but verify the shipped diff actually"
+            echo "   reflects it — do not trust 'succeeded' or adherence 'pass' alone."
+            echo "   The answer is in this job's events (kind: resumed)."
+            echo ""
+        fi
         if [ "$current_tier" != "tier_0" ] && [ -n "$current_tier" ]; then
             local model; model=$(_tier_model "$current_tier")
             local effort; effort=$(_tier_effort "$current_tier")
@@ -1746,12 +1756,24 @@ cmd_adherence_review() {
     pr_checks=$(gh pr checks "$pr_url" 2>/dev/null || echo "(CI status unavailable)")
     pr_comments=$(gh pr view "$pr_url" --comments 2>/dev/null || echo "(comments unavailable)")
 
+    # Operator resume answers are live amendments to the plan document — the
+    # plan itself is never rewritten when the operator resumes, so hand the
+    # Q&A history to the reviewer alongside it. Always present (deterministic
+    # for tests): populated when such events exist, "(none recorded" otherwise.
+    local operator_answers_section
+    if ! operator_answers_section=$(_resume_qa_history "$id"); then
+        operator_answers_section="## Operator Answers (live amendments to the plan)
+
+(none recorded — the operator never answered a question on this job)"
+    fi
+
     # Build the prompt from template + artifacts.
     local review_prompt
     review_prompt=$(cat "$template_file")
-    review_prompt=$(printf '%s\n\n## Original Plan\n\n```\n%s\n```\n\n## PR Diff\n\n```diff\n%s\n```\n\n## CI Status\n\n```\n%s\n```\n\n## PR Comments (Perri review)\n\n```\n%s\n```\n' \
+    review_prompt=$(printf '%s\n\n## Original Plan\n\n```\n%s\n```\n\n%s\n\n## PR Diff\n\n```diff\n%s\n```\n\n## CI Status\n\n```\n%s\n```\n\n## PR Comments (Perri review)\n\n```\n%s\n```\n' \
         "$review_prompt" \
         "$(cat "$plan_file")" \
+        "$operator_answers_section" \
         "$pr_diff" \
         "$pr_checks" \
         "$pr_comments")

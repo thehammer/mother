@@ -130,6 +130,7 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `no_pr` | bool | Set by `no_pr: true` in the plan YAML block. Skips the `no_pr_no_push` failure check. Success condition becomes "worker exited cleanly with commits on the branch." |
 | `continuation_count` | int | Number of auto-continuation attempts so far. Incremented each time an `idle_timeout` triggers a re-queue. |
 | `pipeline.review_cycle` | int | Number of review cycles completed so far (0-indexed). Incremented once per continue-cycle. Surfaced by W5 as `review_cycle_count`. |
+| `resume_not_yet_acted_on` | bool | Sticky audit flag. Set when an idle-timeout continuation is queued for a job that was resumed with an operator answer but has no commit postdating that resume. Never cleared automatically; surfaced by `mother status` as `[RESUME-MAY-BE-UNAPPLIED]`. |
 
 ### Kill switches
 
@@ -421,3 +422,46 @@ The `_pipeline_cycles_json` helper uses these events for timestamps. If they're 
 - The IPC broker's `mother_jobs` snapshot includes `pipeline.advisories` verbatim in
   the raw job JSON passthrough — no Go change needed; the field reaches clients
   automatically once W4 writes it.
+
+## Resume-answer continuity
+
+An operator's `mother resume <id> "<answer>"` reply to a `mother await` question
+is, functionally, a live amendment to the plan document — the plan itself is
+never rewritten to reflect it. Two downstream consumers used to never see that
+amendment at all: the idle-timeout auto-continuation preamble, and the
+adherence-review prompt. Both now do.
+
+`_resume_qa_history` (in `plugins/mother/lib/state.sh`) is the single renderer
+that feeds both. It walks a job's event log pairing each `awaiting_input` event
+with the `resumed` event that answers it, and renders every pair — in
+chronological order, most-recent labelled — as a `## Operator Answers` markdown
+block. `_attempt_continuation` (in `mother-run-job`) splices that block into the
+continuation prompt via `_continuation_preamble`; `cmd_adherence_review` (in
+`mother`) splices it into Archie's review prompt, immediately after the
+`## Original Plan` section.
+
+The `resumed_from_input` event is deliberately **not** the source. It fires on
+every spawn that consumes a `pending_answer` — including adherence rework and
+continuations themselves — so its `answer` field is often a machine-generated
+preamble rather than operator-authored text. Only `awaiting_input`/`resumed`
+pairs are operator-authored.
+
+`_resume_not_yet_acted_on` detects the sharper failure mode the original bug
+report described: a job resumed with an operator answer, then idle-timed-out
+with no commit postdating that resume — meaning the previous worker almost
+certainly never got to implement the answer. When `_attempt_continuation`
+detects this it sets the sticky `resume_not_yet_acted_on` job field (see the
+job-fields table above), surfaces a `⚠️ The operator's answer may not have been
+implemented yet` warning directly in the continuation prompt, and emits a
+`resume_not_yet_acted_on` event (once, on the crossing — mirroring the
+`teardown_needs_attention` precedent in `lib/teardown.sh`) alongside the
+existing `continuation_queued` event, which is otherwise unchanged. The event
+classifies as `activity` in the IPC broker, like `resumed` and `escalated`.
+
+| Event | Detail fields | When emitted |
+|---|---|---|
+| `resume_not_yet_acted_on` | `{resumed_at, last_commit_epoch, last_commit_sha, continuation_count, note}` | Once, when an idle-timeout continuation is queued for a job resumed with an operator answer that has no commit postdating it |
+
+`mother status <id>` renders a `⚠️  [RESUME-MAY-BE-UNAPPLIED]` banner whenever
+`resume_not_yet_acted_on` is `true`, in any job state — it's an audit signal,
+not an operational one, and is never cleared automatically.
