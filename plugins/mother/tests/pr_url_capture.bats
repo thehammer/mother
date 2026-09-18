@@ -449,6 +449,177 @@ _va_bind_context() {
 }
 
 # ---------------------------------------------------------------------------
+# _verify_artifact_or_fail: no_pr:true commit verification.
+#
+# The `no_pr:true` opt-out drops the push/PR requirement, but the success
+# condition it claims in the surrounding comment — "worker exited cleanly
+# with commits on the branch" — must actually be checked. These tests pin
+# down the real contract: count commits between base_ref and a tip ref that
+# depends on isolation (HEAD for worktree jobs; refs/heads/$branch for
+# main-dir jobs, since main-dir jobs restore the operator's original branch
+# to HEAD after the worker exits). Zero commits or an unresolvable ref must
+# fail closed; a non-empty pr_url still short-circuits everything.
+# ---------------------------------------------------------------------------
+
+# Plain (non-worktree) repo for main-dir no_pr fixtures: a real repo with an
+# initial commit on `main`, no worktree involved. Usage: _va_maindir_repo <dir>
+_va_maindir_repo() {
+    local dir="$1"
+    git init -q "$dir"
+    git -C "$dir" config user.email "test@test.com"
+    git -C "$dir" config user.name "Test"
+    git -C "$dir" commit -q --allow-empty -m init
+    git -C "$dir" branch -M "main"
+}
+
+@test "_verify_artifact_or_fail: no_pr job with zero commits on a worktree branch fails with no_commits_on_branch" {
+    local repo_dir="$MOTHER_ROOT/va-repo-np1"
+    local bare_dir="$MOTHER_ROOT/va-bare-np1.git"
+    local wt_dir="$MOTHER_ROOT/va-wt-np1"
+    _va_make_repo_and_worktree "$repo_dir" "$bare_dir" "$wt_dir" "feature/np1" "main"
+    # No commits made in the worktree beyond the fixture's own base commit.
+
+    make_job "np-job1" "running" \
+        ".no_pr = true | .branch = \"feature/np1\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$wt_dir\""
+
+    _va_bind_context "np-job1" "feature/np1" "main" "worktree" "$wt_dir"
+    pr_url=""
+
+    run _verify_artifact_or_fail
+    [ "$status" -eq 1 ]
+
+    run jq -r '.state' "$job_file"
+    [ "$output" = "failed" ]
+
+    assert_event_kind "np-job1" "failed"
+    run grep '"failed"' "$EVENTS_DIR/np-job1.jsonl"
+    [[ "$output" =~ '"reason":"no_commits_on_branch"' ]]
+}
+
+@test "_verify_artifact_or_fail: no_pr job with a worktree commit succeeds without ever pushing" {
+    local repo_dir="$MOTHER_ROOT/va-repo-np2"
+    local bare_dir="$MOTHER_ROOT/va-bare-np2.git"
+    local wt_dir="$MOTHER_ROOT/va-wt-np2"
+    _va_make_repo_and_worktree "$repo_dir" "$bare_dir" "$wt_dir" "feature/np2" "main"
+    git -C "$wt_dir" commit -q --allow-empty -m "did work"
+    # Deliberately never pushed to origin.
+
+    make_job "np-job2" "running" \
+        ".no_pr = true | .branch = \"feature/np2\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$wt_dir\""
+
+    _va_bind_context "np-job2" "feature/np2" "main" "worktree" "$wt_dir"
+    pr_url=""
+
+    run _verify_artifact_or_fail
+    [ "$status" -eq 0 ]
+
+    run jq -r '.state' "$job_file"
+    [ "$output" != "failed" ]
+
+    assert_event_kind "np-job2" "no_pr_commits_verified"
+}
+
+@test "_verify_artifact_or_fail: no_pr main-dir job succeeds off the branch ref even when HEAD was restored elsewhere" {
+    local repo_dir="$MOTHER_ROOT/va-maindir-np3"
+    _va_maindir_repo "$repo_dir"
+    # Commit lands on feature/x, then HEAD is restored to main — exactly what
+    # mother-run-job's main-dir stash-restore does once the worker exits.
+    git -C "$repo_dir" checkout -q -b "feature/x" main
+    git -C "$repo_dir" commit -q --allow-empty -m "did work"
+    git -C "$repo_dir" checkout -q main
+
+    make_job "np-job3" "running" \
+        ".no_pr = true | .branch = \"feature/x\" | .base_ref = \"main\" | .isolation = \"main-dir\" | .work_dir = \"$repo_dir\""
+
+    _va_bind_context "np-job3" "feature/x" "main" "main-dir" "$repo_dir"
+    pr_url=""
+
+    run _verify_artifact_or_fail
+    [ "$status" -eq 0 ]
+
+    run jq -r '.state' "$job_file"
+    [ "$output" != "failed" ]
+
+    assert_event_kind "np-job3" "no_pr_commits_verified"
+}
+
+@test "_verify_artifact_or_fail: no_pr main-dir job with zero commits on the branch ref fails with no_commits_on_branch" {
+    local repo_dir="$MOTHER_ROOT/va-maindir-np4"
+    _va_maindir_repo "$repo_dir"
+    # feature/y is created directly off main with no extra commits.
+    git -C "$repo_dir" checkout -q -b "feature/y" main
+    git -C "$repo_dir" checkout -q main
+
+    make_job "np-job4" "running" \
+        ".no_pr = true | .branch = \"feature/y\" | .base_ref = \"main\" | .isolation = \"main-dir\" | .work_dir = \"$repo_dir\""
+
+    _va_bind_context "np-job4" "feature/y" "main" "main-dir" "$repo_dir"
+    pr_url=""
+
+    run _verify_artifact_or_fail
+    [ "$status" -eq 1 ]
+
+    run jq -r '.state' "$job_file"
+    [ "$output" = "failed" ]
+
+    assert_event_kind "np-job4" "failed"
+    run grep '"failed"' "$EVENTS_DIR/np-job4.jsonl"
+    [[ "$output" =~ '"reason":"no_commits_on_branch"' ]]
+}
+
+@test "_verify_artifact_or_fail: no_pr job with an unresolvable base_ref fails closed as commit_check_indeterminate" {
+    local repo_dir="$MOTHER_ROOT/va-repo-np5"
+    local bare_dir="$MOTHER_ROOT/va-bare-np5.git"
+    local wt_dir="$MOTHER_ROOT/va-wt-np5"
+    _va_make_repo_and_worktree "$repo_dir" "$bare_dir" "$wt_dir" "feature/np5" "main"
+    git -C "$wt_dir" commit -q --allow-empty -m "did work"
+
+    make_job "np-job5" "running" \
+        ".no_pr = true | .branch = \"feature/np5\" | .base_ref = \"nonexistent-base-ref\" | .isolation = \"worktree\" | .work_dir = \"$wt_dir\""
+
+    # base_ref bound here deliberately doesn't exist in the repo.
+    _va_bind_context "np-job5" "feature/np5" "nonexistent-base-ref" "worktree" "$wt_dir"
+    pr_url=""
+
+    run _verify_artifact_or_fail
+    [ "$status" -eq 1 ]
+
+    run jq -r '.state' "$job_file"
+    [ "$output" = "failed" ]
+    [ "$output" != "succeeded" ]
+
+    assert_event_kind "np-job5" "failed"
+    run grep '"failed"' "$EVENTS_DIR/np-job5.jsonl"
+    [[ "$output" =~ '"reason":"commit_check_indeterminate"' ]]
+    [[ "$output" != *'"reason":"no_commits_on_branch"'* ]]
+}
+
+@test "_verify_artifact_or_fail: no_pr job with an existing pr_url short-circuits the commit check entirely" {
+    local repo_dir="$MOTHER_ROOT/va-repo-np6"
+    local bare_dir="$MOTHER_ROOT/va-bare-np6.git"
+    local wt_dir="$MOTHER_ROOT/va-wt-np6"
+    _va_make_repo_and_worktree "$repo_dir" "$bare_dir" "$wt_dir" "feature/np6" "main"
+    # Zero commits ahead of base — would fail the commit check on its own.
+
+    make_job "np-job6" "running" \
+        ".no_pr = true | .branch = \"feature/np6\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$wt_dir\""
+
+    _va_bind_context "np-job6" "feature/np6" "main" "worktree" "$wt_dir"
+    pr_url="https://github.com/x/y/pull/1"
+
+    run _verify_artifact_or_fail
+    [ "$status" -eq 0 ]
+
+    run jq -r '.state' "$job_file"
+    [ "$output" != "failed" ]
+
+    # An existing pr_url means the artifact is real regardless of commit
+    # count — no failed event should be recorded for this job at all.
+    run bash -c "[ -f '$EVENTS_DIR/np-job6.jsonl' ] && grep -c '\"failed\"' '$EVENTS_DIR/np-job6.jsonl' || echo 0"
+    [ "$output" = "0" ]
+}
+
+# ---------------------------------------------------------------------------
 # _finalize_pr_url — authoritative post-run PR URL capture, stale-URL
 # re-derivation, and branch-mismatch validation. This is the biggest single
 # change in the PR-detection rework and previously had zero coverage in this

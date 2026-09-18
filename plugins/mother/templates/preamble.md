@@ -85,7 +85,10 @@ emit your final result event until every one of those steps has actually
 happened.** If you yield with uncommitted changes or without pushing, the
 job will be marked **failed** with `reason: no_pr_no_push` (Mother
 verifies the artifact independently of whatever your result event claims),
-and a retry will start over from scratch — wasting the work you just did.
+and a retry will start over from scratch — wasting the work you just did. If
+your plan sets `no_pr: true`, there is no push/PR requirement, but the branch
+must still carry at least one commit ahead of its base — yielding with
+nothing committed fails the job with `reason: no_commits_on_branch`.
 
 This is different from `mother await`: `await` is an explicit, intentional
 pause that preserves your worktree and resumes you with the operator's
