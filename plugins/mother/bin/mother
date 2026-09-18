@@ -492,6 +492,7 @@ cmd_add() {
         fi
     fi
     [ -z "$origin_session" ] && origin_session="${MOTHER_ORIGIN_SESSION:-}"
+    [ -z "$origin_session" ] && origin_session="${CLAUDE_SESSION_ID:-}"
     enqueued_by=$(whoami)
 
     local id deps_json job_json max_cost_json
@@ -838,6 +839,17 @@ cmd_status() {
             fi
             echo ""
         fi
+
+        echo "=== origin ==="
+        jq -r '
+            (.origin // {}) as $o |
+            "  Project:     \($o.project // "" | if . == "" then "-" else . end)",
+            "  Label:       \($o.label // "" | if . == "" then "-" else . end)",
+            "  Enqueued by: \($o.enqueued_by // "" | if . == "" then "-" else . end)",
+            "  Session:     \($o.session // "" | if . == "" then "-" else . end)",
+            "  Cwd:         \($o.cwd // "" | if . == "" then "-" else . end)"
+        ' "$job_file"
+        echo
 
         echo "=== job ==="
         jq . "$job_file"
@@ -1990,6 +2002,22 @@ cmd_resume() {
 
 # ---------- events (for the hook) ----------
 
+# Write a session cursor atomically, refusing to leave an unreadable file
+# behind. _atomic_write will happily persist an empty string if the jq that
+# produced it failed, and an empty/garbage cursor is exactly what makes
+# cmd_events fall back to replaying all history — so build the JSON, verify
+# it parses, and only then write. Returns 1 without touching the file if the
+# payload could not be built.
+_cursor_write() {
+    local cursor_file="$1" ts="$2" payload
+    [ -n "$ts" ] || return 1
+    payload=$(jq -nc --arg ts "$ts" '{last_seen: $ts}' 2>/dev/null) || return 1
+    [ -n "$payload" ] || return 1
+    printf '%s' "$payload" | jq -e '.last_seen | type == "string"' >/dev/null 2>&1 || return 1
+    mkdir -p "$(dirname "$cursor_file")"
+    _atomic_write "$cursor_file" "$payload"
+}
+
 cmd_events() {
     local session_id="" since_ts=""
     while [ $# -gt 0 ]; do
@@ -2001,18 +2029,33 @@ cmd_events() {
     done
 
     # If session cursor provided, load its last-seen ts.
+    #
+    # Critical: an unreadable cursor must NEVER fall through to an empty
+    # $since_ts. The aggregation filter below treats empty as "no floor at
+    # all", so a zero-byte / truncated / non-JSON cursor file, a missing or
+    # null .last_seen, or any jq failure would silently turn this call into a
+    # full replay of every event file still sitting in $EVENTS_DIR — which
+    # includes months of history for jobs whose records were archived long
+    # ago. That is the 2026-07-14 "hook replays stale archived-job events"
+    # bug. Treat every unusable cursor as a brand-new session instead.
     local cursor_file=""
     if [ -n "$session_id" ]; then
         cursor_file="$CURSORS_DIR/$session_id.json"
-        if [ -f "$cursor_file" ] && [ -z "$since_ts" ]; then
-            since_ts=$(jq -r '.last_seen // ""' "$cursor_file" 2>/dev/null || echo "")
-        elif [ ! -f "$cursor_file" ] && [ -z "$since_ts" ]; then
-            # Brand-new session: bootstrap cursor to now so we don't replay
-            # the full event history on first call. Future calls will pick up
-            # only events emitted after this session started.
-            since_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-            mkdir -p "$CURSORS_DIR"
-            _atomic_write "$cursor_file" "$(jq -n --arg ts "$since_ts" '{last_seen: $ts}')"
+        if [ -z "$since_ts" ]; then
+            if [ -f "$cursor_file" ]; then
+                since_ts=$(jq -r '.last_seen // empty' "$cursor_file" 2>/dev/null || true)
+            fi
+            case "$since_ts" in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z) ;;
+                *) since_ts="" ;;
+            esac
+            if [ -z "$since_ts" ]; then
+                # Brand-new (or unusable) cursor: bootstrap to now so we don't
+                # replay history. Future calls pick up only events emitted
+                # after this point.
+                since_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+                _cursor_write "$cursor_file" "$since_ts" || true
+            fi
         fi
     fi
 
@@ -2031,14 +2074,38 @@ cmd_events() {
         | sort_by(.ts)
     ')
 
-    echo "$all"
+    # Age floor, cursor path only. $EVENTS_DIR retains .jsonl files for jobs
+    # whose records were archived months ago (older archive code did not carry
+    # the events file along; adherence/teardown appends recreate it via >>),
+    # so a stale-but-valid cursor can still surface ancient terminal events as
+    # if they were fresh. Nothing older than the floor is ever "news" for a
+    # between-turns banner. Set MOTHER_EVENTS_MAX_AGE_HOURS=0 to disable.
+    # Only the --since-cursor path is floored: plain `mother events` and
+    # `mother events --since <ts>` remain full-history queries.
+    local visible="$all"
+    if [ -n "$session_id" ]; then
+        local max_age floor
+        max_age="${MOTHER_EVENTS_MAX_AGE_HOURS:-6}"
+        if [ "$max_age" != "0" ]; then
+            floor=$(_iso_hours_ago "$max_age" 2>/dev/null || echo "")
+            if [ -n "$floor" ]; then
+                visible=$(printf '%s' "$all" | jq -c --arg floor "$floor" \
+                    'map(select(.ts > $floor))')
+            fi
+        fi
+    fi
 
-    # Advance cursor to the newest event seen, if session_id given.
-    if [ -n "$session_id" ] && [ "$(echo "$all" | jq 'length')" -gt 0 ]; then
+    echo "$visible"
+
+    # Advance the cursor past everything the cursor filter admitted — floored
+    # or not. Computing max_ts from $all (not $visible) is deliberate: events
+    # suppressed by the floor must not be re-examined on every subsequent
+    # call, or a single ancient orphan file would keep the cursor pinned in
+    # the past forever.
+    if [ -n "$session_id" ] && [ "$(printf '%s' "$all" | jq 'length')" -gt 0 ]; then
         local max_ts
-        max_ts=$(echo "$all" | jq -r 'map(.ts) | max')
-        mkdir -p "$CURSORS_DIR"
-        _atomic_write "$cursor_file" "$(jq -n --arg ts "$max_ts" '{last_seen: $ts}')"
+        max_ts=$(printf '%s' "$all" | jq -r 'map(.ts) | max')
+        _cursor_write "$cursor_file" "$max_ts" || true
     fi
 }
 
@@ -2408,6 +2475,85 @@ _teardown_only() {
     return 0
 }
 
+# Sweep orphaned atomic-write temp files (*.tmp.*) and stray backups
+# (*.bak.*) out of Mother's state directories. `_atomic_write` (lib/state.sh)
+# and `mother_capture_rate_limits` (statusline/segment.sh) both write to
+# `<target>.tmp.$$` then `mv` into place; if the writing process dies between
+# the write and the `mv` (killed mid-render, SIGKILL, crash), the temp file
+# is orphaned and nothing else ever removes it. This has no owner, so it
+# accumulates forever in a state directory that's already large.
+#
+# The age gate (MOTHER_TEMP_ORPHAN_MINUTES) is the entire safety story: it is
+# what guarantees an in-flight write's temp file is never deleted out from
+# under its own writer. Never lower the default without understanding that
+# tradeoff.
+#
+# `-type f` is load-bearing, not decorative: `_with_lock` (lib/state.sh)
+# creates `<target>.lockdir` DIRECTORIES as its mutex primitive, and
+# `_recover_stale_locks` (mother-runner) owns reaping those. A directory
+# that happens to match `*.tmp.*` in name (extremely unlikely, but the glob
+# doesn't know the difference) must also survive — only regular files are
+# ever candidates.
+#
+# Usage: _prune_orphan_temps <dry_run>
+# Always returns 0. Prints exactly one summary line to stdout.
+_prune_orphan_temps() {
+    local dry_run="${1:-0}"
+
+    if [ "${MOTHER_RETENTION_SWEEP_ENABLED:-1}" = "0" ]; then
+        echo "temp sweep: disabled (MOTHER_RETENTION_SWEEP_ENABLED=0)"
+        return 0
+    fi
+
+    local minutes="${MOTHER_TEMP_ORPHAN_MINUTES:-60}"
+    local dirs="${MOTHER_ROOT:-} ${JOBS_DIR:-} ${EVENTS_DIR:-} ${DRAFTS_DIR:-} ${CURSORS_DIR:-} ${RUNNER_DIR:-} ${TEARDOWN_DIR:-}"
+    local count_file
+    count_file=$(mktemp)
+    printf '0' > "$count_file"
+
+    local dir f
+    for dir in $dirs; do
+        [ -n "$dir" ] || continue
+        [ -d "$dir" ] || continue
+        find "$dir" -maxdepth 1 -type f \( -name '*.tmp.*' -o -name '*.bak.*' \) -mmin "+$minutes" \
+            2>/dev/null | while read -r f; do
+                [ -n "$f" ] || continue
+                local n; n=$(cat "$count_file")
+                n=$((n + 1))
+                printf '%s' "$n" > "$count_file"
+                if [ "$dry_run" -eq 1 ]; then
+                    :
+                else
+                    rm -f "$f"
+                fi
+            done
+    done
+
+    local removed; removed=$(cat "$count_file")
+    rm -f "$count_file"
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "temp sweep: would remove $removed orphaned temp file(s) older than ${minutes}m"
+    else
+        echo "temp sweep: removed $removed orphaned temp file(s) older than ${minutes}m"
+    fi
+    return 0
+}
+
+# `mother prune-temps [--dry-run]` — standalone entry point so the daemon can
+# sweep at startup without paying for a full `mother archive` sweep, and so
+# an operator can run it by hand.
+cmd_prune_temps() {
+    local dry_run=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) dry_run=1; shift ;;
+            *) _die "unknown flag for prune-temps: $1" ;;
+        esac
+    done
+    _prune_orphan_temps "$dry_run"
+}
+
 # Archive terminal-state jobs. Two modes:
 #   mother archive <id>                    — archive one specific job now
 #   mother archive [--older-than DAYS] [--dry-run]  — bulk sweep by age
@@ -2498,6 +2644,7 @@ cmd_archive() {
             skipped=$((skipped + 1))
         fi
     done
+    _prune_orphan_temps "$dry_run"
     echo "archived: $moved, teardown-only: $teardown_only, skipped: $skipped (cutoff: $cutoff_iso)"
 }
 
@@ -2608,6 +2755,7 @@ Usage:
   mother daemon start [--foreground] | stop | status | install | uninstall
   mother broker status | path                (IPC broker diagnostics)
   mother archive [--older-than DAYS] [--dry-run]
+  mother prune-temps [--dry-run]              (remove orphaned *.tmp.*/*.bak.* state files)
   mother teardowns [--drain] [--dry-run]      (list/retry pending worktree+docker teardowns)
   mother run --once
 
@@ -2622,7 +2770,8 @@ Add options:
   --format json|text   (default: text — prints job id only)
   --label TEXT         free-text origin label for this job
   --origin-project NAME  override auto-detected originating project name
-  --origin-session ID    originating session id (default: \$MOTHER_ORIGIN_SESSION)
+  --origin-session ID    originating session id
+                          (default: \$MOTHER_ORIGIN_SESSION, then \$CLAUDE_SESSION_ID)
 
 Plan file requirements:
   Every plan must include a ```yaml suggested_config: ... ``` block specifying
@@ -2642,6 +2791,15 @@ Daemon env vars:
   MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
   MOTHER_BROKER_ENABLED        (default: 1)    supervise the IPC broker sidecar (0 to disable)
 
+Hook / events env vars:
+  MOTHER_EVENTS_MAX_AGE_HOURS  (default: 6)    age floor for
+                                                `events --since-cursor`;
+                                                events older than this are
+                                                never surfaced to the
+                                                UserPromptSubmit hook even if
+                                                a session cursor is stale.
+                                                0 disables the floor.
+
 Teardown env vars (worktree + docker cleanup, rides along with `mother archive`
 on every sweep — independent of the record-archiving age cutoff):
   MOTHER_TEARDOWN_ENABLED         (default: 1)  tear down worktrees/containers
@@ -2654,6 +2812,19 @@ on every sweep — independent of the record-archiving age cutoff):
                                                  not count) before a teardown
                                                  is flagged for attention
                                                  (never auto-deleted)
+
+Retention env vars (orphaned atomic-write temp file sweep, rides along with
+`mother archive` on every bulk sweep plus once at daemon startup):
+  MOTHER_RETENTION_SWEEP_ENABLED  (default: 1)  sweep orphaned *.tmp.*/*.bak.*
+                                                 state files (0 to disable;
+                                                 reserved as the shared gate
+                                                 for future retention steps)
+  MOTHER_TEMP_ORPHAN_MINUTES      (default: 60) age in minutes before an
+                                                 orphaned temp/backup file is
+                                                 removed — the gate that
+                                                 guarantees an in-flight
+                                                 write's temp file is never
+                                                 deleted out from under it
 
 IPC broker env vars (the long-lived sidecar that pushes events to clients):
   MOTHER_BROKER_SOCK           (default: ~/.mother/broker.sock)  Unix socket path
@@ -2737,6 +2908,7 @@ main() {
         daemon)            cmd_daemon "$@" ;;
         broker)            cmd_broker "$@" ;;
         archive)           cmd_archive "$@" ;;
+        prune-temps)       cmd_prune_temps "$@" ;;
         teardowns)         cmd_teardowns "$@" ;;
         run)               cmd_run "$@" ;;
         help|-h|--help)    cmd_help ;;

@@ -131,6 +131,7 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `continuation_count` | int | Number of auto-continuation attempts so far. Incremented each time an `idle_timeout` triggers a re-queue. |
 | `pipeline.review_cycle` | int | Number of review cycles completed so far (0-indexed). Incremented once per continue-cycle. Surfaced by W5 as `review_cycle_count`. |
 | `resume_not_yet_acted_on` | bool | Sticky audit flag. Set when an idle-timeout continuation is queued for a job that was resumed with an operator answer but has no commit postdating that resume. Never cleared automatically; surfaced by `mother status` as `[RESUME-MAY-BE-UNAPPLIED]`. |
+| `origin` | object | Provenance captured at `mother add` time: `{project, cwd, session, enqueued_by, label}`. `project` = basename of the enqueuing cwd's git toplevel, or the `--origin-project` override; `session` = `--origin-session` → `$MOTHER_ORIGIN_SESSION` → `$CLAUDE_SESSION_ID` → `""`. Surfaced as `mother list`'s ORIGIN column, filtered by `mother list --project`/`--label`, and rendered by `mother status`'s `=== origin ===` block. |
 
 ### Kill switches
 
@@ -146,6 +147,26 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_TEARDOWN_DOCKER_ENABLED=0` — skip the docker sweep, still tear down worktrees.
 - `MOTHER_TEARDOWN_MAX_DEFERRALS=N` — deferrals before a stalled teardown is flagged for attention (default: 30; never triggers deletion).
 - `MOTHER_ARCHIVE_TIMEOUT=N` — seconds the hourly archive sweep gets before `_maybe_archive` kills it and moves on (default: 300). Not a behaviour toggle like the others above — it's a watchdog bound. `_loop` is single-threaded, so a wedged sweep (gh/docker/git stuck, a TCC prompt with no UI session to answer it, a shell-level pipe deadlock — see the resolved 2026-08-12 bug report) used to block every subsequent tick — dispatch, auto-resume, escalation, adherence, pipeline advancement, everything — forever, silently. Raise this if legitimate sweeps (many jobs, many `gh pr view` calls) routinely take longer than the default.
+- `MOTHER_EVENTS_MAX_AGE_HOURS=N` — age floor (default: 6) for `mother events --since-cursor`, the query the `UserPromptSubmit` hook (`hooks/mother-inject.sh`) uses to inject a queue-update banner into interactive sessions. No event older than this is ever surfaced on the `--since-cursor` path, no matter how stale a syntactically valid cursor is. `0` disables the floor. Plain `mother events` and `mother events --since <ts>` are never floored. This is defense in depth on top of a hard contract in `cmd_events`: an unreadable or non-ISO session cursor (missing file, zero-byte, non-JSON, missing/`null` `.last_seen`, or a `.last_seen` that isn't an ISO-8601 instant) is always treated as a brand-new session — bootstrap the cursor to now, emit nothing — and must never degrade into a full-history replay of `$EVENTS_DIR` (which retains orphaned `.jsonl` files for long-archived jobs; see the resolved 2026-07-14 bug report).
+- `MOTHER_RETENTION_SWEEP_ENABLED=0` — disable the orphaned atomic-write temp file sweep (reserved as the shared gate for future retention steps — see "Orphaned temp file sweep" below).
+- `MOTHER_TEMP_ORPHAN_MINUTES=N` — age threshold in minutes before an orphaned `*.tmp.*` / `*.bak.*` state file is removed (default: 60). This gate is what prevents deleting an in-flight write's temp file out from under its own writer.
+
+### Orphaned temp file sweep
+
+`_atomic_write` (`lib/state.sh`) and `mother_capture_rate_limits`
+(`statusline/segment.sh`) both write state as `<target>.tmp.$$` then `mv` it
+into place. If the writing process dies between the write and the `mv`
+(killed mid-render, SIGKILL, crash), the temp file is orphaned — nothing else
+ever removes it, and `~/.mother/` accumulates them indefinitely. `mother
+prune-temps [--dry-run]` sweeps `$MOTHER_ROOT`, `$JOBS_DIR`, `$EVENTS_DIR`,
+`$DRAFTS_DIR`, `$CURSORS_DIR`, `$RUNNER_DIR`, and `$TEARDOWN_DIR` (each
+`-maxdepth 1`) for regular files matching `*.tmp.*` or `*.bak.*` older than
+`MOTHER_TEMP_ORPHAN_MINUTES`. It never touches directories — `<target>.lockdir`
+mutex directories (`_with_lock` in `lib/state.sh`) are a live concurrency
+primitive owned by `_recover_stale_locks`, not this sweep. Both the bulk
+`mother archive` sweep (every hourly run, just before its summary line) and
+`mother-runner`'s daemon startup call `mother prune-temps`, so a
+long-running daemon and a frequently-restarted one are both covered.
 
 ### Metrics file
 

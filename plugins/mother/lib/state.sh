@@ -43,6 +43,19 @@ _iso_now() {
     '
 }
 
+# Second-precision RFC 3339 timestamp N hours in the past (UTC). Used as an
+# age floor for the hook's event feed. Second precision is deliberate and
+# safe: every consumer compares timestamps lexicographically, and a floor
+# measured in hours never needs to discriminate within a single second.
+# Uses /usr/bin/perl for the same reasons _iso_now does (universal on macOS,
+# absolute path so subshells with a restricted PATH still work).
+_iso_hours_ago() {
+    /usr/bin/perl -MPOSIX=strftime -e '
+        my @t = gmtime(time() - ($ARGV[0] * 3600));
+        printf "%sT%sZ\n", strftime("%Y-%m-%d", @t), strftime("%H:%M:%S", @t);
+    ' "$1"
+}
+
 _job_path()   { echo "$JOBS_DIR/$1.json"; }
 _events_path(){ echo "$EVENTS_DIR/$1.jsonl"; }
 _log_path()   { echo "$LOGS_DIR/$1.log"; }

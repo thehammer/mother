@@ -51,7 +51,8 @@ mother add --plan-file /tmp/plan.md \
            --repo my-service \
            --branch fix/TICKET-1234-slug \
            --isolation worktree \
-           --max-cost 5
+           --max-cost 5 \
+           --label "short description of the requesting work"  # free-text provenance, shown in `mother list`'s ORIGIN column
 
 # List jobs (omit --state to see non-terminal only)
 mother list
@@ -76,6 +77,11 @@ mother attach <id>
 mother events --since-cursor <session-id>
 ```
 
+`origin.session` is auto-captured from `$CLAUDE_SESSION_ID` at enqueue time
+(overridable with `--origin-session` or `$MOTHER_ORIGIN_SESSION`), so a
+session can find the jobs it queued with `mother list --project <p>` /
+`--label <l>`.
+
 ## Typical invocation pattern
 
 After user agreement:
@@ -91,7 +97,8 @@ id=$(mother add --plan-file /tmp/plan-TICKET-1234.md \
                 --repo my-service \
                 --branch fix/TICKET-1234-slug \
                 --isolation worktree \
-                --max-cost 3)
+                --max-cost 3 \
+                --label "short description of the requesting work")
 echo "Queued: $id"
 ```
 
