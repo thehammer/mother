@@ -715,7 +715,14 @@ cmd_list() {
             return 0
         fi
         printf "%-28s  %-16s  %-18s  %-12s  %-16s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "ORIGIN" "TITLE"
-        echo "$rows" | jq -r '.[] |
+        # Field separator: ASCII US (0x1f), not TAB. TAB is an IFS *whitespace*
+        # character, so `read` collapses runs of tabs into one delimiter and
+        # empty fields vanish — any job with an empty .activity used to shift
+        # every later column left by one (state rendered as "succeeded
+        # [tier_0]", REPO showing the isolation, and so on). A non-whitespace
+        # IFS byte makes every delimiter significant, so empty fields survive.
+        local _us; _us=$(printf '\037')
+        echo "$rows" | jq -r --arg us "$_us" '.[] |
             [
                 .id,
                 .state,
@@ -725,9 +732,10 @@ cmd_list() {
                 .isolation,
                 ((.origin // {}) | if (.project != null and .project != "") then .project elif (.label != null and .label != "") then .label else "-" end),
                 .title,
-                (.kind // "")
-            ] | @tsv' | \
-            while IFS=$'\t' read -r id st activity current_tier repo iso origin title kind; do
+                (.kind // ""),
+                (.adherence_status // "")
+            ] | map((. // "") | tostring | gsub("[\n\r\t]"; " ")) | join($us)' | \
+            while IFS="$_us" read -r id st activity current_tier repo iso origin title kind adherence; do
                 # Compose the state display field with markers.
                 local state_display="$st"
                 if [ "${kind:-}" = "pipeline" ]; then
@@ -735,6 +743,13 @@ cmd_list() {
                     local pl_label
                     pl_label=$(_pipeline_list_label "$(_job_path "$id")" 2>/dev/null) || pl_label=""
                     [ -n "${pl_label:-}" ] && state_display="$st [$pl_label]"
+                elif [ "${adherence:-}" = "blocked_for_human" ]; then
+                    # Uppercase marker mirrors cmd_status's [ADHERENCE-BLOCKED]
+                    # banner. It *replaces* the activity bracket rather than
+                    # adding to it: a genuinely blocked job also carries
+                    # activity=adherence_blocked, and rendering both would read
+                    # "awaiting [adherence_blocked] [ADHERENCE-BLOCKED]".
+                    state_display="$st [ADHERENCE-BLOCKED]"
                 else
                     [ -n "$activity" ] && state_display="$st [$activity]"
                 fi
@@ -3213,7 +3228,9 @@ Activity sub-states (visible in `mother list`, indicate what a job is doing
 within its current state):
   running/ready [continuation]   — re-queued after idle_timeout (auto-continuation)
   running       [cody_rework]    — second Cody attempt after adherence fail
-  awaiting      [adherence_blocked] — needs human to review PR; resume or cancel
+  awaiting      [ADHERENCE-BLOCKED] — needs human to review PR; resume or cancel
+                                      (job fields: activity=adherence_blocked,
+                                       adherence_status=blocked_for_human)
   awaiting      (no activity)    — Cody asked a question; answer with `resume`
 
 Metrics:

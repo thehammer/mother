@@ -80,7 +80,7 @@ plan-adherence review. Here's what was added and how to work with it.
 | `escalation_count` | int | Number of times this job has been escalated. |
 | `adherence_attempts` | int | Number of adherence reviews run so far. |
 | `adherence_pending` | bool | True when a succeeded job awaits adherence review. |
-| `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. Audit trail only — do not use for operational logic. |
+| `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. Audit trail only — do not use for operational logic. `mother list` renders an `[ADHERENCE-BLOCKED]` marker in the STATE column from `blocked_for_human` — display only. |
 | `adherence_notes` | string | Archie's notes from the last review (populated on fail). |
 | `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human) or `pipeline_phase` / `pipeline_review` / `pipeline_blocked` (pipeline jobs). Cleared on resume. |
 | `cost_model` | string | Account billing mode at enqueue time: `subscription`, `metered`, or `unknown`. Clients suppress dollar displays when `subscription`. |
@@ -96,6 +96,7 @@ for display and routing.
 |---|---|---|
 | `queued` | — | waiting on dependencies |
 | `ready` | — | runnable, waiting for daemon slot |
+| `ready` | `cody_rework` | re-queued for a second Cody attempt after an adherence fail (the daemon sets this; the worker has not started yet) |
 | `running` | (none) | Cody running (first attempt) |
 | `running` | `cody_rework` | Cody running (second attempt, after adherence fail) |
 | `running` | `continuation` | Cody re-running after idle_timeout (auto-continuation) |

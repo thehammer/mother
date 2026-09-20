@@ -19,8 +19,8 @@
 #   esc       → close the popup (fzf default)
 #   ctrl-q    → quit
 #
-# Rows are colored by state (succeeded/running/awaiting/failed/cancelled/queued/
-# adherence_rework) and carry an elapsed-duration column. The preview pane runs
+# Rows are colored by state (succeeded/running/awaiting/failed/cancelled/queued)
+# and carry an elapsed-duration column. The preview pane runs
 # `mother peek --watch` so the snapshot refreshes while the popup is open.
 #
 # Use absolute paths in fzf bindings so the popup works regardless of the
@@ -66,7 +66,6 @@ _format_rows() {
               elif st == "failed"           then "[38;5;203m" + $padded + "[0m"
               elif st == "cancelled"        then "[38;5;245m" + $padded + "[0m"
               elif st == "awaiting"         then "[38;5;208m" + $padded + "[0m"
-              elif st == "adherence_rework" then "[38;5;213m" + $padded + "[0m"
               elif st == "queued" or st == "ready" then
                                                  "[38;5;75m"  + $padded + "[0m"
               else $padded end;
