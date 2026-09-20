@@ -52,5 +52,15 @@
 
   <key>ProcessType</key>
   <string>Background</string>
+
+  <!-- Every process Mother spawns (broker, mother-run-job supervisors, and
+       the claude workers beneath them) inherits the daemon's process group:
+       `nohup … & disown` does not call setpgid/setsid, so it does not detach
+       one. launchd's default (AbandonProcessGroup=false) kills that entire
+       group when the tracked job exits, which killed live workers on every
+       `mother daemon stop`, crash, or KeepAlive respawn. true tells launchd
+       to leave the group alone. -->
+  <key>AbandonProcessGroup</key>
+  <true/>
 </dict>
 </plist>

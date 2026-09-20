@@ -171,6 +171,23 @@ primitive owned by `_recover_stale_locks`, not this sweep. Both the bulk
 `mother-runner`'s daemon startup call `mother prune-temps`, so a
 long-running daemon and a frequently-restarted one are both covered.
 
+### Daemon process groups and launchd
+
+Every process Mother spawns — the broker sidecar, each `mother-run-job`
+supervisor, and the `claude` workers beneath them — shares the daemon's
+process group ID. `nohup … & disown` in `mother-runner`'s `_spawn_job` /
+`_start_broker` does **not** detach one: `disown` only drops the job from
+the shell's job table, and neither it nor `nohup` calls `setpgid`/`setsid`.
+What keeps live workers alive across a `mother daemon stop`, a daemon
+crash, or a launchd `KeepAlive` respawn is the `AbandonProcessGroup`
+`<true/>` key in `launchd/com.thehammer.mother.plist`; without it launchd
+reaps the whole group when the tracked job exits (`launchd.plist(5)`
+defaults it to false). The installed copy at
+`~/Library/LaunchAgents/com.thehammer.mother.plist` is a separate
+deployment — editing the template alone changes nothing until
+`mother daemon install` re-renders it. `scripts/doctor.sh` warns when the
+installed copy is missing the key.
+
 ### Metrics file
 
 Every terminal transition (succeeded or failed) appends a JSON line to
