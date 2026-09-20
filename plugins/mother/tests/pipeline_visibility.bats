@@ -360,6 +360,22 @@ _write_review_event() {
     [[ "$output" == *"tier:1"* ]]
 }
 
+@test "cmd_list text: a job with no activity keeps its columns aligned" {
+    # Regression: the row encoding used @tsv + IFS=$'\t'. TAB is IFS
+    # whitespace, so an empty .activity collapsed into the next delimiter and
+    # shifted every later column left by one — the state column rendered
+    # "succeeded [tier_0]" and REPO showed the isolation.
+    make_job "plain1" "succeeded" '.repo = "myrepo" | .isolation = "worktree"'
+    run mother list
+    [ "$status" -eq 0 ]
+    local row
+    row=$(printf '%s\n' "$output" | grep '^plain1')
+    [ "$(printf '%s' "$row" | awk '{print $2}')" = "succeeded" ]
+    [ "$(printf '%s' "$row" | awk '{print $3}')" = "myrepo" ]
+    [ "$(printf '%s' "$row" | awk '{print $4}')" = "worktree" ]
+    [[ "$output" != *"[tier_0]"* ]]
+}
+
 @test "cmd_list text: review phase shows findings count" {
     make_pipeline_job "j1" "review" \
         '.state = "succeeded"

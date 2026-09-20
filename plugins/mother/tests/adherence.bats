@@ -87,7 +87,7 @@ All good."
 # ---------------------------------------------------------------------------
 # Fail verdict — first attempt
 
-@test "adherence-review: fail on first attempt -> adherence_rework, attempts=1, notes stored" {
+@test "adherence-review: fail on first attempt -> failed_first, attempts=1, notes stored, state left to the runner" {
     _make_succeeded_job "job-fail1"
 
     export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
@@ -99,10 +99,21 @@ The PR skipped the acceptance criterion about updating the README."
 
     run jq -r '.adherence_status' "$JOBS_DIR/job-fail1.json"
     [ "$output" = "failed_first" ]
-    run jq -r '.state' "$JOBS_DIR/job-fail1.json"
-    [ "$output" = "adherence_rework" ]
     run jq -r '.adherence_attempts' "$JOBS_DIR/job-fail1.json"
     [ "$output" = "1" ]
+
+    # cmd_adherence_review records the verdict only — it deliberately does
+    # not transition the job. The requeue (state=ready, activity=cody_rework)
+    # is the daemon's job: see _run_adherence_pending in mother-runner,
+    # covered by "adherence loop: marks a succeeded PR job pending, then
+    # reviews and requeues on fail" further down this file. An earlier design
+    # folded this into a single dedicated job `state` value for the rework
+    # case; it was superseded by today's state+activity split and never
+    # existed in shipped code.
+    run jq -r '.state' "$JOBS_DIR/job-fail1.json"
+    [ "$output" = "succeeded" ]
+    run jq -r '.activity // ""' "$JOBS_DIR/job-fail1.json"
+    [ "$output" = "" ]
 
     # Notes stored as pending_answer for next Cody run.
     run jq -r '.pending_answer // ""' "$JOBS_DIR/job-fail1.json"
@@ -144,6 +155,18 @@ Still drifted. Please review manually."
     run mother list
     [ "$status" -eq 0 ]
     [[ "$output" =~ "ADHERENCE-BLOCKED" ]]
+}
+
+@test "cmd_list: ADHERENCE-BLOCKED marker replaces the activity bracket" {
+    _make_succeeded_job "job-blocked2"
+    merged=$(jq '.state = "awaiting" | .activity = "adherence_blocked" | .adherence_status = "blocked_for_human"' "$JOBS_DIR/job-blocked2.json") \
+        && printf '%s' "$merged" > "$JOBS_DIR/job-blocked2.json"
+
+    run mother list
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[ADHERENCE-BLOCKED]"* ]]
+    # Not rendered twice: the uppercase marker stands in for the activity.
+    [[ "$output" != *"[adherence_blocked]"* ]]
 }
 
 # ---------------------------------------------------------------------------
