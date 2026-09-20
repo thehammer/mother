@@ -195,8 +195,13 @@ _broker_alive() {
 _start_broker() {
     [ "$MOTHER_BROKER_ENABLED" = "1" ] || return 0
     _broker_alive && return 0
-    # Detach like the job workers: nohup + background + disown so daemon
-    # signals don't cascade. The broker tees its own diagnostics to
+    # Detach like the job workers: nohup + background + disown. NOTE: nohup +
+    # disown does NOT create a new process group or session — `disown` only
+    # drops the job from this shell's job table so we won't SIGHUP it, and
+    # neither call touches setpgid/setsid. The broker keeps the daemon's PGID.
+    # Surviving a daemon restart depends on the launchd agent's
+    # AbandonProcessGroup=true key (see launchd/com.thehammer.mother.plist),
+    # not on anything here. The broker tees its own diagnostics to
     # logs/broker.log.
     nohup "$MOTHER_BIN_DIR/mother-broker" </dev/null >>"$LOGS_DIR/broker.log" 2>&1 &
     local pid=$!
@@ -258,8 +263,12 @@ _spawn_job() {
     _job_transition "$job_id" running '{"spawned_by":"daemon"}'
 
     # Detach via nohup + background + stdin/out/err redirection. mother-run-job
-    # tees its own log. macOS has no setsid, and nohup + disown is sufficient:
-    # signals to the daemon will not cascade once we disown the child.
+    # tees its own log. NOTE: nohup + disown does NOT create a new process
+    # group or session — `disown` only drops the job from this shell's job
+    # table so we won't SIGHUP it, and neither call touches setpgid/setsid.
+    # The child keeps the daemon's PGID. Surviving a daemon restart depends on
+    # the launchd agent's AbandonProcessGroup=true key (see
+    # launchd/com.thehammer.mother.plist), not on anything here.
     nohup "$MOTHER_BIN_DIR/mother-run-job" "$job_id" </dev/null >/dev/null 2>&1 &
     local pid=$!
     disown 2>/dev/null || true

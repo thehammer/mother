@@ -35,6 +35,22 @@ _check "yq"      yq      || echo "             (used for suggested_config parsin
 _check "python3" python3 || echo "             (fallback YAML parser for suggested_config; usually pre-installed)"
 echo ""
 
+# --- launchd agent (macOS only; advisory — never affects exit status) ---
+if [ "$(uname -s)" = "Darwin" ] && command -v plutil >/dev/null 2>&1; then
+    installed_plist="$HOME/Library/LaunchAgents/com.thehammer.mother.plist"
+    echo "launchd agent:"
+    if [ ! -f "$installed_plist" ]; then
+        printf '  – %-12s not installed (run: mother daemon install)\n' "plist"
+    elif [ "$(plutil -extract AbandonProcessGroup raw "$installed_plist" 2>/dev/null)" = "true" ]; then
+        printf '  ✓ %-12s AbandonProcessGroup=true\n' "plist"
+    else
+        printf '  ✗ %-12s AbandonProcessGroup missing or false — a daemon\n' "plist"
+        printf '               restart will kill live job workers.\n'
+        printf '               Fix: mother daemon install (re-deploys the template)\n'
+    fi
+    echo ""
+fi
+
 if [ "$missing" -eq 0 ]; then
     echo "All required deps present."
     exit 0
