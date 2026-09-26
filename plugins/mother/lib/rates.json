@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "updated": "2026-09-26",
+  "basis": "list",
+  "unit": "usd_per_mtok",
+  "source": "Anthropic published per-model list pricing (claude-api skill, cached 2026-06-24). cache_write_5m is the standard 1.25x of base input; cache_read is the standard 0.1x of base input. cache_write_1h is set EQUAL to cache_write_5m rather than the nominal 2x — calibrated against 5 real archived Mother logs (2 sonnet-4-6, 1 opus-4-7, plus 2 more below) whose result.modelUsage costUSD only reconciles (within <0.05%) to rate*token math when ALL cache_creation_input_tokens (regardless of the ephemeral_5m/1h split reported per-turn) are priced at the 5m rate. Token buckets are still split and reported separately per the schema for observability; only the cost multiplier is unified. See the PR body's calibration table.",
+  "models": {
+    "claude-sonnet-5":   {"input": 2.00, "output": 10.00, "cache_read": 0.20, "cache_write_5m": 2.50, "cache_write_1h": 2.50},
+    "claude-opus-5-5":   {"input": 4.00, "output": 20.00, "cache_read": 0.40, "cache_write_5m": 5.00, "cache_write_1h": 5.00},
+    "claude-opus-5":     {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write_5m": 6.25, "cache_write_1h": 6.25},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write_5m": 3.75, "cache_write_1h": 3.75},
+    "claude-opus-4-8":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write_5m": 6.25, "cache_write_1h": 6.25},
+    "claude-opus-4-7":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write_5m": 6.25, "cache_write_1h": 6.25},
+    "claude-haiku-4-5":  {"input": 1.00, "output": 5.00,  "cache_read": 0.10, "cache_write_5m": 1.25, "cache_write_1h": 1.25}
+  },
+  "aliases": {
+    "sonnet": "claude-sonnet-5",
+    "opus": "claude-opus-5",
+    "haiku": "claude-haiku-4-5"
+  },
+  "prefix_match": true
+}
