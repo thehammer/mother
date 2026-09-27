@@ -138,8 +138,29 @@ mother_recompute_job_cost() {
         fi
     fi
 
-    _usage_job_update "$job_file" \
-        ".actual_cost_usd = ${cost} | .actual_tokens = ${tokens} | .actual_cost_complete = ${complete}"
+    # Validate before handing to jq --argjson: a malformed/unexpected value
+    # here must never propagate into the job file as broken JSON.
+    case "$cost" in ''|*[!0-9.]*|*.*.*) cost=0 ;; esac
+    case "$tokens" in ''|*[!0-9]*) tokens=0 ;; esac
+    case "$complete" in true|false) ;; *) complete=true ;; esac
+
+    _usage_job_update_argjson "$job_file" "$cost" "$tokens" "$complete"
+}
+
+# _usage_job_update_argjson <job_file> <cost> <tokens> <complete>
+# Same read-modify-write as _usage_job_update, but passes cost/tokens/complete
+# through jq --argjson (typed) instead of interpolating them into the filter
+# string.
+_usage_job_update_argjson() {
+    local job_file="$1" cost="$2" tokens="$3" complete="$4"
+    [ -f "$job_file" ] || return 1
+    local merged
+    merged=$(jq --argjson cost "$cost" --argjson tokens "$tokens" --argjson complete "$complete" \
+        '.actual_cost_usd = $cost | .actual_tokens = $tokens | .actual_cost_complete = $complete' \
+        "$job_file" 2>/dev/null) || return 1
+    [ -n "$merged" ] || return 1
+    local tmp="${job_file}.tmp.$$"
+    printf '%s' "$merged" > "$tmp" && mv "$tmp" "$job_file"
 }
 
 # mother_maybe_token_alert <job_id>
@@ -282,8 +303,14 @@ mother_usage_check_live() {
     case "$run_tokens_out" in ''|*[!0-9]*) run_tokens_out=0 ;; esac
     local run_tokens=$((run_tokens_in + run_tokens_out))
 
+    # Validate before arithmetic — these feed a computed value straight into
+    # job JSON and (via the caller) a --settings-driven hook comparison, so
+    # a malformed number must degrade to 0 rather than propagate.
+    case "$prior_cost" in ''|*[!0-9.]*|*.*.*) prior_cost=0 ;; esac
+    case "$run_cost" in ''|*[!0-9.]*|*.*.*) run_cost=0 ;; esac
+
     local job_spend
-    job_spend=$(python3 -c "print(${prior_cost} + ${run_cost})" 2>/dev/null) || job_spend="$prior_cost"
+    job_spend=$(awk -v a="$prior_cost" -v b="$run_cost" 'BEGIN { printf "%.6f", a + b }')
     local job_tokens=$((prior_tokens + run_tokens))
 
     echo "$job_spend $job_tokens $run_cost $run_tokens"
