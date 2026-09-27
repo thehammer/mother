@@ -44,6 +44,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/request-types.sh" ] && source "$MOTHER_LIB_DIR/request-types.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ]  && source "$MOTHER_LIB_DIR/phase-prompt.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/usage.sh" ]         && source "$MOTHER_LIB_DIR/usage.sh"
 
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
@@ -326,6 +328,25 @@ _recover_orphans() {
     local now_epoch; now_epoch=$(date +%s)
     local f state pid window id started_at started_at_sec started_epoch cancel_req
     local terminal_state terminal_reason
+
+    # Record a usage row for the dead run before transitioning it, using
+    # .current_run.log_offset (recorded at spawn time — see mother-run-job)
+    # as the slice start. Skipped entirely for legacy job records that
+    # predate .current_run — no offset means no safe slice to parse.
+    _orphan_record_usage_row() {
+        local _oid="$1" _ojf="$2" _oterminal="$3"
+        type mother_record_run_usage >/dev/null 2>&1 || return 0
+        local _ooffset; _ooffset=$(jq -r '.current_run.log_offset // empty' "$_ojf" 2>/dev/null)
+        [ -n "$_ooffset" ] || return 0
+        local _olog="$LOGS_DIR/$_oid.log"
+        local _ooutcome="failed"
+        [ "$_oterminal" = "cancelled" ] && _ooutcome="cancelled"
+        local _ophase; _ophase=$(jq -r '.pipeline.phase // empty' "$_ojf" 2>/dev/null)
+        local _ostage="${_ophase:-cody}"
+        mother_record_run_usage "$_oid" "$_ooutcome" "$_olog" "$_ooffset" "" "$_ostage" "${_ostage}-main" "worker" \
+            "$(jq -nc '{failure_reason: "runner_died"}')"
+    }
+
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state' "$f" 2>/dev/null) || continue
@@ -358,6 +379,7 @@ _recover_orphans() {
                     continue
                 fi
                 _log "marking $id $terminal_state (pid $pid gone; cancel_requested=$cancel_req)"
+                _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
             fi
         elif [ -n "$window" ]; then
@@ -368,6 +390,7 @@ _recover_orphans() {
             fi
             if ! grep -Fxq "$window" <<< "$windows"; then
                 _log "marking $id $terminal_state (window $window gone; cancel_requested=$cancel_req)"
+                _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
             fi
         else
@@ -404,6 +427,7 @@ _recover_orphans() {
                 continue
             fi
             _log "marking $id $terminal_state (no worker_pid or tmux_window; cancel_requested=$cancel_req)"
+            _orphan_record_usage_row "$id" "$f" "$terminal_state"
             _job_transition "$id" "$terminal_state" "$terminal_reason"
         fi
     done
@@ -715,7 +739,6 @@ _run_adherence_pending() {
                             | .activity = "cody_rework"
                             | .finished_at = null
                             | .worker_pid = null
-                            | .actual_cost_usd = null
                             | .cancel_requested = null
                             | .pause_requested = null
                             | .final_result_at = null
@@ -995,7 +1018,6 @@ _run_pipeline_review() {
                     | .finished_at = null
                     | .started_at = null
                     | .worker_pid = null
-                    | .actual_cost_usd = null
                     | .cancel_requested = null
                     | .pause_requested = null
                     | .final_result_at = null' \
@@ -1063,7 +1085,6 @@ _run_pipeline_job() {
                         | .finished_at = null
                         | .started_at = null
                         | .worker_pid = null
-                        | .actual_cost_usd = null
                         | .cancel_requested = null
                         | .pause_requested = null
                         | .final_result_at = null' \
@@ -1194,6 +1215,7 @@ main() {
     _recover_stale_locks
     _prune_temps_startup
     _recover_orphans
+    type mother_publish_rates >/dev/null 2>&1 && mother_publish_rates
     _start_broker
     _loop
     _drain
