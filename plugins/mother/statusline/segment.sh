@@ -10,10 +10,10 @@
 #
 # Cache:
 #   $MOTHER_STATUSLINE_CACHE (default: /tmp/.mother-statusline) — single line,
-#   colon-separated "RUNNING:QUEUED:FAILED:AWAITING" counts. The awaiting
+#   colon-separated "RUNNING:QUEUED:FAILED:AWAITING:TOKEN_ALERTS" counts. Each
 #   field was added later and lives at the end so old caches written by an
-#   older version still parse: a missing fourth field defaults to zero, and
-#   a fresh refresh (TTL ~10s) overwrites the cache in the new format.
+#   older version still parse: a missing field defaults to zero, and a fresh
+#   refresh (TTL ~10s) overwrites the cache in the new format.
 #   TTL-based refresh in the background keeps the statusline fast.
 
 : "${MOTHER_STATUSLINE_CACHE:=/tmp/.mother-statusline}"
@@ -78,7 +78,26 @@ mother_statusline_refresh() {
             END { printf "%d:%d:%d:%d\n", r+0, q+0, fa+0, a+0 }
         ')
 
-    printf '%s\n' "$counts" > "$tmp" && mv "$tmp" "$cache"
+    # Token-alert count: jobs with .token_alert_at set in the last 24h.
+    local now_epoch cutoff_epoch alert_count
+    now_epoch=$(date +%s)
+    cutoff_epoch=$((now_epoch - 86400))
+    alert_count=$(find "$jobs_dir" -maxdepth 1 -name '*.json' -type f 2>/dev/null \
+        | while read -r f; do
+            jq -r '.token_alert_at // empty' "$f" 2>/dev/null
+        done \
+        | while read -r ts; do
+            [ -n "$ts" ] || continue
+            local sec="${ts%%.*}"
+            case "$sec" in *Z) ;; *) sec="${sec}Z" ;; esac
+            local epoch
+            epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$sec" +%s 2>/dev/null \
+                || date -u -d "$sec" +%s 2>/dev/null || echo 0)
+            [ "${epoch:-0}" -ge "$cutoff_epoch" ] && echo 1
+        done | wc -l | tr -d ' ')
+    : "${alert_count:=0}"
+
+    printf '%s:%s\n' "$counts" "$alert_count" > "$tmp" && mv "$tmp" "$cache"
 }
 
 # Render the statusline segment. Trailing space, no separator — callers add
@@ -99,19 +118,20 @@ mother_segment() {
         ( mother_statusline_refresh "$cache" >/dev/null 2>&1 ) &
     fi
 
-    local _mr _mq _mf _ma
-    # Read up to 4 fields. Old caches (3 fields, no awaiting) leave _ma empty,
-    # which the default below maps to 0 — correct until the next refresh
-    # overwrites the cache in the new format.
-    IFS=: read -r _mr _mq _mf _ma < "$cache" 2>/dev/null \
-        || { _mr=0; _mq=0; _mf=0; _ma=0; }
-    : "${_mr:=0}" "${_mq:=0}" "${_mf:=0}" "${_ma:=0}"
+    local _mr _mq _mf _ma _mt
+    # Read up to 5 fields. An older cache (fewer fields) leaves the missing
+    # ones empty, which the defaults below map to 0 — correct until the next
+    # refresh overwrites the cache in the new format.
+    IFS=: read -r _mr _mq _mf _ma _mt < "$cache" 2>/dev/null \
+        || { _mr=0; _mq=0; _mf=0; _ma=0; _mt=0; }
+    : "${_mr:=0}" "${_mq:=0}" "${_mf:=0}" "${_ma:=0}" "${_mt:=0}"
 
     # Only render if something non-zero.
     if ! { [ "$_mr" -gt 0 ] 2>/dev/null \
         || [ "$_mq" -gt 0 ] 2>/dev/null \
         || [ "$_mf" -gt 0 ] 2>/dev/null \
-        || [ "$_ma" -gt 0 ] 2>/dev/null; }; then
+        || [ "$_ma" -gt 0 ] 2>/dev/null \
+        || [ "$_mt" -gt 0 ] 2>/dev/null; }; then
         return 0
     fi
 
@@ -124,6 +144,7 @@ mother_segment() {
     # orange makes them stand out without crying wolf the way red would.
     [ "$_ma" -gt 0 ] && out="${out} \033[38;5;208m?${_ma}${reset}"  # orange — awaiting input
     [ "$_mf" -gt 0 ] && out="${out} \033[38;5;203m!${_mf}${reset}"  # red — failed
+    [ "$_mt" -gt 0 ] && out="${out} \033[38;5;170m\$!${_mt}${reset}" # magenta — token alerts
 
     # Quota gate indicator: 🚦 if either rolling window is over its cap.
     # Rendered last so it sits next to the failure count, signalling that
