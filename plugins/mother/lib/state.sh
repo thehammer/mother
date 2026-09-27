@@ -125,12 +125,24 @@ _job_update() {
 _job_transition() {
     local id="$1" new="$2" detail="${3:-}"
     [ -z "$detail" ] && detail='{}'
+    # D2 guard — mirrors mother-run-job's _transition: a `failed` transition
+    # must always carry a .reason. See CLAUDE.md's structured-failures note.
+    if [ "$new" = "failed" ]; then
+        local _has_reason
+        _has_reason=$(printf '%s' "$detail" | jq -r 'has("reason")' 2>/dev/null)
+        if [ "$_has_reason" != "true" ]; then
+            detail=$(printf '%s' "$detail" | jq -c '. + {reason: "unspecified"}' 2>/dev/null) || detail='{"reason":"unspecified"}'
+            _append_event "$id" "failure_reason_missing" \
+                "$(jq -nc --arg caller "${FUNCNAME[1]:-unknown}" '{caller: $caller}')"
+        fi
+    fi
     _job_update "$id" ".state = \"$new\""
     case "$new" in
         running)    _job_update "$id" ".started_at = \"$(_iso_now)\"" ;;
         succeeded|failed|cancelled)
                     _job_update "$id" ".finished_at = \"$(_iso_now)\""
-                    _job_update "$id" ".force_start = null" ;;
+                    _job_update "$id" ".force_start = null"
+                    type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$id" ;;
     esac
     _append_event "$id" "$new" "$detail"
 }
