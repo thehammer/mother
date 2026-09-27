@@ -54,6 +54,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/prdetect.sh" ]      && source "$MOTHER_LIB_DIR/prdetect.sh"
 # shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/usage.sh" ]         && source "$MOTHER_LIB_DIR/usage.sh"
+# shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/teardown.sh" ]      && source "$MOTHER_LIB_DIR/teardown.sh"
 
 # ---------- CLI-only helpers ----------
@@ -495,6 +497,12 @@ cmd_add() {
     [ -f "$plan_file" ] || _die "add: plan file not found: $plan_file"
     [ -n "$repo" ]      || _die "add: --repo required"
     [ -n "$branch" ]    || _die "add: --branch required"
+    if [ -n "$max_cost" ]; then
+        case "$max_cost" in
+            ''|*[!0-9.]*|.|*.*.*) _die "add: --max-cost must be a positive number (got: $max_cost)" ;;
+        esac
+        awk -v v="$max_cost" 'BEGIN { exit !(v > 0) }' || _die "add: --max-cost must be a positive number (got: $max_cost)"
+    fi
 
     case "$isolation" in worktree|main-dir) ;; *) _die "isolation must be worktree or main-dir" ;; esac
     case "$executor"  in local-tmux)        ;; *) _die "executor must be local-tmux (for now)" ;; esac
@@ -714,7 +722,7 @@ cmd_list() {
             echo "(no jobs)"
             return 0
         fi
-        printf "%-28s  %-16s  %-18s  %-12s  %-16s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "ORIGIN" "TITLE"
+        printf "%-28s  %-16s  %-18s  %-12s  %-16s  %8s  %s\n" "ID" "STATE" "REPO" "ISOLATION" "ORIGIN" "COST" "TITLE"
         # Field separator: ASCII US (0x1f), not TAB. TAB is an IFS *whitespace*
         # character, so `read` collapses runs of tabs into one delimiter and
         # empty fields vanish — any job with an empty .activity used to shift
@@ -731,11 +739,28 @@ cmd_list() {
                 .repo,
                 .isolation,
                 ((.origin // {}) | if (.project != null and .project != "") then .project elif (.label != null and .label != "") then .label else "-" end),
+                (.actual_cost_usd // ""),
+                (.live_cost_usd // ""),
+                (.max_cost_usd // ""),
                 .title,
                 (.kind // ""),
                 (.adherence_status // "")
             ] | map((. // "") | tostring | gsub("[\n\r\t]"; " ")) | join($us)' | \
-            while IFS="$_us" read -r id st activity current_tier repo iso origin title kind adherence; do
+            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence; do
+                cost_display="-"
+                if [ -n "$max_cost" ]; then
+                    if [ "$st" = "running" ] && [ -n "$live_cost" ]; then
+                        cost_display=$(awk -v c="$live_cost" -v m="$max_cost" 'BEGIN { printf "$%.2f/%.0f", c, m }')
+                    elif [ -n "$actual_cost" ]; then
+                        cost_display=$(awk -v c="$actual_cost" -v m="$max_cost" 'BEGIN { printf "$%.2f/%.0f", c, m }')
+                    else
+                        cost_display=$(awk -v m="$max_cost" 'BEGIN { printf "$0.00/%.0f", m }')
+                    fi
+                elif [ "$st" = "running" ] && [ -n "$live_cost" ]; then
+                    cost_display=$(awk -v c="$live_cost" 'BEGIN { printf "~$%.2f", c }')
+                elif [ -n "$actual_cost" ]; then
+                    cost_display=$(awk -v c="$actual_cost" 'BEGIN { printf "$%.2f", c }')
+                fi
                 # Compose the state display field with markers.
                 local state_display="$st"
                 if [ "${kind:-}" = "pipeline" ]; then
@@ -758,7 +783,7 @@ cmd_list() {
                     tier_2) state_display="$state_display tier:2" ;;
                     tier_3) state_display="$state_display tier:3" ;;
                 esac
-                printf "%-28s  %-16s  %-18s  %-12s  %-16s  %s\n" "$id" "$state_display" "$repo" "$iso" "$origin" "$title"
+                printf "%-28s  %-16s  %-18s  %-12s  %-16s  %8s  %s\n" "$id" "$state_display" "$repo" "$iso" "$origin" "$cost_display" "$title"
             done
     fi
 }
@@ -1530,7 +1555,6 @@ cmd_retry() {
         .state = $s
         | .finished_at = null
         | .worker_pid = null
-        | .actual_cost_usd = null
         | .cancel_requested = null
         | .pause_requested = null
         | .final_result_at = null
@@ -1621,7 +1645,6 @@ cmd_escalate() {
         | .escalation_count = $esc
         | .finished_at = null
         | .worker_pid = null
-        | .actual_cost_usd = null
         | .cancel_requested = null
         | .pause_requested = null
         | .final_result_at = null
@@ -1985,9 +2008,54 @@ EOF
     # cwd fallback: the work_dir guard above already `_die`d if work_dir
     # were missing, so reaching here means it exists.
     local tmpfile
+    # --effort: resolved from suggested_config.<reviewer>.effort (empty when
+    # unset — omits the flag). The posture clamp above only ever clamps the
+    # model, never effort.
+    local reviewer_effort
+    reviewer_effort=$(jq -r --arg r "$reviewer" '.suggested_config[$r].effort // empty' "$job_file" 2>/dev/null || echo "")
+    type mother_claude_extra_args >/dev/null 2>&1 || mother_claude_extra_args() { MOTHER_CLAUDE_ARGS=(); }
+    mother_claude_extra_args "$reviewer_effort" review
+
     tmpfile=$(mktemp)
-    ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" -p "$review_prompt" ) \
-        > "$tmpfile" 2>/dev/null || true
+    local review_log
+    review_log="$LOGS_DIR/$id.review-${reviewer}-c$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null).log"
+    ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" \
+        "${MOTHER_CLAUDE_ARGS[@]}" -p "$review_prompt" --output-format stream-json --verbose ) \
+        > "$review_log" 2>/dev/null || true
+    # findings_extract/verdict text want the reviewer's plain-text response;
+    # extract it from the last result event when the stream is stream-json,
+    # falling back to the raw file itself (a plaintext mock in tests, or a
+    # stream that never produced a result event).
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+path = sys.argv[1]
+text = None
+try:
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") == "result":
+                text = obj.get("result")
+except Exception:
+    pass
+if text is None:
+    with open(path) as fh:
+        text = fh.read()
+sys.stdout.write(text or "")
+' "$review_log" > "$tmpfile" 2>/dev/null || cp "$review_log" "$tmpfile" 2>/dev/null
+    else
+        cp "$review_log" "$tmpfile" 2>/dev/null
+    fi
+    type mother_record_run_usage >/dev/null 2>&1 && mother_record_run_usage "$id" "succeeded" "$review_log" 0 "" \
+        "review-${reviewer}" "review-${reviewer}" "review" \
+        "$(jq -nc --arg model "$reviewer_model" --arg effort "$reviewer_effort" '{model: $model, effort: (($effort | select(length>0)) // null)}')"
 
     # Extract findings block.
     local raw_findings
@@ -2140,30 +2208,99 @@ cmd_adherence_review() {
     local archie_model="opus"
     local review_posture
     review_posture=$(_resolve_posture)
+    local posture_clamped="false"
     if [ "$review_posture" = "conservative" ]; then
         archie_model="sonnet"
+        posture_clamped="true"
     fi
+
+    # --effort: unset MOTHER_ADHERENCE_EFFORT means no --effort flag at all
+    # (today's behavior, unchanged).
+    local archie_effort="${MOTHER_ADHERENCE_EFFORT:-}"
+    type mother_claude_extra_args >/dev/null 2>&1 || mother_claude_extra_args() { MOTHER_CLAUDE_ARGS=(); }
+    mother_claude_extra_args "$archie_effort" adherence
+
     _append_event "$id" "adherence_review_spawned" \
         "$(jq -nc --arg m "$archie_model" --arg p "$review_posture" \
             '{model: $m, posture: $p}')"
+
+    local esc_attempts; esc_attempts=$(jq -r '.adherence_attempts // 0' "$job_file")
+    local adherence_attempt=$((esc_attempts + 1))
+    local adherence_log="$LOGS_DIR/$id.adherence-${adherence_attempt}.log"
     local raw_verdict
-    raw_verdict=$(claude --dangerously-skip-permissions --agent archie --model "$archie_model" -p "$review_prompt" 2>/dev/null || true)
+    claude --dangerously-skip-permissions --agent archie --model "$archie_model" \
+        "${MOTHER_CLAUDE_ARGS[@]}" -p "$review_prompt" --output-format stream-json --verbose \
+        > "$adherence_log" 2>/dev/null || true
+
+    # Prefer the last stream-json result event's text; fall back to the raw
+    # file verbatim (keeps existing plaintext-mock tests passing unchanged).
+    if command -v python3 >/dev/null 2>&1; then
+        raw_verdict=$(python3 -c '
+import json, sys
+path = sys.argv[1]
+text = None
+try:
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") == "result":
+                text = obj.get("result")
+except Exception:
+    pass
+if text is None:
+    with open(path) as fh:
+        text = fh.read()
+sys.stdout.write(text or "")
+' "$adherence_log" 2>/dev/null)
+    fi
+    [ -n "$raw_verdict" ] || raw_verdict=$(cat "$adherence_log" 2>/dev/null || echo "")
 
     # Parse the verdict.
     local verdict notes
     verdict=$(printf '%s\n' "$raw_verdict" | grep -Eo 'ADHERENCE:[[:space:]]*(pass|fail)' | head -1 | awk '{print $NF}' || true)
     notes=$(printf '%s\n' "$raw_verdict" | awk '/^NOTES:/{p=1; next} p{print}' || true)
 
+    # Record the usage row on EVERY return path, including the parse-error
+    # return below — never let a missing verdict skip the cost accounting.
+    _record_adherence_usage() {
+        local verdict_val="${1:-}" outcome="${2:-succeeded}"
+        type mother_record_run_usage >/dev/null 2>&1 || return 0
+        mother_record_run_usage "$id" "$outcome" "$adherence_log" 0 "" \
+            "adherence" "adherence" "adherence" \
+            "$(jq -nc \
+                --arg verdict "$verdict_val" \
+                --arg model "$archie_model" \
+                --arg posture "$review_posture" \
+                --argjson posture_clamped "$posture_clamped" \
+                --arg effort "$archie_effort" \
+                --argjson attempt "$adherence_attempt" \
+                '{
+                    verdict: (if ($verdict | length) > 0 then $verdict else null end),
+                    model: $model, model_requested: "opus",
+                    posture: $posture, posture_clamped: $posture_clamped,
+                    effort: (if ($effort | length) > 0 then $effort else null end),
+                    adherence_attempt: $attempt
+                }')"
+    }
+
     if [ -z "$verdict" ]; then
         # Could not parse verdict — treat as error, don't mutate job state.
+        _record_adherence_usage "" "error"
         echo "mother: adherence-review: could not parse ADHERENCE line from Archie's response" >&2
         echo "Raw response preview:" >&2
         printf '%s\n' "$raw_verdict" | head -20 >&2
         return 2
     fi
 
-    local esc_attempts; esc_attempts=$(jq -r '.adherence_attempts // 0' "$job_file")
-    local new_attempts=$((esc_attempts + 1))
+    _record_adherence_usage "$verdict" "succeeded"
+
+    local new_attempts=$adherence_attempt
     local adherence_status
 
     if [ "$verdict" = "pass" ]; then
@@ -2245,6 +2382,20 @@ cmd_await() {
     local state; state=$(jq -r .state "$(_job_path "$id")")
     [ "$state" = "running" ] || _die "await: job is in state $state, expected running"
 
+    # Cost-cap cooperative pause: when the job's cost-gate hook flag is set
+    # (the worker either read the hook's blocking message and is honoring it,
+    # or the operator is calling await on its behalf), this await is a
+    # cost-cap pause, not a plain user one — append the spend summary and
+    # tag paused_reason accordingly.
+    local paused_reason="user"
+    local cost_cap_flag="${RUNNER_DIR}/${id}.cost-cap"
+    if [ -f "$cost_cap_flag" ]; then
+        paused_reason="cost_cap"
+        question="${question}
+
+$(cat "$cost_cap_flag" 2>/dev/null)"
+    fi
+
     # Single atomic write: set question/paused_at/paused_reason/state and
     # clear any stale pending_answer or auto_resume_at (so a resume after
     # this pause must come from a fresh `mother resume` call, not a
@@ -2252,17 +2403,17 @@ cmd_await() {
     # superseded by an operator-initiated one).
     local job_file merged
     job_file=$(_job_path "$id")
-    merged=$(jq --arg q "$question" --arg ts "$(_iso_now)" '
+    merged=$(jq --arg q "$question" --arg ts "$(_iso_now)" --arg pr "$paused_reason" '
         .question = $q
         | .paused_at = $ts
-        | .paused_reason = "user"
+        | .paused_reason = $pr
         | .pending_answer = null
         | .auto_resume_at = null
         | .state = "awaiting"
     ' "$job_file") || _die "await: jq update failed"
     _atomic_write "$job_file" "$merged"
     _append_event "$id" "awaiting_input" \
-        "$(jq -nc --arg q "$question" '{question: $q, paused_reason: "user"}')"
+        "$(jq -nc --arg q "$question" --arg pr "$paused_reason" '{question: $q, paused_reason: $pr}')"
 
     cat <<EOF
 mother: question recorded for $id
@@ -2290,11 +2441,13 @@ EOF
 # choose whichever is convenient for the answer's length / shape.
 
 cmd_resume() {
-    local id="" answer="" from_file="" from_stdin=0
+    local id="" answer="" from_file="" from_stdin=0 max_cost_arg="" max_cost_given=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --from-file)   from_file="$2"; shift 2 ;;
             --from-file=*) from_file="${1#*=}"; shift ;;
+            --max-cost)    max_cost_arg="$2"; max_cost_given=1; shift 2 ;;
+            --max-cost=*)  max_cost_arg="${1#*=}"; max_cost_given=1; shift ;;
             -)             from_stdin=1; shift ;;
             --) shift; break ;;
             -*) _die "unknown flag for resume: $1" ;;
@@ -2314,10 +2467,54 @@ cmd_resume() {
     elif [ "$from_stdin" -eq 1 ]; then
         answer=$(cat)
     fi
+    # An answer is normally required, but a pure --max-cost bump (raising or
+    # clearing the cap with no new operator guidance) is a complete resume
+    # action on its own — default to a generic continuation note instead of
+    # forcing a redundant "keep going" answer.
+    if [ -z "$answer" ] && [ "$max_cost_given" -eq 1 ]; then
+        answer="(no new operator instructions — resumed to adjust --max-cost only)"
+    fi
     [ -n "$answer" ] || _die "resume: <answer> required (positional, --from-file, or '-' for stdin)"
 
     local state; state=$(jq -r .state "$(_job_path "$id")")
     [ "$state" = "awaiting" ] || _die "resume: job is in state $state, expected awaiting"
+
+    local job_file; job_file=$(_job_path "$id")
+    local cur_paused_reason; cur_paused_reason=$(jq -r '.paused_reason // ""' "$job_file" 2>/dev/null)
+    local cur_actual_cost; cur_actual_cost=$(jq -r '.actual_cost_usd // 0' "$job_file" 2>/dev/null)
+
+    # Validate --max-cost, if given: "none" or a positive number.
+    local new_max_cost_json=""
+    if [ "$max_cost_given" -eq 1 ]; then
+        if [ "$max_cost_arg" = "none" ]; then
+            new_max_cost_json="null"
+        else
+            case "$max_cost_arg" in
+                ''|*[!0-9.]*|.|*.*.*) _die "resume: --max-cost must be a positive number or 'none' (got: $max_cost_arg)" ;;
+            esac
+            awk -v v="$max_cost_arg" 'BEGIN { exit !(v > 0) }' \
+                || _die "resume: --max-cost must be a positive number or 'none' (got: $max_cost_arg)"
+            new_max_cost_json="$max_cost_arg"
+        fi
+    fi
+
+    if [ "$cur_paused_reason" = "cost_cap" ]; then
+        [ "$max_cost_given" -eq 1 ] || _die "resume: job $id was paused for a cost cap (spent \$${cur_actual_cost}) — supply --max-cost <usd greater than \$${cur_actual_cost}> or --max-cost none: mother resume $id --max-cost <usd> \"<instructions>\""
+        if [ "$max_cost_arg" != "none" ]; then
+            awk -v v="$max_cost_arg" -v cur="$cur_actual_cost" 'BEGIN { exit !(v > cur) }' \
+                || _die "resume: --max-cost ($max_cost_arg) must be greater than the current spend (\$${cur_actual_cost})"
+        fi
+    fi
+
+    if [ "$max_cost_given" -eq 1 ]; then
+        local old_max_cost; old_max_cost=$(jq -r '.max_cost_usd // "none"' "$job_file" 2>/dev/null)
+        local _mmerged
+        _mmerged=$(jq --argjson m "$new_max_cost_json" '.max_cost_usd = $m' "$job_file") \
+            && _atomic_write "$job_file" "$_mmerged"
+        rm -f "${RUNNER_DIR}/${id}.cost-cap"
+        _append_event "$id" "max_cost_raised" \
+            "$(jq -nc --arg from "$old_max_cost" --arg to "${new_max_cost_json}" '{from: $from, to: $to}')"
+    fi
 
     # Single atomic write: stash the answer, mark resumed_at, bump
     # resume_count (defaulting from null on first resume), and transition
@@ -2325,8 +2522,7 @@ cmd_resume() {
     # fresh worker without going through `queued`. Also clear the system-
     # pause fields if they were set — the operator's manual resume
     # supersedes any pending auto-resume.
-    local job_file merged
-    job_file=$(_job_path "$id")
+    local merged
     merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" '
         .pending_answer = $a
         | .resumed_at = $ts
@@ -2762,6 +2958,15 @@ _archive_one() {
     if [ -f "$LOGS_DIR/$id.log" ]; then
         gzip -c "$LOGS_DIR/$id.log" > "$dest_dir/$id.log.gz" && rm -f "$LOGS_DIR/$id.log"
     fi
+    # Side logs: adherence-review transcripts (<id>.adherence-N.log),
+    # pipeline reviewer transcripts (<id>.review-<reviewer>-cN.log), and the
+    # legacy <id>.pipeline-review.log. Same gzip-and-move treatment as the
+    # main log so the archived record stays complete.
+    local _side_log
+    for _side_log in "$LOGS_DIR/$id".*.log; do
+        [ -f "$_side_log" ] || continue
+        gzip -c "$_side_log" > "$dest_dir/$(basename "$_side_log").gz" && rm -f "$_side_log"
+    done
     _teardown_repoint_pending "$id" "$dest_dir/$id.events.jsonl"
     return 0
 }
@@ -3070,6 +3275,40 @@ cmd_broker() {
     esac
 }
 
+# ---------- retro ----------
+#
+# mother retro --since <60d|2w|36h|YYYY-MM-DD> [--format table|json] [--backfill]
+#
+# Thin CLI wrapper: publishes the shared rates file (best-effort), then execs
+# into bin/mother-usage's Python retro report generator, which owns all the
+# actual data assembly (see lib/rates.json + bin/mother-usage's `retro`
+# subcommand for the table definitions).
+cmd_retro() {
+    local since="" format="table" backfill=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --since)    since="$2"; shift 2 ;;
+            --since=*)  since="${1#*=}"; shift ;;
+            --format)   format="$2"; shift 2 ;;
+            --format=*) format="${1#*=}"; shift ;;
+            --backfill) backfill=1; shift ;;
+            -*) _die "retro: unknown flag: $1" ;;
+            *) _die "retro: unexpected argument: $1" ;;
+        esac
+    done
+    [ -n "$since" ] || _die "retro: --since required (e.g. --since 60d)"
+
+    command -v python3 >/dev/null 2>&1 || _die "retro: python3 is required"
+    local usage_bin="$MOTHER_BIN_DIR/mother-usage"
+    [ -r "$usage_bin" ] || _die "retro: bin/mother-usage not found at $usage_bin"
+
+    type mother_publish_rates >/dev/null 2>&1 && mother_publish_rates
+
+    local args=(retro --root "$MOTHER_ROOT" --since "$since" --format "$format")
+    [ "$backfill" -eq 1 ] && args+=(--backfill)
+    python3 "$usage_bin" "${args[@]}"
+}
+
 # ---------- help ----------
 
 cmd_help() {
@@ -3095,6 +3334,8 @@ Usage:
   mother merge-findings ID                   (merge per-reviewer findings into one array; stdout only)
   mother await [ID] --question TEXT          (worker-side: pause for operator input)
   mother resume ID ANSWER | --from-file PATH | -    (operator-side: answer + resume)
+                                              [--max-cost USD|none]  (required to resume a
+                                               cost-cap pause; also allowed on any resume)
   mother events [--since-cursor SESSION_ID] [--since ISO_TS]
   mother drafts list | save --plan-file PATH | show ID | rm ID
   mother daemon start [--foreground] | stop | status | install | uninstall
@@ -3102,6 +3343,8 @@ Usage:
   mother archive [--older-than DAYS] [--dry-run]
   mother prune-temps [--dry-run]              (remove orphaned *.tmp.*/*.bak.* state files)
   mother teardowns [--drain] [--dry-run]      (list/retry pending worktree+docker teardowns)
+  mother retro --since 60d|2w|36h|YYYY-MM-DD [--format table|json] [--backfill]
+                                              (cost/outcome/failure retrospective report)
   mother run --once
 
 Add options:
@@ -3211,6 +3454,29 @@ Quota gate env vars (require statusline integration — see segment.sh
                            interactive use; e.g. cap=70 reserves the
                            top 30% for non-Mother work.
 
+Cost visibility / --max-cost env vars:
+  MOTHER_USAGE_CHECK_INTERVAL     (default: 120)  seconds between live usage/
+                                                   cost-cap checks in the poll loop
+  MOTHER_TOKEN_ALERT_THRESHOLD    (default: 100000000) cumulative job tokens that
+                                                   trigger one token_alert event
+  MOTHER_COST_CAP_GRACE_SECONDS   (default: 300)  seconds a job may stay `running`
+                                                   after a --max-cost breach before
+                                                   the poll loop force-pauses it
+  MOTHER_ADHERENCE_EFFORT         (default: unset) --effort passed to the
+                                                   adherence-review Archie call;
+                                                   unset means no --effort flag
+  MOTHER_WORKER_MCP_SCOPE         (default: 1)    scope every claude invocation's
+                                                   MCP servers to
+                                                   templates/worker-mcp.json (0 to
+                                                   disable — restores today's
+                                                   full personal-config behavior)
+  MOTHER_WORKER_MCP_CONFIG        (default: plugin's templates/worker-mcp.json)
+                                                   override the MCP allowlist file
+  MOTHER_SHARED_RATES_PATH        (default: ~/.claude/model-rates.json) where
+                                                   `mother-usage publish-rates`
+                                                   writes the shared rate table
+                                                   Bishop reads
+
 State flows:
   queued -> ready -> running -> succeeded | failed | cancelled
   running -> awaiting -> ready -> running     (worker calls `await`, operator
@@ -3234,8 +3500,11 @@ within its current state):
   awaiting      (no activity)    — Cody asked a question; answer with `resume`
 
 Metrics:
-  ~/.mother/metrics/runs.jsonl — one JSON line per terminal transition
-  (succeeded/failed) with model, effort, tier, wall_time, pr_url, etc.
+  ~/.mother/metrics/runs.jsonl — one schema-2 JSON line per worker run
+  (succeeded/failed/cancelled/paused/continuation), with model, effort, tier,
+  wall_time, pr_url, tokens/cost by actor and model, etc. `actual_cost_usd`
+  on the job JSON is the cumulative sum across every run.jsonl row for that
+  job — never reset by retry/escalate/continuation/adherence rework.
 
 See docs/design.md for the full design.
 EOF
@@ -3271,6 +3540,7 @@ main() {
         archive)           cmd_archive "$@" ;;
         prune-temps)       cmd_prune_temps "$@" ;;
         teardowns)         cmd_teardowns "$@" ;;
+        retro)             cmd_retro "$@" ;;
         run)               cmd_run "$@" ;;
         help|-h|--help)    cmd_help ;;
         *) _die "unknown subcommand: $sub (try: mother help)" ;;
