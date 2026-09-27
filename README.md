@@ -223,11 +223,50 @@ Manual review: `mother adherence-review <id>`.
 
 Kill switch: `MOTHER_ADHERENCE_ENABLED=0`.
 
-### Metrics
+### Metrics and cost visibility
 
-Every terminal transition appends a JSON line to `~/.mother/metrics/runs.jsonl`
-with model, effort, tier, wall_time_seconds, log_size_bytes, pr_url, and more.
+Every worker run (succeeded, failed, cancelled, paused, or continuation)
+appends a schema-2 JSON line to `~/.mother/metrics/runs.jsonl` with model,
+effort, tier, wall_time_seconds, log_size_bytes, pr_url, and — new in this
+feature — `tokens_in`/`tokens_out` scoped to *that run's own log slice*
+(not the whole job's cumulative log), `by_model`/`by_actor` breakdowns
+(main session vs. any redd/marty/perri subagents spawned), `cost_usd`
+computed from `lib/rates.json`, and `cost_complete` (false if an unpriced
+model was involved). Adherence reviews and pipeline reviewer invocations
+get their own rows (`stage: adherence` / `stage: review-<reviewer>`).
+
+A job's `actual_cost_usd` field is the cumulative sum of `cost_usd` across
+every one of its `runs.jsonl` rows — always a number, never reset by retry,
+escalation, continuation, or adherence rework. `mother list` shows it in a
+COST column (`$12.34` terminal, `~$3.10` live while running, `$4.00/10`
+when `--max-cost` is set).
+
 Query with `jq` — e.g. `jq -s 'map(.outcome) | group_by(.) | map({outcome: .[0], count: length})' ~/.mother/metrics/runs.jsonl`.
+
+**`mother retro --since 60d|2w|36h|YYYY-MM-DD [--format table|json] [--backfill]`**
+prints an 11-table retrospective (outcomes, failure reasons, escalation,
+adherence, awaiting, tokens & cost, turns & context, wall-clock, repos
+served, teardown backlog, Perri decision mix) assembled from job records,
+events, and `runs.jsonl`. `--backfill` parses historical logs for jobs that
+predate schema-2 rows into `~/.mother/metrics/usage-backfill.jsonl` (never
+`runs.jsonl` itself, so Bishop's reader is unaffected) and is idempotent.
+
+**`mother add --max-cost USD`** is enforced: a job that crosses its cap
+pauses (`awaiting`, `paused_reason: cost_cap`) via a `PreToolUse` hook that
+blocks further tool calls except `mother await`, with a post-grace
+forced-pause fallback if the hook is somehow bypassed. A job with no
+`--max-cost` is completely unaffected — no hook, no extra events, no
+behavior change. Resume a cost-capped job with
+`mother resume <id> --max-cost <usd>|none "<instructions>"`.
+
+**Env vars:**
+- `MOTHER_USAGE_CHECK_INTERVAL` (default 120s) — poll-loop live usage/cost-cap check interval.
+- `MOTHER_TOKEN_ALERT_THRESHOLD` (default 100,000,000) — cumulative job tokens that trigger one `token_alert` event and a statusline `$!N` count.
+- `MOTHER_COST_CAP_GRACE_SECONDS` (default 300) — seconds a job may stay `running` past a `--max-cost` breach before the poll loop force-pauses it.
+- `MOTHER_ADHERENCE_EFFORT` (default unset) — `--effort` for the adherence-review Archie call; unset means no flag (unchanged behavior).
+- `MOTHER_WORKER_MCP_SCOPE` (default 1) — scope every `claude` invocation's MCP servers to `templates/worker-mcp.json`, dropping the operator's personal MCP connectors from background jobs. `0` restores today's full-config behavior.
+- `MOTHER_WORKER_MCP_CONFIG` (default: plugin's `templates/worker-mcp.json`) — override the MCP allowlist file; put servers a background worker genuinely needs here.
+- `MOTHER_SHARED_RATES_PATH` (default `~/.claude/model-rates.json`) — where `mother-usage publish-rates` writes the shared rate table (consumed by Bishop).
 
 ## Reliability behaviors
 
