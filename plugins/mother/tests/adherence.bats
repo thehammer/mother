@@ -3,6 +3,8 @@
 
 load 'test_helper'
 
+FIXTURES="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd -P)/fixtures/usage"
+
 setup() {
     setup_mother_env
 
@@ -82,6 +84,70 @@ All good."
     [ "$output" = "1" ]
 
     assert_event_kind "job-pass" "adherence_reviewed"
+}
+
+# ---------------------------------------------------------------------------
+# Real stream-json result-event parsing (as opposed to the plaintext
+# MOCK_CLAUDE_STDOUT shortcut the rest of this file uses) + the resulting
+# runs.jsonl row's shape.
+
+@test "adherence-review: stream-json pass verdict writes one runs.jsonl row with stage adherence, verdict, and cost" {
+    _make_succeeded_job "job-stream-pass"
+    export MOCK_CLAUDE_STDOUT_FILE="$FIXTURES/adherence_pass_stream.jsonl"
+
+    run mother adherence-review "job-stream-pass"
+    [ "$status" -eq 0 ]
+
+    run jq -r '.adherence_status' "$JOBS_DIR/job-stream-pass.json"
+    [ "$output" = "passed" ]
+
+    local metrics_file="$MOTHER_ROOT/metrics/runs.jsonl"
+    [ -f "$metrics_file" ]
+    run bash -c "grep -F '\"job_id\":\"job-stream-pass\"' '$metrics_file' | wc -l | tr -d ' '"
+    [ "$output" = "1" ]
+
+    local row stage verdict cost
+    row=$(grep -F '"job_id":"job-stream-pass"' "$metrics_file")
+    stage=$(printf '%s' "$row" | jq -r '.stage')
+    verdict=$(printf '%s' "$row" | jq -r '.verdict')
+    cost=$(printf '%s' "$row" | jq -r '.cost_usd')
+    [ "$stage" = "adherence" ]
+    [ "$verdict" = "pass" ]
+    [ -n "$cost" ] && [ "$cost" != "null" ]
+    awk -v c="$cost" 'BEGIN { exit !(c > 0) }'
+}
+
+@test "adherence-review: conservative posture forces sonnet, row records posture_clamped:true" {
+    _make_succeeded_job "job-posture-clamp"
+
+    # Conservative posture -> archie_model clamps from opus to sonnet.
+    cat > "$_MOCK_BIN/bishop" <<'BISHOP'
+#!/usr/bin/env bash
+if [ "${1:-}" = "get" ] && [ "${2:-}" = "posture" ]; then
+    echo "conservative"
+fi
+exit 0
+BISHOP
+    chmod +x "$_MOCK_BIN/bishop"
+
+    export MOCK_CLAUDE_STDOUT_FILE="$FIXTURES/adherence_pass_stream.jsonl"
+
+    run mother adherence-review "job-posture-clamp"
+    [ "$status" -eq 0 ]
+
+    # The spawned claude argv must have actually requested sonnet, not just
+    # the metrics row saying so.
+    local argv_model
+    argv_model=$(mock_claude_flag_value "--model")
+    [ "$argv_model" = "sonnet" ]
+
+    local metrics_file="$MOTHER_ROOT/metrics/runs.jsonl"
+    local row model posture_clamped
+    row=$(grep -F '"job_id":"job-posture-clamp"' "$metrics_file")
+    model=$(printf '%s' "$row" | jq -r '.model')
+    posture_clamped=$(printf '%s' "$row" | jq -r '.posture_clamped')
+    [ "$model" = "sonnet" ]
+    [ "$posture_clamped" = "true" ]
 }
 
 # ---------------------------------------------------------------------------

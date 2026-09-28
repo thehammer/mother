@@ -538,6 +538,84 @@ CAND_EOF
     return 0
 }
 
+# _install_core_job_helpers — (re)defines iso_now/_atomic_write/_with_lock/
+# _append_line/_append_event/_job_update/_transition as a single source of
+# truth for their bodies. Bash function definitions written inside another
+# function's body still install plain, script-global functions when that
+# outer function runs (function names aren't block-scoped in bash) — so
+# calling this once here (before the SOURCE_ONLY guard, for bats) and once
+# again below (after sourcing lib/state.sh, for real execution) reinstalls
+# byte-identical definitions both times without hand-copying the function
+# bodies in two places that could silently drift apart. See the second call
+# site below for why a second call is required at all.
+#
+# Delegates to _iso_now (sourced from state.sh) so worker-written timestamps
+# match the millisecond RFC 3339 format used everywhere else in job JSON.
+_install_core_job_helpers() {
+    iso_now() { _iso_now; }
+    _atomic_write() {
+        # NB: `path` collides with zsh's special array for PATH — use _target.
+        local _target="$1" content="$2" tmp="${1}.tmp.$$"
+        printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
+    }
+    _with_lock() {
+        local target="$1"; shift
+        local lockdir="${target}.lockdir"
+        local tries=0
+        while ! mkdir "$lockdir" 2>/dev/null; do
+            sleep 0.05
+            tries=$((tries + 1))
+            [ "$tries" -gt 200 ] && { echo "mother-run-job: could not acquire lock for $target after 10s" >&2; return 1; }
+        done
+        "$@"
+        local rc=$?
+        rmdir "$lockdir" 2>/dev/null || true
+        return $rc
+    }
+    _append_line() { printf '%s\n' "$2" >> "$1"; }
+    _append_event() {
+        local kind="$1" detail="${2:-}"
+        [ -z "$detail" ] && detail='{}'
+        local ev _eventpath
+        ev=$(jq -nc --arg ts "$(iso_now)" --arg kind "$kind" --argjson detail "$detail" \
+            '{ts: $ts, kind: $kind, detail: $detail}')
+        _eventpath="$EVENTS_DIR/$id.jsonl"
+        _with_lock "$_eventpath" _append_line "$_eventpath" "$ev"
+    }
+    _job_update() {
+        local filter="$1"
+        local merged; merged=$(jq "$filter" "$job_file") || return 1
+        _atomic_write "$job_file" "$merged"
+    }
+    _transition() {
+        local new="$1" detail="${2:-}"
+        [ -z "$detail" ] && detail='{}'
+        # D2 guard: a `failed` transition must always carry a .reason. A caller
+        # that omitted one gets "unspecified" plus a failure_reason_missing
+        # event naming the caller, so "no bare failed events" holds structurally
+        # even for call sites this feature didn't audit.
+        if [ "$new" = "failed" ]; then
+            local _has_reason
+            _has_reason=$(printf '%s' "$detail" | jq -r 'has("reason")' 2>/dev/null)
+            if [ "$_has_reason" != "true" ]; then
+                detail=$(printf '%s' "$detail" | jq -c '. + {reason: "unspecified"}' 2>/dev/null) || detail='{"reason":"unspecified"}'
+                _append_event "failure_reason_missing" \
+                    "$(jq -nc --arg caller "${FUNCNAME[1]:-unknown}" '{caller: $caller}')"
+            fi
+        fi
+        _job_update ".state = \"$new\""
+        case "$new" in
+            running)    _job_update ".started_at = \"$(iso_now)\"" ;;
+            succeeded|failed|cancelled)
+                        _job_update ".finished_at = \"$(iso_now)\""
+                        _job_update ".force_start = null"
+                        type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$id" ;;
+        esac
+        _append_event "$new" "$detail"
+    }
+}
+_install_core_job_helpers
+
 # Allow sourcing helpers without running job logic (used by bats tests).
 [ "${SOURCE_ONLY:-}" = "1" ] && return 0
 
@@ -562,58 +640,33 @@ source "$MOTHER_LIB_DIR/request-types.sh"
 [ -r "$MOTHER_LIB_DIR/findings.sh" ]     && source "$MOTHER_LIB_DIR/findings.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ] && source "$MOTHER_LIB_DIR/phase-prompt.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/usage.sh" ] && source "$MOTHER_LIB_DIR/usage.sh"
+type mother_claude_extra_args >/dev/null 2>&1 || mother_claude_extra_args() { MOTHER_CLAUDE_ARGS=(); }
+type mother_usage_available   >/dev/null 2>&1 || mother_usage_available()   { return 1; }
+type mother_record_run_usage  >/dev/null 2>&1 || mother_record_run_usage() { :; }
+type mother_recompute_job_cost >/dev/null 2>&1 || mother_recompute_job_cost() { :; }
+type mother_usage_check_live  >/dev/null 2>&1 || mother_usage_check_live()  { echo "${5:-0} ${6:-0} 0 0"; }
+type mother_maybe_token_alert >/dev/null 2>&1 || mother_maybe_token_alert() { :; }
+type mother_classify_exit     >/dev/null 2>&1 || mother_classify_exit()     { jq -nc --argjson code "${3:-1}" '{reason: "claude_exit_nonzero", exit_code: $code}'; }
+
+# Re-install iso_now/_atomic_write/_with_lock/_append_line/_append_event/
+# _job_update/_transition AFTER sourcing lib/state.sh above, by calling
+# _install_core_job_helpers (defined and first called before the
+# SOURCE_ONLY guard, so bats can unit-test _transition's D2 guard via
+# SOURCE_ONLY=1 sourcing without pulling in the rest of this script's
+# job-execution logic). A second call is required here because state.sh
+# defines its own same-named _job_update/_atomic_write (different signature:
+# 2-arg, id-keyed) that would otherwise win by sourcing-order and silently
+# break every single-arg `_job_update "<filter>"` call below. Re-running
+# _install_core_job_helpers restores this script's 1-arg convention for real
+# (non-SOURCE_ONLY) execution; the first call (before the guard) only ever
+# matters for SOURCE_ONLY=1 test sourcing, since real execution always passes
+# through the guard before reaching here.
+_install_core_job_helpers
 
 mother_cli="$MOTHER_BIN_DIR/mother"
 
-# Delegate to _iso_now (sourced from state.sh) so worker-written timestamps
-# match the millisecond RFC 3339 format used everywhere else in job JSON.
-iso_now() { _iso_now; }
-_atomic_write() {
-    # NB: `path` collides with zsh's special array for PATH — use _target.
-    local _target="$1" content="$2" tmp="${1}.tmp.$$"
-    printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
-}
-_with_lock() {
-    local target="$1"; shift
-    local lockdir="${target}.lockdir"
-    local tries=0
-    while ! mkdir "$lockdir" 2>/dev/null; do
-        sleep 0.05
-        tries=$((tries + 1))
-        [ "$tries" -gt 200 ] && { echo "mother-run-job: could not acquire lock for $target after 10s" >&2; return 1; }
-    done
-    "$@"
-    local rc=$?
-    rmdir "$lockdir" 2>/dev/null || true
-    return $rc
-}
-_append_line() { printf '%s\n' "$2" >> "$1"; }
-_append_event() {
-    local kind="$1" detail="${2:-}"
-    [ -z "$detail" ] && detail='{}'
-    local ev _eventpath
-    ev=$(jq -nc --arg ts "$(iso_now)" --arg kind "$kind" --argjson detail "$detail" \
-        '{ts: $ts, kind: $kind, detail: $detail}')
-    _eventpath="$EVENTS_DIR/$id.jsonl"
-    _with_lock "$_eventpath" _append_line "$_eventpath" "$ev"
-}
-_job_update() {
-    local filter="$1"
-    local merged; merged=$(jq "$filter" "$job_file") || return 1
-    _atomic_write "$job_file" "$merged"
-}
-_transition() {
-    local new="$1" detail="${2:-}"
-    [ -z "$detail" ] && detail='{}'
-    _job_update ".state = \"$new\""
-    case "$new" in
-        running)    _job_update ".started_at = \"$(iso_now)\"" ;;
-        succeeded|failed|cancelled)
-                    _job_update ".finished_at = \"$(iso_now)\""
-                    _job_update ".force_start = null" ;;
-    esac
-    _append_event "$new" "$detail"
-}
 
 # Safety net: if we die before reaching a clean terminal transition (lock
 # acquisition failure under set -u, missing tool, killed by signal, etc.),
@@ -1095,6 +1148,34 @@ wrapper="$RUNNER_DIR/$id.wrap"
 # state.sh). Computed here, not inside the heredoc, so it interpolates at
 # generation time like $branch/$worker_agent below.
 compose_project=$(mother_compose_project "$id")
+
+# --effort + MCP-scope args (lib/usage.sh). Rendered at generation time
+# (the wrapper is a plain generated script, not a live shell) with printf
+# '%q' so quoting stays sane regardless of what the args contain.
+mother_claude_extra_args "$worker_effort" worker
+extra_claude_args_quoted=""
+if [ "${#MOTHER_CLAUDE_ARGS[@]}" -gt 0 ]; then
+    for _extra_arg in "${MOTHER_CLAUDE_ARGS[@]}"; do
+        extra_claude_args_quoted="$extra_claude_args_quoted $(printf '%q' "$_extra_arg")"
+    done
+fi
+
+# --max-cost enforcement (F3): only when the job has a cap. Writes a
+# job-scoped Claude settings file wiring the PreToolUse cost-gate hook, and
+# clears any stale cost-cap flag left over from a previous poll cycle.
+max_cost_usd=$(jq -r '.max_cost_usd // empty' "$job_file" 2>/dev/null)
+cost_cap_flag="$RUNNER_DIR/$id.cost-cap"
+rm -f "$cost_cap_flag"
+settings_args_quoted=""
+if [ -n "$max_cost_usd" ]; then
+    settings_file="$RUNNER_DIR/$id.settings.json"
+    cost_gate_hook="$MOTHER_LIB_DIR/../hooks/mother-cost-gate.sh"
+    jq -n --arg cmd "$cost_gate_hook" \
+        '{hooks: {PreToolUse: [{matcher: "*", hooks: [{type: "command", command: $cmd}]}]}}' \
+        > "$settings_file" 2>/dev/null
+    settings_args_quoted=" $(printf '%q' --settings) $(printf '%q' "$settings_file")"
+fi
+
 cat > "$wrapper" <<WRAP
 #!/usr/bin/env bash
 cd "$work_dir"
@@ -1103,6 +1184,7 @@ exec > >(tee -a "$log_path") 2>&1
 # "..."\` without bookkeeping. Without this, the agent has no clean way to
 # discover which job it belongs to.
 export MOTHER_JOB_ID="$id"
+export MOTHER_ROOT="$MOTHER_ROOT"
 # Docker Compose reads COMPOSE_PROJECT_NAME automatically, so any
 # `docker compose up` the worker runs lands in a job-scoped project with
 # zero convention-following required by the plan or the agent. Mother tears
@@ -1137,7 +1219,7 @@ _forward_signal() {
     [ -n "\$claude_pid" ] && kill -TERM "\$claude_pid" 2>/dev/null || true
 }
 trap _forward_signal TERM INT
-claude --dangerously-skip-permissions --agent "$worker_agent" --model "$worker_model" --session-id "$session_id" -p "\$(cat "$resolved_plan_path")" --output-format stream-json --verbose &
+claude --dangerously-skip-permissions --agent "$worker_agent" --model "$worker_model"$extra_claude_args_quoted$settings_args_quoted --session-id "$session_id" -p "\$(cat "$resolved_plan_path")" --output-format stream-json --verbose &
 claude_pid=\$!
 # wait may be interrupted by the trap (signal raises EINTR and bash returns
 # 128+sig); loop until claude is actually gone before recording its real
@@ -1152,26 +1234,40 @@ echo "\$rc" > "$marker_file"
 WRAP
 chmod +x "$wrapper"
 
-nohup bash "$wrapper" >/dev/null 2>&1 &
-worker_pid=$!
-disown 2>/dev/null || true
-_job_update ".worker_pid = $worker_pid"
-_append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" '{pid: $pid, session_id: $sid}')"
-
-# Capture the log file's size at spawn time. The wrapper tees to $log_path
-# with `-a`, so on resume cycles the file already contains content from
-# previous runs (one per pause/resume). The result-event detector in the
-# poll loop below uses this offset to ignore content older than this run
-# — without it, the resumed worker's poll loop would see the previous
-# run's `result` event (the one emitted around the `mother await` call)
-# and immediately start the post-result-grace timer, reaping the worker
-# 5 min later regardless of what it's actually doing.
+# Capture the log file's size BEFORE spawning (moved ahead of the nohup
+# below so `.current_run.log_offset` — used by orphan recovery to record a
+# usage row for a dead run — always reflects this run's true starting
+# offset, never a byte written by the process we're about to start). The
+# wrapper tees to $log_path with `-a`, so on resume cycles the file already
+# contains content from previous runs (one per pause/resume). The
+# result-event detector in the poll loop below uses this offset to ignore
+# content older than this run — without it, the resumed worker's poll loop
+# would see the previous run's `result` event (the one emitted around the
+# `mother await` call) and immediately start the post-result-grace timer,
+# reaping the worker 5 min later regardless of what it's actually doing.
 log_offset_at_spawn=0
 if [ -f "$log_path" ]; then
     log_offset_at_spawn=$(stat -f %z "$log_path" 2>/dev/null \
         || stat -c %s "$log_path" 2>/dev/null \
         || echo 0)
 fi
+
+nohup bash "$wrapper" >/dev/null 2>&1 &
+worker_pid=$!
+disown 2>/dev/null || true
+_job_update ".worker_pid = $worker_pid"
+_job_update ".current_run = {\"log_offset\": $log_offset_at_spawn, \"spawned_at\": \"$(iso_now)\", \"session_id\": \"$session_id\"}"
+_append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" '{pid: $pid, session_id: $sid}')"
+
+# Live usage checks (F1/F2/F3): baseline spend/tokens read once at spawn.
+usage_state_file="$RUNNER_DIR/$id.usage-state.json"
+rm -f "$usage_state_file"
+prior_spend=$(jq -r '.actual_cost_usd // 0' "$job_file" 2>/dev/null); : "${prior_spend:=0}"
+prior_tokens=$(jq -r '.actual_tokens // 0' "$job_file" 2>/dev/null); : "${prior_tokens:=0}"
+case "$prior_tokens" in ''|*[!0-9]*) prior_tokens=0 ;; esac
+last_usage_check_epoch=0
+cost_cap_breached=0
+usage_main_actor="${phase_agent:-cody}-main"
 
 # Reaper tunables. RESULT_GRACE_SECONDS is how long we let the worker linger
 # after we observe a top-level "result" event in the stream-json log before
@@ -1292,6 +1388,67 @@ while [ ! -f "$marker_file" ]; do
         fi
     fi
 
+    # Live usage checks (F1-F3): token alert + --max-cost enforcement.
+    # Runs at most once every MOTHER_USAGE_CHECK_INTERVAL seconds (default
+    # 120), and only once the log file exists.
+    _usage_check_interval="${MOTHER_USAGE_CHECK_INTERVAL:-120}"
+    _now_epoch=$(date +%s)
+    if [ -f "$log_path" ] && [ $((_now_epoch - last_usage_check_epoch)) -ge "$_usage_check_interval" ]; then
+        last_usage_check_epoch=$_now_epoch
+        read -r job_spend job_tokens _run_cost _run_tokens <<USAGE_EOF
+$(mother_usage_check_live "$id" "$log_path" "$log_offset_at_spawn" "$usage_state_file" "$prior_spend" "$prior_tokens" "$usage_main_actor")
+USAGE_EOF
+        : "${job_spend:=$prior_spend}" "${job_tokens:=$prior_tokens}"
+        _job_update ".live_cost_usd = ${job_spend:-0} | .live_tokens = ${job_tokens:-0}"
+
+        _token_alert_threshold="${MOTHER_TOKEN_ALERT_THRESHOLD:-100000000}"
+        if [ "${job_tokens:-0}" -gt "$_token_alert_threshold" ] \
+            && [ -z "$(jq -r '.token_alert_at // empty' "$job_file" 2>/dev/null)" ]; then
+            _job_update ".token_alert_at = \"$(iso_now)\""
+            _append_event "token_alert" "$(jq -nc --argjson tokens "${job_tokens:-0}" --arg cost "${job_spend:-0}" --argjson threshold "$_token_alert_threshold" '{tokens: $tokens, cost_usd: ($cost | tonumber), threshold: $threshold}')"
+            echo "job $id: TOKEN ALERT — ${job_tokens} tokens (threshold ${_token_alert_threshold}), cost \$${job_spend}"
+        fi
+
+        if [ -n "$max_cost_usd" ] && [ "$cost_cap_breached" -eq 0 ]; then
+            _over_cap=$(awk -v s="${job_spend:-0}" -v m="$max_cost_usd" 'BEGIN { print (s+0 >= m+0) ? 1 : 0 }' 2>/dev/null)
+            [ -n "$_over_cap" ] || _over_cap=0
+            if [ "$_over_cap" = "1" ]; then
+                cost_cap_breached=1
+                cost_cap_breach_epoch=$_now_epoch
+                _cap_by_actor='{}'
+                _cap_by_model='{}'
+                if mother_usage_available; then
+                    _cap_parsed=$(python3 "$MOTHER_USAGE_BIN" parse --log "$log_path" --offset "$log_offset_at_spawn" \
+                        --state "$usage_state_file" --main-actor "$usage_main_actor" 2>/dev/null)
+                    _cap_by_actor=$(printf '%s' "$_cap_parsed" | jq -c '.by_actor // {}' 2>/dev/null)
+                    _cap_by_model=$(printf '%s' "$_cap_parsed" | jq -c '.by_model // {}' 2>/dev/null)
+                    [ -n "$_cap_by_actor" ] || _cap_by_actor='{}'
+                    [ -n "$_cap_by_model" ] || _cap_by_model='{}'
+                fi
+                _cap_summary="Mother cost cap reached on job $id: spent \$${job_spend} of the \$${max_cost_usd} cap across all runs. Per-actor breakdown: ${_cap_by_actor}. Per-model breakdown: ${_cap_by_model}. Total tokens: ${job_tokens}. To continue: mother resume $id --max-cost <usd> \"<instructions>\". To stop: mother cancel $id."
+                printf '%s\n' "$_cap_summary" > "$cost_cap_flag"
+                _job_update ".cost_cap_breached_at = \"$(iso_now)\""
+                _append_event "cost_cap_breached" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" --argjson by_actor "$_cap_by_actor" --argjson by_model "$_cap_by_model" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber), by_actor: $by_actor, by_model: $by_model}')"
+            fi
+        fi
+
+        # Fallback: if the hook somehow didn't stop the worker, force a
+        # pause MOTHER_COST_CAP_GRACE_SECONDS after the breach.
+        if [ "$cost_cap_breached" -eq 1 ] && [ "$(jq -r '.state' "$job_file" 2>/dev/null)" = "running" ]; then
+            _grace="${MOTHER_COST_CAP_GRACE_SECONDS:-300}"
+            if [ $((_now_epoch - cost_cap_breach_epoch)) -ge "$_grace" ]; then
+                _cap_summary=$(cat "$cost_cap_flag" 2>/dev/null || echo "Mother cost cap reached on job $id.")
+                _cc_merged=$(jq --arg q "$_cap_summary" --arg ts "$(iso_now)" \
+                    '.state = "awaiting" | .question = $q | .paused_at = $ts | .paused_reason = "cost_cap"' \
+                    "$job_file") && _atomic_write "$job_file" "$_cc_merged"
+                _append_event "cost_cap_forced_pause" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber)}')"
+                _append_event "awaiting_input" "$(jq -nc --arg q "$_cap_summary" '{question: $q, paused_reason: "cost_cap"}')"
+                _terminate_worker
+                break
+            fi
+        fi
+    fi
+
     # Layer 1 — result observed + grace window expired. The worker has
     # signalled completion and then sat idle past the patience threshold;
     # force it down and treat the job as succeeded (with metadata noting
@@ -1393,7 +1550,15 @@ current_state=$(jq -r '.state' "$job_file" 2>/dev/null)
 if [ "$current_state" = "awaiting" ]; then
     _append_event "worker_exited_paused" \
         "$(jq -nc --arg pr "${pr_url:-}" '{pr_url: $pr}')"
-    rm -f "$marker_file" "$wrapper" "$spawn_prompt"
+    _paused_reason=$(jq -r '.paused_reason // "user"' "$job_file" 2>/dev/null)
+    mother_record_run_usage "$id" "paused" "$log_path" "$log_offset_at_spawn" "" \
+        "${phase_agent:-cody}" "$usage_main_actor" "worker" \
+        "$(jq -nc --arg model "$worker_model" --arg effort "$worker_effort" --arg tier "$current_tier" \
+            --argjson retry_count "$(jq -r '.retry_count // 0' "$job_file" 2>/dev/null)" \
+            --argjson escalation_count "${escalation_count:-0}" \
+            --arg pr_url "${pr_url:-}" --arg paused_reason "$_paused_reason" \
+            '{model: $model, effort: $effort, tier: $tier, retry_count: $retry_count, escalation_count: $escalation_count, pr_url: $pr_url, paused_reason: $paused_reason}')"
+    rm -f "$marker_file" "$wrapper" "$spawn_prompt" "$usage_state_file"
     # The runner_died_early trap only fires while state == "running"; awaiting
     # is safe by virtue of that, but disarm anyway for clarity.
     trap - EXIT
@@ -1459,7 +1624,6 @@ _attempt_continuation() {
         | .state = "ready"
         | .finished_at = null
         | .worker_pid = null
-        | .actual_cost_usd = null
         | .cancel_requested = null
         | .pause_requested = null
         | .final_result_at = null
@@ -1492,49 +1656,15 @@ _attempt_continuation() {
 # guard, alongside the other PR-detection helpers) so bats can unit-test it
 # via SOURCE_ONLY=1 sourcing. See that definition for the full contract.
 
-# Metrics log: append a record to ~/.mother/metrics/runs.jsonl on every
-# terminal transition. One JSON line per stage outcome.
+# Metrics log: append a schema-2 row to ~/.mother/metrics/runs.jsonl on every
+# terminal transition (and on the paused/awaiting exit path above). One row
+# per worker run — see lib/usage.sh's mother_record_run_usage for the schema.
 METRICS_DIR="$MOTHER_ROOT/metrics"
 mkdir -p "$METRICS_DIR"
-_metrics_file="$METRICS_DIR/runs.jsonl"
-
-# Sum input/output tokens across the worker transcript. Echoes
-# "<tokens_in> <tokens_out>". Echoes "null null" if the log is
-# absent, empty, or yields no usage data. Never fails the caller.
-#
-# tokens_in  = sum of input_tokens + cache_creation_input_tokens
-#              + cache_read_input_tokens (all count against quota)
-# tokens_out = sum of output_tokens
-#
-# De-duplicates assistant events by .message.id — stream-json emits
-# multiple events per assistant message (content-block deltas), each
-# carrying the same final usage object, so naive summation would
-# double/triple-count. One usage object per distinct message.id.
-_sum_tokens() {
-    local lp="$1"
-    [ -n "$lp" ] && [ -s "$lp" ] || { echo "null null"; return 0; }
-    # Tolerate the plaintext banner lines: fromjson? // empty drops
-    # non-JSON. De-dup assistant events by message.id (stream-json
-    # repeats the same id with identical usage). Sum cached + uncached
-    # input; sum output.
-    local out
-    out=$(jq -rR 'fromjson? // empty
-              | select(.type == "assistant" and .message.usage != null)
-              | {id: .message.id, u: .message.usage}' "$lp" 2>/dev/null \
-        | jq -rs 'if length == 0 then "null null"
-              else group_by(.id) | map(.[0].u)
-                   | { ti: (map((.input_tokens//0)
-                              + (.cache_creation_input_tokens//0)
-                              + (.cache_read_input_tokens//0)) | add // 0),
-                       to: (map(.output_tokens//0) | add // 0) }
-                   | "\(.ti) \(.to)"
-              end' 2>/dev/null)
-    if [ -z "$out" ]; then echo "null null"; return 0; fi
-    echo "$out"
-}
 
 _append_metrics() {
-    local outcome="$1"
+    local outcome="$1" extra_detail="${2:-}"
+    [ -z "$extra_detail" ] && extra_detail='{}'
     local now_epoch; now_epoch=$(date +%s)
     local started_epoch=0
     local started_at_raw; started_at_raw=$(jq -r '.started_at // empty' "$job_file" 2>/dev/null)
@@ -1551,41 +1681,33 @@ _append_metrics() {
         || stat -c %s "$log_path" 2>/dev/null || echo 0)
     local retry_count; retry_count=$(jq -r '.retry_count // 0' "$job_file" 2>/dev/null)
     local esc_count_val; esc_count_val=$(jq -r '.escalation_count // 0' "$job_file" 2>/dev/null)
-    local tokens_in tokens_out
-    read -r tokens_in tokens_out <<< "$(_sum_tokens "${log_path:-}")"
-    : "${tokens_in:=null}" "${tokens_out:=null}"
-    local line
-    line=$(jq -nc \
-        --arg ts "$(iso_now)" \
-        --arg job_id "$id" \
-        --arg stage "${phase_agent:-cody}" \
+
+    local extra
+    extra=$(jq -nc \
         --arg model "$worker_model" \
         --arg effort "$worker_effort" \
         --arg tier "$current_tier" \
-        --arg outcome "$outcome" \
         --argjson retry_count "${retry_count:-0}" \
         --argjson escalation_count "${esc_count_val:-0}" \
         --argjson wall_time_seconds "$wall_time" \
         --argjson log_size_bytes "${log_size:-0}" \
-        --argjson tokens_in "$tokens_in" \
-        --argjson tokens_out "$tokens_out" \
         --arg pr_url "${pr_url:-}" \
         --arg posture_at_spawn "${posture_at_spawn:-normal}" \
         --arg posture_bias_applied "${posture_bias_applied:-none}" \
+        --argjson extra_detail "$extra_detail" \
         '{
-            ts: $ts, job_id: $job_id, stage: $stage,
             model: $model, effort: $effort, tier: $tier,
-            outcome: $outcome, retry_count: $retry_count,
+            retry_count: $retry_count,
             escalation_count: $escalation_count,
             wall_time_seconds: $wall_time_seconds,
             log_size_bytes: $log_size_bytes,
-            tokens_in: $tokens_in,
-            tokens_out: $tokens_out,
             pr_url: $pr_url,
             posture_at_spawn: $posture_at_spawn,
             posture_bias_applied: $posture_bias_applied
-        }')
-    _with_lock "$_metrics_file" _append_line "$_metrics_file" "$line"
+        } + $extra_detail')
+
+    mother_record_run_usage "$id" "$outcome" "$log_path" "$log_offset_at_spawn" "" \
+        "${phase_agent:-cody}" "$usage_main_actor" "worker" "$extra"
 }
 
 # Stale-supervisor guard: if a resume cycle updated worker_pid in the job
@@ -1601,8 +1723,11 @@ if [ "$_final_wpid" != "$worker_pid" ]; then
     exit 0
 fi
 
-# Final transition.
+# Final transition. Usage rows are recorded BEFORE the terminal _transition
+# call so that _transition's cost recompute (see lib/usage.sh / _transition
+# below) includes this run's row.
 if [ "$cancel_requested" -eq 1 ]; then
+    _append_metrics "cancelled" '{}'
     _transition cancelled "$(jq -nc '{reason: "user"}')"
 elif [ -n "$reaped_reason" ]; then
     # We forced the worker down via one of the reap heuristics. If we'd
@@ -1613,31 +1738,37 @@ elif [ -n "$reaped_reason" ]; then
     # first; fall back to failed if the continuation cap is reached.
     if [ "$final_result_epoch" -gt 0 ]; then
         if _verify_artifact_or_fail; then
+            _append_metrics "succeeded" "$(jq -nc --arg reason "$reaped_reason" '{reaped: $reason}')"
             _transition succeeded "$(jq -nc --arg pr "$pr_url" --arg reason "$reaped_reason" '{pr_url: $pr, reaped: $reason}')"
-            _append_metrics "succeeded"
+        else
+            _append_metrics "failed" "$(jq -nc --arg reason "$reaped_reason" '{reaped: $reason}')"
         fi
     elif [ "$reaped_reason" = "idle_timeout" ] && _attempt_continuation "$reaped_reason"; then
         # Continuation queued — don't transition to failed; the re-queued
         # worker will handle the terminal transition.
-        _append_metrics "continuation"
+        _append_metrics "continuation" "$(jq -nc --arg reason "$reaped_reason" '{reaped: $reason}')"
     else
-        _transition failed "$(jq -nc --arg reason "$reaped_reason" '{reason: $reason}')"
-        _append_metrics "failed"
+        _fail_detail=$(jq -nc --arg reason "$reaped_reason" '{reason: $reason}')
+        _append_metrics "failed" "$_fail_detail"
+        _transition failed "$_fail_detail"
     fi
 elif [ "$exit_code" = "0" ]; then
     if _verify_artifact_or_fail; then
+        _append_metrics "succeeded" '{}'
         _transition succeeded "$(jq -nc --arg pr "$pr_url" '{pr_url: $pr}')"
-        _append_metrics "succeeded"
     else
         # _verify_artifact_or_fail already transitioned to failed.
-        _append_metrics "failed"
+        _append_metrics "failed" '{}'
     fi
 else
-    _transition failed "$(jq -nc --argjson code "$exit_code" '{exit_code: $code}')"
-    _append_metrics "failed"
+    _classified=$(mother_classify_exit "$log_path" "$log_offset_at_spawn" "$exit_code" 2>/dev/null)
+    [ -n "$_classified" ] || _classified=$(jq -nc --argjson code "$exit_code" '{reason: "claude_exit_nonzero", exit_code: $code}')
+    _fail_detail2=$(printf '%s' "$_classified" | jq -c --argjson code "$exit_code" '. + {exit_code: $code}')
+    _append_metrics "failed" "$_fail_detail2"
+    _transition failed "$_fail_detail2"
 fi
 
-rm -f "$marker_file" "$wrapper"
+rm -f "$marker_file" "$wrapper" "$usage_state_file"
 # Clean exit — disarm the runner_died_early safety net.
 trap - EXIT
 echo "job $id finished: $(jq -r .state "$job_file")"

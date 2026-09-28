@@ -1,0 +1,3 @@
+=== mother job job-err2 starting at Thu Jan  1 00:00:00 UTC 2026 ===
+{"type":"assistant","message":{"id":"msg_e2","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":20}}}
+Error: 429 rate limit exceeded, please retry later

@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_adh1","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":150}}}
+{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.0115,"result":"ADHERENCE: pass\nNOTES:\nAll good.","modelUsage":{"claude-sonnet-5":{"costUSD":0.0115,"inputTokens":1000,"outputTokens":150}}}

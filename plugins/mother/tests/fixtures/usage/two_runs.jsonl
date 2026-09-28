@@ -1,0 +1,4 @@
+=== mother job job-two starting at RUN1 ===
+{"type":"assistant","message":{"id":"msg_t1","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":10}}}
+=== mother job job-two starting at RUN2 ===
+{"type":"assistant","message":{"id":"msg_t2","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":9999,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":999}}}

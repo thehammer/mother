@@ -1,0 +1,4 @@
+=== mother job job-corrupt starting at Thu Jan  1 00:00:00 UTC 2026 ===
+{"type":"assistant","message":{"id":"msg_c1","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":20}}}
+{invalid json here, not even close to parseable
+{"type":"assistant","message":{"id":"msg_c2","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":30}}}
