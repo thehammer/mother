@@ -94,20 +94,6 @@ Initial scaffolding for the Mother plugin.
   a regression. `actual_cost_usd` is the sum of a job's `runs.jsonl` rows and
   is always a number (0, never null) once a job reaches a terminal state.
 
-### Fixed
-
-- Reverted an unplanned mid-implementation change that replaced per-turn
-  `tokens_in`/`tokens_out`/`cost_usd` totals with the run's own `result` event
-  usage whenever it reported more output tokens than the per-turn sum. Per
-  plan decision, the `result` event is used ONLY for the separate
-  `cli_cost_usd` field (calibration/drift, never folded into totals) — the
-  swap-in behavior made the rate-table calibration circular (comparing the
-  CLI's own numbers against themselves) and risked reintroducing a
-  double-count on any session where `modelUsage` turns out to be cumulative
-  rather than per-run rather than per-turn. `mother-usage parse`'s totals are
-  now unconditionally the per-turn `assistant`-event sums, matching the
-  original plan and the (unmodified) `metrics.bats` behavioral cases.
-
 ### Known limitation — output-token accounting undercounts true spend
 
 Per-turn stream-json `usage.output_tokens` reliably matches the CLI's own

@@ -170,6 +170,14 @@ CLAUDE2
     [ "$row2_schema" = "2" ]
     [ "$row2_tokens_in" = "700" ]
     [ "$row2_tokens_out" = "80" ]
+
+    # The job's actual_cost_usd must equal the sum of cost_usd across BOTH
+    # rows, not just the latest run's — this is the "cost is always
+    # populated" / "one row per run" acceptance criterion end-to-end.
+    local rows_cost_sum job_actual_cost
+    rows_cost_sum=$(_metrics_rows_for "$id" | jq -s '[.[] | (.cost_usd // 0)] | add')
+    job_actual_cost=$(jq -r '.actual_cost_usd' "$JOBS_DIR/$id.json")
+    awk -v sum="$rows_cost_sum" -v job="$job_actual_cost" 'BEGIN { d = sum - job; if (d < 0) d = -d; exit !(d < 0.000001) }'
 }
 
 # ---------------------------------------------------------------------------

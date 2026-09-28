@@ -6,8 +6,8 @@ by `tests/usage.bats` and `tests/metrics.bats`. Rates below are from
 
 | model | input | output | cache_read | cache_write_5m | cache_write_1h |
 |---|---|---|---|---|---|
-| claude-sonnet-5 | 2.00 | 10.00 | 0.20 | 2.50 | 4.00 |
-| claude-opus-5-5 | 4.00 | 20.00 | 0.40 | 5.00 | 8.00 |
+| claude-sonnet-5 | 2.00 | 10.00 | 0.20 | 2.50 | 2.50 |
+| claude-opus-5-5 | 4.00 | 20.00 | 0.40 | 5.00 | 5.00 |
 
 `claude-made-up-9` intentionally has no entry in `rates.json` — used to exercise
 `cost_complete: false` / `unpriced_models`.

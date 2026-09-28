@@ -160,13 +160,6 @@ def _new_agg():
         "result": None,
         "init": None,
         "unpriced_models": set(),
-        # Authoritative end-of-run totals from the last `result` event's own
-        # usage/modelUsage fields, if any were seen. See the long comment on
-        # _apply_result_correction below for why these override the per-turn
-        # assistant-event sums for OUTPUT tokens specifically.
-        "result_model_usage": None,
-        "result_usage": None,
-        "last_model_seen": None,
     }
 
 
@@ -235,16 +228,6 @@ def process_event(agg, obj, main_actor, rates):
             )
         elif isinstance(tcu, (int, float)):
             agg["cli_cost_usd"] = tcu
-        # Authoritative totals for this run — see _apply_result_correction.
-        # "Last result event wins" when a slice somehow contains more than
-        # one (observed in practice for nested/background task-notification
-        # result frames within a single run); the last one reflects the most
-        # complete accounting.
-        if isinstance(mu, dict) and mu:
-            agg["result_model_usage"] = mu
-        usage = obj.get("usage")
-        if isinstance(usage, dict) and usage:
-            agg["result_usage"] = usage
         return
 
     if etype != "assistant":
@@ -255,8 +238,6 @@ def process_event(agg, obj, main_actor, rates):
     usage = msg.get("usage")
     model = msg.get("model")
     parent = obj.get("parent_tool_use_id")
-    if model:
-        agg["last_model_seen"] = model
 
     # Register any subagent spawns this message makes, regardless of usage
     # presence — the tool_use block appears on the SAME message as the usage
@@ -456,9 +437,6 @@ def _save_state(path, agg, cursor):
         "result": agg["result"],
         "init": agg["init"],
         "unpriced_models": sorted(agg["unpriced_models"]),
-        "result_model_usage": agg["result_model_usage"],
-        "result_usage": agg["result_usage"],
-        "last_model_seen": agg["last_model_seen"],
     }
     tmp = f"{path}.tmp.{os.getpid()}"
     try:
@@ -491,9 +469,6 @@ def _agg_from_state(raw):
     agg["cli_cost_usd"] = raw.get("cli_cost_usd")
     agg["result"] = raw.get("result")
     agg["init"] = raw.get("init")
-    agg["result_model_usage"] = raw.get("result_model_usage")
-    agg["result_usage"] = raw.get("result_usage")
-    agg["last_model_seen"] = raw.get("last_model_seen")
     agg["unpriced_models"] = set(raw.get("unpriced_models", []))
     return agg
 
@@ -1257,6 +1232,7 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
         "total_median": statistics.median(totals) if totals else None,
         "total_p90": _percentile(totals, 90) if totals else None,
         "queue_wait_median": statistics.median(queue_waits) if queue_waits else None,
+        "queue_wait_p90": _percentile(queue_waits, 90) if queue_waits else None,
         "dependency_wait_median": statistics.median(dep_waits) if dep_waits else None,
         "quota_pause_median": statistics.median(quota_waits) if quota_waits else None,
         "quota_pause_p90": _percentile(quota_waits, 90) if quota_waits else None,
@@ -1444,6 +1420,20 @@ def _coverage_line(key, data, tables):
             return f"escalated jobs: {data.get('escalated_total', 0)} of {total_jobs}"
     if key == "teardown":
         return f"pending records: {data.get('pending_count', 0)}"
+    if key == "failure_reasons":
+        occurrences = sum(v.get("occurrences", 0) for v in data.values())
+        failed_jobs = outcomes.get("failed", 0)
+        return f"failure events: {occurrences} across {failed_jobs} failed job(s) in window"
+    if key == "awaiting":
+        episodes = sum(v.get("episodes", 0) for v in (data.get("by_reason") or {}).values())
+        return f"pause episodes: {episodes} of {total_jobs or 0} jobs in window"
+    if key == "repos":
+        jobs_covered = sum(v.get("jobs", 0) for v in data.values())
+        return f"{jobs_covered} of {total_jobs or 0} jobs across {len(data)} repo(s)"
+    if key == "perri_decisions":
+        reviews = sum(data.get("decision_mix", {}).values())
+        spawns = data.get("perri_subagent_spawns_non_pipeline", 0)
+        return f"pipeline perri reviews: {reviews}; subagent spawns (non-pipeline): {spawns}"
     return None
 
 
