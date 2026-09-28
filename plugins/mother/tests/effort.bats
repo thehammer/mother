@@ -256,3 +256,56 @@ All good."
 
     ! _argv_has_flag "--effort"
 }
+
+# ---------------------------------------------------------------------------
+# MOTHER_WORKER_MCP_SCOPE — mother_claude_extra_args's --strict-mcp-config /
+# --mcp-config passthrough (lib/usage.sh). Same argv-only assertion
+# discipline as the --effort tests above.
+
+_make_mcp_scope_job() {
+    local id="$1"
+    _seed_branch "feature/test-$id"
+    make_job "$id" "ready" \
+        '.isolation = "main-dir"
+         | .repo_path = "'"$TEST_REPO_DIR"'"
+         | .base_ref = "main"
+         | .branch = "feature/test-'"$id"'"
+         | .no_pr = true
+         | .plan_path = "'"$MOTHER_ROOT/plans/$id.md"'"
+         | .log_path = "'"$LOGS_DIR/$id.log"'"
+         | .suggested_config = {
+               "cody":  {"model":"sonnet","effort":"medium","rationale":"test"},
+               "redd":  {"model":"sonnet","effort":"medium","rationale":"test"},
+               "marty": {"model":"sonnet","effort":"medium","rationale":"test"},
+               "perri": {"model":"sonnet","effort":"medium","rationale":"test"}
+           }'
+    mkdir -p "$MOTHER_ROOT/plans"
+    make_plan "$MOTHER_ROOT/plans/$id.md"
+    touch "$LOGS_DIR/$id.log"
+}
+
+@test "MOTHER_WORKER_MCP_SCOPE unset (default): --strict-mcp-config and --mcp-config reach claude argv" {
+    local id="mcp-scope-default"
+    _make_mcp_scope_job "$id"
+
+    unset MOTHER_WORKER_MCP_SCOPE
+
+    rm -f "$MOCK_CLAUDE_ARGS_FILE"
+    run mother-run-job "$id"
+
+    _argv_has_flag "--strict-mcp-config"
+    _argv_has_flag "--mcp-config"
+}
+
+@test "MOTHER_WORKER_MCP_SCOPE=0: neither --strict-mcp-config nor --mcp-config reach claude argv" {
+    local id="mcp-scope-off"
+    _make_mcp_scope_job "$id"
+
+    export MOTHER_WORKER_MCP_SCOPE=0
+
+    rm -f "$MOCK_CLAUDE_ARGS_FILE"
+    run mother-run-job "$id"
+
+    ! _argv_has_flag "--strict-mcp-config"
+    ! _argv_has_flag "--mcp-config"
+}

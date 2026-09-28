@@ -1455,16 +1455,19 @@ USAGE_EOF
                 cost_cap_breached=1
                 cost_cap_breach_epoch=$_now_epoch
                 _cap_by_actor='{}'
+                _cap_by_model='{}'
                 if mother_usage_available; then
-                    _cap_by_actor=$(python3 "$MOTHER_USAGE_BIN" parse --log "$log_path" --offset "$log_offset_at_spawn" \
-                        --state "$usage_state_file" --main-actor "$usage_main_actor" 2>/dev/null \
-                        | jq -c '.by_actor // {}' 2>/dev/null)
+                    _cap_parsed=$(python3 "$MOTHER_USAGE_BIN" parse --log "$log_path" --offset "$log_offset_at_spawn" \
+                        --state "$usage_state_file" --main-actor "$usage_main_actor" 2>/dev/null)
+                    _cap_by_actor=$(printf '%s' "$_cap_parsed" | jq -c '.by_actor // {}' 2>/dev/null)
+                    _cap_by_model=$(printf '%s' "$_cap_parsed" | jq -c '.by_model // {}' 2>/dev/null)
                     [ -n "$_cap_by_actor" ] || _cap_by_actor='{}'
+                    [ -n "$_cap_by_model" ] || _cap_by_model='{}'
                 fi
-                _cap_summary="Mother cost cap reached on job $id: spent \$${job_spend} of the \$${max_cost_usd} cap across all runs. Per-actor breakdown: ${_cap_by_actor}. Total tokens: ${job_tokens}. To continue: mother resume $id --max-cost <usd> \"<instructions>\". To stop: mother cancel $id."
+                _cap_summary="Mother cost cap reached on job $id: spent \$${job_spend} of the \$${max_cost_usd} cap across all runs. Per-actor breakdown: ${_cap_by_actor}. Per-model breakdown: ${_cap_by_model}. Total tokens: ${job_tokens}. To continue: mother resume $id --max-cost <usd> \"<instructions>\". To stop: mother cancel $id."
                 printf '%s\n' "$_cap_summary" > "$cost_cap_flag"
                 _job_update ".cost_cap_breached_at = \"$(iso_now)\""
-                _append_event "cost_cap_breached" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" --argjson by_actor "$_cap_by_actor" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber), by_actor: $by_actor}')"
+                _append_event "cost_cap_breached" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" --argjson by_actor "$_cap_by_actor" --argjson by_model "$_cap_by_model" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber), by_actor: $by_actor, by_model: $by_model}')"
             fi
         fi
 
@@ -1594,7 +1597,7 @@ if [ "$current_state" = "awaiting" ]; then
             --argjson escalation_count "${escalation_count:-0}" \
             --arg pr_url "${pr_url:-}" --arg paused_reason "$_paused_reason" \
             '{model: $model, effort: $effort, tier: $tier, retry_count: $retry_count, escalation_count: $escalation_count, pr_url: $pr_url, paused_reason: $paused_reason}')"
-    rm -f "$marker_file" "$wrapper" "$spawn_prompt"
+    rm -f "$marker_file" "$wrapper" "$spawn_prompt" "$usage_state_file"
     # The runner_died_early trap only fires while state == "running"; awaiting
     # is safe by virtue of that, but disarm anyway for clarity.
     trap - EXIT
@@ -1804,7 +1807,7 @@ else
     _transition failed "$_fail_detail2"
 fi
 
-rm -f "$marker_file" "$wrapper"
+rm -f "$marker_file" "$wrapper" "$usage_state_file"
 # Clean exit — disarm the runner_died_early safety net.
 trap - EXIT
 echo "job $id finished: $(jq -r .state "$job_file")"

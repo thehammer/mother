@@ -332,162 +332,30 @@ def _percentile(values, pct):
 
 
 def _apply_result_correction(agg, by_model_out, by_actor_out, rates, main_actor):
-    """Correct systematically-undercounted OUTPUT tokens using the run's own
-    `result` event, when one was observed.
+    """Sum this run's per-turn `assistant` stream events into totals.
 
-    Empirically (verified against real archived Mother logs, see the PR
-    description's calibration table), the per-turn `assistant` stream
-    events' `usage.output_tokens` field reliably matches the CLI's true
-    input/cache-read/cache-creation totals but can undercount true OUTPUT
-    tokens by an order of magnitude — almost certainly because extended
-    thinking tokens are billed as output but aren't reflected in each
-    per-turn delta the same way. The `result` event's own `usage` /
-    `modelUsage` fields (present only on a clean exit) are the CLI's own
-    final accounting and are authoritative when available; per-turn sums
-    remain the only signal for a run with no result event (live/paused/
-    reaped), so this is a best-effort correction, not a replacement.
+    Per plan decision, the `result` event's own `usage`/`modelUsage` fields
+    are deliberately NOT used to compute totals here — they are used only
+    for the separate `cli_cost_usd` calibration/drift field (see
+    process_event's handling of the `result` event type, and `mother-usage
+    retro`'s calibration table). Folding result-event usage into totals
+    would make the rate-table calibration circular (comparing the CLI's own
+    numbers against themselves) and would risk double-counting on any
+    session whose `modelUsage` turns out to be cumulative rather than
+    per-run. Per-turn sums are the only source for a run with no result
+    event anyway (live/paused/reaped), so using them unconditionally keeps
+    live and recorded cost consistent with each other.
 
     Mutates nothing; returns (tokens, by_model, by_actor, cost_usd,
     cost_complete, unpriced_models).
     """
-    auth = {}
-    mu = agg.get("result_model_usage")
-    ru = agg.get("result_usage")
-    if isinstance(mu, dict) and mu:
-        for model, v in mu.items():
-            if not isinstance(v, dict):
-                continue
-            auth[model] = {
-                "input": v.get("inputTokens", 0) or 0,
-                "output": v.get("outputTokens", 0) or 0,
-                "cache_read": v.get("cacheReadInputTokens", 0) or 0,
-                "cache_create_total": v.get("cacheCreationInputTokens", 0) or 0,
-            }
-    elif isinstance(ru, dict) and ru:
-        model = agg.get("last_model_seen") or (next(iter(by_model_out)) if len(by_model_out) == 1 else None)
-        if model:
-            auth[model] = {
-                "input": ru.get("input_tokens", 0) or 0,
-                "output": ru.get("output_tokens", 0) or 0,
-                "cache_read": ru.get("cache_read_input_tokens", 0) or 0,
-                "cache_create_total": ru.get("cache_creation_input_tokens", 0) or 0,
-            }
-
-    # Guard: the correction exists ONLY to recover output tokens the per-turn
-    # stream undercounts (verified: it never OVERcounts relative to the
-    # CLI's own final accounting on every real archived log checked). A
-    # result payload that would produce a SMALLER output total than we
-    # already observed per-turn is not a legitimate correction — either a
-    # malformed/partial result event (e.g. empty modelUsage with a stale
-    # single-turn `usage` fallback) or a multi-result-event session where
-    # this isn't really the run's final tally. Prefer the (larger, known-
-    # accurate-for-the-non-output-dimensions) per-turn sum in that case
-    # rather than silently reporting a lower number than reality.
-    if auth:
-        _auth_output_total = sum(a["output"] for a in auth.values())
-        _prior_output_total = sum(v["tokens"]["output"] for v in by_model_out.values())
-        if _auth_output_total < _prior_output_total:
-            auth = {}
-
-    if not auth:
-        tokens = {"input": 0, "cache_read": 0, "cache_create_5m": 0, "cache_create_1h": 0, "output": 0}
-        for v in by_model_out.values():
-            for k in tokens:
-                tokens[k] += v["tokens"][k]
-        cost = sum(v["cost_usd"] for v in by_model_out.values())
-        unpriced = sorted(agg["unpriced_models"])
-        return tokens, by_model_out, by_actor_out, cost, len(unpriced) == 0, unpriced
-
-    new_tokens = {"input": 0, "cache_read": 0, "cache_create_5m": 0, "cache_create_1h": 0, "output": 0}
-    new_by_model = {}
-    new_cost = 0.0
-    new_unpriced = set()
-
-    for model, a in auth.items():
-        existing = by_model_out.get(model)
-        total_cc = a["cache_create_total"]
-        ratio_5m = 1.0
-        if existing:
-            e5, e1 = existing["tokens"]["cache_create_5m"], existing["tokens"]["cache_create_1h"]
-            if (e5 + e1) > 0:
-                ratio_5m = e5 / (e5 + e1)
-        c5 = int(round(total_cc * ratio_5m))
-        c1 = total_cc - c5
-        tok = {"input": a["input"], "cache_read": a["cache_read"],
-               "cache_create_5m": c5, "cache_create_1h": c1, "output": a["output"]}
-        price = price_for_model(rates, model)
-        if price:
-            cost = (
-                tok["input"] * price.get("input", 0)
-                + tok["output"] * price.get("output", 0)
-                + tok["cache_read"] * price.get("cache_read", 0)
-                + c5 * price.get("cache_write_5m", 0)
-                + c1 * price.get("cache_write_1h", 0)
-            ) / 1_000_000.0
-        else:
-            cost = 0.0
-            new_unpriced.add(model)
-        new_by_model[model] = {"tokens": tok, "cost_usd": round(cost, 6)}
-        for k in new_tokens:
-            new_tokens[k] += tok[k]
-        new_cost += cost
-
-    # Union in any model the per-turn pass saw that the result didn't mention
-    # (rare — keep its uncorrected per-turn values rather than dropping data).
-    for model, v in by_model_out.items():
-        if model in new_by_model:
-            continue
-        new_by_model[model] = v
-        for k in new_tokens:
-            new_tokens[k] += v["tokens"][k]
-        new_cost += v["cost_usd"]
-        if model in agg["unpriced_models"]:
-            new_unpriced.add(model)
-
-    # Redistribute by_actor's output tokens proportionally to the correction
-    # (input/cache_read were already accurate per-turn, so only output needs
-    # adjusting). Cost is NOT scaled multiplicatively — an actor's per-turn
-    # cost_usd already correctly covers its (accurate) input+cache share;
-    # multiplying the WHOLE cost_usd by an output-only ratio would also
-    # inflate that already-correct input/cache portion by the same large
-    # factor (observed: a $70 run's by_actor cost ballooning to $7,900+ once
-    # thinking-token correction kicked in with a 100x output ratio). Instead,
-    # only the marginal cost of the newly-recovered output tokens is added,
-    # priced at the run's own blended output rate (total corrected cost
-    # increase / total corrected output token increase) and split across
-    # actors proportional to each actor's share of that same output
-    # increase.
-    old_total_out = sum(v["tokens"]["output"] for v in by_actor_out.values())
-    new_total_out = new_tokens["output"]
-    prior_cost_total = sum(v["cost_usd"] for v in by_model_out.values())
-    delta_cost_total = max(new_cost - prior_cost_total, 0.0)
-    delta_out_total = max(new_total_out - old_total_out, 0)
-    blended_output_rate = (delta_cost_total / delta_out_total) if delta_out_total > 0 else 0.0
-    new_by_actor = {}
-    if old_total_out > 0:
-        scale = new_total_out / old_total_out
-        for name, v in by_actor_out.items():
-            nv = {"tokens": dict(v["tokens"]), "cost_usd": v["cost_usd"], "messages": v["messages"], "spawns": v["spawns"]}
-            new_actor_out = int(round(v["tokens"]["output"] * scale))
-            actor_delta_out = new_actor_out - v["tokens"]["output"]
-            nv["tokens"]["output"] = new_actor_out
-            nv["cost_usd"] = round(v["cost_usd"] + actor_delta_out * blended_output_rate, 6)
-            new_by_actor[name] = nv
-        drift = new_total_out - sum(a["tokens"]["output"] for a in new_by_actor.values())
-        if new_by_actor:
-            biggest = max(new_by_actor, key=lambda k: new_by_actor[k]["tokens"]["output"])
-            new_by_actor[biggest]["tokens"]["output"] += drift
-            new_by_actor[biggest]["cost_usd"] = round(new_by_actor[biggest]["cost_usd"] + drift * blended_output_rate, 6)
-    else:
-        new_by_actor = {name: {"tokens": dict(v["tokens"]), "cost_usd": v["cost_usd"],
-                                "messages": v["messages"], "spawns": v["spawns"]}
-                         for name, v in by_actor_out.items()}
-        if new_by_actor:
-            key = main_actor if main_actor in new_by_actor else next(iter(new_by_actor))
-            new_by_actor[key]["tokens"]["output"] = new_total_out
-            new_by_actor[key]["cost_usd"] = new_cost
-
-    return new_tokens, new_by_model, new_by_actor, new_cost, len(new_unpriced) == 0, sorted(new_unpriced)
+    tokens = {"input": 0, "cache_read": 0, "cache_create_5m": 0, "cache_create_1h": 0, "output": 0}
+    for v in by_model_out.values():
+        for k in tokens:
+            tokens[k] += v["tokens"][k]
+    cost = sum(v["cost_usd"] for v in by_model_out.values())
+    unpriced = sorted(agg["unpriced_models"])
+    return tokens, by_model_out, by_actor_out, cost, len(unpriced) == 0, unpriced
 
 
 def finalize_agg(agg, rates, main_actor=DEFAULT_MAIN_ACTOR):
@@ -671,6 +539,69 @@ _CTX_OVERFLOW_RE = re.compile(r"prompt is too long|context (window|length)", re.
 _RATE_LIMIT_RE = re.compile(r"rate.?limit|429|usage limit", re.I)
 _OVERLOADED_RE = re.compile(r"overloaded|529", re.I)
 _BILLING_RE = re.compile(r"credit balance|billing", re.I)
+_BANNER_RE = re.compile(r"^=== mother job \S+ starting at (.+?) ===\s*$")
+
+
+def _parse_banner_ts(s):
+    """Parse the timestamp text a bare shell `date` writes into the
+    '=== mother job ... starting at <date> ===' banner. Best-effort: `date`
+    with no args is locale/TZ-dependent, so this is an approximation used
+    only to order banners relative to event timestamps, never for anything
+    byte-exact."""
+    s = (s or "").strip()
+    for fmt in ("%a %b %d %H:%M:%S %Z %Y", "%a %b %d %H:%M:%S %Y"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _banner_offsets(log_path):
+    """Return a list of (byte_offset, ts_or_None) for every run-start banner
+    line in a log, in file order. Byte offsets are into the DECOMPRESSED
+    stream (matching what read_slice's --offset/--end already expect for a
+    .gz log)."""
+    opener = gzip.open if str(log_path).endswith(".gz") else open
+    offsets = []
+    try:
+        with opener(log_path, "rb") as fh:
+            pos = 0
+            for line in fh:
+                m = _BANNER_RE.match(line.decode("utf-8", errors="replace").rstrip("\n"))
+                if m:
+                    offsets.append((pos, _parse_banner_ts(m.group(1))))
+                pos += len(line)
+    except Exception:
+        return []
+    return offsets
+
+
+def _run_slice_for_event(log_path, event_ts):
+    """Return (offset, end) bounding the single run a given event timestamp
+    falls within, based on '=== mother job ... starting at ===' banners —
+    the offset of the last banner at-or-before event_ts, and the offset of
+    the next banner after it (or None for EOF). Falls back to (0, None) —
+    the whole log — when banners can't be found/parsed, which is exactly
+    the previous (less precise) behavior, not a regression."""
+    offsets = _banner_offsets(log_path)
+    if not offsets:
+        return 0, None
+    if event_ts is None:
+        return offsets[-1][0], None
+    chosen_idx = None
+    for i, (_off, ts) in enumerate(offsets):
+        if ts is None or ts <= event_ts:
+            chosen_idx = i
+        else:
+            break
+    if chosen_idx is None:
+        # event predates every banner we could parse — safest bet is the
+        # first run rather than the whole log.
+        chosen_idx = 0
+    offset = offsets[chosen_idx][0]
+    end = offsets[chosen_idx + 1][0] if chosen_idx + 1 < len(offsets) else None
+    return offset, end
 
 
 def cmd_classify_exit(args):
@@ -679,7 +610,7 @@ def cmd_classify_exit(args):
     result_subtype = None
     api_error_status = None
 
-    blob, _end = read_slice(args.log, args.offset or 0, None)
+    blob, _end = read_slice(args.log, args.offset or 0, getattr(args, "end", None))
     result_event = None
     tail_lines = []
     for obj in iter_json_lines(blob):
@@ -989,6 +920,7 @@ def _do_backfill(root, jobs_meta, rates):
                 "by_model": finalized.get("by_model"),
                 "by_actor": finalized.get("by_actor"),
                 "turns_main": finalized.get("turns_main"),
+                "ctx_per_turn": finalized.get("ctx_per_turn"),
             }
             new_rows.append(row)
 
@@ -1048,7 +980,8 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
             counts["in_flight"] += 1
         if st == "succeeded":
             esc = job.get("escalation_count", 0) or 0
-            if esc == 0:
+            retries = job.get("retry_count", 0) or 0
+            if esc == 0 and retries == 0:
                 first_attempt_success += 1
             else:
                 post_escalation_success += 1
@@ -1074,11 +1007,14 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
                 log_path = _log_path_for(root, job, archived)
                 if log_path:
                     try:
-                        result = subprocess.run(
-                            [sys.executable, os.path.abspath(__file__), "classify-exit",
-                             "--log", log_path, "--offset", "0",
-                             "--exit-code", str((ev.get("detail") or {}).get("exit_code", 1))],
-                            capture_output=True, text=True, timeout=30)
+                        ev_ts = _parse_iso(ev.get("ts"))
+                        run_offset, run_end = _run_slice_for_event(log_path, ev_ts)
+                        ce_args = [sys.executable, os.path.abspath(__file__), "classify-exit",
+                                   "--log", log_path, "--offset", str(run_offset),
+                                   "--exit-code", str((ev.get("detail") or {}).get("exit_code", 1))]
+                        if run_end is not None:
+                            ce_args += ["--end", str(run_end)]
+                        result = subprocess.run(ce_args, capture_output=True, text=True, timeout=30)
                         reason = json.loads(result.stdout).get("reason") + " (reclassified)"
                     except Exception:
                         reason = "unknown (no log)"
@@ -1149,8 +1085,9 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
     }
 
     # 5. Awaiting
-    pause_reasons = {}
-    waits = []
+    pause_episodes = {}   # reason -> episode count (every pause, resolved or not)
+    pause_waits = {}      # reason -> [wait_seconds, ...] (resolved pauses only)
+    now_utc = datetime.now(timezone.utc)
     abandoned = 0
     for job, path, archived in in_window:
         events = _load_events(_events_path_for(root, job, archived))
@@ -1161,18 +1098,35 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
             if kind in ("awaiting_input", "paused_for_quota"):
                 pend_reason = (e.get("detail") or {}).get("paused_reason") or ("user" if kind == "awaiting_input" else "quota")
                 pend_ts = _parse_iso(e.get("ts"))
-                pause_reasons.setdefault(pend_reason, []).append(0)
+                pause_episodes[pend_reason] = pause_episodes.get(pend_reason, 0) + 1
             elif kind in ("resumed", "auto_resumed") and pend_ts:
                 resumed_ts = _parse_iso(e.get("ts"))
-                if resumed_ts:
-                    waits.append((resumed_ts - pend_ts).total_seconds())
+                if resumed_ts and pend_reason:
+                    pause_waits.setdefault(pend_reason, []).append((resumed_ts - pend_ts).total_seconds())
                 pend_ts = None
+                pend_reason = None
+        # Abandoned: a pause that was never resumed, where the job either
+        # ended up cancelled (resumption will never happen), or is still
+        # awaiting after more than 7 days (operator has gone quiet).
         if pend_ts is not None:
-            abandoned += 1
+            st = job.get("state")
+            if st == "cancelled":
+                abandoned += 1
+            elif st == "awaiting" and (now_utc - pend_ts).total_seconds() > 7 * 86400:
+                abandoned += 1
+    all_waits = [w for ws in pause_waits.values() for w in ws]
+    by_reason = {
+        reason: {
+            "episodes": pause_episodes.get(reason, 0),
+            "wait_seconds_median": statistics.median(pause_waits.get(reason, [])) if pause_waits.get(reason) else None,
+            "wait_seconds_p90": _percentile(pause_waits.get(reason, []), 90) if pause_waits.get(reason) else None,
+        }
+        for reason in pause_episodes
+    }
     tables["awaiting"] = {
-        "by_reason": {k: len(v) for k, v in pause_reasons.items()},
-        "wait_seconds_median": statistics.median(waits) if waits else None,
-        "wait_seconds_p90": _percentile(waits, 90) if waits else None,
+        "by_reason": by_reason,
+        "wait_seconds_median": statistics.median(all_waits) if all_waits else None,
+        "wait_seconds_p90": _percentile(all_waits, 90) if all_waits else None,
         "abandoned": abandoned,
     }
 
@@ -1226,34 +1180,90 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
         for r in rows_by_job.get(job.get("id"), []):
             if r.get("turns_main"):
                 turns_vals.append(r["turns_main"])
+            ctx = r.get("ctx_per_turn") or {}
+            if ctx.get("median") is not None:
+                ctx_medians.append(ctx["median"])
+            if ctx.get("p90") is not None:
+                ctx_p90s.append(ctx["p90"])
+            if ctx.get("max") is not None:
+                ctx_maxes.append(ctx["max"])
     tables["turns_context"] = {
+        "jobs_with_usage": len({job.get("id") for job, _p, _a in in_window if rows_by_job.get(job.get("id"))}),
+        "jobs_total": len(in_window),
         "turns_median": statistics.median(turns_vals) if turns_vals else None,
         "turns_p90": _percentile(turns_vals, 90) if turns_vals else None,
         "turns_max": max(turns_vals) if turns_vals else None,
+        "ctx_per_turn_median": statistics.median(ctx_medians) if ctx_medians else None,
+        "ctx_per_turn_p90": _percentile(ctx_p90s, 90) if ctx_p90s else None,
+        "ctx_per_turn_max": max(ctx_maxes) if ctx_maxes else None,
     }
 
     # 8. Wall-clock
     totals = []
     queue_waits = []
     dep_waits = []
+    quota_waits = []
+    human_waits = []
+    actives = []
     for job, path, archived in in_window:
         if job.get("state") not in ("succeeded", "failed", "cancelled"):
             continue
         created = _parse_iso(job.get("created_at"))
         finished = _parse_iso(job.get("finished_at"))
         started = _parse_iso(job.get("started_at"))
+        total_secs = None
         if created and finished:
-            totals.append((finished - created).total_seconds())
+            total_secs = (finished - created).total_seconds()
+            totals.append(total_secs)
+        queue_wait = 0.0
         if created and started:
-            qw = (started - created).total_seconds()
-            queue_waits.append(qw)
+            queue_wait = (started - created).total_seconds()
+            queue_waits.append(queue_wait)
             if job.get("depends_on"):
-                dep_waits.append(qw)
+                dep_waits.append(queue_wait)
+
+        # Quota pause (paused_for_quota -> auto_resumed/resumed) and human
+        # wait (awaiting_input -> resumed) can each recur within one job;
+        # sum every episode. A pause left open at job end (abandoned, or the
+        # job is still non-terminal) contributes nothing further here — it's
+        # covered by Table 5.
+        events = _load_events(_events_path_for(root, job, archived))
+        quota_pend_ts = None
+        human_pend_ts = None
+        quota_total = 0.0
+        human_total = 0.0
+        for e in events:
+            kind = e.get("kind")
+            ts = _parse_iso(e.get("ts"))
+            if kind == "paused_for_quota":
+                quota_pend_ts = ts
+            elif kind == "awaiting_input":
+                human_pend_ts = ts
+            elif kind in ("resumed", "auto_resumed") and ts:
+                if quota_pend_ts:
+                    quota_total += (ts - quota_pend_ts).total_seconds()
+                    quota_pend_ts = None
+                if human_pend_ts:
+                    human_total += (ts - human_pend_ts).total_seconds()
+                    human_pend_ts = None
+        quota_waits.append(quota_total)
+        human_waits.append(human_total)
+        if total_secs is not None:
+            actives.append(max(total_secs - queue_wait - quota_total - human_total, 0.0))
+
     tables["wall_clock"] = {
+        "jobs_terminal": len(totals),
+        "jobs_total": len(in_window),
         "total_median": statistics.median(totals) if totals else None,
         "total_p90": _percentile(totals, 90) if totals else None,
         "queue_wait_median": statistics.median(queue_waits) if queue_waits else None,
         "dependency_wait_median": statistics.median(dep_waits) if dep_waits else None,
+        "quota_pause_median": statistics.median(quota_waits) if quota_waits else None,
+        "quota_pause_p90": _percentile(quota_waits, 90) if quota_waits else None,
+        "human_wait_median": statistics.median(human_waits) if human_waits else None,
+        "human_wait_p90": _percentile(human_waits, 90) if human_waits else None,
+        "active_median": statistics.median(actives) if actives else None,
+        "active_p90": _percentile(actives, 90) if actives else None,
     }
 
     # 9. Repos served
@@ -1291,11 +1301,48 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
     for p in pending:
         r = p.get("last_reason", "unknown")
         reason_hist[r] = reason_hist.get(r, 0) + 1
+
+    # Orphan worktree candidates: for every distinct repo_path seen in the
+    # window, list `git worktree list` entries that aren't the main checkout
+    # and aren't claimed as a work_dir by any job (live or pending-teardown).
+    # Best-effort — a repo whose git command fails/hangs is just skipped,
+    # never guessed at.
+    known_work_dirs = set()
+    for job, _p, _a in in_window:
+        wd = job.get("work_dir")
+        if wd:
+            known_work_dirs.add(os.path.normpath(wd))
+    for p in pending:
+        wd = p.get("work_dir")
+        if wd:
+            known_work_dirs.add(os.path.normpath(wd))
+    repo_paths = sorted({job.get("repo_path") for job, _p, _a in in_window if job.get("repo_path")})
+    orphan_worktrees = []
+    for repo_path in repo_paths:
+        try:
+            result = subprocess.run(
+                ["git", "-C", repo_path, "worktree", "list", "--porcelain"],
+                capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                continue
+        except Exception:
+            continue
+        wt_path = None
+        is_main = True
+        for line in result.stdout.splitlines() + [""]:
+            if line.startswith("worktree "):
+                wt_path = line[len("worktree "):].strip()
+                is_main = (os.path.normpath(wt_path) == os.path.normpath(repo_path))
+            elif line == "":
+                if wt_path and not is_main and os.path.normpath(wt_path) not in known_work_dirs:
+                    orphan_worktrees.append({"repo_path": repo_path, "worktree_path": wt_path})
+                wt_path = None
     tables["teardown"] = {
         "pending_count": len(pending),
         "max_deferrals": max_deferrals, "max_deferrals_job": max_deferrals_job,
         "max_stall_deferrals": max_stall,
         "reason_histogram": reason_hist,
+        "orphan_worktrees": orphan_worktrees,
     }
 
     # 11. Perri decision mix
@@ -1337,6 +1384,69 @@ _RETRO_TITLES = [
 ]
 
 
+_MONEY_KEY_RE = re.compile(r"(^|_)cost(_usd)?($|_)")
+_TOKEN_KEY_RE = re.compile(r"token")
+
+
+def _fmt_scalar(key, val):
+    if val is None or isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        if _MONEY_KEY_RE.search(key):
+            return _fmt_money(val)
+        if _TOKEN_KEY_RE.search(key):
+            return _fmt_tokens(val)
+    return val
+
+
+def _render_value(key, val, indent):
+    pad = "  " * indent
+    if isinstance(val, dict):
+        if not val:
+            return [f"{pad}{key}: (none)"]
+        lines = [f"{pad}{key}:"]
+        for k, v in val.items():
+            lines.extend(_render_value(str(k), v, indent + 1))
+        return lines
+    if isinstance(val, list):
+        if not val:
+            return [f"{pad}{key}: (none)"]
+        lines = [f"{pad}{key}:"]
+        for item in val:
+            if isinstance(item, dict):
+                rendered = ", ".join(f"{ik}={_fmt_scalar(ik, iv)}" for ik, iv in item.items())
+                lines.append(f"{pad}  - {rendered}")
+            else:
+                lines.append(f"{pad}  - {item}")
+        return lines
+    return [f"{pad}{key}: {_fmt_scalar(key, val)}"]
+
+
+def _coverage_line(key, data, tables):
+    """A one-line 'N of M jobs' summary for tables where coverage is
+    meaningful — every usage-derived table should make it obvious how many
+    of the jobs in the window actually contributed data."""
+    outcomes = tables.get("outcomes") or {}
+    total_jobs = outcomes.get("jobs")
+    if key == "outcomes":
+        return f"jobs in window: {data.get('jobs', 0)}"
+    if key == "tokens_cost":
+        return f"usage for {data.get('jobs_with_usage', 0)} of {data.get('jobs_total', 0)} jobs"
+    if key == "turns_context":
+        return f"usage for {data.get('jobs_with_usage', 0)} of {data.get('jobs_total', 0)} jobs"
+    if key == "wall_clock":
+        return f"terminal jobs: {data.get('jobs_terminal', 0)} of {data.get('jobs_total', 0)}"
+    if key == "adherence":
+        if total_jobs is not None:
+            return f"jobs reviewed: {data.get('jobs_reviewed', 0)} of {total_jobs}"
+    if key == "escalation":
+        if total_jobs is not None:
+            return f"escalated jobs: {data.get('escalated_total', 0)} of {total_jobs}"
+    if key == "teardown":
+        return f"pending records: {data.get('pending_count', 0)}"
+    return None
+
+
 def render_retro_table(tables):
     lines = []
     for key, title in _RETRO_TITLES:
@@ -1346,7 +1456,11 @@ def render_retro_table(tables):
             lines.append("(no data)")
             lines.append("")
             continue
-        lines.append(json.dumps(data, indent=2, default=str))
+        coverage = _coverage_line(key, data, tables)
+        if coverage:
+            lines.append(coverage)
+        for k, v in data.items():
+            lines.extend(_render_value(k, v, 0))
         lines.append("")
     return "\n".join(lines)
 
@@ -1392,6 +1506,7 @@ def build_arg_parser():
     ce = sub.add_parser("classify-exit")
     ce.add_argument("--log", required=True)
     ce.add_argument("--offset", type=int, default=0)
+    ce.add_argument("--end", type=int, default=None)
     ce.add_argument("--exit-code", type=int, required=True)
 
     pr = sub.add_parser("publish-rates")

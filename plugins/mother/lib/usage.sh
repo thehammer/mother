@@ -250,6 +250,14 @@ mother_record_run_usage() {
             init_mcp_servers: ($p.init.mcp_servers // null),
             log_bytes: ($p.log_bytes // null)
         } + $extra
+        # Every failed row carries failure_reason consistently (not just the
+        # ad hoc `reason` field individual callers happen to set) — derive it
+        # from whatever the caller already supplied (failure_reason, else
+        # reason, else "unspecified") rather than requiring every call site
+        # to remember to set it explicitly.
+        | if $outcome == "failed" then
+            . + {failure_reason: (.failure_reason // .reason // "unspecified")}
+          else . end
         ' 2>/dev/null)
 
     if [ -z "$row" ]; then

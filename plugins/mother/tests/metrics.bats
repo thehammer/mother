@@ -126,6 +126,31 @@ EOF
     [ "$tokens_out" = "200" ]
 }
 
+@test "mother-usage parse: a non-empty modelUsage with MORE output than per-turn totals is still ignored" {
+    # Regression: an earlier implementation replaced per-turn totals with
+    # result.modelUsage whenever it reported more output tokens, which made
+    # the rate-table calibration circular and risked double-counting on
+    # sessions where modelUsage turns out to be cumulative. Per-turn sums
+    # must win regardless of what modelUsage says.
+    local log_file="$MOTHER_ROOT/with-model-usage.log"
+    cat > "$log_file" <<'EOF'
+=== mother job test-job starting ===
+{"type":"assistant","message":{"id":"msg_aaa","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":500,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":100}}}
+{"type":"assistant","message":{"id":"msg_bbb","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":500,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":100}}}
+{"type":"result","subtype":"success","is_error":false,"total_cost_usd":50.0,"modelUsage":{"claude-sonnet-5":{"inputTokens":1000,"outputTokens":90000,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":50.0}}}
+EOF
+    run mother-usage parse --log "$log_file" --rates "$(_rates)"
+    [ "$status" -eq 0 ]
+    tokens_in=$(printf '%s' "$output" | jq -r '.tokens_in')
+    tokens_out=$(printf '%s' "$output" | jq -r '.tokens_out')
+    cli_cost_usd=$(printf '%s' "$output" | jq -r '.cli_cost_usd')
+    [ "$tokens_in" = "1000" ]
+    [ "$tokens_out" = "200" ]
+    # cli_cost_usd is still exposed for calibration/drift checks, just never
+    # folded into tokens_in/tokens_out/cost_usd totals.
+    [ "$cli_cost_usd" = "50.0" ]
+}
+
 # ---------------------------------------------------------------------------
 # Absent log → null (usage_available:false)
 

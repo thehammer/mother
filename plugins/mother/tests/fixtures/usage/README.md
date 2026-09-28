@@ -92,6 +92,15 @@ sandwiched between two valid assistant events (`msg_c1` in=100/out=20,
 `msg_c2` in=200/out=30). Must tolerate/skip the corrupt line, not abort.
 **tokens_in=300, tokens_out=50**.
 
+## adherence_pass_stream.jsonl
+A minimal `claude --output-format stream-json --verbose`-shaped adherence-review
+transcript: one assistant event (in=1000, out=150) followed by a `result` event
+whose `.result` text is `"ADHERENCE: pass\nNOTES:\nAll good."` — used by
+`tests/adherence.bats` to drive `mother adherence-review` through the real
+stream-json result-event parsing path (as opposed to the plaintext
+`MOCK_CLAUDE_STDOUT` shortcut most other adherence tests use) and assert on the
+resulting `stage:"adherence"` runs.jsonl row's `verdict`/`cost_usd` fields.
+
 ## error_tail_*.jsonl (classify-exit inputs)
 No `result` event in any of these — classification must fall through to the
 last-60-lines plaintext-tail rules. One assistant event precedes the tail line

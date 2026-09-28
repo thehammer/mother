@@ -134,6 +134,24 @@ _make_pipeline_succeeded_job() {
     assert_event_kind "job-rf3" "reviewed"
 }
 
+@test "review-phase (perri): writes one runs.jsonl row with stage review-perri" {
+    _make_pipeline_succeeded_job "job-rf-usage"
+    export MOCK_CLAUDE_STDOUT="$(_valid_findings_stdout)"
+
+    run mother review-phase "job-rf-usage" --reviewer perri
+    [ "$status" -eq 0 ]
+
+    local metrics_file="$MOTHER_ROOT/metrics/runs.jsonl"
+    [ -f "$metrics_file" ]
+    run bash -c "grep -F '\"job_id\":\"job-rf-usage\"' '$metrics_file' | wc -l | tr -d ' '"
+    [ "$output" = "1" ]
+
+    local row stage
+    row=$(grep -F '"job_id":"job-rf-usage"' "$metrics_file")
+    stage=$(printf '%s' "$row" | jq -r '.stage')
+    [ "$stage" = "review-perri" ]
+}
+
 @test "review-phase: reviewed event contains reviewer and finding_count" {
     _make_pipeline_succeeded_job "job-rf4"
     export MOCK_CLAUDE_STDOUT="$(_valid_findings_stdout)"
