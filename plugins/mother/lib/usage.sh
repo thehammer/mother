@@ -49,6 +49,29 @@ _usage_job_update() {
     printf '%s' "$merged" > "$tmp" && mv "$tmp" "$job_file"
 }
 
+# _usage_with_lock <lockable-file> <cmd> [args...]
+# Acquires a sibling "<lockable-file>.lockdir" mkdir-based lock (best-effort:
+# gives up and proceeds unlocked after ~10s of retries rather than hanging
+# forever), runs <cmd> with the remaining args, then releases the lock.
+# Shared by every append-under-lock call site in this file (today:
+# _usage_append_event and mother_record_run_usage) so there is one
+# acquire/retry/release implementation instead of hand-copied ones that could
+# drift apart.
+_usage_with_lock() {
+    local lockable="$1"; shift
+    local lockdir="${lockable}.lockdir"
+    local tries=0
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        sleep 0.05
+        tries=$((tries + 1))
+        [ "$tries" -gt 200 ] && break
+    done
+    "$@"
+    rmdir "$lockdir" 2>/dev/null || true
+}
+
+_usage_append_line() { printf '%s\n' "$2" >> "$1"; }
+
 _usage_append_event() {
     local job_id="$1" kind="$2" detail="${3:-}"
     [ -z "$detail" ] && detail='{}'
@@ -59,15 +82,7 @@ _usage_append_event() {
     ev=$(jq -nc --arg ts "$(_usage_iso_now)" --arg kind "$kind" --argjson detail "$detail" \
         '{ts: $ts, kind: $kind, detail: $detail}' 2>/dev/null) || return 0
     [ -n "$ev" ] || return 0
-    local lockdir="${events_file}.lockdir"
-    local tries=0
-    while ! mkdir "$lockdir" 2>/dev/null; do
-        sleep 0.05
-        tries=$((tries + 1))
-        [ "$tries" -gt 200 ] && break
-    done
-    printf '%s\n' "$ev" >> "$events_file"
-    rmdir "$lockdir" 2>/dev/null || true
+    _usage_with_lock "$events_file" _usage_append_line "$events_file" "$ev"
 }
 
 # ---------------------------------------------------------------------------
@@ -265,15 +280,7 @@ mother_record_run_usage() {
         return 0
     fi
 
-    local lockdir="${metrics_file}.lockdir"
-    local tries=0
-    while ! mkdir "$lockdir" 2>/dev/null; do
-        sleep 0.05
-        tries=$((tries + 1))
-        [ "$tries" -gt 200 ] && break
-    done
-    printf '%s\n' "$row" >> "$metrics_file"
-    rmdir "$lockdir" 2>/dev/null || true
+    _usage_with_lock "$metrics_file" _usage_append_line "$metrics_file" "$row"
 
     mother_recompute_job_cost "$job_id"
     mother_maybe_token_alert "$job_id"

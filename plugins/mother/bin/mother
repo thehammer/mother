@@ -70,6 +70,18 @@ _gen_id() {
 
 _die() { echo "mother: $*" >&2; exit 1; }
 
+# _is_positive_number <value>
+# True (exit 0) if <value> is a positive decimal number: digits and at most
+# one '.', not empty, not "0"/"0.0". Shared by cmd_add and cmd_resume's
+# --max-cost validation so both go through one number-format check.
+_is_positive_number() {
+    local v="$1"
+    case "$v" in
+        ''|*[!0-9.]*|.|*.*.*) return 1 ;;
+    esac
+    awk -v v="$v" 'BEGIN { exit !(v > 0) }'
+}
+
 # ---------- plan metadata parsing ----------
 
 # _validate_sc_entry <sc_json> <agent>
@@ -498,10 +510,7 @@ cmd_add() {
     [ -n "$repo" ]      || _die "add: --repo required"
     [ -n "$branch" ]    || _die "add: --branch required"
     if [ -n "$max_cost" ]; then
-        case "$max_cost" in
-            ''|*[!0-9.]*|.|*.*.*) _die "add: --max-cost must be a positive number (got: $max_cost)" ;;
-        esac
-        awk -v v="$max_cost" 'BEGIN { exit !(v > 0) }' || _die "add: --max-cost must be a positive number (got: $max_cost)"
+        _is_positive_number "$max_cost" || _die "add: --max-cost must be a positive number (got: $max_cost)"
     fi
 
     case "$isolation" in worktree|main-dir) ;; *) _die "isolation must be worktree or main-dir" ;; esac
@@ -1830,6 +1839,43 @@ HITEOF
     echo "$id: $previous_state -> succeeded (pr_url=$url)"
 }
 
+# _extract_transcript_result_text <log_path>
+# Extracts the plain-text response from a `claude --output-format
+# stream-json` transcript: the last `result` event's `.result` field, when
+# present, else the raw file contents verbatim (a plaintext mock in tests, or
+# a stream that never produced a result event). Echoes to stdout. Shared by
+# cmd_review_phase and cmd_adherence_review, which both spawn a reviewer
+# headlessly and need its final text response, not the raw event stream.
+_extract_transcript_result_text() {
+    local log_path="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+path = sys.argv[1]
+text = None
+try:
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") == "result":
+                text = obj.get("result")
+except Exception:
+    pass
+if text is None:
+    with open(path) as fh:
+        text = fh.read()
+sys.stdout.write(text or "")
+' "$log_path" 2>/dev/null && return 0
+    fi
+    cat "$log_path" 2>/dev/null
+}
+
 # ---------- review-phase ----------
 #
 # Run a single reviewer (ada, archie, or perri) in the `review` request type
@@ -2026,33 +2072,8 @@ EOF
     # extract it from the last result event when the stream is stream-json,
     # falling back to the raw file itself (a plaintext mock in tests, or a
     # stream that never produced a result event).
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c '
-import json, sys
-path = sys.argv[1]
-text = None
-try:
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if obj.get("type") == "result":
-                text = obj.get("result")
-except Exception:
-    pass
-if text is None:
-    with open(path) as fh:
-        text = fh.read()
-sys.stdout.write(text or "")
-' "$review_log" > "$tmpfile" 2>/dev/null || cp "$review_log" "$tmpfile" 2>/dev/null
-    else
-        cp "$review_log" "$tmpfile" 2>/dev/null
-    fi
+    _extract_transcript_result_text "$review_log" > "$tmpfile" 2>/dev/null \
+        || cp "$review_log" "$tmpfile" 2>/dev/null
     # Extract findings block.
     local raw_findings
     raw_findings=$(findings_extract "$tmpfile" 2>/dev/null || true)
@@ -2242,31 +2263,7 @@ cmd_adherence_review() {
 
     # Prefer the last stream-json result event's text; fall back to the raw
     # file verbatim (keeps existing plaintext-mock tests passing unchanged).
-    if command -v python3 >/dev/null 2>&1; then
-        raw_verdict=$(python3 -c '
-import json, sys
-path = sys.argv[1]
-text = None
-try:
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if obj.get("type") == "result":
-                text = obj.get("result")
-except Exception:
-    pass
-if text is None:
-    with open(path) as fh:
-        text = fh.read()
-sys.stdout.write(text or "")
-' "$adherence_log" 2>/dev/null)
-    fi
+    raw_verdict=$(_extract_transcript_result_text "$adherence_log")
     [ -n "$raw_verdict" ] || raw_verdict=$(cat "$adherence_log" 2>/dev/null || echo "")
 
     # Parse the verdict.
@@ -2497,10 +2494,7 @@ cmd_resume() {
         if [ "$max_cost_arg" = "none" ]; then
             new_max_cost_json="null"
         else
-            case "$max_cost_arg" in
-                ''|*[!0-9.]*|.|*.*.*) _die "resume: --max-cost must be a positive number or 'none' (got: $max_cost_arg)" ;;
-            esac
-            awk -v v="$max_cost_arg" 'BEGIN { exit !(v > 0) }' \
+            _is_positive_number "$max_cost_arg" \
                 || _die "resume: --max-cost must be a positive number or 'none' (got: $max_cost_arg)"
             new_max_cost_json="$max_cost_arg"
         fi

@@ -312,7 +312,7 @@ def _percentile(values, pct):
     return s[k - 1]
 
 
-def _apply_result_correction(agg, by_model_out, by_actor_out, rates, main_actor):
+def _apply_result_correction(agg, by_model_out, by_actor_out):
     """Sum this run's per-turn `assistant` stream events into totals.
 
     Per plan decision, the `result` event's own `usage`/`modelUsage` fields
@@ -355,7 +355,7 @@ def finalize_agg(agg, rates, main_actor=DEFAULT_MAIN_ACTOR):
         by_model_out[name] = {"tokens": v["tokens"], "cost_usd": round(v["cost_usd"], 6)}
 
     tokens, by_model_out, by_actor_out, cost_usd, cost_complete, unpriced_models = \
-        _apply_result_correction(agg, by_model_out, by_actor_out, rates, main_actor)
+        _apply_result_correction(agg, by_model_out, by_actor_out)
     tokens_in = tokens["input"] + tokens["cache_read"] + tokens["cache_create_5m"] + tokens["cache_create_1h"]
     tokens_out = tokens["output"]
 
@@ -579,25 +579,31 @@ def _run_slice_for_event(log_path, event_ts):
     return offset, end
 
 
-def cmd_classify_exit(args):
-    exit_code = args.exit_code
+def classify_exit(log_path, offset, exit_code, end=None):
+    """Classify why a worker process exited with the given exit_code, given
+    its log file and the byte range [offset, end) covering the run in
+    question. Returns the same dict shape cmd_classify_exit prints as JSON:
+    reason, exit_code, result_subtype, api_error_status, tail_excerpt.
+
+    This is the one classification codepath in the process — both
+    cmd_classify_exit (the CLI subcommand) and build_retro (which
+    reclassifies old failures that have no persisted .detail.reason) call it
+    directly in-process, rather than either of them shelling out to a fresh
+    `python3 mother-usage classify-exit` subprocess per event.
+    """
     reason = None
     result_subtype = None
     api_error_status = None
 
-    blob, _end = read_slice(args.log, args.offset or 0, getattr(args, "end", None))
+    blob, _end = read_slice(log_path, offset or 0, end)
     result_event = None
-    tail_lines = []
     for obj in iter_json_lines(blob):
         if obj.get("type") == "result":
             result_event = obj
-        else:
-            pass
 
     text = blob.decode("utf-8", errors="replace")
     all_lines = [l for l in text.split("\n") if l.strip()]
-    tail_lines = all_lines[-60:]
-    tail_text = "\n".join(tail_lines)
+    tail_text = "\n".join(all_lines[-60:])
     tail_excerpt = " ".join(tail_text.split())[:300]
 
     if result_event:
@@ -631,13 +637,18 @@ def cmd_classify_exit(args):
     else:
         reason = "claude_exit_nonzero"
 
-    print(json.dumps({
+    return {
         "reason": reason,
         "exit_code": exit_code,
         "result_subtype": result_subtype,
         "api_error_status": api_error_status,
         "tail_excerpt": tail_excerpt,
-    }))
+    }
+
+
+def cmd_classify_exit(args):
+    result = classify_exit(args.log, args.offset or 0, args.exit_code, getattr(args, "end", None))
+    print(json.dumps(result))
     return 0
 
 
@@ -980,21 +991,23 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
             reason = (ev.get("detail") or {}).get("reason")
             if not reason:
                 log_path = _log_path_for(root, job, archived)
-                if log_path:
-                    try:
-                        ev_ts = _parse_iso(ev.get("ts"))
-                        run_offset, run_end = _run_slice_for_event(log_path, ev_ts)
-                        ce_args = [sys.executable, os.path.abspath(__file__), "classify-exit",
-                                   "--log", log_path, "--offset", str(run_offset),
-                                   "--exit-code", str((ev.get("detail") or {}).get("exit_code", 1))]
-                        if run_end is not None:
-                            ce_args += ["--end", str(run_end)]
-                        result = subprocess.run(ce_args, capture_output=True, text=True, timeout=30)
-                        reason = json.loads(result.stdout).get("reason") + " (reclassified)"
-                    except Exception:
-                        reason = "unknown (no log)"
-                else:
+                try:
+                    log_readable = bool(log_path) and os.path.isfile(log_path)
+                except OSError:
+                    log_readable = False
+                if not log_readable:
+                    # Genuinely nothing to classify from — the only case this
+                    # falls back silently. Any other error (a real bug in
+                    # classify_exit, a corrupt log, ...) propagates instead of
+                    # being swallowed here (see the module docstring: retro is
+                    # an explicit operator command and raises normally).
                     reason = "unknown (no log)"
+                else:
+                    ev_ts = _parse_iso(ev.get("ts"))
+                    run_offset, run_end = _run_slice_for_event(log_path, ev_ts)
+                    exit_code = (ev.get("detail") or {}).get("exit_code", 1)
+                    classified = classify_exit(log_path, run_offset, exit_code, run_end)
+                    reason = classified.get("reason") + " (reclassified)"
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
             reason_jobs.setdefault(reason, set()).add(job.get("id"))
     tables["failure_reasons"] = {

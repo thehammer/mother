@@ -538,69 +538,83 @@ CAND_EOF
     return 0
 }
 
-# Delegate to _iso_now (sourced from state.sh) so worker-written timestamps
+# _install_core_job_helpers — (re)defines iso_now/_atomic_write/_with_lock/
+# _append_line/_append_event/_job_update/_transition as a single source of
+# truth for their bodies. Bash function definitions written inside another
+# function's body still install plain, script-global functions when that
+# outer function runs (function names aren't block-scoped in bash) — so
+# calling this once here (before the SOURCE_ONLY guard, for bats) and once
+# again below (after sourcing lib/state.sh, for real execution) reinstalls
+# byte-identical definitions both times without hand-copying the function
+# bodies in two places that could silently drift apart. See the second call
+# site below for why a second call is required at all.
+#
+# Delegates to _iso_now (sourced from state.sh) so worker-written timestamps
 # match the millisecond RFC 3339 format used everywhere else in job JSON.
-iso_now() { _iso_now; }
-_atomic_write() {
-    # NB: `path` collides with zsh's special array for PATH — use _target.
-    local _target="$1" content="$2" tmp="${1}.tmp.$$"
-    printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
-}
-_with_lock() {
-    local target="$1"; shift
-    local lockdir="${target}.lockdir"
-    local tries=0
-    while ! mkdir "$lockdir" 2>/dev/null; do
-        sleep 0.05
-        tries=$((tries + 1))
-        [ "$tries" -gt 200 ] && { echo "mother-run-job: could not acquire lock for $target after 10s" >&2; return 1; }
-    done
-    "$@"
-    local rc=$?
-    rmdir "$lockdir" 2>/dev/null || true
-    return $rc
-}
-_append_line() { printf '%s\n' "$2" >> "$1"; }
-_append_event() {
-    local kind="$1" detail="${2:-}"
-    [ -z "$detail" ] && detail='{}'
-    local ev _eventpath
-    ev=$(jq -nc --arg ts "$(iso_now)" --arg kind "$kind" --argjson detail "$detail" \
-        '{ts: $ts, kind: $kind, detail: $detail}')
-    _eventpath="$EVENTS_DIR/$id.jsonl"
-    _with_lock "$_eventpath" _append_line "$_eventpath" "$ev"
-}
-_job_update() {
-    local filter="$1"
-    local merged; merged=$(jq "$filter" "$job_file") || return 1
-    _atomic_write "$job_file" "$merged"
-}
-_transition() {
-    local new="$1" detail="${2:-}"
-    [ -z "$detail" ] && detail='{}'
-    # D2 guard: a `failed` transition must always carry a .reason. A caller
-    # that omitted one gets "unspecified" plus a failure_reason_missing
-    # event naming the caller, so "no bare failed events" holds structurally
-    # even for call sites this feature didn't audit.
-    if [ "$new" = "failed" ]; then
-        local _has_reason
-        _has_reason=$(printf '%s' "$detail" | jq -r 'has("reason")' 2>/dev/null)
-        if [ "$_has_reason" != "true" ]; then
-            detail=$(printf '%s' "$detail" | jq -c '. + {reason: "unspecified"}' 2>/dev/null) || detail='{"reason":"unspecified"}'
-            _append_event "failure_reason_missing" \
-                "$(jq -nc --arg caller "${FUNCNAME[1]:-unknown}" '{caller: $caller}')"
+_install_core_job_helpers() {
+    iso_now() { _iso_now; }
+    _atomic_write() {
+        # NB: `path` collides with zsh's special array for PATH — use _target.
+        local _target="$1" content="$2" tmp="${1}.tmp.$$"
+        printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
+    }
+    _with_lock() {
+        local target="$1"; shift
+        local lockdir="${target}.lockdir"
+        local tries=0
+        while ! mkdir "$lockdir" 2>/dev/null; do
+            sleep 0.05
+            tries=$((tries + 1))
+            [ "$tries" -gt 200 ] && { echo "mother-run-job: could not acquire lock for $target after 10s" >&2; return 1; }
+        done
+        "$@"
+        local rc=$?
+        rmdir "$lockdir" 2>/dev/null || true
+        return $rc
+    }
+    _append_line() { printf '%s\n' "$2" >> "$1"; }
+    _append_event() {
+        local kind="$1" detail="${2:-}"
+        [ -z "$detail" ] && detail='{}'
+        local ev _eventpath
+        ev=$(jq -nc --arg ts "$(iso_now)" --arg kind "$kind" --argjson detail "$detail" \
+            '{ts: $ts, kind: $kind, detail: $detail}')
+        _eventpath="$EVENTS_DIR/$id.jsonl"
+        _with_lock "$_eventpath" _append_line "$_eventpath" "$ev"
+    }
+    _job_update() {
+        local filter="$1"
+        local merged; merged=$(jq "$filter" "$job_file") || return 1
+        _atomic_write "$job_file" "$merged"
+    }
+    _transition() {
+        local new="$1" detail="${2:-}"
+        [ -z "$detail" ] && detail='{}'
+        # D2 guard: a `failed` transition must always carry a .reason. A caller
+        # that omitted one gets "unspecified" plus a failure_reason_missing
+        # event naming the caller, so "no bare failed events" holds structurally
+        # even for call sites this feature didn't audit.
+        if [ "$new" = "failed" ]; then
+            local _has_reason
+            _has_reason=$(printf '%s' "$detail" | jq -r 'has("reason")' 2>/dev/null)
+            if [ "$_has_reason" != "true" ]; then
+                detail=$(printf '%s' "$detail" | jq -c '. + {reason: "unspecified"}' 2>/dev/null) || detail='{"reason":"unspecified"}'
+                _append_event "failure_reason_missing" \
+                    "$(jq -nc --arg caller "${FUNCNAME[1]:-unknown}" '{caller: $caller}')"
+            fi
         fi
-    fi
-    _job_update ".state = \"$new\""
-    case "$new" in
-        running)    _job_update ".started_at = \"$(iso_now)\"" ;;
-        succeeded|failed|cancelled)
-                    _job_update ".finished_at = \"$(iso_now)\""
-                    _job_update ".force_start = null"
-                    type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$id" ;;
-    esac
-    _append_event "$new" "$detail"
+        _job_update ".state = \"$new\""
+        case "$new" in
+            running)    _job_update ".started_at = \"$(iso_now)\"" ;;
+            succeeded|failed|cancelled)
+                        _job_update ".finished_at = \"$(iso_now)\""
+                        _job_update ".force_start = null"
+                        type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$id" ;;
+        esac
+        _append_event "$new" "$detail"
+    }
 }
+_install_core_job_helpers
 
 # Allow sourcing helpers without running job logic (used by bats tests).
 [ "${SOURCE_ONLY:-}" = "1" ] && return 0
@@ -636,73 +650,20 @@ type mother_usage_check_live  >/dev/null 2>&1 || mother_usage_check_live()  { ec
 type mother_maybe_token_alert >/dev/null 2>&1 || mother_maybe_token_alert() { :; }
 type mother_classify_exit     >/dev/null 2>&1 || mother_classify_exit()     { jq -nc --argjson code "${3:-1}" '{reason: "claude_exit_nonzero", exit_code: $code}'; }
 
-# Re-declare this script's own iso_now/_atomic_write/_with_lock/_append_line/
-# _append_event/_job_update/_transition AFTER sourcing lib/state.sh above.
-# They're ALSO defined before the SOURCE_ONLY guard (identically) so bats can
-# unit-test _transition's D2 guard via SOURCE_ONLY=1 sourcing without pulling
-# in the rest of this script's job-execution logic — but state.sh defines its
-# own same-named _job_update/_atomic_write (different signature: 2-arg,
-# id-keyed) that would otherwise win by sourcing-order and silently break
-# every single-arg `_job_update "<filter>"` call below. Redeclaring here
-# restores this script's 1-arg convention for real (non-SOURCE_ONLY)
-# execution; the pre-guard copy is for testability only, never actually
-# reached at runtime (execution always passes through the guard first).
-iso_now() { _iso_now; }
-_atomic_write() {
-    local _target="$1" content="$2" tmp="${1}.tmp.$$"
-    printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
-}
-_with_lock() {
-    local target="$1"; shift
-    local lockdir="${target}.lockdir"
-    local tries=0
-    while ! mkdir "$lockdir" 2>/dev/null; do
-        sleep 0.05
-        tries=$((tries + 1))
-        [ "$tries" -gt 200 ] && { echo "mother-run-job: could not acquire lock for $target after 10s" >&2; return 1; }
-    done
-    "$@"
-    local rc=$?
-    rmdir "$lockdir" 2>/dev/null || true
-    return $rc
-}
-_append_line() { printf '%s\n' "$2" >> "$1"; }
-_append_event() {
-    local kind="$1" detail="${2:-}"
-    [ -z "$detail" ] && detail='{}'
-    local ev _eventpath
-    ev=$(jq -nc --arg ts "$(iso_now)" --arg kind "$kind" --argjson detail "$detail" \
-        '{ts: $ts, kind: $kind, detail: $detail}')
-    _eventpath="$EVENTS_DIR/$id.jsonl"
-    _with_lock "$_eventpath" _append_line "$_eventpath" "$ev"
-}
-_job_update() {
-    local filter="$1"
-    local merged; merged=$(jq "$filter" "$job_file") || return 1
-    _atomic_write "$job_file" "$merged"
-}
-_transition() {
-    local new="$1" detail="${2:-}"
-    [ -z "$detail" ] && detail='{}'
-    if [ "$new" = "failed" ]; then
-        local _has_reason
-        _has_reason=$(printf '%s' "$detail" | jq -r 'has("reason")' 2>/dev/null)
-        if [ "$_has_reason" != "true" ]; then
-            detail=$(printf '%s' "$detail" | jq -c '. + {reason: "unspecified"}' 2>/dev/null) || detail='{"reason":"unspecified"}'
-            _append_event "failure_reason_missing" \
-                "$(jq -nc --arg caller "${FUNCNAME[1]:-unknown}" '{caller: $caller}')"
-        fi
-    fi
-    _job_update ".state = \"$new\""
-    case "$new" in
-        running)    _job_update ".started_at = \"$(iso_now)\"" ;;
-        succeeded|failed|cancelled)
-                    _job_update ".finished_at = \"$(iso_now)\""
-                    _job_update ".force_start = null"
-                    type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$id" ;;
-    esac
-    _append_event "$new" "$detail"
-}
+# Re-install iso_now/_atomic_write/_with_lock/_append_line/_append_event/
+# _job_update/_transition AFTER sourcing lib/state.sh above, by calling
+# _install_core_job_helpers (defined and first called before the
+# SOURCE_ONLY guard, so bats can unit-test _transition's D2 guard via
+# SOURCE_ONLY=1 sourcing without pulling in the rest of this script's
+# job-execution logic). A second call is required here because state.sh
+# defines its own same-named _job_update/_atomic_write (different signature:
+# 2-arg, id-keyed) that would otherwise win by sourcing-order and silently
+# break every single-arg `_job_update "<filter>"` call below. Re-running
+# _install_core_job_helpers restores this script's 1-arg convention for real
+# (non-SOURCE_ONLY) execution; the first call (before the guard) only ever
+# matters for SOURCE_ONLY=1 test sourcing, since real execution always passes
+# through the guard before reaching here.
+_install_core_job_helpers
 
 mother_cli="$MOTHER_BIN_DIR/mother"
 
