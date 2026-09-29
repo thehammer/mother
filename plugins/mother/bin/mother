@@ -1532,6 +1532,19 @@ cmd_force_start() {
         case "$posture" in conservative|normal|elevated|flush) ;; *) posture="normal" ;; esac
     fi
 
+    # A queued job may also be held behind an unsatisfied `--depends-on`
+    # dependency (see `_dep_gate`/`_promote_ready` in state.sh). force-start
+    # skips that gate entirely for a queued job, releasing it whether the
+    # dependency is merely still running/waiting on its PR to merge (a
+    # "wait" status) or stuck needing operator intervention (a "blocked"
+    # status) — so the confirm prompt below must call that out; quota/
+    # posture context alone understates what forcing actually does here.
+    local dep_wait_id="" dep_wait_reason=""
+    if [ "$state" = "queued" ]; then
+        dep_wait_id=$(jq -r '.dep_wait.dep_id // ""' "$job_file")
+        dep_wait_reason=$(jq -r '.dep_wait.reason // ""' "$job_file")
+    fi
+
     # Confirmation gate.
     if [ "$yes" -ne 1 ]; then
         # Non-interactive context without --yes: refuse.
@@ -1543,6 +1556,8 @@ cmd_force_start() {
         local summary=""
         if [ "$quota_paused" -eq 1 ]; then
             summary="Job is paused for quota (awaiting, paused_reason=$paused_reason) — forcing will resume it immediately and dispatch despite the quota gate."
+        elif [ -n "$dep_wait_id" ]; then
+            summary="Job is queued behind dependency $dep_wait_id ($dep_wait_reason) — forcing will release it past the dependency gate."
         elif [ "$over_cap" -eq 1 ] && [ "$posture" = "conservative" ]; then
             summary="Quota is over cap AND posture is conservative — forcing will dispatch this job immediately at full configured strength, bypassing both guards."
         elif [ "$over_cap" -eq 1 ]; then

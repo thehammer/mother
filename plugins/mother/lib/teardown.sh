@@ -608,17 +608,24 @@ _teardown_repoint_pending() {
 }
 
 # _teardown_park <facts_json> <status> <reason> <event_kind> [<detail_json>]
+#              [<open_pr_url>] [<emit_event=1>]
 # Shared tail for every non-dry-run "this job needs another pass" outcome in
 # _teardown_execute — deferred (waiting on something external: PR, gh,
 # docker, a racing job) or failed (worktree_error, worth retrying). Sets
-# TEARDOWN_LAST_STATUS/REASON, emits the event, and upserts the pending
-# record. Always returns 1; callers still `return 1` themselves for clarity
-# at the call site rather than relying on this function's exit code.
+# TEARDOWN_LAST_STATUS/REASON, upserts the pending record (passing
+# <open_pr_url> through to _teardown_defer_record when given), and emits the
+# event — unless <emit_event> is explicitly "0", for the healthy-wait re-check
+# case in _teardown_execute, which wants the status/pending-record bookkeeping
+# on every pass but the event only on the first (see
+# _teardown_healthy_wait_is_new). Always returns 1; callers still `return 1`
+# themselves for clarity at the call site rather than relying on this
+# function's exit code.
 _teardown_park() {
     local facts="$1" status="$2" reason="$3" kind="$4" detail="${5:-{\}}"
+    local open_pr_url="${6:-}" emit_event="${7:-1}"
     TEARDOWN_LAST_STATUS="$status"; TEARDOWN_LAST_REASON="$reason"
-    _teardown_event "$facts" "$kind" "$detail"
-    _teardown_defer_record "$facts" "$reason"
+    [ "$emit_event" = "0" ] || _teardown_event "$facts" "$kind" "$detail"
+    _teardown_defer_record "$facts" "$reason" "$open_pr_url"
     return 1
 }
 
@@ -662,12 +669,13 @@ _teardown_execute() {
         local gate_detail
         gate_detail=$(jq -nc --arg r "$reason" --arg pr "${gate_url:-$pr_url}" '{reason: $r, pr_url: $pr}')
         if _teardown_is_healthy_wait "$reason"; then
-            # Quiet no-op re-check: event only on the first pass of the wait.
-            TEARDOWN_LAST_STATUS="deferred"; TEARDOWN_LAST_REASON="$reason"
-            if _teardown_healthy_wait_is_new "$id" "$reason" "$gate_url"; then
-                _teardown_event "$facts" "teardown_deferred" "$gate_detail"
-            fi
-            _teardown_defer_record "$facts" "$reason" "$gate_url"
+            # Quiet no-op re-check: event only on the first pass of the wait
+            # (_teardown_park's status/pending-record bookkeeping still runs
+            # every pass; only the event emission is suppressed on repeats).
+            local healthy_emit=1
+            _teardown_healthy_wait_is_new "$id" "$reason" "$gate_url" || healthy_emit=0
+            _teardown_park "$facts" "deferred" "$reason" "teardown_deferred" "$gate_detail" \
+                "$gate_url" "$healthy_emit"
             return 1
         fi
         _teardown_park "$facts" "deferred" "$reason" "teardown_deferred" "$gate_detail"
