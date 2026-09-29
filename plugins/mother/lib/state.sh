@@ -708,6 +708,28 @@ Resume from the first uncommitted step in the original plan below. Skip any step
     printf '%s' "$preamble"
 }
 
+# Look up a dependency's state, checking JOBS_DIR first and falling back to
+# ARCHIVE_DIR/*/<id>.json — a dependency job is very often archived (terminal
+# + old + PR no longer open) by the time a dependent job's own dependencies
+# get re-checked, and a job whose dependency has vanished from JOBS_DIR must
+# not be read as unmet forever. Without this fallback, any --depends-on job
+# that outlives its dependency's archival sweep gets stuck in "queued"
+# permanently, with no error or event to signal it.
+_dep_state() {
+    local dep="$1" f
+    f="$(_job_path "$dep")"
+    if [ -f "$f" ]; then
+        jq -r .state "$f"
+        return
+    fi
+    f=$(find "$ARCHIVE_DIR" -maxdepth 2 -name "${dep}.json" -type f -print -quit 2>/dev/null)
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        jq -r .state "$f"
+        return
+    fi
+    echo "missing"
+}
+
 # Promote queued jobs whose dependencies are all succeeded to ready.
 _promote_ready() {
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f | while read -r f; do
@@ -717,8 +739,7 @@ _promote_ready() {
         local id; id=$(jq -r .id "$f")
         local blocked=0
         for dep in $(echo "$deps" | jq -r '.[]'); do
-            local dep_state="missing"
-            [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
+            local dep_state; dep_state=$(_dep_state "$dep")
             case "$dep_state" in succeeded) ;; *) blocked=1; break ;; esac
         done
         if [ "$blocked" -eq 0 ]; then
