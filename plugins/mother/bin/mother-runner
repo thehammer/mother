@@ -48,6 +48,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/usage.sh" ]         && source "$MOTHER_LIB_DIR/usage.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/attention.sh" ]     && source "$MOTHER_LIB_DIR/attention.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/notify.sh" ]        && source "$MOTHER_LIB_DIR/notify.sh"
 
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
@@ -56,6 +58,9 @@ MOTHER_ARCHIVE_INTERVAL="${MOTHER_ARCHIVE_INTERVAL:-3600}"   # seconds between r
 MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
 MOTHER_ARCHIVE_TIMEOUT="${MOTHER_ARCHIVE_TIMEOUT:-300}"      # seconds before a stuck sweep is killed
 MOTHER_ATTENTION_INTERVAL="${MOTHER_ATTENTION_INTERVAL:-60}" # seconds between attention.json refreshes
+MOTHER_NOTIFY_ENABLED="${MOTHER_NOTIFY_ENABLED:-1}"           # push when a job enters `awaiting` (0 to disable)
+MOTHER_NOTIFY_SCAN_INTERVAL="${MOTHER_NOTIFY_SCAN_INTERVAL:-60}" # seconds between awaiting scans
+MOTHER_AWAITING_REMIND_HOURS="${MOTHER_AWAITING_REMIND_HOURS:-24}" # reminder cadence for a job left awaiting
 
 # Kill switches: set to 0 to disable without redeploying.
 MOTHER_ESCALATION_ENABLED="${MOTHER_ESCALATION_ENABLED:-1}"
@@ -523,6 +528,144 @@ _maybe_refresh_attention() {
         echo "$now" > "$marker"
         mother_attention_write 2>/dev/null || _log "attention: refresh failed"
     fi
+}
+
+# ---------- awaiting notifications ----------
+
+# _notify_send <id> <kind> <count> <ok> — record the outcome of one push as an
+# awaiting_notified event. (The job-field write happens in _notify_awaiting.)
+_notify_event() {
+    local id="$1" kind="$2" count="$3" ok="$4"
+    _append_event "$id" "awaiting_notified" \
+        "$(jq -nc --arg k "$kind" --argjson c "$count" --arg t "${MOTHER_NOTIFY_LAST_TRANSPORT:-unknown}" \
+            --argjson ok "$ok" '{kind: $k, count: $c, transport: $t, ok: $ok}')"
+}
+
+# _notify_awaiting — one scan over $JOBS_DIR that pushes a notification to the
+# operator when a job is waiting on them.
+#
+# PERMANENT OPERATOR-ONLY BOUNDARY (not a temporary limitation): this function
+# may write exactly two things — the job's `.awaiting_notify` bookkeeping
+# field, and `awaiting_notified` events. It must NEVER change `state`,
+# `activity`, `pending_answer`, `question`, `paused_reason` or
+# `auto_resume_at`, and must never call cancel, resume, retry, escalate or
+# reconcile. Cancelling, resuming, answering or reworking an unanswered
+# `awaiting` job is the operator's decision, forever; Mother only tells them
+# it is waiting. (The one daemon-side resume that exists — _auto_resume_check —
+# is limited to quota_* system pauses and is untouched by this.)
+#
+# Eligible: state == awaiting and paused_reason NOT quota_* (quota pauses are
+# system pauses _auto_resume_check clears on its own). Episode key: paused_at
+# (fallback: awaiting_notify.first_seen_at, stamped the first time it is seen).
+#   * new episode      -> INITIAL push
+#   * >= MOTHER_AWAITING_REMIND_HOURS since last push -> REMINDER (open-ended:
+#     first at 24h, then one every 24h)
+#   * left `awaiting`  -> awaiting_notify cleared, no push
+#   * more than 3 pushes due in one scan -> ONE coalesced summary push
+# last_notified_at advances even when the transport fails, so a broken
+# notifier can't become a push storm (the failure shows as ok:false).
+_notify_awaiting() {
+    [ "${MOTHER_NOTIFY_ENABLED:-1}" = "1" ] || return 0
+    type mother_notify >/dev/null 2>&1 || return 0
+
+    local marker="$RUNNER_DIR/last-notify-scan.ts" now last=0
+    now=$(date +%s)
+    [ -f "$marker" ] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ $((now - last)) -ge "${MOTHER_NOTIFY_SCAN_INTERVAL:-60}" ] || return 0
+    echo "$now" > "$marker"
+
+    local remind_secs
+    remind_secs=$(awk -v h="${MOTHER_AWAITING_REMIND_HOURS:-24}" 'BEGIN { printf "%d", h * 3600 }')
+    local now_iso; now_iso=$(_iso_now)
+    local us; us=$(printf '\037')
+
+    # Pass 1: classify. `due` holds one "id<US>kind<US>episode<US>first_seen<US>count<US>age_secs<US>title<US>question"
+    # record per line; jobs no longer eligible get their bookkeeping cleared.
+    local due="" due_n=0 f
+    local id state reason paused_at title question has_an an_episode an_first an_count an_last
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        IFS="$us" read -r id state reason paused_at title question has_an an_episode an_first an_count an_last < <(
+            jq -r --arg us "$us" '[.id, .state, (.paused_reason // ""), (.paused_at // ""),
+                (.title // ""), ((.question // "") | .[0:150]),
+                (if .awaiting_notify != null then "1" else "0" end),
+                (.awaiting_notify.episode // ""), (.awaiting_notify.first_seen_at // ""),
+                ((.awaiting_notify.count // 0) | tostring), (.awaiting_notify.last_notified_at // "")]
+                | map(tostring | gsub("[\n\r\t]"; " ")) | join($us)' "$f" 2>/dev/null) || continue
+        [ -n "$id" ] || continue
+
+        local eligible=1
+        [ "$state" = "awaiting" ] || eligible=0
+        case "$reason" in quota_*) eligible=0 ;; esac
+        if [ "$eligible" -eq 0 ]; then
+            [ "$has_an" = "1" ] && _job_update "$id" 'del(.awaiting_notify)'
+            continue
+        fi
+
+        local key="$paused_at" first_seen="$an_first" kind=""
+        if [ -z "$key" ]; then
+            [ -n "$an_first" ] && key="$an_first" || key="$now_iso"
+        fi
+        [ -n "$first_seen" ] || first_seen="$key"
+        local count="${an_count:-0}"
+        case "$count" in ''|*[!0-9]*) count=0 ;; esac
+        if [ "$has_an" != "1" ] || [ "$an_episode" != "$key" ]; then
+            kind="initial"; count=0; first_seen="$key"
+        else
+            local last_epoch; last_epoch=$(_iso_to_epoch "$an_last")
+            [ $((now - last_epoch)) -ge "$remind_secs" ] && kind="reminder"
+        fi
+        [ -n "$kind" ] || continue
+
+        local since_epoch age_secs
+        since_epoch=$(_iso_to_epoch "$first_seen")
+        [ "$since_epoch" -gt 0 ] && age_secs=$((now - since_epoch)) || age_secs=0
+        [ -n "$paused_at" ] && { since_epoch=$(_iso_to_epoch "$paused_at"); [ "$since_epoch" -gt 0 ] && age_secs=$((now - since_epoch)); }
+        due="${due}${id}${us}${kind}${us}${key}${us}${first_seen}${us}${count}${us}${age_secs}${us}${title}${us}${question}
+"
+        due_n=$((due_n + 1))
+    done
+    [ "$due_n" -gt 0 ] || return 0
+
+    # Pass 2: send. More than 3 due -> one summary push covering all of them.
+    local summary_ok="" line
+    if [ "$due_n" -gt 3 ]; then
+        if mother_notify "Mother: $due_n jobs waiting for you" \
+            "$due_n Mother jobs are waiting for you — mother status" ""; then
+            summary_ok=true
+        else
+            summary_ok=false
+        fi
+    fi
+
+    local kind key first_seen count age_secs ok body ptitle
+    while IFS="$us" read -r id kind key first_seen count age_secs title question; do
+        [ -n "$id" ] || continue
+        if [ -n "$summary_ok" ]; then
+            ok="$summary_ok"
+        else
+            if [ "$kind" = "initial" ]; then
+                ptitle="Mother: job needs your answer"
+            else
+                ptitle="Mother: job still waiting ($((age_secs / 3600))h)"
+            fi
+            body="${title:-$id}"
+            [ "$kind" = "reminder" ] && body="$body (waiting $((age_secs / 3600))h)"
+            [ -n "$question" ] && body="$body — $question"
+            body="$body
+mother resume $id \"…\""
+            if mother_notify "$ptitle" "$body" "$id"; then ok=true; else ok=false; fi
+        fi
+        count=$((count + 1))
+        # Only touch our own field, and only while the job is still awaiting.
+        _job_update "$id" "if .state == \"awaiting\" then .awaiting_notify = $(jq -nc \
+            --arg e "$key" --arg fs "$first_seen" --argjson c "$count" --arg ts "$(_iso_now)" \
+            '{episode: $e, first_seen_at: $fs, count: $c, last_notified_at: $ts}') else . end"
+        _notify_event "$id" "$kind" "$count" "$ok"
+    done <<EOF
+$due
+EOF
 }
 
 # ---------- quota-aware dispatch ----------
@@ -1200,6 +1343,7 @@ _loop() {
 
         _maybe_archive
         _maybe_refresh_attention
+        _notify_awaiting
         # Sleep in short slices so signal handling is responsive.
         local slept=0
         while [ "$slept" -lt "$MOTHER_POLL_INTERVAL" ] && [ "$SHUTDOWN" -eq 0 ]; do
@@ -1287,6 +1431,15 @@ case "${1:-}" in
         # the last-attention.ts marker. Used by attention.bats.
         # Usage: mother-runner --attention-tick
         _maybe_refresh_attention
+        exit 0
+        ;;
+    --notify-tick)
+        # Test entry point: run one _notify_awaiting pass and exit without
+        # starting the daemon loop. Callers control whether the scan gate
+        # fires via MOTHER_NOTIFY_SCAN_INTERVAL (0 = always) / the
+        # last-notify-scan.ts marker. Used by awaiting_notify.bats.
+        # Usage: mother-runner --notify-tick
+        _notify_awaiting
         exit 0
         ;;
     --prune-temps-tick)

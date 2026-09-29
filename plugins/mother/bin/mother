@@ -3514,6 +3514,22 @@ Hook / events env vars:
                                                 a session cursor is stale.
                                                 0 disables the floor.
 
+Operator attention / notification env vars:
+  MOTHER_ATTENTION_INTERVAL       (default: 60)  seconds between daemon refreshes of
+                                                 attention.json (statusline count)
+  MOTHER_DEP_PR_POLL_INTERVAL     (default: 120) seconds between re-checks of a
+                                                 dependency PR's merge state
+                                                 (merged/closed are cached forever)
+  MOTHER_NOTIFY_ENABLED           (default: 1)   push a notification when a job
+                                                 enters `awaiting` (0 to disable)
+  MOTHER_NOTIFY_TRANSPORT         (default: auto) auto|terminal-notifier|osascript|
+                                                 command|none
+  MOTHER_NOTIFY_COMMAND           (unset)        program run as CMD TITLE BODY JOB_ID
+                                                 when TRANSPORT=command
+  MOTHER_NOTIFY_SCAN_INTERVAL     (default: 60)  seconds between awaiting scans
+  MOTHER_AWAITING_REMIND_HOURS    (default: 24)  reminder cadence for a job left
+                                                 awaiting (open-ended)
+
 Teardown env vars (worktree + docker cleanup, rides along with `mother archive`
 on every sweep — independent of the record-archiving age cutoff):
   MOTHER_TEARDOWN_ENABLED         (default: 1)  tear down worktrees/containers
