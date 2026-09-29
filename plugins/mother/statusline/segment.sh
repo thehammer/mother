@@ -10,7 +10,8 @@
 #
 # Cache:
 #   $MOTHER_STATUSLINE_CACHE (default: /tmp/.mother-statusline) — single line,
-#   colon-separated "RUNNING:QUEUED:FAILED:AWAITING:TOKEN_ALERTS" counts. Each
+#   colon-separated "RUNNING:QUEUED:FAILED:AWAITING:TOKEN_ALERTS:ATTENTION" counts
+#   (ATTENTION = length of $MOTHER_ROOT/attention.json, written by the daemon). Each
 #   field was added later and lives at the end so old caches written by an
 #   older version still parse: a missing field defaults to zero, and a fresh
 #   refresh (TTL ~10s) overwrites the cache in the new format.
@@ -97,7 +98,13 @@ mother_statusline_refresh() {
         done | wc -l | tr -d ' ')
     : "${alert_count:=0}"
 
-    printf '%s:%s\n' "$counts" "$alert_count" > "$tmp" && mv "$tmp" "$cache"
+    # Attention count: length of the cached needs-attention list (0 when the
+    # file is missing/unreadable). Read-only — the daemon owns the refresh.
+    local attention_count
+    attention_count=$(jq 'length' "$MOTHER_ROOT/attention.json" 2>/dev/null)
+    case "${attention_count:-}" in ''|*[!0-9]*) attention_count=0 ;; esac
+
+    printf '%s:%s:%s\n' "$counts" "$alert_count" "$attention_count" > "$tmp" && mv "$tmp" "$cache"
 }
 
 # Render the statusline segment. Trailing space, no separator — callers add
@@ -118,20 +125,21 @@ mother_segment() {
         ( mother_statusline_refresh "$cache" >/dev/null 2>&1 ) &
     fi
 
-    local _mr _mq _mf _ma _mt
-    # Read up to 5 fields. An older cache (fewer fields) leaves the missing
+    local _mr _mq _mf _ma _mt _mn
+    # Read up to 6 fields. An older cache (fewer fields) leaves the missing
     # ones empty, which the defaults below map to 0 — correct until the next
     # refresh overwrites the cache in the new format.
-    IFS=: read -r _mr _mq _mf _ma _mt < "$cache" 2>/dev/null \
-        || { _mr=0; _mq=0; _mf=0; _ma=0; _mt=0; }
-    : "${_mr:=0}" "${_mq:=0}" "${_mf:=0}" "${_ma:=0}" "${_mt:=0}"
+    IFS=: read -r _mr _mq _mf _ma _mt _mn < "$cache" 2>/dev/null \
+        || { _mr=0; _mq=0; _mf=0; _ma=0; _mt=0; _mn=0; }
+    : "${_mr:=0}" "${_mq:=0}" "${_mf:=0}" "${_ma:=0}" "${_mt:=0}" "${_mn:=0}"
 
     # Only render if something non-zero.
     if ! { [ "$_mr" -gt 0 ] 2>/dev/null \
         || [ "$_mq" -gt 0 ] 2>/dev/null \
         || [ "$_mf" -gt 0 ] 2>/dev/null \
         || [ "$_ma" -gt 0 ] 2>/dev/null \
-        || [ "$_mt" -gt 0 ] 2>/dev/null; }; then
+        || [ "$_mt" -gt 0 ] 2>/dev/null \
+        || [ "$_mn" -gt 0 ] 2>/dev/null; }; then
         return 0
     fi
 
@@ -144,6 +152,7 @@ mother_segment() {
     # orange makes them stand out without crying wolf the way red would.
     [ "$_ma" -gt 0 ] && out="${out} \033[38;5;208m?${_ma}${reset}"  # orange — awaiting input
     [ "$_mf" -gt 0 ] && out="${out} \033[38;5;203m!${_mf}${reset}"  # red — failed
+    [ "$_mn" -gt 0 ] && out="${out} \033[38;5;214m⚑${_mn}${reset}"  # amber — needs attention
     [ "$_mt" -gt 0 ] && out="${out} \033[38;5;170m\$!${_mt}${reset}" # magenta — token alerts
 
     # Quota gate indicator: 🚦 if either rolling window is over its cap.

@@ -20,7 +20,7 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 # Usage:
 #   mother add --plan-file <path> --repo <name> --branch <branch> [options]
 #   mother list [--state ...] [--repo ...] [--format json|table]
-#   mother status <id>
+#   mother status [<id>]
 #   mother logs <id> [--follow]
 #   mother peek <id> [--format json|text] [--tail N]
 #   mother cancel <id>
@@ -57,6 +57,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/usage.sh" ]         && source "$MOTHER_LIB_DIR/usage.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/teardown.sh" ]      && source "$MOTHER_LIB_DIR/teardown.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/attention.sh" ]     && source "$MOTHER_LIB_DIR/attention.sh"
 
 # ---------- CLI-only helpers ----------
 
@@ -794,15 +796,80 @@ cmd_list() {
                 esac
                 printf "%-28s  %-16s  %-18s  %-12s  %-16s  %8s  %s\n" "$id" "$state_display" "$repo" "$iso" "$origin" "$cost_display" "$title"
             done
+        # Attention footer: reads the cached list only (never recomputes, never gh).
+        local _att_n
+        _att_n=$(jq 'length' "$MOTHER_ROOT/attention.json" 2>/dev/null) || _att_n=0
+        case "${_att_n:-0}" in ''|*[!0-9]*) _att_n=0 ;; esac
+        if [ "$_att_n" -gt 0 ]; then
+            echo "⚑ $_att_n item(s) need attention — run: mother status"
+        fi
     fi
 }
 
 # ---------- status ----------
 
+# `mother status` with no id: queue overview + the needs-attention list.
+# Recomputes live (no gh — see lib/attention.sh) and refreshes attention.json
+# as a side effect so the statusline / `mother list` footer stay in step.
+_status_overview() {
+    local format="$1"
+    local items counts awaiting
+    items=$(mother_attention_items)
+    printf '%s' "$items" | jq -e 'type == "array"' >/dev/null 2>&1 || items='[]'
+    _atomic_write "$MOTHER_ROOT/attention.json" "$items"
+
+    local jobs_json
+    jobs_json=$(find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | sort | while read -r f; do
+        jq -c '.' "$f" 2>/dev/null
+    done | jq -cs '.')
+    [ -n "$jobs_json" ] || jobs_json='[]'
+
+    counts=$(printf '%s' "$jobs_json" | jq -c 'group_by(.state) | map({key: (.[0].state // "unknown"), value: length}) | from_entries')
+    awaiting=$(printf '%s' "$jobs_json" | jq -c --argjson now "$(date +%s)" '
+        def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+        map(select(.state == "awaiting"))
+        | map({id, title: (.title // ""), paused_reason: (.paused_reason // ""),
+               paused_at: (.paused_at // null),
+               age_seconds: (if (.paused_at // "") != "" then ($now - (.paused_at | try epoch catch $now)) else null end),
+               question: ((.question // "") | .[0:100]),
+               auto_resumes: ((.paused_reason // "") | startswith("quota_"))})')
+
+    if [ "$format" = "json" ]; then
+        jq -nc --argjson counts "$counts" --argjson awaiting "$awaiting" --argjson na "$items" \
+            '{counts: $counts, awaiting: $awaiting, needs_attention: $na}'
+        return 0
+    fi
+
+    echo "Queue: $(printf '%s' "$counts" | jq -r 'to_entries | if length == 0 then "(no jobs)" else map("\(.key)=\(.value)") | join("  ") end')"
+    echo ""
+    echo "=== awaiting operator ==="
+    if [ "$(printf '%s' "$awaiting" | jq 'length')" = "0" ]; then
+        echo "  (none)"
+    else
+        printf '%s' "$awaiting" | jq -r '.[] |
+            "  " + .id
+            + "  " + (if .age_seconds == null then "age ?" else "waiting " + ((.age_seconds / 3600 * 10 | floor) / 10 | tostring) + "h" end)
+            + "  " + (if .paused_reason == "" then "question" else .paused_reason end)
+            + (if .auto_resumes then " (auto-resumes)" else "" end)
+            + (if .question != "" then "  — " + .question else "" end)'
+    fi
+    echo ""
+    mother_attention_render_text "$items"
+}
+
 cmd_status() {
-    local id="${1:-}" format="text"
-    [ -n "$id" ] || _die "status: <id> required"
-    shift
+    local id="" format="text"
+    case "${1:-}" in ""|-*) ;; *) id="$1"; shift ;; esac
+    if [ -z "$id" ]; then
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --format) format="$2"; shift 2 ;;
+                *) _die "unknown flag for status: $1" ;;
+            esac
+        done
+        _status_overview "$format"
+        return 0
+    fi
     while [ $# -gt 0 ]; do
         case "$1" in
             --format) format="$2"; shift 2 ;;
@@ -861,6 +928,26 @@ cmd_status() {
             echo "     mother resume $id \"<guidance>\"   — resume with instructions for the agents"
             echo "     mother resume $id \"SHIP\"          — force ship despite findings"
             echo "     mother cancel $id                   — abandon the job"
+            echo ""
+        fi
+        local dep_wait_line
+        dep_wait_line=$(jq -r 'select(.dep_wait != null) | .dep_wait
+            | "⏳ [WAITING-ON-DEPENDENCY] \(.dep_id) — \(.reason)\(if (.pr_url // "") != "" then " (" + .pr_url + ")" else "" end)|\(.status)"' "$job_file")
+        if [ -n "$dep_wait_line" ]; then
+            echo ""
+            echo "${dep_wait_line%|*}"
+            if [ "${dep_wait_line##*|}" = "blocked" ]; then
+                echo "   This dependency will not resolve on its own; the job stays queued (never auto-cancelled)."
+                echo "   Run: mother force-start $id  (release it anyway)"
+                echo "   Or:  mother cancel $id"
+            fi
+            echo ""
+        fi
+        local notify_line
+        notify_line=$(jq -r 'select(.awaiting_notify != null) | "  Notified: \(.awaiting_notify.count // 0) time(s), last \(.awaiting_notify.last_notified_at // "never")"' "$job_file")
+        if [ -n "$notify_line" ] && [ "$(jq -r '.state' "$job_file")" = "awaiting" ]; then
+            echo ""
+            echo "$notify_line"
             echo ""
         fi
         if [ "$(jq -r '.resume_not_yet_acted_on // false' "$job_file")" = "true" ]; then
@@ -3320,7 +3407,7 @@ mother — background work for Claude Code
 Usage:
   mother add --plan-file PATH --repo NAME --branch BRANCH [options]
   mother list [--state STATE] [--repo REPO] [--project NAME] [--label LABEL] [--format json|table]
-  mother status ID [--format json|text]
+  mother status [ID] [--format json|text]     (no ID: queue overview, awaiting jobs, needs-attention list)
   mother logs ID [--follow]
   mother peek ID [--format json|text] [--tail N] [--watch]
   mother attach ID

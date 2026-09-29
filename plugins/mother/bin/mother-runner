@@ -46,6 +46,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ]  && source "$MOTHER_LIB_DIR/phase-prompt.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/usage.sh" ]         && source "$MOTHER_LIB_DIR/usage.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/attention.sh" ]     && source "$MOTHER_LIB_DIR/attention.sh"
 
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
@@ -53,6 +55,7 @@ MOTHER_SHUTDOWN_GRACE="${MOTHER_SHUTDOWN_GRACE:-30}"
 MOTHER_ARCHIVE_INTERVAL="${MOTHER_ARCHIVE_INTERVAL:-3600}"   # seconds between retention sweeps
 MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
 MOTHER_ARCHIVE_TIMEOUT="${MOTHER_ARCHIVE_TIMEOUT:-300}"      # seconds before a stuck sweep is killed
+MOTHER_ATTENTION_INTERVAL="${MOTHER_ATTENTION_INTERVAL:-60}" # seconds between attention.json refreshes
 
 # Kill switches: set to 0 to disable without redeploying.
 MOTHER_ESCALATION_ENABLED="${MOTHER_ESCALATION_ENABLED:-1}"
@@ -501,6 +504,24 @@ _maybe_archive() {
             _log "archive: sweep exceeded ${MOTHER_ARCHIVE_TIMEOUT}s, killed pid $sweep_pid — dispatch resumes; it will retry next interval"
             rm -f "$timeout_flag"
         fi
+    fi
+}
+
+# Refresh $MOTHER_ROOT/attention.json (the needs-attention list the statusline
+# and `mother list` footer read) at most once per MOTHER_ATTENTION_INTERVAL
+# seconds, so the statusline stays fresh without anyone running `mother
+# status`. Same marker-file gating as _maybe_archive. mother_attention_items
+# only reads local state (never gh), so this is cheap and safe on the loop.
+_maybe_refresh_attention() {
+    type mother_attention_write >/dev/null 2>&1 || return 0
+    local marker="$RUNNER_DIR/last-attention.ts"
+    local now last=0
+    now=$(date +%s)
+    [ -f "$marker" ] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ $((now - last)) -ge "${MOTHER_ATTENTION_INTERVAL:-60}" ]; then
+        echo "$now" > "$marker"
+        mother_attention_write 2>/dev/null || _log "attention: refresh failed"
     fi
 }
 
@@ -1178,6 +1199,7 @@ _loop() {
         fi
 
         _maybe_archive
+        _maybe_refresh_attention
         # Sleep in short slices so signal handling is responsive.
         local slept=0
         while [ "$slept" -lt "$MOTHER_POLL_INTERVAL" ] && [ "$SHUTDOWN" -eq 0 ]; do
@@ -1256,6 +1278,15 @@ case "${1:-}" in
         # cmd_adherence_review alone (invoked directly) never exercises.
         # Usage: mother-runner --adherence-tick
         _run_adherence_pending
+        exit 0
+        ;;
+    --attention-tick)
+        # Test entry point: run one _maybe_refresh_attention pass and exit
+        # without starting the daemon loop. Callers control whether the
+        # interval gate fires via MOTHER_ATTENTION_INTERVAL (0 = always) /
+        # the last-attention.ts marker. Used by attention.bats.
+        # Usage: mother-runner --attention-tick
+        _maybe_refresh_attention
         exit 0
         ;;
     --prune-temps-tick)
