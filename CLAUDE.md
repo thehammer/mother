@@ -95,8 +95,8 @@ plan-adherence review. Here's what was added and how to work with it.
 | `cost_cap_breached_at` | string | ISO timestamp set when live spend first crosses `max_cost_usd`. Triggers the `$RUNNER_DIR/<id>.cost-cap` hook flag file and, after `MOTHER_COST_CAP_GRACE_SECONDS` (default 300) with no cooperative `mother await`, a forced pause to `awaiting`/`paused_reason: cost_cap`. |
 | `failure_reason` | string | The `.reason` of the job's most recent `failed` transition (`unspecified` if the caller gave none), persisted by both `_transition` (`mother-run-job`) and `_job_transition` (`lib/state.sh`). Cleared on `succeeded`. Lets the runner route on it without replaying events. |
 | `failure_routed` | bool\|null | Set `true` by `mother route-failure` when it deliberately leaves a job `failed` (`left_failed`) so the runner stops re-examining it. Cleared by the next `failed` transition. |
-| `auto_retry_count` | int | Number of as-is (no tier bump) automatic retries the failure router has granted (max 1). |
-| `operator_hold` | object | `{failure_reason, sub_reason, detail, held_at}` — present while a job is held (`activity: operator_hold`). |
+| `auto_retry_count` | int | Number of as-is (no tier bump) automatic retries the failure router has granted (max 1). Reset to `0` by `mother resume` — an operator resuming the job is a fresh chance, not a continuation of the failed retry budget. |
+| `operator_hold` | object\|null | `{failure_reason, sub_reason, detail, held_at}` — present while a job is held (`activity: operator_hold`). Cleared (set to `null`) by `mother retry`, `mother reconcile`, and `mother resume`. |
 | `current_run.*` (baseline) | object | In addition to `log_offset`/`spawned_at`/`session_id`: `head_sha_at_start`, `remote_ref`, `remote_sha_at_start`, `pr_url_at_start`, `had_artifact_at_start` — what already existed on origin/as a PR when this run began (audit fields for the rework-advance check). |
 
 ### State machine

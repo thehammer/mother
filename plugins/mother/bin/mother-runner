@@ -349,6 +349,27 @@ _recover_orphans() {
             "$(jq -nc '{failure_reason: "runner_died"}')"
     }
 
+    # Another RUNNING main-dir job already occupying <_repo> (other than
+    # <_skip_id> itself) — its live workspace must not be touched by an
+    # orphan's stash-restore. Echoes that job's id (empty if none). One jq
+    # call per candidate file (id/state/isolation/repo_path as a single
+    # @tsv row) instead of four, since this runs once per job file in the
+    # sibling-conflict check below.
+    _find_conflicting_main_dir_job() {
+        local _skip_id="$1" _repo="$2" _f _fields _fid _fstate _fiso _frepo
+        for _f in "$JOBS_DIR"/*.json; do
+            [ -f "$_f" ] || continue
+            _fields=$(jq -r '[.id, (.state // ""), (.isolation // ""), (.repo_path // "")] | @tsv' "$_f" 2>/dev/null) || continue
+            IFS=$'\t' read -r _fid _fstate _fiso _frepo <<<"$_fields"
+            [ "$_fid" != "$_skip_id" ] || continue
+            [ "$_fstate" = "running" ] || continue
+            [ "$_fiso" = "main-dir" ] || continue
+            [ "$_frepo" = "$_repo" ] || continue
+            echo "$_fid"
+            return 0
+        done
+    }
+
     # A dead supervisor never ran its EXIT trap (SIGKILL, host crash), so a
     # main-dir job's auto-stash is still sitting in the operator's stash list.
     # Put it back — but only when no OTHER main-dir job is running against the
@@ -356,21 +377,15 @@ _recover_orphans() {
     # no sibling runs nobody else is in that checkout, whereas popping into a
     # sibling's live workspace would dump the operator's changes into its tree.
     _orphan_restore_autostash() {
-        local _rid="$1" _rjf="$2" _riso _rrepo _rmarker _rf _rconf="" _rres _routcome _rmsg _rorig _rref
+        local _rid="$1" _rjf="$2" _riso _rrepo _rmarker _rconf _rres _routcome _rmsg _rout _rkind _rdetail
         _riso=$(jq -r '.isolation // empty' "$_rjf" 2>/dev/null)
         [ "$_riso" = "main-dir" ] || return 0
         _rmarker="$RUNNER_DIR/$_rid.stash"
         [ -f "$_rmarker" ] || return 0
         _rrepo=$(jq -r '.repo_path // empty' "$_rjf" 2>/dev/null)
         [ -n "$_rrepo" ] || return 0
-        for _rf in "$JOBS_DIR"/*.json; do
-            [ -f "$_rf" ] || continue
-            [ "$(jq -r '.id' "$_rf" 2>/dev/null)" != "$_rid" ] || continue
-            [ "$(jq -r '.state // ""' "$_rf" 2>/dev/null)" = "running" ] || continue
-            [ "$(jq -r '.isolation // ""' "$_rf" 2>/dev/null)" = "main-dir" ] || continue
-            [ "$(jq -r '.repo_path // ""' "$_rf" 2>/dev/null)" = "$_rrepo" ] || continue
-            _rconf=$(jq -r '.id' "$_rf"); break
-        done
+
+        _rconf=$(_find_conflicting_main_dir_job "$_rid" "$_rrepo")
         _rmsg=$(sed -n '1p' "$_rmarker" 2>/dev/null)
         if [ -n "$_rconf" ]; then
             _append_event "$_rid" "auto_stash_restore_deferred" \
@@ -378,21 +393,14 @@ _recover_orphans() {
             _log "deferred auto-stash restore for $_rid (main-dir job $_rconf running in the same repo)"
             return 0
         fi
+
         _rres=$(mother_autostash_restore "$_rrepo" "$_rmarker" 2>/dev/null) || return 0
         _routcome=$(printf '%s' "$_rres" | jq -r '.outcome // "none"' 2>/dev/null)
-        _rorig=$(printf '%s' "$_rres" | jq -r '.original_branch // ""' 2>/dev/null)
-        _rref=$(printf '%s' "$_rres" | jq -r '.stash_ref // ""' 2>/dev/null)
-        case "$_routcome" in
-            restored)
-                _append_event "$_rid" "auto_stash_restored" \
-                    "$(jq -nc --arg m "$_rmsg" --arg b "$_rorig" '{stash_message: $m, original_branch: $b}')" ;;
-            restore_failed)
-                _append_event "$_rid" "auto_stash_restore_failed" \
-                    "$(jq -nc --arg m "$_rmsg" --arg r "$_rref" '{stash_message: $m, stash_ref: $r, note: "git stash pop failed; resolve manually via git stash list / git stash pop"}')" ;;
-            stash_not_found)
-                _append_event "$_rid" "auto_stash_not_found" \
-                    "$(jq -nc --arg m "$_rmsg" '{stash_message: $m}')" ;;
-        esac
+        _rout=$(mother_autostash_event_detail "$_rres") && {
+            _rkind="${_rout%%$'\t'*}"
+            _rdetail="${_rout#*$'\t'}"
+            _append_event "$_rid" "$_rkind" "$_rdetail"
+        }
         _log "auto-stash restore for orphaned $_rid: $_routcome"
     }
 
@@ -667,6 +675,7 @@ _maybe_pause_running() {
 # own without disabling escalation.
 _auto_escalate_failed() {
     local f state esc_count id reconcile_rc failure_reason failure_routed
+    local route_rc route_out merged
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
@@ -683,7 +692,25 @@ _auto_escalate_failed() {
         # behavior for every job.
         if [ "${MOTHER_FAILURE_ROUTING_ENABLED:-1}" != "0" ] && [ -n "$failure_reason" ]; then
             [ "$failure_routed" = "true" ] && continue
-            "$MOTHER_BIN_DIR/mother" route-failure "$id" 2>&1 | while read -r line; do _log "route-failure: $line"; done
+            # Captured directly (not via a `cmd | while read` pipe, whose exit
+            # status here would be the while loop's, not route-failure's) so a
+            # non-zero exit — e.g. `mother` calling _die on a jq update
+            # failure — is actually seen below.
+            route_out=$("$MOTHER_BIN_DIR/mother" route-failure "$id" 2>&1)
+            route_rc=$?
+            [ -n "$route_out" ] && printf '%s\n' "$route_out" | while read -r line; do _log "route-failure: $line"; done
+            if [ "$route_rc" -ne 0 ]; then
+                # route-failure errored out instead of deliberately leaving the
+                # job failed (that path sets failure_routed itself). Mark it
+                # routed anyway so the daemon doesn't re-run route-failure —
+                # and re-log the same error — on every future poll tick
+                # forever; a persistent error becomes visible once, via a
+                # distinct event, instead of spamming the daemon log.
+                merged=$(jq '.failure_routed = true' "$f" 2>/dev/null) && _atomic_write "$f" "$merged"
+                _append_event "$id" "route_error" \
+                    "$(jq -nc --arg err "$route_out" --argjson rc "$route_rc" '{error: $err, exit_code: $rc}')"
+                _log "route-failure exited $route_rc for $id; marked failure_routed to stop retrying"
+            fi
             continue
         fi
 
@@ -1305,6 +1332,18 @@ case "${1:-}" in
         # daemon loop. Used by orphan_recovery.bats.
         # Usage: mother-runner --recover-orphans-tick [grace_seconds]
         _recover_orphans "${2:-$MOTHER_ORPHAN_GRACE}"
+        exit 0
+        ;;
+    --auto-escalate-tick)
+        # Test entry point: run one _auto_escalate_failed pass and exit
+        # without starting the daemon loop. Used by escalation.bats to drive
+        # the REAL failure-routing/legacy-escalation wiring (which failed job
+        # gets routed via `mother route-failure`, which is skipped because
+        # failure_routed is already true, and which falls back to the legacy
+        # reconcile-then-escalate path when MOTHER_FAILURE_ROUTING_ENABLED=0)
+        # behaviorally, instead of grepping this script's source for strings.
+        # Usage: mother-runner --auto-escalate-tick
+        _auto_escalate_failed
         exit 0
         ;;
     --archive-tick)

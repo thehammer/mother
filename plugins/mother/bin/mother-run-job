@@ -72,6 +72,7 @@ type prd_owner_repo_from_url >/dev/null 2>&1 || prd_owner_repo_from_url() {
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/autostash.sh" ] && source "$MOTHER_LIB_DIR/autostash.sh"
 type mother_autostash_restore >/dev/null 2>&1 || mother_autostash_restore() { echo '{"outcome":"none"}'; }
+type mother_autostash_event_detail >/dev/null 2>&1 || mother_autostash_event_detail() { return 1; }
 
 # _restore_auto_stash — put the operator's main-dir working tree back and
 # record what happened. No-op unless isolation is main-dir and a stash marker
@@ -84,25 +85,12 @@ type mother_autostash_restore >/dev/null 2>&1 || mother_autostash_restore() { ec
 _restore_auto_stash() {
     [ "${isolation:-}" = "main-dir" ] || return 0
     [ -n "${stash_marker:-}" ] || return 0
-    local res outcome msg orig ref
+    local res out kind detail
     res=$(mother_autostash_restore "${work_dir:-}" "$stash_marker" 2>/dev/null) || return 0
-    outcome=$(printf '%s' "$res" | jq -r '.outcome // "none"' 2>/dev/null)
-    msg=$(printf '%s' "$res" | jq -r '.stash_message // ""' 2>/dev/null)
-    orig=$(printf '%s' "$res" | jq -r '.original_branch // ""' 2>/dev/null)
-    ref=$(printf '%s' "$res" | jq -r '.stash_ref // ""' 2>/dev/null)
-    case "$outcome" in
-        restored)
-            _append_event "auto_stash_restored" \
-                "$(jq -nc --arg m "$msg" --arg b "$orig" \
-                    '{stash_message: $m, original_branch: $b}')" ;;
-        restore_failed)
-            _append_event "auto_stash_restore_failed" \
-                "$(jq -nc --arg m "$msg" --arg ref "$ref" \
-                    '{stash_message: $m, stash_ref: $ref, note: "git stash pop failed; resolve manually via git stash list / git stash pop"}')" ;;
-        stash_not_found)
-            _append_event "auto_stash_not_found" \
-                "$(jq -nc --arg m "$msg" '{stash_message: $m}')" ;;
-    esac
+    out=$(mother_autostash_event_detail "$res") || return 0
+    kind="${out%%$'\t'*}"
+    detail="${out#*$'\t'}"
+    _append_event "$kind" "$detail"
     return 0
 }
 
@@ -797,7 +785,7 @@ _install_core_job_helpers() {
         case "$new" in
             failed)
                 local _reason_lit
-                _reason_lit=$(printf '%s' "$detail" | jq -c '(.reason // "") | tostring | if . == "" then "unspecified" else . end' 2>/dev/null) || _reason_lit='"unspecified"'
+                _reason_lit=$(_failure_reason_literal "$detail") || _reason_lit='"unspecified"'
                 _job_update ".failure_reason = $_reason_lit | .failure_routed = null" ;;
             succeeded)
                 _job_update ".failure_reason = null" ;;
@@ -813,6 +801,20 @@ _install_core_job_helpers() {
     }
 }
 _install_core_job_helpers
+
+# _failure_reason_literal's canonical definition lives in lib/state.sh (see
+# there — it's shared with _job_transition so the "missing/blank reason
+# becomes unspecified" rule can't drift between the two copies). state.sh
+# isn't sourced yet at this point (real execution sources it further down;
+# SOURCE_ONLY=1 bats sourcing returns before ever reaching that source line),
+# so install a byte-identical fallback now for _transition (called above the
+# guard, both for real dry-run-free execution before re-sourcing and for
+# SOURCE_ONLY=1 tests) to call. Real execution re-sources state.sh below,
+# which overwrites this with the canonical definition; keep this in sync
+# with lib/state.sh's version if that normalization rule ever changes.
+type _failure_reason_literal >/dev/null 2>&1 || _failure_reason_literal() {
+    printf '%s' "$1" | jq -c '(.reason // "") | tostring | if . == "" then "unspecified" else . end' 2>/dev/null || echo '"unspecified"'
+}
 
 # Allow sourcing helpers without running job logic (used by bats tests).
 [ "${SOURCE_ONLY:-}" = "1" ] && return 0

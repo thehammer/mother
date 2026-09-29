@@ -293,26 +293,73 @@ GHEOF
 }
 
 # ---------------------------------------------------------------------------
-# Failure routing (mother route-failure) and orphan stash restore in
-# mother-runner. Same honest caveat as above: the daemon loop can't be run
-# under bats, so these assert on the textual load-bearing facts; the behavior
-# behind them is covered by failure_route.bats and autostash.bats.
+# Failure routing (mother route-failure) wiring in mother-runner's
+# _auto_escalate_failed.
+#
+# These used to just grep this script's source for strings like
+# 'route-failure' / 'MOTHER_FAILURE_ROUTING_ENABLED' — which keeps passing
+# even if the wiring itself is broken, and fails on a harmless rename (the
+# comment above them said so). Driven behaviorally instead, via mother-runner
+# --auto-escalate-tick (mirrors the existing --recover-orphans-tick test
+# entry point): the REAL _auto_escalate_failed runs, and each test asserts on
+# the resulting job state/events. `mother route-failure`'s own classification
+# logic (which class each failure_reason maps to, hold vs. retry vs.
+# escalate) is exhaustively covered by failure_route.bats — these three only
+# check the wiring around that call. _recover_orphans' auto-stash restore is
+# likewise covered behaviorally already, by autostash.bats' "orphan reaper:
+# restores..." / "orphan reaper: defers..." tests (both driven through the
+# same kind of tick entry point, --recover-orphans-tick), so there's no
+# separate grep-replacement test for it here.
 
-@test "mother-runner routes failed jobs through 'mother route-failure', gated by MOTHER_FAILURE_ROUTING_ENABLED" {
-    run grep -c 'route-failure' "$_BIN_DIR/mother-runner"
-    [ "$output" -ge 1 ]
-    run grep -c 'MOTHER_FAILURE_ROUTING_ENABLED' "$_BIN_DIR/mother-runner"
-    [ "$output" -ge 1 ]
+@test "_auto_escalate_failed routes a failed+reasoned job through mother route-failure exactly once" {
+    export MOTHER_FAILURE_ROUTING_ENABLED=1
+    make_job "job-route-new" "failed" '.failure_reason = "unspecified"'
+
+    run mother-runner --auto-escalate-tick
+    [ "$status" -eq 0 ]
+
+    # "unspecified" is a retry_once-class reason (see failure_route.bats): a
+    # single as-is retry back to ready, auto_retry_count bumped, and a
+    # failure_routed/retried_as_is event — proof route-failure actually ran
+    # (the legacy path below would instead emit an `escalated` event and
+    # bump current_tier, never failure_routed/retried_as_is).
+    assert_job_field "job-route-new" '.state' "ready"
+    assert_job_field "job-route-new" '.auto_retry_count' "1"
+    local detail
+    detail=$(jq -c 'select(.kind=="failure_routed") | .detail' "$EVENTS_DIR/job-route-new.jsonl" | tail -1)
+    [ "$(printf '%s' "$detail" | jq -r '.action')" = "retried_as_is" ]
+    run grep -c '"kind":"escalated"' "$EVENTS_DIR/job-route-new.jsonl"
+    [ "$output" -eq 0 ]
 }
 
-@test "mother-runner keeps the legacy reconcile-then-escalate path for when failure routing is disabled" {
-    run grep -c 'mother" reconcile\|mother reconcile' "$_BIN_DIR/mother-runner"
-    [ "$output" -ge 1 ]
-    run grep -c 'mother" escalate\|mother escalate' "$_BIN_DIR/mother-runner"
-    [ "$output" -ge 1 ]
+@test "_auto_escalate_failed skips a failed job whose failure_routed is already true" {
+    export MOTHER_FAILURE_ROUTING_ENABLED=1
+    make_job "job-route-skip" "failed" '.failure_reason = "unspecified" | .failure_routed = true'
+
+    run mother-runner --auto-escalate-tick
+    [ "$status" -eq 0 ]
+
+    # Untouched: no retry, no escalation, no new event at all.
+    assert_job_field "job-route-skip" '.state' "failed"
+    assert_job_field "job-route-skip" '.auto_retry_count' "null"
+    [ ! -f "$EVENTS_DIR/job-route-skip.jsonl" ]
 }
 
-@test "_recover_orphans restores a reaped main-dir job's auto-stash via mother_autostash_restore" {
-    run bash -c "sed -n '/^_recover_orphans()/,/^}/p' '$_BIN_DIR/mother-runner' | grep -c 'mother_autostash_restore'"
-    [ "$output" -ge 1 ]
+@test "_auto_escalate_failed takes the legacy escalation path when MOTHER_FAILURE_ROUTING_ENABLED=0" {
+    export MOTHER_FAILURE_ROUTING_ENABLED=0
+    export MOTHER_ESCALATION_ENABLED=1
+    export MOTHER_RECONCILE_ENABLED=0
+    make_job "job-route-legacy" "failed" '.failure_reason = "unspecified" | .escalation_count = 0 | .current_tier = "tier_0"'
+
+    run mother-runner --auto-escalate-tick
+    [ "$status" -eq 0 ]
+
+    # Legacy path: a real `mother escalate`, not route-failure — tier bumped,
+    # escalation_count incremented, an `escalated` event, and none of
+    # route-failure's own bookkeeping (auto_retry_count, failure_routed).
+    assert_job_field "job-route-legacy" '.current_tier' "tier_1"
+    assert_job_field "job-route-legacy" '.escalation_count' "1"
+    assert_event_kind "job-route-legacy" "escalated"
+    assert_job_field "job-route-legacy" '.auto_retry_count' "null"
+    assert_job_field "job-route-legacy" '.failure_routed' "null"
 }

@@ -2753,7 +2753,14 @@ cmd_resume() {
     # straight to `ready` so the daemon's next promotion tick spawns a
     # fresh worker without going through `queued`. Also clear the system-
     # pause fields if they were set — the operator's manual resume
-    # supersedes any pending auto-resume.
+    # supersedes any pending auto-resume. Clear .operator_hold too — same as
+    # retry/reconcile — so a resumed job doesn't keep carrying stale hold
+    # detail once it's no longer held. And reset .auto_retry_count to 0: a
+    # human resuming the job (whether it was held as retry_exhausted or for
+    # any other reason) is a fresh chance, not a continuation of the same
+    # failed retry budget, so the as-is auto-retry the failure router may
+    # grant on the next failure shouldn't be foreclosed by a budget spent
+    # before the operator stepped in.
     local merged
     merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" '
         .pending_answer = $a
@@ -2763,6 +2770,8 @@ cmd_resume() {
         | .paused_reason = null
         | .pause_requested = null
         | .activity = null
+        | .operator_hold = null
+        | .auto_retry_count = 0
         | .state = "ready"
     ' "$job_file") || _die "resume: jq update failed"
     _atomic_write "$job_file" "$merged"

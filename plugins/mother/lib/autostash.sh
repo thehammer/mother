@@ -57,3 +57,43 @@ mother_autostash_restore() {
         '{outcome: $o, stash_message: $m, original_branch: $b, stash_ref: $r}'
     return 0
 }
+
+# mother_autostash_event_detail <result-json>
+#
+# Maps a mother_autostash_restore result to the (event kind, detail JSON)
+# pair its caller should emit. Shared by mother-run-job's _restore_auto_stash
+# and mother-runner's _orphan_restore_autostash — the only thing that differs
+# between those two callers is the arity of the _append_event call they make
+# (mother-run-job's job-scoped version vs. mother-runner's id-taking one), so
+# each just passes this call's output straight through. Centralizing the
+# mapping (including the "git stash pop failed; resolve manually..." note
+# text) keeps the two callers from drifting apart.
+#
+# Prints "<kind>\t<detail-json>" (kind is one of auto_stash_restored /
+# auto_stash_restore_failed / auto_stash_not_found) and returns 0. For
+# outcome "none" (nothing to restore — see mother_autostash_restore's doc
+# comment) there is nothing worth an event for, so it prints nothing and
+# returns 1.
+mother_autostash_event_detail() {
+    local res="$1" outcome msg orig ref kind detail
+    outcome=$(printf '%s' "$res" | jq -r '.outcome // "none"' 2>/dev/null)
+    msg=$(printf '%s' "$res" | jq -r '.stash_message // ""' 2>/dev/null)
+    orig=$(printf '%s' "$res" | jq -r '.original_branch // ""' 2>/dev/null)
+    ref=$(printf '%s' "$res" | jq -r '.stash_ref // ""' 2>/dev/null)
+    case "$outcome" in
+        restored)
+            kind="auto_stash_restored"
+            detail=$(jq -nc --arg m "$msg" --arg b "$orig" \
+                '{stash_message: $m, original_branch: $b}') ;;
+        restore_failed)
+            kind="auto_stash_restore_failed"
+            detail=$(jq -nc --arg m "$msg" --arg r "$ref" \
+                '{stash_message: $m, stash_ref: $r, note: "git stash pop failed; resolve manually via git stash list / git stash pop"}') ;;
+        stash_not_found)
+            kind="auto_stash_not_found"
+            detail=$(jq -nc --arg m "$msg" '{stash_message: $m}') ;;
+        *)
+            return 1 ;;
+    esac
+    printf '%s\t%s\n' "$kind" "$detail"
+}
