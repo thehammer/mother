@@ -3316,8 +3316,8 @@ cmd_teardowns() {
         branch=$(jq -r '.branch // ""' "$f")
         reason=$(jq -r '.last_reason // ""' "$f")
         deferrals=$(jq -r '.deferrals // 0' "$f")
-        deferred_at=$(jq -r '.deferred_at // ""' "$f")
         stalls=$(jq -r '.stall_deferrals // 0' "$f")
+        deferred_at=$(jq -r '.deferred_at // ""' "$f")
         case "$reason" in
             pr_open|pr_open_live)
                 # A healthy wait, not a stall: show how long the PR has been
@@ -3542,6 +3542,14 @@ on every sweep — independent of the record-archiving age cutoff):
                                                  not count) before a teardown
                                                  is flagged for attention
                                                  (never auto-deleted)
+  MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS
+                                  (default: 2)  stalled passes before a
+                                                 worktree_probe_failed teardown
+                                                 is flagged (about 2h hourly)
+  MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS
+                                  (default: 7)  days a teardown may wait on an
+                                                 open PR before it is listed
+                                                 under needs-attention
   MOTHER_TEARDOWN_ALLOW_UNSAFE    (default: 0)  restore unconditional
                                                  force-removal, bypassing the
                                                  uncommitted/unpushed-work guard
@@ -3565,14 +3573,6 @@ IPC broker env vars (the long-lived sidecar that pushes events to clients):
   MOTHER_BROKER_CLIENT_BUF     (default: 1024) per-client outbound buffer (messages)
   MOTHER_BROKER_ACTIVITY_SEC   (default: 1)    current_activity transcript poll interval
   MOTHER_CLAUDE_PROJECTS_DIR   (default: ~/.claude/projects)  transcript root for current_activity
-  MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS
-                                  (default: 2)  stalled passes before a
-                                                 worktree_probe_failed teardown
-                                                 is flagged (about 2h hourly)
-  MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS
-                                  (default: 7)  days a teardown may wait on an
-                                                 open PR before it is listed
-                                                 under needs-attention
 
 Worker prompt env vars:
   MOTHER_PREAMBLE_PATH    path to a markdown file prepended to every

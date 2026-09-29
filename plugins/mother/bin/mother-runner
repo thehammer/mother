@@ -95,6 +95,17 @@ _write_pidfile() {
     echo $$ > "$tmp" && mv "$tmp" "$PIDFILE"
 }
 
+# Publish the absolute path of the CLI this daemon runs from to
+# $RUNNER_DIR/cli-path. The UserPromptSubmit hook prefers it over the plugin
+# cache's copy: the events on disk are written by THIS code, so the reader has
+# to be the same code — a months-stale cached CLI once replayed ancient
+# archived-job events into unrelated sessions. Written atomically.
+_publish_cli_path() {
+    local cli="$MOTHER_BIN_DIR/mother" dir
+    dir=$(cd "$(dirname "$cli")" 2>/dev/null && pwd -P) || return 0
+    _atomic_write "$RUNNER_DIR/cli-path" "$dir/$(basename "$cli")"
+}
+
 _remove_pidfile() {
     # Only remove the pidfile if it still names us. Otherwise a second
     # instance shutting down (e.g. one that lost the singleton race, or was
@@ -1376,6 +1387,7 @@ _drain() {
 main() {
     _singleton_guard
     _write_pidfile
+    _publish_cli_path
     trap '_on_signal' TERM INT
     _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
     _recover_stale_locks

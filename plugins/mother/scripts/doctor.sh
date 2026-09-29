@@ -51,6 +51,36 @@ if [ "$(uname -s)" = "Darwin" ] && command -v plutil >/dev/null 2>&1; then
     echo ""
 fi
 
+# --- plugin cache freshness (advisory — never affects exit status) ---
+# The UserPromptSubmit hook and CLI the plugin manager serves come from a
+# cached copy of this repo. If that copy is older than the checkout the daemon
+# runs from, the hook reads events with stale code (see CHANGELOG 0.2.0).
+_doctor_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+_plugin_dir="$(cd "$_doctor_dir/.." && pwd -P)"
+installed_json="$HOME/.claude/plugins/installed_plugins.json"
+if [ -f "$installed_json" ] && command -v jq >/dev/null 2>&1; then
+    echo "plugin cache:"
+    cache_path=$(jq -r '(.plugins // {}) | to_entries | map(select(.key | startswith("mother@"))) | .[0].value[0].installPath // empty' "$installed_json" 2>/dev/null)
+    cache_date=$(jq -r '(.plugins // {}) | to_entries | map(select(.key | startswith("mother@"))) | .[0].value[0].installedAt // "unknown"' "$installed_json" 2>/dev/null)
+    if [ -z "$cache_path" ]; then
+        printf '  – %-12s mother plugin not installed via the plugin manager\n' "cache"
+    else
+        stale=0
+        for rel in hooks/mother-inject.sh bin/mother; do
+            if [ ! -f "$cache_path/$rel" ] || [ "$(cksum < "$cache_path/$rel")" != "$(cksum < "$_plugin_dir/$rel")" ]; then
+                stale=1
+            fi
+        done
+        if [ "$stale" -eq 0 ]; then
+            printf '  ✓ %-12s cached hook + CLI match this checkout\n' "cache"
+        else
+            printf '  ✗ %-12s cached copy (installed %s) differs from this checkout\n' "cache" "$cache_date"
+            printf '               Fix: claude plugin update mother@thehammer-mother\n'
+        fi
+    fi
+    echo ""
+fi
+
 if [ "$missing" -eq 0 ]; then
     echo "All required deps present."
     exit 0
