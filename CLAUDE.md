@@ -93,6 +93,11 @@ plan-adherence review. Here's what was added and how to work with it.
 | `token_alert_at` | string | ISO timestamp, set once (sticky) the first time a job's cumulative `actual_tokens`/live tokens crosses `MOTHER_TOKEN_ALERT_THRESHOLD` (default 100,000,000). Drives the statusline's `$!N` count (last 24h). |
 | `max_cost_usd` | number\|null | Operator-set spend cap (`mother add --max-cost` / `mother resume --max-cost`). No cap means no cost-cap behavior at all — spawn args, poll-loop checks, and events are all skipped. |
 | `cost_cap_breached_at` | string | ISO timestamp set when live spend first crosses `max_cost_usd`. Triggers the `$RUNNER_DIR/<id>.cost-cap` hook flag file and, after `MOTHER_COST_CAP_GRACE_SECONDS` (default 300) with no cooperative `mother await`, a forced pause to `awaiting`/`paused_reason: cost_cap`. |
+| `failure_reason` | string | The `.reason` of the job's most recent `failed` transition (`unspecified` if the caller gave none), persisted by both `_transition` (`mother-run-job`) and `_job_transition` (`lib/state.sh`). Cleared on `succeeded`. Lets the runner route on it without replaying events. |
+| `failure_routed` | bool\|null | Set `true` by `mother route-failure` when it deliberately leaves a job `failed` (`left_failed`) so the runner stops re-examining it. Cleared by the next `failed` transition. |
+| `auto_retry_count` | int | Number of as-is (no tier bump) automatic retries the failure router has granted (max 1). Reset to `0` by `mother resume` — an operator resuming the job is a fresh chance, not a continuation of the failed retry budget. |
+| `operator_hold` | object\|null | `{failure_reason, sub_reason, detail, held_at}` — present while a job is held (`activity: operator_hold`). Cleared (set to `null`) by `mother retry`, `mother reconcile`, and `mother resume`. |
+| `current_run.*` (baseline) | object | In addition to `log_offset`/`spawned_at`/`session_id`: `head_sha_at_start`, `remote_ref`, `remote_sha_at_start`, `pr_url_at_start`, `had_artifact_at_start` — what already existed on origin/as a PR when this run began (audit fields for the rework-advance check). |
 
 ### State machine
 
@@ -110,6 +115,7 @@ for display and routing.
 | `running` | `continuation` | Cody re-running after idle_timeout (auto-continuation) |
 | `awaiting` | (none) | Cody asked a question; answer with `mother resume` |
 | `awaiting` | `adherence_blocked` | Archie failed twice; human must review PR, then `resume` or `cancel` |
+| `awaiting` | `operator_hold` | Mother held a failed job instead of escalating it (see "Failure routing"); `.question` names the next commands. Act with `resume`, `retry`, `reconcile`, or `cancel` |
 | `running` | `pipeline_phase` | pipeline job: a build agent (redd/cody/marty) is actively running |
 | `ready` | `pipeline_phase` | pipeline job: next build agent queued (driver just advanced the phase) |
 | `succeeded` | `pipeline_review` | pipeline job: all build phases done, concurrent review in progress |
@@ -167,6 +173,8 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_USAGE_CHECK_INTERVAL=N` — seconds between live usage/cost-cap checks in `mother-run-job`'s poll loop (default: 120).
 - `MOTHER_TOKEN_ALERT_THRESHOLD=N` — cumulative token count (default: 100,000,000) that trips the sticky `token_alert_at` field and the statusline's `$!N` count.
 - `MOTHER_COST_CAP_GRACE_SECONDS=N` — seconds a job with `max_cost_usd` set is given, after crossing the cap, for a cooperative `mother await` before the runner force-pauses it (default: 300).
+- `MOTHER_FAILURE_ROUTING_ENABLED=0` — restore the pre-routing behavior: every `failed` job takes the legacy reconcile-then-escalate path in `_auto_escalate_failed`, regardless of `.failure_reason` (default: `1`).
+- `MOTHER_REWORK_ADVANCE_CHECK_ENABLED=0` — disable `_verify_run_advanced_or_fail` (default: `1`), so a run that starts with an existing PR/pushed branch can report `succeeded` without pushing anything new.
 - `MOTHER_ADHERENCE_EFFORT=<low|medium|high|xhigh|max>` — pass `--effort` to the adherence-review `claude` invocation. Unset (default) means no `--effort` flag, i.e. today's behavior.
 - `MOTHER_SHARED_RATES_PATH=PATH` — destination `mother-usage publish-rates` writes the rate table to (default: `~/.claude/model-rates.json`), for Bishop or other tools to read the same per-model pricing Mother uses.
 
@@ -511,8 +519,8 @@ to success, but otherwise the job must have at least one commit ahead of
 `base_ref` on a ref that depends on isolation — `HEAD` for `worktree` jobs
 (a dedicated workspace, safe to trust), or `refs/heads/<branch>` for
 `main-dir` jobs, because a main-dir workspace's `HEAD` may have already been
-restored to the operator's original branch by the stash-restore block that
-runs before verification. Zero commits fails with `reason:
+restored to the operator's original branch by `_restore_auto_stash`
+(`lib/autostash.sh` does the work) that runs before verification. Zero commits fails with `reason:
 no_commits_on_branch`; an unresolvable `base_ref` or missing branch ref fails
 closed with `reason: commit_check_indeterminate` (same fail-closed precedent
 as `prd_sha_on_origin` above — a false `succeeded` is worse than a false
@@ -555,6 +563,58 @@ doesn't exist, instead of falling back to rendering artifacts and spawning
 the reviewer against the operator's ambient cwd — the exact failure mode in
 the 2026-08-14 bug doc above, including a fabricated finding about a
 completely unrelated repo.
+
+## Failure routing and truthful terminal states
+
+Three fixes make a job's terminal state mean what it says.
+
+**Failure routing.** Escalating the model tier is wrong for most failures.
+`mother-runner`'s `_auto_escalate_failed` now calls `mother route-failure <id>`
+(internal subcommand, `lib/failure-route.sh`) for every `failed` job that has a
+persisted `.failure_reason` and `.failure_routed != true`. Jobs that pre-date
+`.failure_reason` keep the legacy reconcile-then-escalate path unchanged.
+
+| reason | class | action |
+|---|---|---|
+| `no_pr_no_push` | `reconcile_then_hold` | `reconcile --auto`; if nothing adopted, hold (`unmerged_dependency` if a `depends_on` PR isn't merged, else `nothing_to_reconcile`). Never escalates. |
+| `rework_no_new_commit` | `hold` | Hold immediately. Deliberately does **not** reconcile — that would adopt the stale PR and undo the rework-advance check. |
+| `branch_create_failed`, `checkout_failed` | `hold` | Hold immediately; these fail identically every time (e.g. wrong `--base`). |
+| `worktree_create_failed`, `runner_died_early`, `unspecified`, empty | `retry_once` | One as-is retry (no tier bump, adherence state untouched, a consumed operator answer is replayed), then hold `retry_exhausted`. |
+| anything else | `escalate` | Reconcile, then escalate if `escalation_count < 2`; otherwise stay `failed` with `failure_routed: true`. |
+
+**Hold** = `state: awaiting`, `activity: operator_hold`, `paused_reason:
+operator_hold`, `.question` naming the concrete commands, and an
+`operator_hold` object. It is non-terminal, so teardown never touches the
+worktree holding the unpushed work. `mother resume`, `mother retry`,
+`mother reconcile`, and `mother cancel` all accept a held job (other
+`awaiting` sub-states are still refused by `retry`/`reconcile`);
+`mother status` shows `[OPERATOR-HOLD]`.
+
+**Rework-advance check.** `_capture_run_baseline` snapshots, before the worker
+spawns, whether an OPEN PR or a pushed origin branch already exists.
+`_verify_run_advanced_or_fail` (first step of `_verify_artifact_or_fail`, after
+the `no_pr` branch) then requires the run to have moved it: a different final
+`pr_url`, or a changed `git ls-remote` tip of the PR's head branch. Otherwise
+the job fails `rework_no_new_commit` (`.pr_url` is not cleared; an unreachable
+origin fails closed with `origin_check: "indeterminate"`). No-op for pipeline
+jobs, `no_pr` jobs, and runs that started without a pre-existing artifact.
+
+**Auto-stash restore.** `lib/autostash.sh`'s `mother_autostash_restore` is the
+single implementation of putting a main-dir job's `mother:auto-stash:<id>` back.
+`_restore_auto_stash` (`mother-run-job`) runs it on the post-run path, on the
+`checkout_failed`/`branch_create_failed` early exits, and from the EXIT trap
+via `_exit_cleanup_workspace` — always **before** releasing the workspace lock.
+`mother-runner`'s orphan reaper restores for a SIGKILLed supervisor unless
+another main-dir job is running in the same repo (then it emits
+`auto_stash_restore_deferred`).
+
+| Event | Detail fields | When emitted |
+|---|---|---|
+| `failure_routed` | `{action: reconciled\|retried_as_is\|escalated\|held\|left_failed, ...}` | Once per routing decision |
+| `held_for_operator` | `{failure_reason, sub_reason, detail}` | A job is put in `operator_hold` (alongside `awaiting_input`) |
+| `rework_advance_verified` | `{remote_ref, remote_sha_at_start, remote_sha_at_end}` | A run that began with an artifact advanced it |
+| `auto_stash_not_found` | `{stash_message}` | Marker existed but no matching stash |
+| `auto_stash_restore_deferred` | `{stash_message, conflicting_job_id}` | Orphan reaper couldn't safely restore |
 
 ## Pipeline visibility (W5)
 

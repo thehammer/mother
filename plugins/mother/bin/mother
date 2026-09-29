@@ -57,6 +57,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/usage.sh" ]         && source "$MOTHER_LIB_DIR/usage.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/teardown.sh" ]      && source "$MOTHER_LIB_DIR/teardown.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/failure-route.sh" ]  && source "$MOTHER_LIB_DIR/failure-route.sh"
 
 # ---------- CLI-only helpers ----------
 
@@ -849,6 +851,12 @@ cmd_status() {
             echo "   See .adherence_notes on the job JSON for Archie's findings."
             echo ""
         fi
+        if [ "$activity" = "operator_hold" ]; then
+            echo ""
+            echo "⚠️  [OPERATOR-HOLD] Mother held this job instead of escalating."
+            jq -r '.question // empty' "$job_file" | sed 's/^/   /'
+            echo ""
+        fi
         if [ "$activity" = "pipeline_blocked" ]; then
             echo ""
             echo "⚠️  [PIPELINE-BLOCKED] This job requires human review."
@@ -1518,7 +1526,18 @@ cmd_retry() {
     _job_exists "$id" || _die "no such job: $id"
     local job_file; job_file=$(_job_path "$id")
     local state; state=$(jq -r .state "$job_file")
-    case "$state" in failed|cancelled) ;; *) _die "can only retry failed/cancelled jobs (state=$state)" ;; esac
+    local was_hold=0
+    case "$state" in
+        failed|cancelled) ;;
+        awaiting)
+            if [ "$(jq -r '.activity // ""' "$job_file")" = "operator_hold" ]; then
+                was_hold=1
+            else
+                _die "can only retry failed/cancelled jobs (state=$state)"
+            fi
+            ;;
+        *) _die "can only retry failed/cancelled jobs (state=$state)" ;;
+    esac
 
     if [ "$yes" -ne 1 ]; then
         _guard_existing_pr "$id" "retry" || exit 1
@@ -1560,7 +1579,7 @@ cmd_retry() {
     # Preserve routing fields: suggested_config, current_tier, escalation_count.
     # Reset adherence state since we're doing a fresh run.
     local merged
-    merged=$(jq --arg s "$new_state" '
+    merged=$(jq --arg s "$new_state" --argjson hold "$was_hold" '
         .state = $s
         | .finished_at = null
         | .worker_pid = null
@@ -1578,6 +1597,8 @@ cmd_retry() {
         | .adherence_status = null
         | .adherence_notes = null
         | .adherence_attempts = 0
+        | .failure_routed = null
+        | (if $hold == 1 then .activity = null | .operator_hold = null else . end)
     ' "$job_file") || _die "retry: jq update failed"
     _atomic_write "$job_file" "$merged"
     _append_event "$id" "retried" \
@@ -1713,8 +1734,19 @@ cmd_reconcile() {
 
     local job_file; job_file=$(_job_path "$id")
     local state; state=$(jq -r '.state // ""' "$job_file")
+    local was_hold=0
     case "$state" in
         failed|cancelled|succeeded) ;;
+        awaiting)
+            # A job Mother held instead of escalating (see cmd_route_failure)
+            # is reconcilable; every other awaiting sub-state is not.
+            if [ "$(jq -r '.activity // ""' "$job_file")" = "operator_hold" ]; then
+                was_hold=1
+            else
+                echo "mother: reconcile: job $id is $state; reconcile only applies to failed/cancelled/succeeded jobs" >&2
+                exit 1
+            fi
+            ;;
         *)
             echo "mother: reconcile: job $id is $state; reconcile only applies to failed/cancelled/succeeded jobs" >&2
             exit 1
@@ -1823,7 +1855,14 @@ HITEOF
         | .adherence_status = null
         | .adherence_notes = null
         | .adherence_attempts = 0
+        | .failure_reason = null
+        | .failure_routed = null
         ' "$job_file") || _die "reconcile: jq update failed"
+    if [ "$was_hold" -eq 1 ]; then
+        merged=$(printf '%s' "$merged" | jq '
+            .activity = null | .paused_reason = null | .paused_at = null
+            | .question = null | .operator_hold = null') || _die "reconcile: jq update failed"
+    fi
     if [ -n "$pr_branch" ] && [ "$pr_branch" != "$branch" ]; then
         merged=$(printf '%s' "$merged" | jq --arg pb "$pr_branch" '.actual_branch = $pb')
     fi
@@ -1837,6 +1876,197 @@ HITEOF
     _append_event "$id" "succeeded" "$(jq -nc --arg pr "$url" '{pr_url: $pr}')"
 
     echo "$id: $previous_state -> succeeded (pr_url=$url)"
+}
+
+# ---------- route-failure ----------
+#
+# Internal subcommand called by mother-runner for each `failed` job that
+# carries a `.failure_reason`. Routes the failure by reason instead of
+# escalating blindly (see lib/failure-route.sh for the class table):
+#   reconcile_then_hold  reconcile --auto, else hold. Never escalates.
+#   hold                 hold immediately.
+#   retry_once           one as-is retry (no tier bump), then hold.
+#   escalate             legacy: reconcile, then escalate if under the cap.
+# "Hold" = state awaiting / activity operator_hold with a concrete question;
+# it is non-terminal, so teardown never touches the worktree holding the work.
+# Exits 0 in all handled cases.
+
+# Last `failed` event detail for a job (compact JSON, `{}` if none).
+_rf_last_failed_detail() {
+    local ev; ev=$(_events_path "$1")
+    [ -f "$ev" ] || { echo '{}'; return; }
+    jq -c 'select(.kind == "failed") | .detail' "$ev" 2>/dev/null | tail -1 | grep . || echo '{}'
+}
+
+# Path of a dependency's job JSON (live or archived); empty if not found.
+_rf_dep_file() {
+    local dep="$1" f
+    f=$(_job_path "$dep")
+    if [ -f "$f" ]; then echo "$f"; return; fi
+    for f in "$ARCHIVE_DIR"/*/"$dep".json; do
+        if [ -f "$f" ]; then echo "$f"; return; fi
+    done
+}
+
+# Dependencies whose PR is not merged, as a JSON array [{job_id,pr_url,pr_state}].
+_rf_unmerged_deps() {
+    local job_file="$1" dep depf url st out="[]"
+    for dep in $(jq -r '.depends_on // [] | .[]' "$job_file"); do
+        depf=$(_rf_dep_file "$dep")
+        [ -n "$depf" ] || continue
+        url=$(jq -r '.pr_url // empty' "$depf" 2>/dev/null)
+        [ -n "$url" ] || continue
+        st=$(gh pr view "$url" --json state -q .state 2>/dev/null)
+        [ -n "$st" ] || st="UNKNOWN"
+        [ "$st" = "MERGED" ] && continue
+        out=$(printf '%s' "$out" | jq -c --arg j "$dep" --arg u "$url" --arg s "$st" \
+            '. + [{job_id: $j, pr_url: $u, pr_state: $s}]')
+    done
+    printf '%s' "$out"
+}
+
+# _rf_hold <id> <failure_reason> <sub_reason> <detail-json>
+_rf_hold() {
+    local id="$1" reason="$2" sub="$3" detail="$4" job_file q merged now
+    job_file=$(_job_path "$id")
+    now=$(_iso_now)
+    detail=$(printf '%s' "$detail" | jq -c --arg wd "$(jq -r '.work_dir // empty' "$job_file")" \
+        '(if ($wd | length) > 0 then {work_dir: $wd} else {} end) + .' 2>/dev/null) || detail='{}'
+    q=$(mother_failure_hold_question "$id" "$reason" "$sub" "$detail")
+    merged=$(jq --arg q "$q" --arg ts "$now" --arg fr "$reason" --arg sr "$sub" --argjson d "$detail" '
+        .state = "awaiting"
+        | .activity = "operator_hold"
+        | .paused_reason = "operator_hold"
+        | .paused_at = $ts
+        | .question = $q
+        | .operator_hold = {failure_reason: $fr, sub_reason: $sr, detail: $d, held_at: $ts}
+    ' "$job_file") || _die "route-failure: jq update failed"
+    _atomic_write "$job_file" "$merged"
+    _append_event "$id" "held_for_operator" \
+        "$(jq -nc --arg fr "$reason" --arg sr "$sub" --argjson d "$detail" \
+            '{failure_reason: $fr, sub_reason: $sr, detail: $d}')"
+    _append_event "$id" "awaiting_input" \
+        "$(jq -nc --arg q "$q" '{question: $q, paused_reason: "operator_hold"}')"
+    _append_event "$id" "failure_routed" \
+        "$(jq -nc --arg sr "$sub" '{action: "held", sub_reason: $sr}')"
+    echo "$id: held for operator ($sub)"
+}
+
+# Reconcile --auto in a subshell (cmd_reconcile may exit). Returns its rc.
+_rf_try_reconcile() {
+    local id="$1"
+    [ "${MOTHER_RECONCILE_ENABLED:-1}" != "0" ] || return 3
+    ( cmd_reconcile "$id" --auto )
+}
+
+# reconcile --auto; on success record the routing verdict. Returns reconcile's rc.
+_rf_reconcile_and_record() {
+    _rf_try_reconcile "$1" || return $?
+    _append_event "$1" "failure_routed" '{"action":"reconciled"}'
+    return 0
+}
+
+# As-is retry of an infra failure, at most once; then hold.
+# Deliberately NOT cmd_retry: that resets adherence state, and an infra retry
+# must not grant an extra adherence loop.
+# _rf_retry_once <id> <failure_reason> <detail-json>
+_rf_retry_once() {
+    local id="$1" reason="$2" detail="$3"
+    local job_file; job_file=$(_job_path "$id")
+    local tries; tries=$(jq -r '.auto_retry_count // 0' "$job_file")
+    if [ "$tries" -ge 1 ]; then
+        _rf_hold "$id" "$reason" "retry_exhausted" "$detail"
+        return 0
+    fi
+    local dep dep_state new_state="ready"
+    for dep in $(jq -r '.depends_on // [] | .[]' "$job_file"); do
+        dep_state="missing"
+        [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
+        if [ "$dep_state" != "succeeded" ]; then new_state="queued"; break; fi
+    done
+    # Replay an operator answer the failed run consumed at spawn.
+    local ev replay="null"
+    ev=$(_events_path "$id")
+    if [ -f "$ev" ]; then
+        replay=$(jq -sc '
+            (to_entries | map(select(.value.kind == "running" or .value.kind == "started")) | last | .key // -1) as $si
+            | [to_entries[] | select(.key > $si and .value.kind == "resumed_from_input") | .value.detail] | last // null
+        ' "$ev" 2>/dev/null) || replay="null"
+        [ -n "$replay" ] || replay="null"
+    fi
+    local merged
+    merged=$(jq --arg s "$new_state" --argjson replay "$replay" '
+        .state = $s
+        | .finished_at = null
+        | .worker_pid = null
+        | .cancel_requested = null
+        | .pause_requested = null
+        | .final_result_at = null
+        | .auto_retry_count = ((.auto_retry_count // 0) + 1)
+        | (if $replay != null
+           then .pending_answer = ($replay.answer // null) | .question = ($replay.question // null)
+           else . end)
+    ' "$job_file") || _die "route-failure: jq update failed"
+    _atomic_write "$job_file" "$merged"
+    _append_event "$id" "failure_routed" \
+        "$(jq -nc --argjson n "$((tries + 1))" '{action: "retried_as_is", auto_retry_count: $n}')"
+    echo "$id: retried as-is ($reason) -> $new_state"
+}
+
+# Legacy behaviour: reconcile first, then escalate while under the cap; else
+# leave the job failed (and flag it so the runner stops re-examining it).
+_rf_reconcile_or_escalate() {
+    local id="$1"
+    local job_file; job_file=$(_job_path "$id")
+    _rf_reconcile_and_record "$id" && return 0
+    local esc; esc=$(jq -r '.escalation_count // 0' "$job_file")
+    local why
+    if [ "${MOTHER_ESCALATION_ENABLED:-1}" != "1" ]; then
+        why="escalation_disabled"
+    elif [ "$esc" -ge 2 ]; then
+        why="escalation_cap"
+    elif ( cmd_escalate "$id" ); then
+        _append_event "$id" "failure_routed" '{"action":"escalated"}'
+        return 0
+    else
+        why="escalate_refused"
+    fi
+    # The next `failed` transition clears the flag.
+    _job_update "$id" '.failure_routed = true'
+    _append_event "$id" "failure_routed" \
+        "$(jq -nc --arg w "$why" '{action: "left_failed", why: $w}')"
+    echo "$id: left failed ($why)"
+}
+
+cmd_route_failure() {
+    local id="${1:-}"
+    [ -n "$id" ] || _die "route-failure: <id> required"
+    _job_exists "$id" || _die "no such job: $id"
+    local job_file; job_file=$(_job_path "$id")
+    local state; state=$(jq -r .state "$job_file")
+    [ "$state" = "failed" ] || _die "route-failure: job $id is $state, expected failed"
+
+    local reason; reason=$(jq -r '.failure_reason // empty' "$job_file")
+    [ -n "$reason" ] || reason="unspecified"
+    local class; class=$(mother_failure_class "$reason")
+    local detail; detail=$(_rf_last_failed_detail "$id")
+
+    case "$class" in
+        reconcile_then_hold)
+            _rf_reconcile_and_record "$id" && return 0
+            local deps; deps=$(_rf_unmerged_deps "$job_file")
+            if [ "$(printf '%s' "$deps" | jq 'length')" -gt 0 ]; then
+                detail=$(printf '%s' "$detail" | jq -c --argjson d "$deps" '. + {dependencies: $d}')
+                _rf_hold "$id" "$reason" "unmerged_dependency" "$detail"
+            else
+                _rf_hold "$id" "$reason" "nothing_to_reconcile" "$detail"
+            fi
+            ;;
+        hold)       _rf_hold "$id" "$reason" "$reason" "$detail" ;;
+        retry_once) _rf_retry_once "$id" "$reason" "$detail" ;;
+        *)          _rf_reconcile_or_escalate "$id" ;;
+    esac
+    return 0
 }
 
 # _extract_transcript_result_text <log_path>
@@ -2523,7 +2753,14 @@ cmd_resume() {
     # straight to `ready` so the daemon's next promotion tick spawns a
     # fresh worker without going through `queued`. Also clear the system-
     # pause fields if they were set — the operator's manual resume
-    # supersedes any pending auto-resume.
+    # supersedes any pending auto-resume. Clear .operator_hold too — same as
+    # retry/reconcile — so a resumed job doesn't keep carrying stale hold
+    # detail once it's no longer held. And reset .auto_retry_count to 0: a
+    # human resuming the job (whether it was held as retry_exhausted or for
+    # any other reason) is a fresh chance, not a continuation of the same
+    # failed retry budget, so the as-is auto-retry the failure router may
+    # grant on the next failure shouldn't be foreclosed by a budget spent
+    # before the operator stepped in.
     local merged
     merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" '
         .pending_answer = $a
@@ -2533,6 +2770,8 @@ cmd_resume() {
         | .paused_reason = null
         | .pause_requested = null
         | .activity = null
+        | .operator_hold = null
+        | .auto_retry_count = 0
         | .state = "ready"
     ' "$job_file") || _die "resume: jq update failed"
     _atomic_write "$job_file" "$merged"
@@ -3499,6 +3738,9 @@ within its current state):
   awaiting      [ADHERENCE-BLOCKED] — needs human to review PR; resume or cancel
                                       (job fields: activity=adherence_blocked,
                                        adherence_status=blocked_for_human)
+  awaiting      [OPERATOR-HOLD]  — Mother held a failed job instead of escalating
+                                      (activity=operator_hold; see .question). Act with
+                                      `resume`, `retry`, `reconcile`, or `cancel`
   awaiting      (no activity)    — Cody asked a question; answer with `resume`
 
 Metrics:
@@ -3530,6 +3772,7 @@ main() {
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;
         reconcile)         cmd_reconcile "$@" ;;
+        route-failure)     cmd_route_failure "$@" ;;
         adherence-review)  cmd_adherence_review "$@" ;;
         review-phase)      cmd_review_phase "$@" ;;
         merge-findings)    _merge_reviewer_findings "${1:-}" ;;
