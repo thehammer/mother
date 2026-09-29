@@ -2787,7 +2787,8 @@ cmd_run() {
     done
     [ "$once" -eq 1 ] || _die "run: only --once is supported in phase 1 (daemon comes in phase 2)"
 
-    # Promote queued jobs whose deps are all in terminal state to ready.
+    # Promote queued jobs whose dependencies are all satisfied (each
+    # succeeded AND its PR merged, or a no_pr job) to ready.
     _promote_ready
 
     # Pick the oldest ready job.
@@ -3462,7 +3463,13 @@ Add options:
   --isolation worktree|main-dir   (default: worktree)
   --executor local-tmux           (only option in phase 2)
   --max-cost USD
-  --depends-on ID[,ID...]
+  --depends-on ID[,ID...]  the job stays queued until every dependency has
+                           succeeded AND its PR has merged (a no_pr dependency
+                           needs no merge). Never auto-cancelled: a failed /
+                           cancelled / closed-unmerged / missing dependency
+                           keeps it queued and lists it under `mother status`
+                           needs-attention. `mother force-start ID` releases a
+                           queued job past its dependency gate.
   --title TEXT         (default: first heading of plan file)
   --format json|text   (default: text — prints job id only)
   --label TEXT         free-text origin label for this job
