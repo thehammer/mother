@@ -66,6 +66,58 @@ type prd_owner_repo_from_url >/dev/null 2>&1 || prd_owner_repo_from_url() {
     echo "$url" | sed -n 's|.*github\.com[:/]\(.*\)|\1|p'
 }
 
+# Shared main-dir auto-stash restore (mother_autostash_restore). Sourced
+# pre-SOURCE_ONLY-guard so _restore_auto_stash / _exit_cleanup_workspace are
+# bats-callable. Degrades to "nothing to restore" if the lib is absent.
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/autostash.sh" ] && source "$MOTHER_LIB_DIR/autostash.sh"
+type mother_autostash_restore >/dev/null 2>&1 || mother_autostash_restore() { echo '{"outcome":"none"}'; }
+
+# _restore_auto_stash — put the operator's main-dir working tree back and
+# record what happened. No-op unless isolation is main-dir and a stash marker
+# path is set. Idempotent: mother_autostash_restore removes the marker, so a
+# second call reports outcome "none" and emits nothing.
+#
+# MUST run before lock_release "${repo}:workspace": releasing first would let
+# another main-dir job acquire the lock, see a clean tree (our stash is still
+# in the stash list), and have our pop dump the operator's changes into it.
+_restore_auto_stash() {
+    [ "${isolation:-}" = "main-dir" ] || return 0
+    [ -n "${stash_marker:-}" ] || return 0
+    local res outcome msg orig ref
+    res=$(mother_autostash_restore "${work_dir:-}" "$stash_marker" 2>/dev/null) || return 0
+    outcome=$(printf '%s' "$res" | jq -r '.outcome // "none"' 2>/dev/null)
+    msg=$(printf '%s' "$res" | jq -r '.stash_message // ""' 2>/dev/null)
+    orig=$(printf '%s' "$res" | jq -r '.original_branch // ""' 2>/dev/null)
+    ref=$(printf '%s' "$res" | jq -r '.stash_ref // ""' 2>/dev/null)
+    case "$outcome" in
+        restored)
+            _append_event "auto_stash_restored" \
+                "$(jq -nc --arg m "$msg" --arg b "$orig" \
+                    '{stash_message: $m, original_branch: $b}')" ;;
+        restore_failed)
+            _append_event "auto_stash_restore_failed" \
+                "$(jq -nc --arg m "$msg" --arg ref "$ref" \
+                    '{stash_message: $m, stash_ref: $ref, note: "git stash pop failed; resolve manually via git stash list / git stash pop"}')" ;;
+        stash_not_found)
+            _append_event "auto_stash_not_found" \
+                "$(jq -nc --arg m "$msg" '{stash_message: $m}')" ;;
+    esac
+    return 0
+}
+
+# _exit_cleanup_workspace — EXIT-trap cleanup for main-dir workspace state:
+# restore the auto-stash (first!), then release the workspace lock iff THIS
+# supervisor acquired it. Safe to call repeatedly and from any exit path.
+_exit_cleanup_workspace() {
+    _restore_auto_stash
+    if [ "${_workspace_lock_held:-0}" = "1" ]; then
+        lock_release "${repo:-}:workspace" >/dev/null 2>&1 || true
+        _workspace_lock_held=0
+    fi
+    return 0
+}
+
 # Parse a git remote URL to "owner/repo". Thin delegation to the shared
 # prdetect.sh implementation — kept under this name because pr_url_capture.bats
 # (and possibly other callers) source this file with SOURCE_ONLY=1 and assert
@@ -265,6 +317,138 @@ _verify_no_pr_commits_or_fail() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Rework-advance check (a run that started with a shipped artifact must move it)
+#
+# _verify_artifact_or_fail used to return 0 as soon as ANY pr_url was set, and
+# (worktree jobs) as soon as the branch merely existed on origin. Once an
+# earlier run had opened a PR, a later rework/resume run that made only local
+# edits — or nothing at all — sailed through both checks and was reported
+# `succeeded`. _capture_run_baseline snapshots "what already existed" before
+# the worker spawns; _verify_run_advanced_or_fail then demands this run moved
+# it. Both are defined pre-SOURCE_ONLY-guard so bats can drive them.
+# ---------------------------------------------------------------------------
+
+# Current tip of the job's own branch in $work_dir: HEAD for worktree jobs,
+# refs/heads/$branch for main-dir jobs (HEAD may have been restored to the
+# operator's branch by then). Echoes empty when unresolvable.
+_run_head_sha() {
+    [ -n "${work_dir:-}" ] && [ -d "$work_dir" ] || { echo ""; return 0; }
+    local ref="HEAD"
+    [ "${isolation:-}" = "main-dir" ] && ref="refs/heads/${branch:-}"
+    (cd "$work_dir" && git rev-parse --verify --quiet "$ref" 2>/dev/null) || echo ""
+}
+
+# Echoes "<sha>" of origin's refs/heads/<ref> (empty if absent) and returns 0,
+# or returns 1 (echoing nothing) when ls-remote itself failed.
+_run_remote_sha() {
+    local ref="$1" out
+    [ -n "$ref" ] && [ -n "${work_dir:-}" ] && [ -d "$work_dir" ] || return 1
+    out=$(cd "$work_dir" && git ls-remote origin "refs/heads/$ref" 2>/dev/null) || return 1
+    printf '%s\n' "$out" | awk 'NR==1 {print $1}'
+    return 0
+}
+
+_capture_run_baseline() {
+    run_pr_url_at_start=$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)
+    run_head_sha_at_start=$(_run_head_sha)
+    run_remote_ref=$(jq -r '.actual_branch // .branch // empty' "$job_file" 2>/dev/null)
+    [ -n "$run_remote_ref" ] || run_remote_ref="${branch:-}"
+    local pr_open=false pv pv_state pv_head
+    if [ -n "$run_pr_url_at_start" ]; then
+        pv=$(gh pr view "$run_pr_url_at_start" --json state,headRefName --jq '(.state)+"\t"+(.headRefName)' 2>/dev/null)
+        if [ -n "$pv" ]; then
+            IFS=$'\t' read -r pv_state pv_head <<BASELINE_PV_EOF
+$pv
+BASELINE_PV_EOF
+            if [ "$pv_state" = "OPEN" ]; then
+                pr_open=true
+                [ -z "$pv_head" ] || run_remote_ref="$pv_head"
+            fi
+        fi
+    fi
+    run_remote_check_at_start=ok
+    if ! run_remote_sha_at_start=$(_run_remote_sha "$run_remote_ref"); then
+        run_remote_sha_at_start=""
+        run_remote_check_at_start=indeterminate
+    fi
+    run_had_artifact_at_start=false
+    if [ "$pr_open" = "true" ] || [ -n "$run_remote_sha_at_start" ]; then
+        run_had_artifact_at_start=true
+    fi
+    return 0
+}
+
+# _emit_rework_advance_verified <ref> <sha_at_start> <sha_at_end> [via]
+_emit_rework_advance_verified() {
+    _append_event "rework_advance_verified" "$(jq -nc \
+        --arg ref "$1" --arg s "$2" --arg e "$3" --arg via "${4:-}" \
+        '{remote_ref: $ref, remote_sha_at_start: $s, remote_sha_at_end: $e}
+         + (if $via != "" then {via: $via} else {} end)')"
+}
+
+# Returns 0 when the run may proceed to the ordinary artifact checks; returns 1
+# after having transitioned to failed (rework_no_new_commit) itself.
+_verify_run_advanced_or_fail() {
+    [ "${MOTHER_REWORK_ADVANCE_CHECK_ENABLED:-1}" != "0" ] || return 0
+    # Pipeline phases legitimately make no commits (e.g. marty finding nothing
+    # to refactor); the pipeline driver owns that contract.
+    [ "$(jq -r '.kind // empty' "$job_file" 2>/dev/null)" != "pipeline" ] || return 0
+    # Without a pre-existing artifact the ordinary no_pr_no_push logic below
+    # already catches a run that shipped nothing.
+    [ "${run_had_artifact_at_start:-false}" = "true" ] || return 0
+
+    local ref="${run_remote_ref:-}" start_sha="${run_remote_sha_at_start:-}"
+    local end_sha="" origin_check=ok
+
+    if ! end_sha=$(_run_remote_sha "$ref"); then
+        end_sha=""
+        origin_check=indeterminate
+    fi
+
+    if [ "$origin_check" = "ok" ]; then
+        if [ -n "${pr_url:-}" ] && [ "${pr_url:-}" != "${run_pr_url_at_start:-}" ]; then
+            _emit_rework_advance_verified "$ref" "$start_sha" "$end_sha" new_pr
+            return 0
+        fi
+        if [ -n "$end_sha" ] && [ "$end_sha" != "$start_sha" ]; then
+            _emit_rework_advance_verified "$ref" "$start_sha" "$end_sha"
+            return 0
+        fi
+    fi
+
+    local head_end uncommitted=0 local_advanced=false
+    head_end=$(_run_head_sha)
+    if [ -n "$head_end" ] && [ "$head_end" != "${run_head_sha_at_start:-}" ]; then
+        local_advanced=true
+    fi
+    if [ -n "${work_dir:-}" ] && [ -d "$work_dir" ]; then
+        uncommitted=$(cd "$work_dir" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    _transition failed "$(jq -nc \
+        --arg pr "${pr_url:-${run_pr_url_at_start:-}}" \
+        --arg ref "$ref" --arg rs "$start_sha" --arg re "$end_sha" \
+        --arg hs "${run_head_sha_at_start:-}" --arg he "$head_end" \
+        --argjson la "$local_advanced" \
+        --argjson unc "${uncommitted:-0}" \
+        --arg oc "$origin_check" \
+        '{
+            reason: "rework_no_new_commit",
+            pr_url: $pr,
+            remote_ref: $ref,
+            remote_sha_at_start: $rs,
+            remote_sha_at_end: $re,
+            head_sha_at_start: $hs,
+            head_sha_at_end: $he,
+            local_advanced: $la,
+            uncommitted_files: $unc,
+            origin_check: $oc,
+            note: "run started with an existing PR/pushed branch and ended without pushing anything new to it"
+        }')"
+    return 1
+}
+
 _verify_artifact_or_fail() {
     # Plans with no_pr:true opt out of the push/PR contract below, but the
     # commits-on-branch contract is enforced, not skipped — see
@@ -274,6 +458,9 @@ _verify_artifact_or_fail() {
         _verify_no_pr_commits_or_fail
         return $?
     fi
+
+    # A run that began with a shipped artifact must have advanced it.
+    _verify_run_advanced_or_fail || return 1
 
     # If a pr_url was captured (live or post-loop), the artifact is real.
     [ -z "${pr_url:-}" ] || return 0
@@ -604,6 +791,17 @@ _install_core_job_helpers() {
             fi
         fi
         _job_update ".state = \"$new\""
+        # Persist the failure reason on the job JSON so the runner can route on
+        # it without replaying the events log. A new `failed` clears any prior
+        # routing verdict; `succeeded` clears a stale reason.
+        case "$new" in
+            failed)
+                local _reason_lit
+                _reason_lit=$(printf '%s' "$detail" | jq -c '(.reason // "") | tostring | if . == "" then "unspecified" else . end' 2>/dev/null) || _reason_lit='"unspecified"'
+                _job_update ".failure_reason = $_reason_lit | .failure_routed = null" ;;
+            succeeded)
+                _job_update ".failure_reason = null" ;;
+        esac
         case "$new" in
             running)    _job_update ".started_at = \"$(iso_now)\"" ;;
             succeeded|failed|cancelled)
@@ -681,6 +879,10 @@ _runner_died_trap() {
         _transition failed "$(jq -nc --argjson rc "$rc" \
             '{reason: "runner_died_early", exit_code: $rc}')" 2>/dev/null || true
     fi
+    # Regardless of state: never leave the operator's main-dir changes in the
+    # stash list or the workspace lock held (set -u crashes, later-added
+    # `exit 1` paths, SIGTERM/SIGINT). Idempotent.
+    _exit_cleanup_workspace
 }
 trap _runner_died_trap EXIT
 
@@ -741,6 +943,7 @@ fi
 
 # Resolve working directory.
 work_dir=""
+_workspace_lock_held=0
 if [ "$isolation" = "worktree" ]; then
     (cd "$repo_path" && git fetch --quiet origin "${base_ref#origin/}" 2>/dev/null || true)
     # Create the branch + worktree from base_ref.
@@ -766,6 +969,7 @@ else
         _transition failed "$(jq -nc --arg r "lock_busy" --arg lock "$lock_name" '{reason: $r, lock: $lock}')"
         exit 1
     fi
+    _workspace_lock_held=1
     work_dir="$repo_path"
 
     # Workspace setup. main-dir jobs share the operator's checkout, so the
@@ -810,7 +1014,9 @@ else
         if ! (cd "$work_dir" && git checkout --quiet "$branch" 2>/dev/null); then
             echo "mother-run-job: failed to checkout existing branch $branch" >&2
             _transition failed "$(jq -nc --arg b "$branch" '{reason: "checkout_failed", branch: $b}')"
+            _restore_auto_stash
             lock_release "$lock_name" >/dev/null 2>&1 || true
+            _workspace_lock_held=0
             exit 1
         fi
         _append_event "branch_checked_out" "$(jq -nc --arg b "$branch" '{branch: $b, created: false}')"
@@ -818,7 +1024,9 @@ else
         if ! (cd "$work_dir" && git checkout --quiet -b "$branch" "$base_ref" 2>/dev/null); then
             echo "mother-run-job: failed to create branch $branch from $base_ref" >&2
             _transition failed "$(jq -nc --arg b "$branch" --arg base "$base_ref" '{reason: "branch_create_failed", branch: $b, base: $base}')"
+            _restore_auto_stash
             lock_release "$lock_name" >/dev/null 2>&1 || true
+            _workspace_lock_held=0
             exit 1
         fi
         _append_event "branch_checked_out" "$(jq -nc --arg b "$branch" --arg base "$base_ref" '{branch: $b, created: true, base: $base}')"
@@ -828,6 +1036,10 @@ fi
 # Persist resolved work_dir on the job JSON so peek (and similar consumers)
 # can read it without re-deriving from repo_path/branch/isolation.
 _job_update ".work_dir = \"$work_dir\""
+
+# Snapshot what already exists on origin / as a PR, so the terminal verify can
+# tell "this run shipped something" from "an earlier run did".
+_capture_run_baseline
 
 # Record the resolved work_dir on the job. If we were started from `ready`
 # (via `mother run --once`), also emit the running transition; if the daemon
@@ -1256,7 +1468,14 @@ nohup bash "$wrapper" >/dev/null 2>&1 &
 worker_pid=$!
 disown 2>/dev/null || true
 _job_update ".worker_pid = $worker_pid"
-_job_update ".current_run = {\"log_offset\": $log_offset_at_spawn, \"spawned_at\": \"$(iso_now)\", \"session_id\": \"$session_id\"}"
+_job_update ".current_run = $(jq -nc \
+    --argjson lo "$log_offset_at_spawn" --arg at "$(iso_now)" --arg sid "$session_id" \
+    --arg hs "${run_head_sha_at_start:-}" --arg rr "${run_remote_ref:-}" \
+    --arg rs "${run_remote_sha_at_start:-}" --arg pu "${run_pr_url_at_start:-}" \
+    --argjson ha "${run_had_artifact_at_start:-false}" \
+    '{log_offset: $lo, spawned_at: $at, session_id: $sid,
+      head_sha_at_start: $hs, remote_ref: $rr, remote_sha_at_start: $rs,
+      pr_url_at_start: $pu, had_artifact_at_start: $ha}')"
 _append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" '{pid: $pid, session_id: $sid}')"
 
 # Live usage checks (F1/F2/F3): baseline spend/tokens read once at spawn.
@@ -1516,29 +1735,9 @@ _finalize_pr_url
 # and emit an event — operator can resolve manually rather than us silently
 # discarding their work.
 if [ "$isolation" = "main-dir" ]; then
-    if [ -f "${stash_marker:-/dev/null}" ]; then
-        _stash_msg=$(sed -n '1p' "$stash_marker" 2>/dev/null)
-        _stash_orig_branch=$(sed -n '2p' "$stash_marker" 2>/dev/null)
-        if [ -n "$_stash_orig_branch" ] \
-            && (cd "$work_dir" && git rev-parse --verify "$_stash_orig_branch" >/dev/null 2>&1); then
-            (cd "$work_dir" && git checkout --quiet "$_stash_orig_branch" 2>/dev/null) || true
-        fi
-        _stash_ref=$(cd "$work_dir" && git stash list 2>/dev/null \
-            | awk -F: -v msg="$_stash_msg" '$0 ~ msg {print $1; exit}')
-        if [ -n "$_stash_ref" ]; then
-            if (cd "$work_dir" && git stash pop --quiet "$_stash_ref" 2>/dev/null); then
-                _append_event "auto_stash_restored" \
-                    "$(jq -nc --arg m "$_stash_msg" --arg b "$_stash_orig_branch" \
-                        '{stash_message: $m, original_branch: $b}')"
-            else
-                _append_event "auto_stash_restore_failed" \
-                    "$(jq -nc --arg m "$_stash_msg" --arg ref "$_stash_ref" \
-                        '{stash_message: $m, stash_ref: $ref, note: "git stash pop failed; resolve manually via git stash list / git stash pop"}')"
-            fi
-        fi
-        rm -f "$stash_marker"
-    fi
+    _restore_auto_stash
     lock_release "${repo}:workspace" >/dev/null 2>&1 || true
+    _workspace_lock_held=0
 fi
 
 # If the worker called `mother await` and transitioned the job to

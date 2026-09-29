@@ -291,3 +291,28 @@ GHEOF
     run grep -c 'MOTHER_RECONCILE_ENABLED' "$_BIN_DIR/mother-runner"
     [ "$output" -ge 1 ]
 }
+
+# ---------------------------------------------------------------------------
+# Failure routing (mother route-failure) and orphan stash restore in
+# mother-runner. Same honest caveat as above: the daemon loop can't be run
+# under bats, so these assert on the textual load-bearing facts; the behavior
+# behind them is covered by failure_route.bats and autostash.bats.
+
+@test "mother-runner routes failed jobs through 'mother route-failure', gated by MOTHER_FAILURE_ROUTING_ENABLED" {
+    run grep -c 'route-failure' "$_BIN_DIR/mother-runner"
+    [ "$output" -ge 1 ]
+    run grep -c 'MOTHER_FAILURE_ROUTING_ENABLED' "$_BIN_DIR/mother-runner"
+    [ "$output" -ge 1 ]
+}
+
+@test "mother-runner keeps the legacy reconcile-then-escalate path for when failure routing is disabled" {
+    run grep -c 'mother" reconcile\|mother reconcile' "$_BIN_DIR/mother-runner"
+    [ "$output" -ge 1 ]
+    run grep -c 'mother" escalate\|mother escalate' "$_BIN_DIR/mother-runner"
+    [ "$output" -ge 1 ]
+}
+
+@test "_recover_orphans restores a reaped main-dir job's auto-stash via mother_autostash_restore" {
+    run bash -c "sed -n '/^_recover_orphans()/,/^}/p' '$_BIN_DIR/mother-runner' | grep -c 'mother_autostash_restore'"
+    [ "$output" -ge 1 ]
+}

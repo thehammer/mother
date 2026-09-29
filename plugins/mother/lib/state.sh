@@ -137,6 +137,17 @@ _job_transition() {
         fi
     fi
     _job_update "$id" ".state = \"$new\""
+    # Persist the failure reason on the job JSON so the runner can route on it
+    # without replaying the events log. A new `failed` clears any prior routing
+    # verdict; `succeeded` clears a stale reason.
+    case "$new" in
+        failed)
+            local _reason_lit
+            _reason_lit=$(printf '%s' "$detail" | jq -c '(.reason // "") | tostring | if . == "" then "unspecified" else . end' 2>/dev/null) || _reason_lit='"unspecified"'
+            _job_update "$id" ".failure_reason = $_reason_lit | .failure_routed = null" ;;
+        succeeded)
+            _job_update "$id" ".failure_reason = null" ;;
+    esac
     case "$new" in
         running)    _job_update "$id" ".started_at = \"$(_iso_now)\"" ;;
         succeeded|failed|cancelled)
