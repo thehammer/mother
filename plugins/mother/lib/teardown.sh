@@ -38,6 +38,12 @@
 : "${MOTHER_TEARDOWN_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_DOCKER_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_MAX_DEFERRALS:=30}"
+# A probe failure (worktree_probe_failed) should be loud in ~2 hourly sweeps,
+# not ~30 — it means we can't tell whether removing the worktree is safe.
+: "${MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS:=2}"
+# A healthy PR wait only becomes an attention item once the PR has been open
+# this many days.
+: "${MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS:=7}"
 : "${MOTHER_DOCKER_PROBE_TIMEOUT:=5}"  # seconds before a wedged `docker info` probe is killed
 : "${MOTHER_TEARDOWN_ALLOW_UNSAFE:=0}" # 1 restores unconditional force-removal, bypassing the unsafe-worktree probe
 
@@ -106,6 +112,10 @@ _teardown_pr_disposition() {
 # ---------- gate ----------
 
 # _teardown_gate <facts_json> -> echoes "proceed:<reason>" or "defer:<reason>".
+# For the two healthy-wait reasons (pr_open_live, pr_open) the verdict is
+# followed by a TAB and the open PR's URL: "defer:pr_open<TAB><url>". The gate
+# is called via command substitution, so a global couldn't carry the URL back;
+# callers split on the TAB. The reason itself is unchanged.
 _teardown_gate() {
     local facts="$1"
     local pr_url state no_pr
@@ -132,7 +142,7 @@ _teardown_gate() {
             if [ -n "$live_owner_repo" ]; then
                 live_url=$(prd_pr_for_branch "$live_owner_repo" "$live_branch")
                 if [ -n "$live_url" ]; then
-                    echo "defer:pr_open_live"
+                    printf 'defer:pr_open_live\t%s\n' "$live_url"
                     return 0
                 fi
             fi
@@ -167,7 +177,7 @@ _teardown_gate() {
     case "$disposition" in
         merged) echo "proceed:pr_merged" ;;
         closed) echo "proceed:pr_closed" ;;
-        open)   echo "defer:pr_open" ;;
+        open)   printf 'defer:pr_open\t%s\n' "$pr_url" ;;
         *)      echo "defer:gh_inconclusive" ;;
     esac
     return 0
@@ -391,10 +401,26 @@ _teardown_worktree() {
 _teardown_worktree_unsafe() {
     local facts="$1"
     local work_dir; work_dir=$(_facts_get "$facts" '.work_dir // ""')
-    # An empty/unset work_dir field genuinely IS ambiguous: we don't know
-    # which directory the job used, so we can't say anything about what's
-    # in it.
-    [ -n "$work_dir" ] || return 2
+    if [ -z "$work_dir" ]; then
+        # No recorded work_dir: the job either never created a worktree (it was
+        # cancelled before it started — every such job used to be re-probed
+        # hourly forever) or we lost track of it. Disambiguate with git's own
+        # registry: if NO worktree is registered for the job's branch, Mother
+        # never created anything for this job and there is nothing to lose
+        # (safe; the caller's _teardown_worktree then takes its already_absent
+        # skip). If one IS registered we can't prove THIS job owns it (two jobs
+        # can share a branch), so it stays indeterminate — the low
+        # MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS cap makes it loud fast.
+        local u_repo u_branch registered
+        u_repo=$(_facts_get "$facts" '.repo_path // ""')
+        u_branch=$(_facts_get "$facts" '.branch // ""')
+        [ -n "$u_repo" ] && [ -d "$u_repo" ] && [ -n "$u_branch" ] || return 2
+        registered=$(git -C "$u_repo" worktree list --porcelain 2>/dev/null) || return 2
+        if printf '%s\n' "$registered" | grep -Fxq "branch refs/heads/$u_branch"; then
+            return 2
+        fi
+        return 0
+    fi
     # A work_dir that is SET but absent from disk is NOT ambiguous. There is
     # categorically nothing left in it to lose — "the directory is gone" and
     # "there's unrecovered work at risk" are mutually exclusive. Returning 2
@@ -421,52 +447,120 @@ _teardown_worktree_unsafe() {
 
 # ---------- pending queue ----------
 
-# _teardown_defer_record <facts_json> <reason> — upsert the pending record,
-# incrementing its total deferral count (`deferrals`) and, unless the reason
-# is the healthy `pr_open` wait, its stall count (`stall_deferrals`). Crossing
-# MOTHER_TEARDOWN_MAX_DEFERRALS worth of `stall_deferrals` emits
-# teardown_needs_attention exactly once (on the crossing, not on every
-# subsequent pass) — it never triggers destruction, only makes the stall loud.
+# _teardown_is_healthy_wait <reason> — pr_open / pr_open_live: the job's PR
+# really is still open. A wait, not a stall: PRs legitimately stay open for
+# days, and counting them would cry wolf.
+_teardown_is_healthy_wait() {
+    case "$1" in pr_open|pr_open_live) return 0 ;; *) return 1 ;; esac
+}
+
+# _teardown_healthy_wait_is_new <id> <reason> <pr_url> — 0 when this pass is
+# the FIRST of a healthy wait (no pending record yet, the previous
+# last_reason wasn't a healthy wait, or the open PR changed). Only that pass
+# emits a teardown_deferred event; later passes are silent no-ops so a PR that
+# stays open for weeks doesn't write ~600 identical events into the job's
+# events file.
+_teardown_healthy_wait_is_new() {
+    local id="$1" pr_url="$3"
+    local path; path=$(_teardown_pending_path "$id")
+    [ -f "$path" ] || return 0
+    local prev_reason prev_url
+    prev_reason=$(jq -r '.last_reason // ""' "$path" 2>/dev/null) || return 0
+    _teardown_is_healthy_wait "$prev_reason" || return 0
+    prev_url=$(jq -r '.open_pr.url // ""' "$path" 2>/dev/null) || return 0
+    [ "$prev_url" = "$pr_url" ] || return 0
+    return 1
+}
+
+# _teardown_open_pr_json <prev_open_pr_json_or_empty> <pr_url> — the record's
+# `open_pr` object {url, created_at, first_seen_open_at}. `gh pr view` runs
+# only when the URL changed or created_at is still unknown: one call per PR per
+# lifetime, not per sweep. If gh fails created_at stays null and
+# first_seen_open_at is the fallback age source.
+_teardown_open_pr_json() {
+    local prev="$1" url="$2"
+    local prev_url="" created="" first_seen=""
+    if [ -n "$prev" ]; then
+        prev_url=$(printf '%s' "$prev" | jq -r '.url // ""' 2>/dev/null)
+        if [ "$prev_url" = "$url" ]; then
+            created=$(printf '%s' "$prev" | jq -r '.created_at // ""' 2>/dev/null)
+            first_seen=$(printf '%s' "$prev" | jq -r '.first_seen_open_at // ""' 2>/dev/null)
+        fi
+    fi
+    [ -n "$first_seen" ] || first_seen=$(_iso_now)
+    if [ -z "$created" ] && [ -n "$url" ]; then
+        local out; out=$(mktemp "${TMPDIR:-/tmp}/mother-prcreated.XXXXXX") || out=""
+        if [ -n "$out" ]; then
+            if _bounded_run "${MOTHER_GH_TIMEOUT:-10}" "$out" gh pr view "$url" --json createdAt -q .createdAt; then
+                created=$(tr -d '[:space:]' < "$out")
+            fi
+            rm -f "$out"
+        fi
+    fi
+    jq -nc --arg url "$url" --arg created "$created" --arg first "$first_seen" \
+        '{url: $url, created_at: (if $created == "" then null else $created end), first_seen_open_at: $first}'
+}
+
+# _teardown_defer_record <facts_json> <reason> [<open_pr_url>] — upsert the
+# pending record.
+#
+# Healthy waits (pr_open, pr_open_live) are re-checked every sweep as quiet
+# no-ops: `deferrals` and `stall_deferrals` do NOT move (historical values on
+# older records are left as they are), and the record just refreshes
+# last_reason / last_checked_at / open_pr. The operator hears about a PR wait
+# only once it has been open more than MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS
+# (see lib/attention.sh).
+#
+# Every other reason increments both `deferrals` and `stall_deferrals`.
+# Crossing the reason's cap of `stall_deferrals` emits teardown_needs_attention
+# exactly once (on the crossing, not on every subsequent pass): the cap is
+# MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS (default 2) for
+# worktree_probe_failed, MOTHER_TEARDOWN_MAX_DEFERRALS (default 30) otherwise.
+# It never triggers destruction, only makes the stall loud.
 _teardown_defer_record() {
-    local facts="$1" reason="$2"
+    local facts="$1" reason="$2" open_pr_url="${3:-}"
     local id; id=$(_facts_get "$facts" '.id')
     local path; path=$(_teardown_pending_path "$id")
 
-    local prev_deferrals=0 prev_stalls=0
+    local prev_deferrals=0 prev_stalls=0 prev_open_pr=""
     if [ -f "$path" ]; then
         prev_deferrals=$(jq -r '.deferrals // 0' "$path" 2>/dev/null) || prev_deferrals=0
         prev_stalls=$(jq -r '.stall_deferrals // 0' "$path" 2>/dev/null) || prev_stalls=0
+        prev_open_pr=$(jq -c '.open_pr // empty' "$path" 2>/dev/null) || prev_open_pr=""
     fi
     case "$prev_deferrals" in ''|*[!0-9]*) prev_deferrals=0 ;; esac
     case "$prev_stalls"    in ''|*[!0-9]*) prev_stalls=0 ;; esac
-    local deferrals=$((prev_deferrals + 1))
 
-    # `pr_open` (and `pr_open_live`, its live-branch-derived twin — see
-    # _teardown_gate) is a healthy WAIT, not a stall — PRs legitimately stay
-    # open for days. Now that every young terminal job gets a teardown
-    # attempt on the hourly sweep, counting either toward the attention cap
-    # would fire teardown_needs_attention for every PR still open after
-    # ~MAX_DEFERRALS hours. Only anomalous reasons (gh unreachable, docker
-    # down, a stuck racing job, a succeeded job with no captured PR url, an
-    # unsafe/unprobeable worktree, the kill switch left off) mean something
-    # actually needs a human.
-    local stalls="$prev_stalls"
-    case "$reason" in
-        pr_open|pr_open_live) ;;
-        *) stalls=$((prev_stalls + 1)) ;;
-    esac
-
+    local now; now=$(_iso_now)
     local record
+    mkdir -p "$TEARDOWN_DIR"
+
+    if _teardown_is_healthy_wait "$reason"; then
+        local open_pr
+        open_pr=$(_teardown_open_pr_json "$prev_open_pr" "$open_pr_url")
+        record=$(printf '%s' "$facts" | jq \
+            --arg reason "$reason" --arg now "$now" \
+            --argjson deferrals "$prev_deferrals" --argjson stalls "$prev_stalls" \
+            --argjson open_pr "$open_pr" \
+            '. + {last_reason: $reason, deferred_at: $now, last_checked_at: $now,
+                  deferrals: $deferrals, stall_deferrals: $stalls, open_pr: $open_pr}')
+        _atomic_write "$path" "$record"
+        return 0
+    fi
+
+    local deferrals=$((prev_deferrals + 1))
+    local stalls=$((prev_stalls + 1))
     record=$(printf '%s' "$facts" | jq \
         --arg reason "$reason" \
-        --arg deferred_at "$(_iso_now)" \
+        --arg deferred_at "$now" \
         --argjson deferrals "$deferrals" \
         --argjson stalls "$stalls" \
-        '. + {last_reason: $reason, deferred_at: $deferred_at, deferrals: $deferrals, stall_deferrals: $stalls}')
-    mkdir -p "$TEARDOWN_DIR"
+        '. + {last_reason: $reason, deferred_at: $deferred_at, deferrals: $deferrals, stall_deferrals: $stalls}
+         | del(.open_pr)')
     _atomic_write "$path" "$record"
 
     local cap="${MOTHER_TEARDOWN_MAX_DEFERRALS:-30}"
+    [ "$reason" = "worktree_probe_failed" ] && cap="${MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS:-2}"
     if [ "$stalls" -gt "$cap" ] && [ "$prev_stalls" -le "$cap" ]; then
         _teardown_event "$facts" "teardown_needs_attention" \
             "$(jq -nc --argjson s "$stalls" --argjson d "$deferrals" --arg r "$reason" \
@@ -553,8 +647,10 @@ _teardown_execute() {
         return 1
     fi
 
-    local gate reason
+    local gate reason gate_url=""
     gate=$(_teardown_gate "$facts")
+    # Healthy-wait verdicts carry the open PR's URL after a TAB (see the gate).
+    case "$gate" in *$'\t'*) gate_url="${gate#*$'\t'}"; gate="${gate%%$'\t'*}" ;; esac
     reason="${gate#*:}"
 
     if [ "${gate%%:*}" = "defer" ]; then
@@ -564,7 +660,16 @@ _teardown_execute() {
             return 1
         fi
         local gate_detail
-        gate_detail=$(jq -nc --arg r "$reason" --arg pr "$pr_url" '{reason: $r, pr_url: $pr}')
+        gate_detail=$(jq -nc --arg r "$reason" --arg pr "${gate_url:-$pr_url}" '{reason: $r, pr_url: $pr}')
+        if _teardown_is_healthy_wait "$reason"; then
+            # Quiet no-op re-check: event only on the first pass of the wait.
+            TEARDOWN_LAST_STATUS="deferred"; TEARDOWN_LAST_REASON="$reason"
+            if _teardown_healthy_wait_is_new "$id" "$reason" "$gate_url"; then
+                _teardown_event "$facts" "teardown_deferred" "$gate_detail"
+            fi
+            _teardown_defer_record "$facts" "$reason" "$gate_url"
+            return 1
+        fi
         _teardown_park "$facts" "deferred" "$reason" "teardown_deferred" "$gate_detail"
         return 1
     fi

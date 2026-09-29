@@ -3306,7 +3306,8 @@ cmd_teardowns() {
         return 0
     fi
 
-    local f count=0 id branch reason deferrals deferred_at
+    local f count=0 id branch reason deferrals stalls cap deferred_at pr_url pr_since age_days now_epoch
+    now_epoch=$(date +%s)
     for f in "$TEARDOWN_DIR"/*.json; do
         [ -f "$f" ] || continue
         count=$((count + 1))
@@ -3315,8 +3316,27 @@ cmd_teardowns() {
         reason=$(jq -r '.last_reason // ""' "$f")
         deferrals=$(jq -r '.deferrals // 0' "$f")
         deferred_at=$(jq -r '.deferred_at // ""' "$f")
-        printf '%-40s %-30s reason=%-24s deferrals=%-4s deferred_at=%s\n' \
-            "$id" "$branch" "$reason" "$deferrals" "$deferred_at"
+        stalls=$(jq -r '.stall_deferrals // 0' "$f")
+        case "$reason" in
+            pr_open|pr_open_live)
+                # A healthy wait, not a stall: show how long the PR has been
+                # open instead of a deferral counter.
+                pr_url=$(jq -r '.open_pr.url // .pr_url // ""' "$f")
+                pr_since=$(jq -r '.open_pr.created_at // .open_pr.first_seen_open_at // ""' "$f")
+                age_days="?"
+                if [ -n "$pr_since" ]; then
+                    age_days=$(( (now_epoch - $(_iso_to_epoch "$pr_since")) / 86400 ))
+                fi
+                printf '%-40s %-30s reason=%-24s waiting: PR open %sd (%s)\n' \
+                    "$id" "$branch" "$reason" "$age_days" "$pr_url"
+                ;;
+            *)
+                cap="${MOTHER_TEARDOWN_MAX_DEFERRALS:-30}"
+                [ "$reason" = "worktree_probe_failed" ] && cap="${MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS:-2}"
+                printf '%-40s %-30s reason=%-24s stalls=%s/%s deferrals=%-4s deferred_at=%s\n' \
+                    "$id" "$branch" "$reason" "$stalls" "$cap" "$deferrals" "$deferred_at"
+                ;;
+        esac
     done
     [ "$count" -eq 0 ] && echo "no pending teardowns"
     return 0
@@ -3522,6 +3542,14 @@ IPC broker env vars (the long-lived sidecar that pushes events to clients):
   MOTHER_BROKER_CLIENT_BUF     (default: 1024) per-client outbound buffer (messages)
   MOTHER_BROKER_ACTIVITY_SEC   (default: 1)    current_activity transcript poll interval
   MOTHER_CLAUDE_PROJECTS_DIR   (default: ~/.claude/projects)  transcript root for current_activity
+  MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS
+                                  (default: 2)  stalled passes before a
+                                                 worktree_probe_failed teardown
+                                                 is flagged (about 2h hourly)
+  MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS
+                                  (default: 7)  days a teardown may wait on an
+                                                 open PR before it is listed
+                                                 under needs-attention
 
 Worker prompt env vars:
   MOTHER_PREAMBLE_PATH    path to a markdown file prepended to every

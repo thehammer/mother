@@ -134,6 +134,12 @@ if [ "${MOCK_GH_EXIT:-0}" != "0" ]; then
     exit "${MOCK_GH_EXIT}"
 fi
 case "$*" in
+    *"pr view"*createdAt*)
+        if [ "${MOCK_GH_CREATED_EXIT:-0}" != "0" ]; then
+            exit "${MOCK_GH_CREATED_EXIT}"
+        fi
+        printf '%s\n' "${MOCK_GH_CREATED_AT:-2026-09-01T00:00:00Z}"
+        ;;
     *"pr view"*state*)
         printf '%s\n' "${MOCK_GH_STATE:-OPEN}"
         ;;
@@ -207,6 +213,12 @@ if [ "\${MOCK_GH_EXIT:-0}" != "0" ]; then
     exit "\${MOCK_GH_EXIT}"
 fi
 case "\$*" in
+    *"pr view"*createdAt*)
+        if [ "\${MOCK_GH_CREATED_EXIT:-0}" != "0" ]; then
+            exit "\${MOCK_GH_CREATED_EXIT}"
+        fi
+        printf '%s\n' "\${MOCK_GH_CREATED_AT:-2026-09-01T00:00:00Z}"
+        ;;
     *"pr view"*state*)
         printf '%s\n' "$stored_state"
         ;;
@@ -248,9 +260,19 @@ _tw_repo_with_pushed_base() {
 # 1 on zero matches while still printing "0", so the missing-file case is
 # handled separately and the exit status is swallowed with `|| true` — a
 # `|| echo 0` here would print a second "0".
+#
+# Counts only the state lookups (`gh pr view <url> --json state`). The
+# one-time `--json createdAt` lookup that records a PR's age for the
+# pr_open_stale attention item is counted separately by _gh_created_at_count.
 _gh_view_count() {
     [ -f "$MOTHER_ROOT/mock-gh-calls" ] || { echo 0; return 0; }
-    grep -c "pr view" "$MOTHER_ROOT/mock-gh-calls" 2>/dev/null || true
+    grep "pr view" "$MOTHER_ROOT/mock-gh-calls" 2>/dev/null | grep -vc "createdAt" || true
+}
+
+# Count `gh pr view <url> --json createdAt` invocations recorded by the mock.
+_gh_created_at_count() {
+    [ -f "$MOTHER_ROOT/mock-gh-calls" ] || { echo 0; return 0; }
+    grep -c "createdAt" "$MOTHER_ROOT/mock-gh-calls" 2>/dev/null || true
 }
 
 setup() {
@@ -379,7 +401,9 @@ teardown() {
     facts=$(_facts_json "job-g6" "/tmp/r6" "b6" "/tmp/w6" "worktree" "https://github.com/x/y/pull/6" "succeeded" false)
     run bash -c "$(_source_teardown_libs) _teardown_gate '$facts'"
     [ "$status" -eq 0 ]
-    [ "$output" = "defer:pr_open" ]
+    # Healthy-wait verdicts carry the PR url after a TAB so callers can record
+    # it without a second gh lookup.
+    [ "$output" = "$(printf 'defer:pr_open\thttps://github.com/x/y/pull/6')" ]
 }
 
 @test "_teardown_gate: pr_url set + disposition inconclusive -> defer:gh_inconclusive" {
@@ -837,14 +861,17 @@ teardown() {
 
 # ---- 4 ----
 
-@test "teardown-only accrues exactly one deferral per sweep" {
-    export MOCK_GH_STATE="OPEN"
+@test "teardown-only accrues exactly one deferral per sweep for a genuine stall" {
+    # gh unreachable is a real stall (gh_inconclusive), not a healthy wait, so
+    # it keeps accruing exactly one deferral AND one stall per sweep.
+    export MOCK_GH_EXIT=1
     local wt_dir
     wt_dir=$(_make_teardown_job "one-deferral-per-sweep" "succeeded" '.pr_url = "https://github.com/x/y/pull/24"')
 
     run mother archive
     [ "$status" -eq 0 ]
     [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "1" ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "1" ]
 
     run mother archive
     [ "$status" -eq 0 ]
@@ -853,10 +880,36 @@ teardown() {
     run mother archive
     [ "$status" -eq 0 ]
     [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "3" ]
-    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "0" ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/one-deferral-per-sweep.json")" = "3" ]
 
     [ -d "$wt_dir" ]
     [ -f "$JOBS_DIR/one-deferral-per-sweep.json" ]
+}
+
+@test "teardown-only never accrues deferrals while a PR is simply open (healthy wait)" {
+    export MOCK_GH_STATE="OPEN"
+    local wt_dir
+    wt_dir=$(_make_teardown_job "healthy-wait-no-accrual" "succeeded" '.pr_url = "https://github.com/x/y/pull/24"')
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    [ -f "$TEARDOWN_DIR/healthy-wait-no-accrual.json" ]
+    local first_deferrals
+    first_deferrals=$(jq -r '.deferrals // 0' "$TEARDOWN_DIR/healthy-wait-no-accrual.json")
+
+    run mother archive
+    [ "$status" -eq 0 ]
+    run mother archive
+    [ "$status" -eq 0 ]
+
+    # An open PR is a wait, not a failure: neither counter moves, no matter
+    # how many hourly sweeps look at it.
+    [ "$(jq -r '.deferrals // 0' "$TEARDOWN_DIR/healthy-wait-no-accrual.json")" = "$first_deferrals" ]
+    [ "$(jq -r '.stall_deferrals // 0' "$TEARDOWN_DIR/healthy-wait-no-accrual.json")" = "0" ]
+    [ "$(jq -r '.last_reason' "$TEARDOWN_DIR/healthy-wait-no-accrual.json")" = "pr_open" ]
+
+    [ -d "$wt_dir" ]
+    [ -f "$JOBS_DIR/healthy-wait-no-accrual.json" ]
 }
 
 # ---- 5 ----
@@ -880,14 +933,17 @@ teardown() {
 # One drain guard shared by both cmd_archive teardown call sites
 # ---------------------------------------------------------------------------
 
-@test "a sweep that ages a job with a pending record makes exactly one gh call and one deferral" {
+@test "a sweep that ages a job with a pending record makes exactly one gh state lookup" {
     export MOCK_GH_STATE="OPEN"
     local wt_dir
     wt_dir=$(_make_teardown_job "one-shot-aged" "succeeded" '.pr_url = "https://github.com/x/y/pull/40"')
 
     run mother archive
     [ "$status" -eq 0 ]
-    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-shot-aged.json")" = "1" ]
+    # pr_open is a healthy wait: the pending record exists but deferrals do
+    # not increment for it.
+    [ -f "$TEARDOWN_DIR/one-shot-aged.json" ]
+    [ "$(jq -r '.deferrals // 0' "$TEARDOWN_DIR/one-shot-aged.json")" = "0" ]
 
     _age_job "one-shot-aged" "2020-01-01T00:00:00Z"
     : > "$MOTHER_ROOT/mock-gh-calls"
@@ -896,8 +952,10 @@ teardown() {
     [ "$status" -eq 0 ]
     [[ "$output" =~ "archived: 1" ]]
 
+    # Exactly one state lookup for the aged job (no double attempt), and the
+    # healthy wait still does not accrue a deferral.
     [ "$(_gh_view_count)" = "1" ]
-    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/one-shot-aged.json")" = "2" ]
+    [ "$(jq -r '.deferrals // 0' "$TEARDOWN_DIR/one-shot-aged.json")" = "0" ]
 
     [ ! -f "$JOBS_DIR/one-shot-aged.json" ]
     [ -d "$wt_dir" ]
@@ -1063,8 +1121,9 @@ teardown() {
     run grep -F '"kind":"teardown_needs_attention"' "$events_file"
     [ "$status" -ne 0 ]
 
-    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/pr-open-never-stalls.json")" = "3" ]
-    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/pr-open-never-stalls.json")" = "0" ]
+    # Healthy waits move neither counter (no per-pass deferral accrual).
+    [ "$(jq -r '.deferrals // 0' "$TEARDOWN_DIR/pr-open-never-stalls.json")" = "0" ]
+    [ "$(jq -r '.stall_deferrals // 0' "$TEARDOWN_DIR/pr-open-never-stalls.json")" = "0" ]
 }
 
 # ---- 7 ----
@@ -1187,7 +1246,7 @@ teardown() {
         "https://github.com/x/y/pull/1" "succeeded" false)
     run bash -c "$(_source_teardown_libs) _teardown_gate '$facts'"
     [ "$status" -eq 0 ]
-    [ "$output" = "defer:pr_open_live" ]
+    [ "$output" = "$(printf 'defer:pr_open_live\thttps://github.com/thehammer/mother/pull/199')" ]
 }
 
 @test "pr_open_live: mother archive defers and preserves the worktree" {
@@ -1207,14 +1266,14 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
-@test "pr_open_live deferrals never increment stall_deferrals, unlike unrelated stalls" {
+@test "pr_open_live never increments deferrals or stall_deferrals, unlike unrelated stalls" {
     # Uses the bulk sweep (bare `mother archive`), not the single-id form:
     # `mother archive <id>` archives-and-moves unconditionally on its very
     # first call (see the "PR open on a succeeded job defers teardown" test
     # above), so the job record wouldn't survive to be attempted a second
     # time. The bulk sweep gives every terminal job younger than the archive
     # cutoff a teardown-ONLY attempt each pass without moving its record —
-    # see "teardown-only accrues exactly one deferral per sweep" for the
+    # see "teardown-only accrues exactly one deferral per sweep for a genuine stall" for the
     # established pattern this mirrors.
     local wt_dir
     wt_dir=$(_make_teardown_job "e2e-live2" "succeeded" '.pr_url = "https://github.com/x/y/pull/62"')
@@ -1224,13 +1283,14 @@ teardown() {
 
     run mother archive
     [ "$status" -eq 0 ]
-    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/e2e-live2.json")" = "1" ]
-    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/e2e-live2.json")" = "0" ]
+    [ "$(jq -r '.last_reason' "$TEARDOWN_DIR/e2e-live2.json")" = "pr_open_live" ]
+    [ "$(jq -r '.deferrals // 0' "$TEARDOWN_DIR/e2e-live2.json")" = "0" ]
+    [ "$(jq -r '.stall_deferrals // 0' "$TEARDOWN_DIR/e2e-live2.json")" = "0" ]
 
     run mother archive
     [ "$status" -eq 0 ]
-    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/e2e-live2.json")" = "2" ]
-    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/e2e-live2.json")" = "0" ]
+    [ "$(jq -r '.deferrals // 0' "$TEARDOWN_DIR/e2e-live2.json")" = "0" ]
+    [ "$(jq -r '.stall_deferrals // 0' "$TEARDOWN_DIR/e2e-live2.json")" = "0" ]
 
     [ -d "$wt_dir" ]
     [ -f "$JOBS_DIR/e2e-live2.json" ]
@@ -1449,4 +1509,402 @@ teardown() {
     [[ "$output" == *"status=skipped"* ]]
     [[ "$output" == *"reason=main_dir"* ]]
     [ -d "$repo_dir" ]
+}
+
+# ===========================================================================
+# Operator-surfacing & scheduling change — teardown behaviours
+#
+#   * an EMPTY work_dir is no longer automatically indeterminate: when git has
+#     no worktree registered for the job's branch there is nothing to lose
+#   * a healthy PR-open wait is recorded (url + age) instead of being counted
+#     as a deferral, and only announces itself once
+#   * the attention cap for a `worktree_probe_failed` stall is much lower than
+#     for other stalls (MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS, default 2)
+#   * `mother teardowns` shows healthy waits as "waiting: PR open Nd (<url>)"
+# ===========================================================================
+
+# ISO-8601 UTC timestamp <days> days (plus <extra_seconds>) in the past.
+# Usage: _iso_days_ago <days> [extra_seconds]
+_iso_days_ago() {
+    /usr/bin/perl -MPOSIX=strftime -e \
+        'print strftime("%Y-%m-%dT%H:%M:%SZ", gmtime(time - $ARGV[0]*86400 - $ARGV[1]))' \
+        "$1" "${2:-0}"
+}
+
+# Run _teardown_execute <passes> times over the same facts blob (the shape the
+# teardown-only path drives it with), in one shell, real time between passes.
+# Usage: _exec_passes <facts_json> <passes>
+_exec_passes() {
+    local facts="$1" passes="$2"
+    bash -c "$(_source_teardown_libs)
+        for _i in \$(seq 1 $passes); do _teardown_execute '$facts' 0; done
+        true   # a deferral makes _teardown_execute return 1; that is not a failure here
+    "
+}
+
+# Count events of a kind in a job's live events file.
+# Usage: _count_events <id> <kind>
+_count_events() {
+    local f="$EVENTS_DIR/$1.jsonl"
+    [ -f "$f" ] || { echo 0; return 0; }
+    grep -c "\"kind\":\"$2\"" "$f" 2>/dev/null || true
+}
+
+# Write a pending-teardown record directly (schema per the queue contract).
+# Usage: _seed_pending <id> [extra-jq-filter]
+_seed_pending() {
+    local id="$1" extra="${2:-.}"
+    jq -n --arg id "$id" \
+        '{id: $id, repo: "testrepo", repo_path: "/tmp/nonexistent-repo", branch: ("feature/" + $id),
+          work_dir: "", isolation: "worktree", pr_url: null, state: "succeeded", no_pr: false,
+          events_path: "", deferrals: 0, stall_deferrals: 0, deferred_at: "2026-09-01T00:00:00Z"}' \
+        | jq "$extra" > "$TEARDOWN_DIR/$id.json"
+}
+
+# ---------------------------------------------------------------------------
+# Empty work_dir: safe iff git has no worktree registered for the branch
+# ---------------------------------------------------------------------------
+
+@test "_teardown_worktree_unsafe: empty work_dir with no worktree registered for the branch is safe" {
+    local repo_dir="$MOTHER_ROOT/tw-nowt-repo"
+    _make_teardown_repo "$repo_dir"
+    facts=$(_facts_json "job-tw-nowt" "$repo_dir" "feature/tw-nowt" "" "worktree" "" "cancelled" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 0 ]
+}
+
+@test "_teardown_worktree_unsafe: empty work_dir but a worktree IS registered for the branch is still indeterminate" {
+    local repo_dir="$MOTHER_ROOT/tw-regwt-repo" wt_dir="$MOTHER_ROOT/tw-regwt-wt"
+    _make_teardown_repo "$repo_dir"
+    _make_teardown_worktree "$repo_dir" "$wt_dir" "feature/tw-regwt"
+    facts=$(_facts_json "job-tw-regwt" "$repo_dir" "feature/tw-regwt" "" "worktree" "" "cancelled" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 2 ]
+    [ -d "$wt_dir" ]
+}
+
+@test "_teardown_worktree_unsafe: empty work_dir with no branch on the facts is indeterminate" {
+    local repo_dir="$MOTHER_ROOT/tw-nobranch-repo"
+    _make_teardown_repo "$repo_dir"
+    facts=$(_facts_json "job-tw-nobranch" "$repo_dir" "" "" "worktree" "" "cancelled" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 2 ]
+}
+
+@test "_teardown_worktree_unsafe: empty work_dir with repo_path that is not a git repo is indeterminate" {
+    local dir="$MOTHER_ROOT/tw-nogit-repo"
+    mkdir -p "$dir"
+    facts=$(_facts_json "job-tw-nogit" "$dir" "feature/tw-nogit" "" "worktree" "" "cancelled" false)
+
+    run bash -c "$(_source_teardown_libs) _teardown_worktree_unsafe '$facts'"
+    [ "$status" -eq 2 ]
+}
+
+@test "_teardown_execute completes a cancelled job with empty work_dir and no registered worktree as already_absent, clearing its pending record" {
+    local repo_dir="$MOTHER_ROOT/tw-cancel-repo"
+    _make_teardown_repo "$repo_dir"
+    # A record parked by the old behaviour (indeterminate probe) must be
+    # released once the job resolves.
+    _seed_pending "job-tw-cancel" \
+        '.state = "cancelled" | .last_reason = "worktree_probe_failed" | .stall_deferrals = 2 | .deferrals = 2'
+    facts=$(_facts_json "job-tw-cancel" "$repo_dir" "feature/tw-cancel" "" "worktree" "" "cancelled" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=skipped"* ]]
+    [[ "$output" == *"reason=already_absent"* ]]
+    [ ! -f "$TEARDOWN_DIR/job-tw-cancel.json" ]
+}
+
+# ---------------------------------------------------------------------------
+# Healthy PR-open wait: recorded, not counted, announced once
+# ---------------------------------------------------------------------------
+
+@test "healthy pr_open wait: three passes leave deferrals and stall_deferrals untouched and record the PR" {
+    export MOCK_GH_STATE="OPEN" MOCK_GH_CREATED_AT="2026-09-20T12:00:00Z"
+    : > "$EVENTS_DIR/hw-count.jsonl"
+    facts=$(_facts_json "hw-count" "/tmp/nonexistent-repo" "feature/hw-count" "" "worktree" \
+        "https://github.com/x/y/pull/101" "succeeded" false)
+
+    run _exec_passes "$facts" 3
+    [ "$status" -eq 0 ]
+
+    local rec="$TEARDOWN_DIR/hw-count.json"
+    [ -f "$rec" ]
+    [ "$(jq -r '.deferrals // 0' "$rec")" = "0" ]
+    [ "$(jq -r '.stall_deferrals // 0' "$rec")" = "0" ]
+    [ "$(jq -r '.last_reason' "$rec")" = "pr_open" ]
+    [ "$(jq -r '.last_checked_at // ""' "$rec")" != "" ]
+    [ "$(jq -r '.open_pr.url' "$rec")" = "https://github.com/x/y/pull/101" ]
+    [ "$(jq -r '.open_pr.created_at' "$rec")" = "2026-09-20T12:00:00Z" ]
+    [ "$(jq -r '.open_pr.first_seen_open_at // ""' "$rec")" != "" ]
+}
+
+@test "healthy pr_open wait: createdAt is fetched from gh once across three passes, not every pass" {
+    export MOCK_GH_STATE="OPEN"
+    facts=$(_facts_json "hw-once" "/tmp/nonexistent-repo" "feature/hw-once" "" "worktree" \
+        "https://github.com/x/y/pull/102" "succeeded" false)
+
+    run _exec_passes "$facts" 3
+    [ "$status" -eq 0 ]
+    [ "$(_gh_created_at_count)" = "1" ]
+}
+
+@test "healthy pr_open wait: teardown_deferred is emitted exactly once across three passes" {
+    export MOCK_GH_STATE="OPEN"
+    : > "$EVENTS_DIR/hw-event.jsonl"
+    facts=$(_facts_json "hw-event" "/tmp/nonexistent-repo" "feature/hw-event" "" "worktree" \
+        "https://github.com/x/y/pull/103" "succeeded" false)
+
+    run _exec_passes "$facts" 3
+    [ "$status" -eq 0 ]
+    [ "$(_count_events hw-event teardown_deferred)" = "1" ]
+    run grep -F '"reason":"pr_open"' "$EVENTS_DIR/hw-event.jsonl"
+    [ "$status" -eq 0 ]
+}
+
+@test "healthy pr_open wait: a record's historical deferrals count is not rewritten" {
+    export MOCK_GH_STATE="OPEN"
+    : > "$EVENTS_DIR/hw-history.jsonl"
+    _seed_pending "hw-history" \
+        '.pr_url = "https://github.com/x/y/pull/104" | .last_reason = "pr_open" | .deferrals = 7 | .stall_deferrals = 0
+         | .open_pr = {url: "https://github.com/x/y/pull/104", created_at: "2026-09-20T12:00:00Z", first_seen_open_at: "2026-09-21T00:00:00Z"}'
+    facts=$(_facts_json "hw-history" "/tmp/nonexistent-repo" "feature/hw-history" "" "worktree" \
+        "https://github.com/x/y/pull/104" "succeeded" false)
+
+    run _exec_passes "$facts" 2
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.deferrals' "$TEARDOWN_DIR/hw-history.json")" = "7" ]
+    # Same URL, created_at already known: nothing to look up, nothing to announce.
+    [ "$(_gh_created_at_count)" = "0" ]
+    [ "$(_count_events hw-history teardown_deferred)" = "0" ]
+}
+
+@test "healthy pr_open wait: entering it from a genuine stall announces teardown_deferred once" {
+    export MOCK_GH_STATE="OPEN"
+    : > "$EVENTS_DIR/hw-reenter.jsonl"
+    _seed_pending "hw-reenter" \
+        '.pr_url = "https://github.com/x/y/pull/105" | .last_reason = "gh_inconclusive" | .deferrals = 3 | .stall_deferrals = 3'
+    facts=$(_facts_json "hw-reenter" "/tmp/nonexistent-repo" "feature/hw-reenter" "" "worktree" \
+        "https://github.com/x/y/pull/105" "succeeded" false)
+
+    run _exec_passes "$facts" 3
+    [ "$status" -eq 0 ]
+    [ "$(_count_events hw-reenter teardown_deferred)" = "1" ]
+    [ "$(jq -r '.last_reason' "$TEARDOWN_DIR/hw-reenter.json")" = "pr_open" ]
+    # Stalls already accrued are history, not new accrual.
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/hw-reenter.json")" = "3" ]
+}
+
+@test "healthy pr_open wait: a different open PR re-announces and re-fetches createdAt" {
+    export MOCK_GH_STATE="OPEN"
+    : > "$EVENTS_DIR/hw-newpr.jsonl"
+    local facts_a facts_b
+    facts_a=$(_facts_json "hw-newpr" "/tmp/nonexistent-repo" "feature/hw-newpr" "" "worktree" \
+        "https://github.com/x/y/pull/106" "succeeded" false)
+    facts_b=$(_facts_json "hw-newpr" "/tmp/nonexistent-repo" "feature/hw-newpr" "" "worktree" \
+        "https://github.com/x/y/pull/107" "succeeded" false)
+
+    run _exec_passes "$facts_a" 2
+    [ "$status" -eq 0 ]
+    run _exec_passes "$facts_b" 2
+    [ "$status" -eq 0 ]
+
+    [ "$(_count_events hw-newpr teardown_deferred)" = "2" ]
+    [ "$(_gh_created_at_count)" = "2" ]
+    [ "$(jq -r '.open_pr.url' "$TEARDOWN_DIR/hw-newpr.json")" = "https://github.com/x/y/pull/107" ]
+}
+
+@test "healthy pr_open wait: a failed createdAt lookup records created_at null plus first_seen_open_at, and is retried next pass" {
+    export MOCK_GH_STATE="OPEN" MOCK_GH_CREATED_EXIT=1
+    facts=$(_facts_json "hw-nocreated" "/tmp/nonexistent-repo" "feature/hw-nocreated" "" "worktree" \
+        "https://github.com/x/y/pull/108" "succeeded" false)
+
+    run _exec_passes "$facts" 1
+    [ "$status" -eq 0 ]
+    local rec="$TEARDOWN_DIR/hw-nocreated.json"
+    [ "$(jq -r '.open_pr.created_at' "$rec")" = "null" ]
+    [ "$(jq -r '.open_pr.first_seen_open_at // ""' "$rec")" != "" ]
+    [ "$(jq -r '.open_pr.url' "$rec")" = "https://github.com/x/y/pull/108" ]
+
+    # gh recovers: the missing created_at is filled in on the next pass.
+    unset MOCK_GH_CREATED_EXIT
+    export MOCK_GH_CREATED_AT="2026-09-22T08:00:00Z"
+    run _exec_passes "$facts" 1
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.open_pr.created_at' "$rec")" = "2026-09-22T08:00:00Z" ]
+}
+
+@test "healthy pr_open_live wait: three passes leave counters untouched and emit exactly one teardown_deferred" {
+    local repo_dir="$MOTHER_ROOT/repo-hwl"
+    _make_teardown_repo "$repo_dir"
+    _add_origin_remote "$repo_dir" "thehammer/mother"
+    _install_mock_gh_pr_open_live "MERGED" "feature/hwl" "https://github.com/thehammer/mother/pull/300"
+    : > "$EVENTS_DIR/hwl.jsonl"
+    facts=$(_facts_json "hwl" "$repo_dir" "feature/hwl" "" "worktree" \
+        "https://github.com/x/y/pull/299" "succeeded" false)
+
+    run _exec_passes "$facts" 3
+    [ "$status" -eq 0 ]
+
+    local rec="$TEARDOWN_DIR/hwl.json"
+    [ "$(jq -r '.last_reason' "$rec")" = "pr_open_live" ]
+    [ "$(jq -r '.deferrals // 0' "$rec")" = "0" ]
+    [ "$(jq -r '.stall_deferrals // 0' "$rec")" = "0" ]
+    [ "$(jq -r '.open_pr.url' "$rec")" = "https://github.com/thehammer/mother/pull/300" ]
+    [ "$(_count_events hwl teardown_deferred)" = "1" ]
+    [ "$(_gh_created_at_count)" = "1" ]
+}
+
+@test "healthy pr_open_live wait ends in teardown once the live PR merges, removing the pending record" {
+    local wt_dir
+    wt_dir=$(_make_teardown_job "hwl-merge" "succeeded" '.pr_url = "https://github.com/x/y/pull/310"')
+    local repo_dir="$MOTHER_ROOT/repo-hwl-merge"
+    _add_origin_remote "$repo_dir" "thehammer/mother"
+    _install_mock_gh_pr_open_live "MERGED" "feature/hwl-merge" "https://github.com/thehammer/mother/pull/311"
+    facts=$(_facts_json "hwl-merge" "$repo_dir" "feature/hwl-merge" "$wt_dir" "worktree" \
+        "https://github.com/x/y/pull/310" "succeeded" false)
+
+    run _exec_passes "$facts" 2
+    [ "$status" -eq 0 ]
+    [ -f "$TEARDOWN_DIR/hwl-merge.json" ]
+    [ -d "$wt_dir" ]
+
+    # The live PR merges: the branch has no open PR any more and the stored PR
+    # is merged too.
+    _install_mock_gh
+    export MOCK_GH_STATE="MERGED"
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=torn_down"* ]]
+    [ ! -d "$wt_dir" ]
+    [ ! -f "$TEARDOWN_DIR/hwl-merge.json" ]
+}
+
+# ---------------------------------------------------------------------------
+# Attention cap: worktree_probe_failed is low (2), other stalls stay at 30
+# ---------------------------------------------------------------------------
+
+@test "worktree_probe_failed fires teardown_needs_attention exactly once, on the third pass" {
+    local repo_dir="$MOTHER_ROOT/tw-cap-repo" not_repo_dir="$MOTHER_ROOT/tw-cap-notrepo"
+    _make_teardown_repo "$repo_dir"
+    mkdir -p "$not_repo_dir"
+    : > "$EVENTS_DIR/job-cap-probe.jsonl"
+    facts=$(_facts_json "job-cap-probe" "$repo_dir" "feature/cap-probe" "$not_repo_dir" "worktree" "" "failed" false)
+
+    run _exec_passes "$facts" 2
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/job-cap-probe.json")" = "2" ]
+    [ "$(_count_events job-cap-probe teardown_needs_attention)" = "0" ]
+
+    run _exec_passes "$facts" 1
+    [ "$status" -eq 0 ]
+    [ "$(_count_events job-cap-probe teardown_needs_attention)" = "1" ]
+
+    run _exec_passes "$facts" 3
+    [ "$status" -eq 0 ]
+    [ "$(_count_events job-cap-probe teardown_needs_attention)" = "1" ]
+}
+
+@test "MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS overrides the worktree_probe_failed cap" {
+    export MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS=5
+    local repo_dir="$MOTHER_ROOT/tw-cap5-repo" not_repo_dir="$MOTHER_ROOT/tw-cap5-notrepo"
+    _make_teardown_repo "$repo_dir"
+    mkdir -p "$not_repo_dir"
+    : > "$EVENTS_DIR/job-cap-probe5.jsonl"
+    facts=$(_facts_json "job-cap-probe5" "$repo_dir" "feature/cap-probe5" "$not_repo_dir" "worktree" "" "failed" false)
+
+    run _exec_passes "$facts" 5
+    [ "$status" -eq 0 ]
+    [ "$(_count_events job-cap-probe5 teardown_needs_attention)" = "0" ]
+
+    run _exec_passes "$facts" 1
+    [ "$status" -eq 0 ]
+    [ "$(_count_events job-cap-probe5 teardown_needs_attention)" = "1" ]
+}
+
+@test "other stall reasons keep the default cap of 30: quiet through pass 30, one event on pass 31, never again" {
+    export MOCK_GH_EXIT=1
+    : > "$EVENTS_DIR/job-cap-gh.jsonl"
+    facts=$(_facts_json "job-cap-gh" "/tmp/nonexistent-repo" "feature/cap-gh" "" "worktree" \
+        "https://github.com/x/y/pull/120" "succeeded" false)
+
+    run _exec_passes "$facts" 3
+    [ "$status" -eq 0 ]
+    # gh_inconclusive is not held to the probe-failed cap of 2.
+    [ "$(_count_events job-cap-gh teardown_needs_attention)" = "0" ]
+
+    run _exec_passes "$facts" 27
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.stall_deferrals' "$TEARDOWN_DIR/job-cap-gh.json")" = "30" ]
+    [ "$(_count_events job-cap-gh teardown_needs_attention)" = "0" ]
+
+    run _exec_passes "$facts" 1
+    [ "$status" -eq 0 ]
+    [ "$(_count_events job-cap-gh teardown_needs_attention)" = "1" ]
+
+    run _exec_passes "$facts" 3
+    [ "$status" -eq 0 ]
+    [ "$(_count_events job-cap-gh teardown_needs_attention)" = "1" ]
+}
+
+# ---------------------------------------------------------------------------
+# `mother teardowns` display
+# ---------------------------------------------------------------------------
+
+@test "mother teardowns: a healthy PR-open wait prints its age and URL instead of a deferral count" {
+    _seed_pending "disp-wait" \
+        ".last_reason = \"pr_open\" | .deferrals = 12 | .pr_url = \"https://github.com/x/y/pull/9\"
+         | .open_pr = {url: \"https://github.com/x/y/pull/9\", created_at: \"$(_iso_days_ago 8 3600)\", first_seen_open_at: \"$(_iso_days_ago 1)\"}"
+
+    run mother teardowns
+    [ "$status" -eq 0 ]
+    local line
+    line=$(printf '%s\n' "$output" | grep 'disp-wait')
+    [[ "$line" == *"waiting: PR open 8d (https://github.com/x/y/pull/9)"* ]]
+    [[ "$line" != *"deferrals="* ]]
+}
+
+@test "mother teardowns: a healthy wait with no created_at falls back to first_seen_open_at for its age" {
+    _seed_pending "disp-wait-fallback" \
+        ".last_reason = \"pr_open_live\" | .pr_url = \"https://github.com/x/y/pull/8\"
+         | .open_pr = {url: \"https://github.com/x/y/pull/10\", created_at: null, first_seen_open_at: \"$(_iso_days_ago 3 3600)\"}"
+
+    run mother teardowns
+    [ "$status" -eq 0 ]
+    local line
+    line=$(printf '%s\n' "$output" | grep 'disp-wait-fallback')
+    [[ "$line" == *"waiting: PR open 3d (https://github.com/x/y/pull/10)"* ]]
+}
+
+@test "mother teardowns: a stall prints stalls=N/cap and the total deferrals" {
+    _seed_pending "disp-stall" '.last_reason = "gh_inconclusive" | .deferrals = 5 | .stall_deferrals = 3'
+
+    run mother teardowns
+    [ "$status" -eq 0 ]
+    local line
+    line=$(printf '%s\n' "$output" | grep 'disp-stall')
+    [[ "$line" == *"stalls=3/30"* ]]
+    [[ "$line" == *"deferrals=5"* ]]
+    [[ "$line" != *"waiting:"* ]]
+}
+
+@test "mother teardowns: a worktree_probe_failed stall shows the probe-failed cap" {
+    _seed_pending "disp-probe" '.last_reason = "worktree_probe_failed" | .deferrals = 1 | .stall_deferrals = 1'
+
+    run mother teardowns
+    [ "$status" -eq 0 ]
+    local line
+    line=$(printf '%s\n' "$output" | grep 'disp-probe')
+    [[ "$line" == *"stalls=1/2"* ]]
+    [[ "$line" == *"deferrals=1"* ]]
 }

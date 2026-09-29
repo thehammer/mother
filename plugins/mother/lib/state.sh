@@ -71,6 +71,30 @@ _atomic_write() {
     printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
 }
 
+# _bounded_run <timeout_secs> <stdout_file|-> <external-cmd> [args...]
+# Runs an EXTERNAL command with a wall-clock bound, using the same
+# background-race watchdog idiom as `_docker_reachable` (lib/teardown.sh) and
+# `_maybe_archive` (bin/mother-runner): race the command against a
+# `sleep N; kill -9`. The command is `exec`'d inside the background subshell
+# so the killed pid IS the command (no orphaned grandchild); that means it must
+# be an executable, not a shell function. stdout goes to <stdout_file> (or is
+# discarded with "-"); stderr is discarded. Returns the command's exit status,
+# or 137 when the watchdog killed it. Callers that must never stall a single-
+# threaded loop (notifier transports, `gh` polls) go through this.
+_bounded_run() {
+    local secs="$1" out="$2"; shift 2
+    [ "$out" = "-" ] && out=/dev/null
+    ( exec "$@" >"$out" 2>/dev/null </dev/null 3>&- ) &
+    local pid=$!
+    ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 3>&- &
+    local wd=$!
+    local rc=0
+    wait "$pid" 2>/dev/null || rc=$?
+    kill "$wd" 2>/dev/null
+    wait "$wd" 2>/dev/null
+    return "$rc"
+}
+
 # Portable mkdir-based mutex (macOS lacks flock).
 # Usage: _with_lock <path> <command...>
 _with_lock() {
