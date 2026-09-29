@@ -220,3 +220,88 @@ GH
     run grep '"failure_reason_missing"' "$events_file"
     [ "$status" -ne 0 ]
 }
+
+# ===========================================================================
+# .failure_reason — the job's current failure, queryable without walking the
+# events log. Set by every `failed` transition (mother-run-job's _transition
+# and state.sh's _job_transition), cleared by `succeeded`, and it resets
+# .failure_routed (the "the router already handled this failure" flag) so a
+# fresh failure is always routed afresh.
+# ===========================================================================
+
+@test "_transition failed sets .failure_reason from the detail's reason and resets .failure_routed" {
+    SOURCE_ONLY=1 source "$MOTHER_RUN_JOB" 2>/dev/null || true
+
+    id="fr-field-1"
+    job_file="$JOBS_DIR/$id.json"
+    make_job "$id" "running" '.failure_routed = true'
+
+    run _transition failed '{"reason":"x"}'
+
+    assert_job_field "$id" '.state' "failed"
+    assert_job_field "$id" '.failure_reason' "x"
+    assert_job_field "$id" '.failure_routed' "null"
+}
+
+@test "_transition failed with no reason records .failure_reason=unspecified" {
+    SOURCE_ONLY=1 source "$MOTHER_RUN_JOB" 2>/dev/null || true
+
+    id="fr-field-2"
+    job_file="$JOBS_DIR/$id.json"
+    make_job "$id" "running" '.failure_routed = true'
+
+    run _transition failed '{}'
+
+    assert_job_field "$id" '.failure_reason' "unspecified"
+    assert_job_field "$id" '.failure_routed' "null"
+}
+
+@test "_transition succeeded clears a stale .failure_reason" {
+    SOURCE_ONLY=1 source "$MOTHER_RUN_JOB" 2>/dev/null || true
+
+    id="fr-field-3"
+    job_file="$JOBS_DIR/$id.json"
+    make_job "$id" "running" '.failure_reason = "no_pr_no_push"'
+
+    run _transition succeeded '{}'
+
+    assert_job_field "$id" '.state' "succeeded"
+    assert_job_field "$id" '.failure_reason' "null"
+}
+
+@test "_job_transition failed sets .failure_reason from the detail's reason and resets .failure_routed" {
+    source "$MOTHER_LIB_DIR/state.sh"
+
+    local id="fr-field-4"
+    make_job "$id" "running" '.failure_routed = true'
+
+    run _job_transition "$id" failed '{"reason":"x"}'
+
+    assert_job_field "$id" '.state' "failed"
+    assert_job_field "$id" '.failure_reason' "x"
+    assert_job_field "$id" '.failure_routed' "null"
+}
+
+@test "_job_transition failed with no reason records .failure_reason=unspecified" {
+    source "$MOTHER_LIB_DIR/state.sh"
+
+    local id="fr-field-5"
+    make_job "$id" "running" '.failure_routed = true'
+
+    run _job_transition "$id" failed '{}'
+
+    assert_job_field "$id" '.failure_reason' "unspecified"
+    assert_job_field "$id" '.failure_routed' "null"
+}
+
+@test "_job_transition succeeded clears a stale .failure_reason" {
+    source "$MOTHER_LIB_DIR/state.sh"
+
+    local id="fr-field-6"
+    make_job "$id" "running" '.failure_reason = "no_pr_no_push"'
+
+    run _job_transition "$id" succeeded '{}'
+
+    assert_job_field "$id" '.state' "succeeded"
+    assert_job_field "$id" '.failure_reason' "null"
+}

@@ -61,6 +61,27 @@ Initial scaffolding for the Mother plugin.
 - `scripts/install.sh` and `scripts/doctor.sh` bootstrap + dependency checks.
 - Design doc at `docs/design.md`.
 
+## [Unreleased] - truthful terminal states
+
+### Fixed
+
+- Failures are routed by reason instead of always escalating the model tier.
+  `no_pr_no_push` (reconcile, else hold), `rework_no_new_commit`,
+  `branch_create_failed` and `checkout_failed` (hold) never escalate;
+  `worktree_create_failed`, `runner_died_early` and `unspecified` get one
+  as-is retry then a hold; everything else keeps reconcile-then-escalate.
+  A hold is `awaiting` / `activity: operator_hold` with a question naming the
+  next commands (`resume`, `retry`, `reconcile`, `cancel` all accept it).
+  Every `failed` transition now persists `.failure_reason` on the job.
+  Kill switch: `MOTHER_FAILURE_ROUTING_ENABLED=0`.
+- A rework/resume run that started with an open PR or pushed branch can no
+  longer report `succeeded` without pushing anything new; it fails
+  `rework_no_new_commit`. Kill switch: `MOTHER_REWORK_ADVANCE_CHECK_ENABLED=0`.
+- A main-dir job that fails during workspace setup (`branch_create_failed`,
+  `checkout_failed`), or whose supervisor dies, now restores the operator's
+  auto-stashed tracked and untracked changes — before releasing the workspace
+  lock — instead of leaving them only in `git stash list`.
+
 ## [Unreleased] - cost visibility, `--max-cost` enforcement, `--effort` passthrough, `mother retro`
 
 ### Added

@@ -144,6 +144,20 @@ _job_update() {
     _atomic_write "$_jobpath" "$merged"
 }
 
+# Compute the persisted `.failure_reason` literal (compact JSON, always a
+# quoted string) from a failure transition's detail payload: the detail's
+# `.reason` verbatim, or the literal string "unspecified" when it's missing
+# or blank. Single source of truth for this normalization rule, shared by
+# _job_transition below and mother-run-job's local _transition (which
+# sources this file for real execution — see the fallback definition near
+# mother-run-job's `_install_core_job_helpers` for the SOURCE_ONLY=1 bats
+# path, which runs before this file is sourced) — so the rule can't drift
+# between the two copies.
+# Usage: _failure_reason_literal <detail-json>
+_failure_reason_literal() {
+    printf '%s' "$1" | jq -c '(.reason // "") | tostring | if . == "" then "unspecified" else . end' 2>/dev/null || echo '"unspecified"'
+}
+
 # Transition job state and emit matching event.
 # Usage: _job_transition <id> <new-state> [<detail-json>]
 _job_transition() {
@@ -161,6 +175,17 @@ _job_transition() {
         fi
     fi
     _job_update "$id" ".state = \"$new\""
+    # Persist the failure reason on the job JSON so the runner can route on it
+    # without replaying the events log. A new `failed` clears any prior routing
+    # verdict; `succeeded` clears a stale reason.
+    case "$new" in
+        failed)
+            local _reason_lit
+            _reason_lit=$(_failure_reason_literal "$detail") || _reason_lit='"unspecified"'
+            _job_update "$id" ".failure_reason = $_reason_lit | .failure_routed = null" ;;
+        succeeded)
+            _job_update "$id" ".failure_reason = null" ;;
+    esac
     case "$new" in
         running)    _job_update "$id" ".started_at = \"$(_iso_now)\"" ;;
         succeeded|failed|cancelled)
