@@ -71,6 +71,30 @@ _atomic_write() {
     printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
 }
 
+# _bounded_run <timeout_secs> <stdout_file|-> <external-cmd> [args...]
+# Runs an EXTERNAL command with a wall-clock bound, using the same
+# background-race watchdog idiom as `_docker_reachable` (lib/teardown.sh) and
+# `_maybe_archive` (bin/mother-runner): race the command against a
+# `sleep N; kill -9`. The command is `exec`'d inside the background subshell
+# so the killed pid IS the command (no orphaned grandchild); that means it must
+# be an executable, not a shell function. stdout goes to <stdout_file> (or is
+# discarded with "-"); stderr is discarded. Returns the command's exit status,
+# or 137 when the watchdog killed it. Callers that must never stall a single-
+# threaded loop (notifier transports, `gh` polls) go through this.
+_bounded_run() {
+    local secs="$1" out="$2"; shift 2
+    [ "$out" = "-" ] && out=/dev/null
+    ( exec "$@" >"$out" 2>/dev/null </dev/null 3>&- ) &
+    local pid=$!
+    ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 3>&- &
+    local wd=$!
+    local rc=0
+    wait "$pid" 2>/dev/null || rc=$?
+    kill "$wd" 2>/dev/null
+    wait "$wd" 2>/dev/null
+    return "$rc"
+}
+
 # Portable mkdir-based mutex (macOS lacks flock).
 # Usage: _with_lock <path> <command...>
 _with_lock() {
@@ -733,21 +757,182 @@ Resume from the first uncommitted step in the original plan below. Skip any step
     printf '%s' "$preamble"
 }
 
-# Promote queued jobs whose dependencies are all succeeded to ready.
+# Path of a dependency job's JSON record: $JOBS_DIR first, falling back to
+# ARCHIVE_DIR/*/<id>.json — a dependency job is very often archived (terminal
+# + old + PR no longer open) by the time a dependent job's own dependencies
+# get re-checked, and a job whose dependency has vanished from JOBS_DIR must
+# not be read as unmet forever. Without this fallback, any --depends-on job
+# that outlives its dependency's archival sweep gets stuck in "queued"
+# permanently, with no error or event to signal it. Prints nothing when the
+# record exists in neither place.
+_dep_record() {
+    local dep="$1" f
+    f="$(_job_path "$dep")"
+    if [ -f "$f" ]; then
+        echo "$f"
+        return 0
+    fi
+    f=$(find "$ARCHIVE_DIR" -maxdepth 2 -name "${dep}.json" -type f -print -quit 2>/dev/null)
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        echo "$f"
+    fi
+    return 0
+}
+
+# Look up a dependency's state (see _dep_record for the archive fallback).
+_dep_state() {
+    local f
+    f=$(_dep_record "$1")
+    if [ -n "$f" ]; then
+        jq -r .state "$f"
+        return
+    fi
+    echo "missing"
+}
+
+: "${MOTHER_DEP_PR_POLL_INTERVAL:=120}"
+
+# _dep_pr_merge_state <pr_url> — echoes merged|open|closed|unknown.
+#
+# `_promote_ready` runs every daemon tick (MOTHER_POLL_INTERVAL, 2s), so an
+# uncached `gh` call per queued dependent per tick would hammer the API and
+# slow dispatch. Results are cached in $RUNNER_DIR/dep-pr-cache/<sha1 of
+# url>.json as {state, checked_at}: `merged` and `closed` are final and cached
+# permanently; `open` and `unknown` are re-queried once they're older than
+# MOTHER_DEP_PR_POLL_INTERVAL. The gh call is time-bounded. An inconclusive
+# gh (offline, unauthenticated, timeout) yields `unknown` — callers must never
+# release a dependent on it.
+_dep_pr_merge_state() {
+    local url="$1"
+    local cache_dir="$RUNNER_DIR/dep-pr-cache" key cache cstate cat_epoch now
+    key=$(printf '%s' "$url" | shasum 2>/dev/null | cut -d' ' -f1)
+    [ -n "$key" ] || key=$(printf '%s' "$url" | cksum | tr ' ' '_')
+    cache="$cache_dir/$key.json"
+    now=$(date +%s)
+
+    if [ -f "$cache" ]; then
+        cstate=$(jq -r '.state // ""' "$cache" 2>/dev/null)
+        case "$cstate" in
+            merged|closed) echo "$cstate"; return 0 ;;
+        esac
+        cat_epoch=$(_iso_to_epoch "$(jq -r '.checked_at // ""' "$cache" 2>/dev/null)")
+        if [ -n "$cstate" ] && [ $((now - cat_epoch)) -lt "${MOTHER_DEP_PR_POLL_INTERVAL:-120}" ]; then
+            echo "$cstate"
+            return 0
+        fi
+    fi
+
+    local out state="unknown" raw
+    out=$(mktemp "${TMPDIR:-/tmp}/mother-deppr.XXXXXX") || { echo "unknown"; return 0; }
+    if _bounded_run "${MOTHER_GH_TIMEOUT:-10}" "$out" gh pr view "$url" --json state -q .state; then
+        raw=$(tr -d '[:space:]' < "$out" | tr '[:upper:]' '[:lower:]')
+        case "$raw" in merged|open|closed) state="$raw" ;; esac
+    fi
+    rm -f "$out"
+
+    mkdir -p "$cache_dir"
+    _atomic_write "$cache" "$(jq -nc --arg s "$state" --arg t "$(_iso_now)" '{state: $s, checked_at: $t}')"
+    echo "$state"
+}
+
+# _dep_gate <dep_id> — echoes `satisfied`, `wait:<reason>` or `blocked:<reason>`.
+#
+# A dependency is satisfied when it is `succeeded` AND its PR has merged (or it
+# is a no_pr job, which has nothing to merge). A job reaches `succeeded` as
+# soon as it OPENS a PR, so gating on state alone started dependents from a
+# base that didn't yet contain their parent's work.
+#   wait:*    will resolve on its own (dependency still running, PR open, gh
+#             inconclusive)
+#   blocked:* needs the operator (mother force-start / cancel); the dependent
+#             stays `queued` and is NEVER auto-cancelled. Re-evaluated every
+#             tick, so e.g. an escalation re-queueing a failed dependency
+#             turns blocked:dep_failed back into wait.
+_dep_gate() {
+    local dep="$1" rec
+    rec=$(_dep_record "$dep")
+    [ -n "$rec" ] || { echo "blocked:dep_missing"; return 0; }
+
+    local state no_pr pr_url
+    state=$(jq -r '.state // ""' "$rec" 2>/dev/null)
+    case "$state" in
+        queued|ready|running|awaiting) echo "wait:dep_not_finished"; return 0 ;;
+        failed)    echo "blocked:dep_failed"; return 0 ;;
+        cancelled) echo "blocked:dep_cancelled"; return 0 ;;
+        succeeded) ;;
+        *)         echo "wait:dep_not_finished"; return 0 ;;
+    esac
+
+    no_pr=$(jq -r '.no_pr // false' "$rec" 2>/dev/null)
+    [ "$no_pr" = "true" ] && { echo "satisfied"; return 0; }
+    pr_url=$(jq -r '.pr_url // ""' "$rec" 2>/dev/null)
+    [ -n "$pr_url" ] || { echo "blocked:dep_no_pr_url"; return 0; }
+
+    case "$(_dep_pr_merge_state "$pr_url")" in
+        merged) echo "satisfied" ;;
+        open)   echo "wait:pr_open" ;;
+        closed) echo "blocked:pr_closed_unmerged" ;;
+        *)      echo "wait:pr_state_unknown" ;;
+    esac
+}
+
+# Promote queued jobs to ready once every dependency's gate is `satisfied`.
+# Otherwise record the FIRST unsatisfied dependency on the job as `dep_wait`
+# ({dep_id, status: wait|blocked, reason, pr_url, checked_at}). dep_wait and
+# its dependency_waiting / dependency_blocked event are written only when
+# dep_id/status/reason change — never every tick. Never cancels anything.
 _promote_ready() {
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f | while read -r f; do
         local state; state=$(jq -r .state "$f")
         [ "$state" = "queued" ] || continue
         local deps; deps=$(jq -c '.depends_on' "$f")
         local id; id=$(jq -r .id "$f")
-        local blocked=0
-        for dep in $(echo "$deps" | jq -r '.[]'); do
-            local dep_state="missing"
-            [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
-            case "$dep_state" in succeeded) ;; *) blocked=1; break ;; esac
-        done
+        local blocked=0 first_dep="" first_gate="" forced=0
+        # `mother force-start <id>` is the operator override for a queued job
+        # stuck behind its dependency gate: it sets force_start and the gate is
+        # skipped (the job is promoted on this tick, and force_start then
+        # carries through dispatch as it does for any ready job).
+        [ "$(jq -r '.force_start // false' "$f")" = "true" ] && forced=1
+        if [ "$forced" -eq 0 ]; then
+            for dep in $(echo "$deps" | jq -r '.[]'); do
+                local gate; gate=$(_dep_gate "$dep")
+                if [ "$gate" != "satisfied" ]; then
+                    blocked=1; first_dep="$dep"; first_gate="$gate"
+                    break
+                fi
+            done
+        fi
+        if [ "$blocked" -eq 1 ]; then
+            local g_status="${first_gate%%:*}" g_reason="${first_gate#*:}"
+            local cur
+            cur=$(jq -r '(.dep_wait // {}) | [.dep_id // "", .status // "", .reason // ""] | join("|")' "$f")
+            if [ "$cur" != "$first_dep|$g_status|$g_reason" ]; then
+                local dep_pr_url="" drec
+                drec=$(_dep_record "$first_dep")
+                [ -n "$drec" ] && dep_pr_url=$(jq -r '.pr_url // ""' "$drec" 2>/dev/null)
+                local wait_obj
+                wait_obj=$(jq -nc --arg d "$first_dep" --arg s "$g_status" --arg r "$g_reason" \
+                    --arg pr "$dep_pr_url" --arg t "$(_iso_now)" \
+                    '{dep_id: $d, status: $s, reason: $r, pr_url: $pr, checked_at: $t}')
+                _job_update "$id" ".dep_wait = $wait_obj"
+                if [ "$g_status" = "blocked" ]; then
+                    _append_event "$id" "dependency_blocked" "$wait_obj"
+                else
+                    _append_event "$id" "dependency_waiting" "$wait_obj"
+                fi
+            fi
+            continue
+        fi
         if [ "$blocked" -eq 0 ]; then
+            local had_deps; had_deps=$(echo "$deps" | jq 'length')
+            _job_update "$id" 'del(.dep_wait)'
             _job_transition "$id" ready '{}'
+            if [ "$forced" -eq 1 ]; then
+                _append_event "$id" "dependency_gate_bypassed" \
+                    "$(jq -nc --argjson d "$deps" '{dep_ids: $d, by: "force_start"}')"
+            elif [ "${had_deps:-0}" -gt 0 ]; then
+                _append_event "$id" "dependency_satisfied" \
+                    "$(jq -nc --argjson d "$deps" '{dep_ids: $d}')"
+            fi
             # W5: emit the cycle-0 phase_started for the first build agent. The runner
             # only emits phase_started on phase *advance* (cycle >= the first advance)
             # and on new review cycles, so without this the initial Redd phase has no

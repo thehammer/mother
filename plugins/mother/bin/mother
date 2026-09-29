@@ -20,7 +20,7 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 # Usage:
 #   mother add --plan-file <path> --repo <name> --branch <branch> [options]
 #   mother list [--state ...] [--repo ...] [--format json|table]
-#   mother status <id>
+#   mother status [<id>]
 #   mother logs <id> [--follow]
 #   mother peek <id> [--format json|text] [--tail N]
 #   mother cancel <id>
@@ -57,6 +57,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/usage.sh" ]         && source "$MOTHER_LIB_DIR/usage.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/teardown.sh" ]      && source "$MOTHER_LIB_DIR/teardown.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/attention.sh" ]     && source "$MOTHER_LIB_DIR/attention.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/failure-route.sh" ]  && source "$MOTHER_LIB_DIR/failure-route.sh"
 
@@ -796,15 +798,80 @@ cmd_list() {
                 esac
                 printf "%-28s  %-16s  %-18s  %-12s  %-16s  %8s  %s\n" "$id" "$state_display" "$repo" "$iso" "$origin" "$cost_display" "$title"
             done
+        # Attention footer: reads the cached list only (never recomputes, never gh).
+        local _att_n
+        _att_n=$(jq 'length' "$MOTHER_ROOT/attention.json" 2>/dev/null) || _att_n=0
+        case "${_att_n:-0}" in ''|*[!0-9]*) _att_n=0 ;; esac
+        if [ "$_att_n" -gt 0 ]; then
+            echo "⚑ $_att_n item(s) need attention — run: mother status"
+        fi
     fi
 }
 
 # ---------- status ----------
 
+# `mother status` with no id: queue overview + the needs-attention list.
+# Recomputes live (no gh — see lib/attention.sh) and refreshes attention.json
+# as a side effect so the statusline / `mother list` footer stay in step.
+_status_overview() {
+    local format="$1"
+    local items counts awaiting
+    items=$(mother_attention_items)
+    printf '%s' "$items" | jq -e 'type == "array"' >/dev/null 2>&1 || items='[]'
+    _atomic_write "$MOTHER_ROOT/attention.json" "$items"
+
+    local jobs_json
+    jobs_json=$(find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | sort | while read -r f; do
+        jq -c '.' "$f" 2>/dev/null
+    done | jq -cs '.')
+    [ -n "$jobs_json" ] || jobs_json='[]'
+
+    counts=$(printf '%s' "$jobs_json" | jq -c 'group_by(.state) | map({key: (.[0].state // "unknown"), value: length}) | from_entries')
+    awaiting=$(printf '%s' "$jobs_json" | jq -c --argjson now "$(date +%s)" '
+        def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+        map(select(.state == "awaiting"))
+        | map({id, title: (.title // ""), paused_reason: (.paused_reason // ""),
+               paused_at: (.paused_at // null),
+               age_seconds: (if (.paused_at // "") != "" then ($now - (.paused_at | try epoch catch $now)) else null end),
+               question: ((.question // "") | .[0:100]),
+               auto_resumes: ((.paused_reason // "") | startswith("quota_"))})')
+
+    if [ "$format" = "json" ]; then
+        jq -nc --argjson counts "$counts" --argjson awaiting "$awaiting" --argjson na "$items" \
+            '{counts: $counts, awaiting: $awaiting, needs_attention: $na}'
+        return 0
+    fi
+
+    echo "Queue: $(printf '%s' "$counts" | jq -r 'to_entries | if length == 0 then "(no jobs)" else map("\(.key)=\(.value)") | join("  ") end')"
+    echo ""
+    echo "=== awaiting operator ==="
+    if [ "$(printf '%s' "$awaiting" | jq 'length')" = "0" ]; then
+        echo "  (none)"
+    else
+        printf '%s' "$awaiting" | jq -r '.[] |
+            "  " + .id
+            + "  " + (if .age_seconds == null then "age ?" else "waiting " + ((.age_seconds / 3600 * 10 | floor) / 10 | tostring) + "h" end)
+            + "  " + (if .paused_reason == "" then "question" else .paused_reason end)
+            + (if .auto_resumes then " (auto-resumes)" else "" end)
+            + (if .question != "" then "  — " + .question else "" end)'
+    fi
+    echo ""
+    mother_attention_render_text "$items"
+}
+
 cmd_status() {
-    local id="${1:-}" format="text"
-    [ -n "$id" ] || _die "status: <id> required"
-    shift
+    local id="" format="text"
+    case "${1:-}" in ""|-*) ;; *) id="$1"; shift ;; esac
+    if [ -z "$id" ]; then
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --format) format="$2"; shift 2 ;;
+                *) _die "unknown flag for status: $1" ;;
+            esac
+        done
+        _status_overview "$format"
+        return 0
+    fi
     while [ $# -gt 0 ]; do
         case "$1" in
             --format) format="$2"; shift 2 ;;
@@ -869,6 +936,26 @@ cmd_status() {
             echo "     mother resume $id \"<guidance>\"   — resume with instructions for the agents"
             echo "     mother resume $id \"SHIP\"          — force ship despite findings"
             echo "     mother cancel $id                   — abandon the job"
+            echo ""
+        fi
+        local dep_wait_line
+        dep_wait_line=$(jq -r 'select(.dep_wait != null) | .dep_wait
+            | "⏳ [WAITING-ON-DEPENDENCY] \(.dep_id) — \(.reason)\(if (.pr_url // "") != "" then " (" + .pr_url + ")" else "" end)|\(.status)"' "$job_file")
+        if [ -n "$dep_wait_line" ]; then
+            echo ""
+            echo "${dep_wait_line%|*}"
+            if [ "${dep_wait_line##*|}" = "blocked" ]; then
+                echo "   This dependency will not resolve on its own; the job stays queued (never auto-cancelled)."
+                echo "   Run: mother force-start $id  (release it anyway)"
+                echo "   Or:  mother cancel $id"
+            fi
+            echo ""
+        fi
+        local notify_line
+        notify_line=$(jq -r 'select(.awaiting_notify != null) | "  Notified: \(.awaiting_notify.count // 0) time(s), last \(.awaiting_notify.last_notified_at // "never")"' "$job_file")
+        if [ -n "$notify_line" ] && [ "$(jq -r '.state' "$job_file")" = "awaiting" ]; then
+            echo ""
+            echo "$notify_line"
             echo ""
         fi
         if [ "$(jq -r '.resume_not_yet_acted_on // false' "$job_file")" = "true" ]; then
@@ -1453,6 +1540,19 @@ cmd_force_start() {
         case "$posture" in conservative|normal|elevated|flush) ;; *) posture="normal" ;; esac
     fi
 
+    # A queued job may also be held behind an unsatisfied `--depends-on`
+    # dependency (see `_dep_gate`/`_promote_ready` in state.sh). force-start
+    # skips that gate entirely for a queued job, releasing it whether the
+    # dependency is merely still running/waiting on its PR to merge (a
+    # "wait" status) or stuck needing operator intervention (a "blocked"
+    # status) — so the confirm prompt below must call that out; quota/
+    # posture context alone understates what forcing actually does here.
+    local dep_wait_id="" dep_wait_reason=""
+    if [ "$state" = "queued" ]; then
+        dep_wait_id=$(jq -r '.dep_wait.dep_id // ""' "$job_file")
+        dep_wait_reason=$(jq -r '.dep_wait.reason // ""' "$job_file")
+    fi
+
     # Confirmation gate.
     if [ "$yes" -ne 1 ]; then
         # Non-interactive context without --yes: refuse.
@@ -1464,6 +1564,8 @@ cmd_force_start() {
         local summary=""
         if [ "$quota_paused" -eq 1 ]; then
             summary="Job is paused for quota (awaiting, paused_reason=$paused_reason) — forcing will resume it immediately and dispatch despite the quota gate."
+        elif [ -n "$dep_wait_id" ]; then
+            summary="Job is queued behind dependency $dep_wait_id ($dep_wait_reason) — forcing will release it past the dependency gate."
         elif [ "$over_cap" -eq 1 ] && [ "$posture" = "conservative" ]; then
             summary="Quota is over cap AND posture is conservative — forcing will dispatch this job immediately at full configured strength, bypassing both guards."
         elif [ "$over_cap" -eq 1 ]; then
@@ -2939,7 +3041,8 @@ cmd_run() {
     done
     [ "$once" -eq 1 ] || _die "run: only --once is supported in phase 1 (daemon comes in phase 2)"
 
-    # Promote queued jobs whose deps are all in terminal state to ready.
+    # Promote queued jobs whose dependencies are all satisfied (each
+    # succeeded AND its PR merged, or a no_pr job) to ready.
     _promote_ready
 
     # Pick the oldest ready job.
@@ -3458,7 +3561,8 @@ cmd_teardowns() {
         return 0
     fi
 
-    local f count=0 id branch reason deferrals deferred_at
+    local f count=0 id branch reason deferrals stalls cap deferred_at pr_url pr_since age_days now_epoch
+    now_epoch=$(date +%s)
     for f in "$TEARDOWN_DIR"/*.json; do
         [ -f "$f" ] || continue
         count=$((count + 1))
@@ -3466,9 +3570,28 @@ cmd_teardowns() {
         branch=$(jq -r '.branch // ""' "$f")
         reason=$(jq -r '.last_reason // ""' "$f")
         deferrals=$(jq -r '.deferrals // 0' "$f")
+        stalls=$(jq -r '.stall_deferrals // 0' "$f")
         deferred_at=$(jq -r '.deferred_at // ""' "$f")
-        printf '%-40s %-30s reason=%-24s deferrals=%-4s deferred_at=%s\n' \
-            "$id" "$branch" "$reason" "$deferrals" "$deferred_at"
+        case "$reason" in
+            pr_open|pr_open_live)
+                # A healthy wait, not a stall: show how long the PR has been
+                # open instead of a deferral counter.
+                pr_url=$(jq -r '.open_pr.url // .pr_url // ""' "$f")
+                pr_since=$(jq -r '.open_pr.created_at // .open_pr.first_seen_open_at // ""' "$f")
+                age_days="?"
+                if [ -n "$pr_since" ]; then
+                    age_days=$(( (now_epoch - $(_iso_to_epoch "$pr_since")) / 86400 ))
+                fi
+                printf '%-40s %-30s reason=%-24s waiting: PR open %sd (%s)\n' \
+                    "$id" "$branch" "$reason" "$age_days" "$pr_url"
+                ;;
+            *)
+                cap="${MOTHER_TEARDOWN_MAX_DEFERRALS:-30}"
+                [ "$reason" = "worktree_probe_failed" ] && cap="${MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS:-2}"
+                printf '%-40s %-30s reason=%-24s stalls=%s/%s deferrals=%-4s deferred_at=%s\n' \
+                    "$id" "$branch" "$reason" "$stalls" "$cap" "$deferrals" "$deferred_at"
+                ;;
+        esac
     done
     [ "$count" -eq 0 ] && echo "no pending teardowns"
     return 0
@@ -3559,7 +3682,7 @@ mother — background work for Claude Code
 Usage:
   mother add --plan-file PATH --repo NAME --branch BRANCH [options]
   mother list [--state STATE] [--repo REPO] [--project NAME] [--label LABEL] [--format json|table]
-  mother status ID [--format json|text]
+  mother status [ID] [--format json|text]     (no ID: queue overview, awaiting jobs, needs-attention list)
   mother logs ID [--follow]
   mother peek ID [--format json|text] [--tail N] [--watch]
   mother attach ID
@@ -3594,7 +3717,13 @@ Add options:
   --isolation worktree|main-dir   (default: worktree)
   --executor local-tmux           (only option in phase 2)
   --max-cost USD
-  --depends-on ID[,ID...]
+  --depends-on ID[,ID...]  the job stays queued until every dependency has
+                           succeeded AND its PR has merged (a no_pr dependency
+                           needs no merge). Never auto-cancelled: a failed /
+                           cancelled / closed-unmerged / missing dependency
+                           keeps it queued and lists it under `mother status`
+                           needs-attention. `mother force-start ID` releases a
+                           queued job past its dependency gate.
   --title TEXT         (default: first heading of plan file)
   --format json|text   (default: text — prints job id only)
   --label TEXT         free-text origin label for this job
@@ -3639,6 +3768,22 @@ Hook / events env vars:
                                                 a session cursor is stale.
                                                 0 disables the floor.
 
+Operator attention / notification env vars:
+  MOTHER_ATTENTION_INTERVAL       (default: 60)  seconds between daemon refreshes of
+                                                 attention.json (statusline count)
+  MOTHER_DEP_PR_POLL_INTERVAL     (default: 120) seconds between re-checks of a
+                                                 dependency PR's merge state
+                                                 (merged/closed are cached forever)
+  MOTHER_NOTIFY_ENABLED           (default: 1)   push a notification when a job
+                                                 enters `awaiting` (0 to disable)
+  MOTHER_NOTIFY_TRANSPORT         (default: auto) auto|terminal-notifier|osascript|
+                                                 command|none
+  MOTHER_NOTIFY_COMMAND           (unset)        program run as CMD TITLE BODY JOB_ID
+                                                 when TRANSPORT=command
+  MOTHER_NOTIFY_SCAN_INTERVAL     (default: 60)  seconds between awaiting scans
+  MOTHER_AWAITING_REMIND_HOURS    (default: 24)  reminder cadence for a job left
+                                                 awaiting (open-ended)
+
 Teardown env vars (worktree + docker cleanup, rides along with `mother archive`
 on every sweep — independent of the record-archiving age cutoff):
   MOTHER_TEARDOWN_ENABLED         (default: 1)  tear down worktrees/containers
@@ -3651,6 +3796,14 @@ on every sweep — independent of the record-archiving age cutoff):
                                                  not count) before a teardown
                                                  is flagged for attention
                                                  (never auto-deleted)
+  MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS
+                                  (default: 2)  stalled passes before a
+                                                 worktree_probe_failed teardown
+                                                 is flagged (about 2h hourly)
+  MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS
+                                  (default: 7)  days a teardown may wait on an
+                                                 open PR before it is listed
+                                                 under needs-attention
   MOTHER_TEARDOWN_ALLOW_UNSAFE    (default: 0)  restore unconditional
                                                  force-removal, bypassing the
                                                  uncommitted/unpushed-work guard

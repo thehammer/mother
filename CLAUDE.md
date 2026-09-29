@@ -107,7 +107,7 @@ for display and routing.
 
 | state | activity | meaning |
 |---|---|---|
-| `queued` | — | waiting on dependencies |
+| `queued` | — | waiting on dependencies — each dependency must be `succeeded` **and** its PR merged (or be a `no_pr` job). A `queued` job with `dep_wait.status == "blocked"` is never auto-cancelled; it shows under `mother status` needs-attention (see "Operator attention and notifications") |
 | `ready` | — | runnable, waiting for daemon slot |
 | `ready` | `cody_rework` | re-queued for a second Cody attempt after an adherence fail (the daemon sets this; the worker has not started yet) |
 | `running` | (none) | Cody running (first attempt) |
@@ -148,6 +148,9 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `expect_branch_mismatch` | bool | Set by `expect_branch_mismatch: true` in the plan YAML block, or `mother add --expect-branch-mismatch`. Declares that the worker is deliberately targeting a branch other than the assigned one (e.g. landing more commits on an existing open PR) — a mismatching PR head branch is accepted without the commit-containment check. Default `false`. |
 | `actual_branch` | string | Set when the captured/accepted PR's head branch differs from the job's assigned `branch` (a branch-name mismatch that PR detection accepted via `expect_branch_mismatch` or commit-containment, or that `mother reconcile` adopted). Absent when the PR's head branch matches `branch`. |
 | `resume_not_yet_acted_on` | bool | Sticky audit flag. Set when an idle-timeout continuation is queued for a job that was resumed with an operator answer but has no commit postdating that resume. Never cleared automatically; surfaced by `mother status` as `[RESUME-MAY-BE-UNAPPLIED]`. |
+| `dep_wait` | object | Set on a `queued` job that isn't promotable yet: `{dep_id, status: "wait"\|"blocked", reason, pr_url, checked_at}` for the first unsatisfied dependency. Written only when `dep_id`/`status`/`reason` change. Cleared on promotion. `blocked` (dependency failed/cancelled/missing, PR closed unmerged, no PR url) never auto-cancels the job; it appears under needs-attention and `mother force-start <id>` releases it. |
+| `awaiting_notify` | object | `{episode, first_seen_at, count, last_notified_at}` — the push-notification bookkeeping for an `awaiting` job (see "Operator attention and notifications"). Cleared when the job leaves `awaiting`. |
+| `needs_attention` | object | Producer-agnostic flag `{reason, note, since}`. Anything that holds a job for the operator sets it; Mother renders it as a `job_flagged` needs-attention item. This repo adds no producer. |
 | `origin` | object | Provenance captured at `mother add` time: `{project, cwd, session, enqueued_by, label}`. `project` = basename of the enqueuing cwd's git toplevel, or the `--origin-project` override; `session` = `--origin-session` → `$MOTHER_ORIGIN_SESSION` → `$CLAUDE_SESSION_ID` → `""`. Surfaced as `mother list`'s ORIGIN column, filtered by `mother list --project`/`--label`, and rendered by `mother status`'s `=== origin ===` block. |
 
 ### Kill switches
@@ -176,6 +179,15 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_FAILURE_ROUTING_ENABLED=0` — restore the pre-routing behavior: every `failed` job takes the legacy reconcile-then-escalate path in `_auto_escalate_failed`, regardless of `.failure_reason` (default: `1`).
 - `MOTHER_REWORK_ADVANCE_CHECK_ENABLED=0` — disable `_verify_run_advanced_or_fail` (default: `1`), so a run that starts with an existing PR/pushed branch can report `succeeded` without pushing anything new.
 - `MOTHER_ADHERENCE_EFFORT=<low|medium|high|xhigh|max>` — pass `--effort` to the adherence-review `claude` invocation. Unset (default) means no `--effort` flag, i.e. today's behavior.
+- `MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS=N` — stalled passes before a `worktree_probe_failed` teardown is flagged (default: 2, about two hourly sweeps). Other stall reasons use `MOTHER_TEARDOWN_MAX_DEFERRALS`.
+- `MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS=N` — days a teardown may wait on an open PR before it is listed under needs-attention (default: 7).
+- `MOTHER_ATTENTION_INTERVAL=N` — seconds between daemon refreshes of `$MOTHER_ROOT/attention.json`, the file the statusline and `mother list` footer read (default: 60).
+- `MOTHER_DEP_PR_POLL_INTERVAL=N` — seconds between re-checks of a `--depends-on` dependency's PR merge state (default: 120). `merged`/`closed` results are cached permanently; `open`/`unknown` are re-queried after this interval.
+- `MOTHER_NOTIFY_ENABLED=0` — disable the `awaiting` push notifications (default: `1`).
+- `MOTHER_NOTIFY_TRANSPORT=auto|terminal-notifier|osascript|command|none` — how pushes are delivered (default: `auto`).
+- `MOTHER_NOTIFY_COMMAND=PATH` — program run as `PATH TITLE BODY JOB_ID` when the transport is `command` (the swap point for off-box delivery).
+- `MOTHER_NOTIFY_SCAN_INTERVAL=N` — seconds between the daemon's awaiting scans (default: 60).
+- `MOTHER_AWAITING_REMIND_HOURS=N` — reminder cadence for a job left `awaiting` (default: 24; open-ended).
 - `MOTHER_SHARED_RATES_PATH=PATH` — destination `mother-usage publish-rates` writes the rate table to (default: `~/.claude/model-rates.json`), for Bishop or other tools to read the same per-model pricing Mother uses.
 
 ### Orphaned temp file sweep
@@ -349,10 +361,16 @@ about to be torn down, probes whether the worktree holds uncommitted/untracked
 changes or commits that exist on no remote at all. Either makes the worktree
 **unsafe** — force-removing it would destroy genuinely unrecoverable work —
 and teardown defers instead, with reason `unsafe_worktree` (detail:
-`{uncommitted_files, unpushed_commits}`). An **empty/unset** `work_dir`, a
-`work_dir` that exists but isn't a git repo, or an unexpected git error while
-probing all defer as `worktree_probe_failed` (indeterminate — never guess
-"safe"). A `work_dir` that is *set* but simply absent from disk is **not**
+`{uncommitted_files, unpushed_commits}`). An **empty/unset** `work_dir` is
+disambiguated with git's own registry: if `repo_path` has **no** worktree
+registered for `refs/heads/<branch>`, Mother never created anything for the job
+(typically it was cancelled before it started) and it is treated as safe — the
+worktree step then takes its `already_absent` skip and the pending record
+clears on the next sweep. If one *is* registered, we can't prove this job owns
+it (two jobs can share a branch), so it stays `worktree_probe_failed`
+(indeterminate). A `work_dir` that exists but isn't a git repo, a missing
+`repo_path`/branch, or an unexpected git error also defer as
+`worktree_probe_failed` (never guess "safe"). A `work_dir` that is *set* but simply absent from disk is **not**
 indeterminate — there is categorically nothing left in it to lose, so that
 case is treated as safe and falls through to the ordinary `already_absent`
 skip below. Both `unsafe_worktree` and `worktree_probe_failed` count as
@@ -414,15 +432,27 @@ and teardown-only paths wrote those fields), so `mother teardowns --drain`
 against a live job is no longer lossy.
 
 **Deferral counters:** each pending record tracks two counts. `deferrals` is
-the total number of attempts (what `mother teardowns` displays).
-`stall_deferrals` excludes the healthy `pr_open` wait — a PR staying open for
-days is normal, not a stall — and is what `MOTHER_TEARDOWN_MAX_DEFERRALS`
-actually gates on. Crossing the cap in `stall_deferrals` emits
+the total number of *stalled* attempts and `stall_deferrals` is what the
+attention cap gates on. **Healthy waits (`pr_open`, `pr_open_live`) move
+neither**: while a PR really is open, each sweep re-checks it as a quiet
+no-op — it refreshes `last_reason` / `last_checked_at` and an
+`open_pr: {url, created_at, first_seen_open_at}` object (`created_at` comes
+from one `gh pr view` per PR per lifetime, not per sweep), and emits a
+`teardown_deferred` event only on the **first** pass of the wait (or when the
+open PR changes). The operator hears about a PR wait only once it has been open
+longer than `MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS` (default 7), as a
+`pr_open_stale` attention item. `mother teardowns` shows a healthy wait as
+`waiting: PR open Nd (<url>)` and everything else as `stalls=N/cap`.
+Crossing the reason's cap in `stall_deferrals` — `MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS`
+(default **2**, about two hourly sweeps) for `worktree_probe_failed`,
+`MOTHER_TEARDOWN_MAX_DEFERRALS` (default 30) for everything else — emits
 `teardown_needs_attention` exactly once (on the crossing, not every
-subsequent pass); it only makes a genuine stall (gh/docker unreachable, a
-racing job, a missing PR url, a worktree error, the kill switch left off)
-loud, it never triggers destruction. Records written before this counter
-existed default `stall_deferrals` to 0 via `// 0` — no backfill needed.
+subsequent pass) *and* keeps the record listed as a `teardown_stalled` attention
+item for as long as it stays over the cap; it only makes a genuine stall
+(gh/docker unreachable, a racing job, a missing PR url, a worktree error, the
+kill switch left off) loud, it never triggers destruction. Records written
+before these counters existed default `stall_deferrals` to 0 via `// 0` — no
+backfill needed, and historical `deferrals` values are left as they were.
 
 **Events** (see `_teardown_event` in `lib/teardown.sh`):
 
@@ -430,7 +460,7 @@ existed default `stall_deferrals` to 0 via `// 0` — no backfill needed.
 |---|---|---|
 | `teardown_started` | `{gate_reason, pr_url}` | Gate passed, about to remove |
 | `teardown_completed` | `{worktree_path, worktree_removed, compose_project, containers, volumes, networks}` | Teardown finished |
-| `teardown_deferred` | `{reason, pr_url, conflicting_job_id, deferrals}` — `reason` includes `pr_open_live`, `unsafe_worktree` (detail merged in), `worktree_probe_failed` | Retryable skip; record queued |
+| `teardown_deferred` | `{reason, pr_url, conflicting_job_id, deferrals}` — `reason` includes `pr_open_live`, `unsafe_worktree` (detail merged in), `worktree_probe_failed` | Retryable skip; record queued. For the healthy waits `pr_open`/`pr_open_live` only the **first** pass of a wait (or a change of open PR) emits it — later passes are silent |
 | `teardown_skipped` | `{reason}` | `disabled` / `main_dir` / `already_absent` |
 | `teardown_failed` | `{stage, note}` | Docker or worktree step errored |
 | `teardown_needs_attention` | `{deferrals, stall_deferrals, reason}` | Stall cap crossed (once) |
@@ -615,6 +645,69 @@ another main-dir job is running in the same repo (then it emits
 | `rework_advance_verified` | `{remote_ref, remote_sha_at_start, remote_sha_at_end}` | A run that began with an artifact advanced it |
 | `auto_stash_not_found` | `{stash_message}` | Marker existed but no matching stash |
 | `auto_stash_restore_deferred` | `{stash_message, conflicting_job_id}` | Orphan reaper couldn't safely restore |
+
+## Operator attention and notifications
+
+What the operator is told, and when, has to be trustworthy: a signal that
+cries wolf trains them to ignore it, and one that never fires leaves real
+problems sitting for days.
+
+**One needs-attention list, three renderers.** `lib/attention.sh`'s
+`mother_attention_items` builds a JSON array of `{kind, job_id, repo, branch,
+reason, since, detail, hint}` from local state only (`$JOBS_DIR`,
+`$TEARDOWN_DIR`, local `git`) — it **never calls `gh`**, because it runs on the
+status/statusline hot path. Anything needing GitHub data is computed by the
+hourly teardown sweep or the dependency poller and stored where it can read it.
+Kinds: `teardown_stalled`, `pr_open_stale`, `dependency_blocked`,
+`auto_stash_unrestored` (a `mother:auto-stash:<id>` git stash whose job is no
+longer running/ready/awaiting — display only, nothing is ever popped),
+`job_flagged` (a job carrying the `needs_attention` field), and
+`plugin_cache_stale`. `mother_attention_write` publishes the list atomically to
+`$MOTHER_ROOT/attention.json` (always valid JSON). Renderers: `mother status`
+with no id (queue overview, awaiting jobs, needs-attention section;
+`--format json` emits `{counts, awaiting, needs_attention}`), a one-line
+`⚑ N item(s) need attention` footer on `mother list`, and the statusline's 6th
+cache field `ATTENTION` (rendered `⚑N`). The daemon refreshes the file every
+`MOTHER_ATTENTION_INTERVAL` seconds. External consumers of the statusline cache
+must read 6 colon-separated fields.
+
+**Merge-gated `--depends-on`.** `_promote_ready` (`lib/state.sh`) releases a
+`queued` job only when `_dep_gate` says every dependency is `satisfied`:
+`succeeded` **and** its PR merged (or a `no_pr` job). Gate results are
+`satisfied`, `wait:<reason>` (dependency still in flight, PR open, `gh`
+inconclusive) or `blocked:<reason>` (failed / cancelled / missing dependency,
+PR closed unmerged, no PR url). PR state is cached in
+`$RUNNER_DIR/dep-pr-cache/` (`merged`/`closed` forever; `open`/`unknown` for
+`MOTHER_DEP_PR_POLL_INTERVAL`). Blocked dependents stay `queued` — Mother never
+auto-cancels them — and `mother force-start <id>` bypasses the gate. Events:
+`dependency_waiting`, `dependency_blocked` (both only on change) and
+`dependency_satisfied`. `mother retry`'s own ready/queued decision is unchanged.
+
+**Awaiting pushes.** `_notify_awaiting` (`bin/mother-runner`) pushes one
+notification when a job first enters `awaiting` for a non-`quota_*` reason
+(quota pauses auto-resume), a reminder at 24h, then one a day for as long as it
+sits there. If more than 3 pushes are due in one scan they are coalesced into a
+single summary push. State lives in the job's `awaiting_notify` field; each
+push emits `awaiting_notified {kind, count, transport, ok}`; `last_notified_at`
+advances even when the transport fails so a broken notifier can't storm.
+`lib/notify.sh`'s `mother_notify` picks the transport (`MOTHER_NOTIFY_TRANSPORT`);
+every transport is time-bounded and worker-authored text reaches `osascript`
+only as argv. **Permanent boundary:** `_notify_awaiting` may only write
+`.awaiting_notify` and append `awaiting_notified` events — Mother must never
+auto-cancel, auto-resume, auto-answer or auto-rework an unanswered `awaiting`
+job. Push is reserved for `awaiting`; everything else is attention-list and
+statusline only.
+
+**The hook reads from the daemon's CLI.** `hooks/mother-inject.sh` resolves
+the CLI as `$MOTHER_CLI`, then the path `mother-runner` publishes to
+`$RUNNER_DIR/cli-path` at startup, then `$CLAUDE_PLUGIN_ROOT/bin/mother`, then
+`$PATH`. The daemon's copy wins because the events on disk are written by its
+code; a plugin cache installed months ago (before the cursor fixes) once
+replayed every archived job's events as live failures. As defence in depth the
+hook also drops any event older than `MOTHER_EVENTS_MAX_AGE_HOURS` (default 6,
+`0` disables) before its kind filter. `scripts/doctor.sh` and the
+`plugin_cache_stale` attention item flag a plugin cache that differs from the
+checkout; plugin versions are bumped so `claude plugin update` refreshes it.
 
 ## Pipeline visibility (W5)
 

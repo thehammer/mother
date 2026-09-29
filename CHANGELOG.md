@@ -4,6 +4,47 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - unreleased
+
+Operator-facing signals made trustworthy.
+
+### Added
+
+- **Needs-attention list** (`lib/attention.sh`): `mother status` with no id now
+  prints a queue overview, awaiting jobs and a needs-attention section
+  (`--format json` supported); `mother list` prints a `⚑ N item(s) need
+  attention` footer; the statusline cache gains a 6th `ATTENTION` field
+  rendered `⚑N`. The daemon refreshes `attention.json` every
+  `MOTHER_ATTENTION_INTERVAL` seconds. Sources: stalled teardowns, PRs open
+  more than `MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS`, blocked dependencies,
+  unrestored `mother:auto-stash:*` stashes, jobs carrying a `needs_attention`
+  field, and a stale plugin cache. Never calls `gh`.
+- **Awaiting push notifications** (`lib/notify.sh`, `_notify_awaiting`): one push
+  when a job enters `awaiting`, a reminder at 24h then daily, coalesced when
+  many are due; transports `terminal-notifier` / `osascript` (argv-safe) /
+  `command` / `none`. Never auto-acts on an awaiting job.
+- `--depends-on` waits for the dependency's **PR to merge** (or a `no_pr`
+  dependency); `dep_wait` job field, `dependency_waiting` / `dependency_blocked`
+  / `dependency_satisfied` events. Blocked dependents are never auto-cancelled.
+- `mother-runner` publishes its CLI path to `runner/cli-path`; the hook prefers it.
+- `scripts/doctor.sh` warns when the plugin cache differs from the checkout.
+
+### Fixed
+
+- Teardown: healthy `pr_open`/`pr_open_live` waits no longer increment
+  `deferrals` or write a `teardown_deferred` event every sweep.
+- Teardown: a job that never created a worktree (empty `work_dir`, no worktree
+  registered for its branch) clears on the next sweep instead of parking as
+  `worktree_probe_failed` forever; a real probe failure is flagged after 2
+  stalled passes (`MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS`).
+- The `UserPromptSubmit` hook no longer replays months-old archived job events
+  as live failures: it reads from the daemon's CLI rather than a possibly stale
+  plugin cache, and applies its own `MOTHER_EVENTS_MAX_AGE_HOURS` age floor.
+
+### Changed
+
+- Plugin version `0.1.0` → `0.2.0` (so `claude plugin update` refreshes the cache).
+
 ## [0.1.0] - unreleased
 
 Initial scaffolding for the Mother plugin.
