@@ -160,9 +160,11 @@ _teardown_gate() {
                     echo "proceed:no_pr_by_design"
                 else
                     # A work_dir that is SET but absent from disk is not
-                    # ambiguous: nothing local is left to tear down or lose,
-                    # and teardown never touches the remote branch. An
-                    # empty/unset work_dir stays deferred (never guess).
+                    # ambiguous: no local worktree content is at risk, and
+                    # teardown never touches the remote branch. Job-scoped
+                    # docker resources and the git worktree admin entry are
+                    # still cleaned up downstream. An empty/unset work_dir
+                    # stays deferred (never guess).
                     local absent_work_dir
                     absent_work_dir=$(_facts_get "$facts" '.work_dir // ""')
                     if [ -n "$absent_work_dir" ] && [ ! -d "$absent_work_dir" ]; then

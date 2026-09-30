@@ -427,7 +427,12 @@ teardown() {
     grep -F '"kind":"teardown_skipped"' "$EVENTS_DIR/teardown.jsonl"
 }
 
-@test "_teardown_execute: succeeded no-PR job whose existing work_dir holds uncommitted changes is still deferred" {
+# Regression guard only: an EXISTING work_dir never takes the new
+# proceed:work_dir_absent path, so the gate defers before the unrecovered-work
+# guard is reached. The guard that protects the absent-work_dir proceed path is
+# pinned separately by "_teardown_worktree_unsafe: a work_dir that no longer
+# exists on disk is safe, not indeterminate".
+@test "_teardown_execute: succeeded no-PR job whose existing work_dir holds uncommitted changes is deferred at the gate (no_pr_url_on_succeeded)" {
     local repo_dir="$MOTHER_ROOT/tw-keep-repo" bare_dir="$MOTHER_ROOT/tw-keep-bare.git" wt_dir="$MOTHER_ROOT/tw-keep-wt"
     _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-keep"
     echo "dirty" > "$wt_dir/dirty.txt"
@@ -439,6 +444,7 @@ teardown() {
     "
     [ "$status" -eq 0 ]
     [[ "$output" == *"status=deferred"* ]]
+    [[ "$output" == *"reason=no_pr_url_on_succeeded"* ]]
     [ -f "$wt_dir/dirty.txt" ]
 }
 
