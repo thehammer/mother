@@ -374,10 +374,72 @@ teardown() {
 }
 
 @test "_teardown_gate: no pr_url + succeeded + no_pr=false -> defer:no_pr_url_on_succeeded" {
-    facts=$(_facts_json "job-g3" "/tmp/r3" "b3" "/tmp/w3" "worktree" "" "succeeded" false)
+    facts=$(_facts_json "job-g3" "/tmp/r3" "b3" "" "worktree" "" "succeeded" false)
     run bash -c "$(_source_teardown_libs) _teardown_gate '$facts'"
     [ "$status" -eq 0 ]
     [ "$output" = "defer:no_pr_url_on_succeeded" ]
+}
+
+@test "_teardown_gate: succeeded + no_pr=false + work_dir set but absent -> proceed:work_dir_absent" {
+    facts=$(_facts_json "job-g3a" "/tmp/r3a" "b3a" "$MOTHER_ROOT/g3a-gone" "worktree" "" "succeeded" false)
+    run bash -c "$(_source_teardown_libs) _teardown_gate '$facts'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "proceed:work_dir_absent" ]
+}
+
+@test "_teardown_gate: succeeded + no_pr=false + work_dir exists -> defer:no_pr_url_on_succeeded" {
+    mkdir -p "$MOTHER_ROOT/g3b-here"
+    facts=$(_facts_json "job-g3b" "/tmp/r3b" "b3b" "$MOTHER_ROOT/g3b-here" "worktree" "" "succeeded" false)
+    run bash -c "$(_source_teardown_libs) _teardown_gate '$facts'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "defer:no_pr_url_on_succeeded" ]
+}
+
+@test "_teardown_gate: succeeded + no_pr=false + work_dir unset -> defer:no_pr_url_on_succeeded" {
+    facts=$(_facts_json "job-g3c" "/tmp/r3c" "b3c" "" "worktree" "" "succeeded" false)
+    run bash -c "$(_source_teardown_libs) _teardown_gate '$facts'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "defer:no_pr_url_on_succeeded" ]
+}
+
+@test "_teardown_gate: non-terminal state + absent work_dir -> still defer:no_pr_url_on_succeeded" {
+    facts=$(_facts_json "job-g3d" "/tmp/r3d" "b3d" "$MOTHER_ROOT/g3d-gone" "worktree" "" "running" false)
+    run bash -c "$(_source_teardown_libs) _teardown_gate '$facts'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "defer:no_pr_url_on_succeeded" ]
+}
+
+@test "_teardown_execute: succeeded no-PR worktree job with absent work_dir is skipped (already_absent) and its pending record clears" {
+    local repo_dir="$MOTHER_ROOT/tw-abs-repo" wt_dir="$MOTHER_ROOT/tw-abs-gone"
+    _make_teardown_repo "$repo_dir"
+    facts=$(_facts_json "job-tw-abs" "$repo_dir" "feature/tw-abs" "$wt_dir" "worktree" "" "succeeded" false)
+    mkdir -p "$TEARDOWN_DIR"
+    echo "$facts" > "$TEARDOWN_DIR/job-tw-abs.json"
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_attempt '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=skipped"* ]]
+    [[ "$output" == *"reason=already_absent"* ]]
+    [ ! -f "$TEARDOWN_DIR/job-tw-abs.json" ]
+    grep -F '"kind":"teardown_skipped"' "$EVENTS_DIR/teardown.jsonl"
+}
+
+@test "_teardown_execute: succeeded no-PR job whose existing work_dir holds uncommitted changes is still deferred" {
+    local repo_dir="$MOTHER_ROOT/tw-keep-repo" bare_dir="$MOTHER_ROOT/tw-keep-bare.git" wt_dir="$MOTHER_ROOT/tw-keep-wt"
+    _tw_repo_with_pushed_base "$repo_dir" "$bare_dir" "$wt_dir" "feature/tw-keep"
+    echo "dirty" > "$wt_dir/dirty.txt"
+    facts=$(_facts_json "job-tw-keep" "$repo_dir" "feature/tw-keep" "$wt_dir" "worktree" "" "succeeded" false)
+
+    run bash -c "$(_source_teardown_libs)
+        _teardown_execute '$facts' 0
+        echo \"rc=\$? status=\$TEARDOWN_LAST_STATUS reason=\$TEARDOWN_LAST_REASON\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"status=deferred"* ]]
+    [ -f "$wt_dir/dirty.txt" ]
 }
 
 @test "_teardown_gate: pr_url set + disposition merged -> proceed:pr_merged" {
