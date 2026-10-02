@@ -53,6 +53,14 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/autostash.sh" ]     && source "$MOTHER_LIB_DIR/autostash.sh"
 
+# Durable operator settings (${MOTHER_ROOT}/config.env) fill in anything the
+# environment doesn't set, so they survive `mother daemon install` re-rendering
+# the launchd plist. Must run before the defaults below.
+# shellcheck source=/dev/null
+source "$MOTHER_LIB_DIR/config.sh"
+mother_config_load
+MOTHER_CONCURRENCY_SOURCE=$(mother_config_source MOTHER_CONCURRENCY)
+
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
 MOTHER_SHUTDOWN_GRACE="${MOTHER_SHUTDOWN_GRACE:-30}"
@@ -106,6 +114,16 @@ _publish_cli_path() {
     local cli="$MOTHER_BIN_DIR/mother" dir
     dir=$(cd "$(dirname "$cli")" 2>/dev/null && pwd -P) || return 0
     _atomic_write "$RUNNER_DIR/cli-path" "$dir/$(basename "$cli")"
+}
+
+# Publish the effective concurrency and where it came from (env | config file |
+# default) to $RUNNER_DIR/effective-config.json for `mother status`. Written
+# atomically at startup.
+_publish_effective_config() {
+    _atomic_write "$RUNNER_DIR/effective-config.json" "$(jq -nc \
+        --argjson pid "$$" --arg at "$(_iso_now)" \
+        --arg c "$MOTHER_CONCURRENCY" --arg src "$MOTHER_CONCURRENCY_SOURCE" \
+        '{pid: $pid, started_at: $at, concurrency: ($c | tonumber? // $c), concurrency_source: $src}')"
 }
 
 _remove_pidfile() {
@@ -1482,8 +1500,9 @@ main() {
     _singleton_guard
     _write_pidfile
     _publish_cli_path
+    _publish_effective_config
     trap '_on_signal' TERM INT
-    _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
+    _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY [$MOTHER_CONCURRENCY_SOURCE], poll=${MOTHER_POLL_INTERVAL}s)"
     _recover_stale_locks
     _prune_temps_startup
     _recover_orphans
@@ -1500,6 +1519,13 @@ main() {
 # the daemon loop. Used by pipeline_driver.bats.
 # Usage: mother-runner --driver-tick
 case "${1:-}" in
+    --publish-config-tick)
+        # Test entry point: publish effective-config.json and exit without
+        # starting the daemon loop. Used by config.bats / launchd_plist.bats.
+        # Usage: mother-runner --publish-config-tick
+        _publish_effective_config
+        exit 0
+        ;;
     --driver-tick)
         _run_pipeline_job
         exit 0

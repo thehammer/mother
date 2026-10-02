@@ -61,6 +61,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/attention.sh" ]     && source "$MOTHER_LIB_DIR/attention.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/failure-route.sh" ]  && source "$MOTHER_LIB_DIR/failure-route.sh"
+# shellcheck source=/dev/null
+source "$MOTHER_LIB_DIR/config.sh"
 
 # ---------- CLI-only helpers ----------
 
@@ -810,6 +812,25 @@ cmd_list() {
 
 # ---------- status ----------
 
+# The concurrency the daemon is actually running with and where it came from,
+# as {value, source, daemon}. Prefers what the live runner published at startup
+# (effective-config.json, valid only while its pid is alive); otherwise
+# resolves it the way a fresh runner would from this shell + config.env.
+_effective_concurrency() {
+    local f="$RUNNER_DIR/effective-config.json" pid
+    if [ -f "$f" ]; then
+        pid=$(jq -r '.pid // 0' "$f" 2>/dev/null)
+        if [ "${pid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+            jq -c '{value: .concurrency, source: .concurrency_source, daemon: true}' "$f" 2>/dev/null && return 0
+        fi
+    fi
+    (
+        mother_config_load
+        jq -nc --arg v "${MOTHER_CONCURRENCY:-2}" --arg s "$(mother_config_source MOTHER_CONCURRENCY)" \
+            '{value: ($v | tonumber? // $v), source: $s, daemon: false}'
+    )
+}
+
 # `mother status` with no id: queue overview + the needs-attention list.
 # Recomputes live (no gh — see lib/attention.sh) and refreshes attention.json
 # as a side effect so the statusline / `mother list` footer stay in step.
@@ -836,12 +857,15 @@ _status_overview() {
                question: ((.question // "") | .[0:100]),
                auto_resumes: ((.paused_reason // "") | startswith("quota_"))})')
 
+    local conc; conc=$(_effective_concurrency)
     if [ "$format" = "json" ]; then
         jq -nc --argjson counts "$counts" --argjson awaiting "$awaiting" --argjson na "$items" \
-            '{counts: $counts, awaiting: $awaiting, needs_attention: $na}'
+            --argjson conc "$conc" \
+            '{counts: $counts, awaiting: $awaiting, needs_attention: $na, concurrency: $conc}'
         return 0
     fi
 
+    echo "Concurrency: $(printf '%s' "$conc" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
     echo "Queue: $(printf '%s' "$counts" | jq -r 'to_entries | if length == 0 then "(no jobs)" else map("\(.key)=\(.value)") | join("  ") end')"
     echo ""
     echo "=== awaiting operator ==="
@@ -3185,6 +3209,13 @@ _daemon_install() {
     mkdir -p "$HOME/Library/LaunchAgents"
     mkdir -p "$MOTHER_ROOT/runner"
 
+    # The plist is re-rendered from the shipped template, which carries no
+    # MOTHER_CONCURRENCY. Move an existing plist's value into config.env (which
+    # the runner reads) first so a reinstall never resets or lowers it.
+    local migrated
+    migrated=$(mother_config_migrate_plist "$plist_dst")
+    [ -z "$migrated" ] || echo "kept MOTHER_CONCURRENCY=$migrated from the installed plist (now in $(mother_config_file))"
+
     # Resolve the runner path to an absolute, symlink-resolved path so the
     # plist works even if the plugin is installed via symlink.
     runner_path="$(cd "$MOTHER_BIN_DIR" && pwd -P)/mother-runner"
@@ -3750,7 +3781,13 @@ Escalation tier ladder:
   →  tier_3: opus/high   (cap: 2 escalations per job)
 
 Daemon env vars:
-  MOTHER_CONCURRENCY           (default: 2)    max parallel jobs
+  MOTHER_CONCURRENCY           (default: 2)    max parallel jobs. Any MOTHER_* var may
+                                                 also be set in $MOTHER_ROOT/config.env
+                                                 (KEY=VALUE lines); the environment wins.
+                                                 Unlike a hand-edited launchd plist, it
+                                                 survives `mother daemon install`.
+                                                 `mother status` shows the effective value
+                                                 and where it came from.
   MOTHER_POLL_INTERVAL         (default: 2)    seconds between ticks
   MOTHER_SHUTDOWN_GRACE        (default: 30)   seconds to wait for children on stop
   MOTHER_ESCALATION_ENABLED    (default: 1)    auto-escalate failed jobs (0 to disable)
@@ -3783,6 +3820,16 @@ Operator attention / notification env vars:
   MOTHER_NOTIFY_SCAN_INTERVAL     (default: 60)  seconds between awaiting scans
   MOTHER_AWAITING_REMIND_HOURS    (default: 24)  reminder cadence for a job left
                                                  awaiting (open-ended)
+
+RWX sandbox env vars (repos that commit .rwx/sandbox.yml; best-effort, never
+change a job's outcome):
+  MOTHER_RWX_SANDBOX_ENABLED      (default: 1)  reset the job's RWX sandbox when a
+                                                 fresh attempt starts and stop it
+                                                 when the worker exits
+  MOTHER_RWX_RESET_TIMEOUT        (default: 90) seconds before a hung `rwx sandbox
+                                                 reset` is abandoned (spawn proceeds)
+  MOTHER_RWX_STOP_TIMEOUT         (default: 60) seconds before a hung `rwx sandbox
+                                                 stop` is abandoned
 
 Teardown env vars (worktree + docker cleanup, rides along with `mother archive`
 on every sweep — independent of the record-archiving age cutoff):

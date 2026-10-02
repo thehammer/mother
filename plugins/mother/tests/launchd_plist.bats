@@ -47,3 +47,105 @@ setup() {
     # grep exits 1 when it finds no matches — that's the success case here.
     [ "$status" -eq 1 ]
 }
+
+# ---------------------------------------------------------------------------
+# Concurrency survives `mother daemon install` (config.env + plist migration).
+# The template deliberately carries no MOTHER_CONCURRENCY, so a reinstall would
+# silently reset the daemon to the runner's default of 2 unless the installed
+# plist's value is moved into $MOTHER_ROOT/config.env first.
+
+_make_installed_plist() {
+    # An "installed" plist that hand-sets MOTHER_CONCURRENCY=$1.
+    local out="$BATS_TEST_TMPDIR/installed.plist" conc="$1"
+    sed -e "s|<key>PATH</key>|<key>MOTHER_CONCURRENCY</key><string>$conc</string><key>PATH</key>|" \
+        "$RENDERED" > "$out"
+    echo "$out"
+}
+
+_runner_effective() {
+    # What a freshly started runner resolves, as "<value>|<source>".
+    env -u MOTHER_CONCURRENCY MOTHER_ROOT="$BATS_TEST_TMPDIR/root" \
+        "$PLUGIN_DIR/bin/mother-runner" --publish-config-tick >/dev/null 2>&1
+    jq -r '"\(.concurrency)|\(.concurrency_source)"' "$BATS_TEST_TMPDIR/root/runner/effective-config.json"
+}
+
+@test "shipped template does not hardcode MOTHER_CONCURRENCY" {
+    run grep -c MOTHER_CONCURRENCY "$PLIST_SRC"
+    [ "$output" = "0" ]
+}
+
+@test "runner defaults to concurrency 2 from 'default' with no env or config" {
+    run _runner_effective
+    [ "$output" = "2|default" ]
+}
+
+@test "a reinstall keeps a non-default concurrency (plist value migrated to config.env)" {
+    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$MOTHER_ROOT"
+    local installed; installed=$(_make_installed_plist 3)
+
+    source "$PLUGIN_DIR/lib/config.sh"
+    run mother_config_migrate_plist "$installed"
+    [ "$output" = "3" ]
+
+    # The reinstalled plist is the bare template: no concurrency in it...
+    run grep -c MOTHER_CONCURRENCY "$RENDERED"
+    [ "$output" = "0" ]
+    # ...yet a fresh runner still resolves 3, from the config file.
+    run _runner_effective
+    [ "$output" = "3|config file" ]
+}
+
+@test "migration never lowers an existing higher config.env value" {
+    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$MOTHER_ROOT"
+    echo "MOTHER_CONCURRENCY=5" > "$MOTHER_ROOT/config.env"
+    local installed; installed=$(_make_installed_plist 3)
+
+    source "$PLUGIN_DIR/lib/config.sh"
+    run mother_config_migrate_plist "$installed"
+    [ -z "$output" ]
+    run _runner_effective
+    [ "$output" = "5|config file" ]
+}
+
+@test "migration raises a lower config.env value to the plist's" {
+    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$MOTHER_ROOT"
+    echo "MOTHER_CONCURRENCY=2" > "$MOTHER_ROOT/config.env"
+    local installed; installed=$(_make_installed_plist 4)
+
+    source "$PLUGIN_DIR/lib/config.sh"
+    run mother_config_migrate_plist "$installed"
+    [ "$output" = "4" ]
+    run _runner_effective
+    [ "$output" = "4|config file" ]
+}
+
+@test "environment variable wins over config.env and is reported as env" {
+    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$MOTHER_ROOT/runner"
+    echo "MOTHER_CONCURRENCY=3" > "$MOTHER_ROOT/config.env"
+    MOTHER_CONCURRENCY=7 "$PLUGIN_DIR/bin/mother-runner" --publish-config-tick >/dev/null 2>&1
+    run jq -r '"\(.concurrency)|\(.concurrency_source)"' "$MOTHER_ROOT/runner/effective-config.json"
+    [ "$output" = "7|env" ]
+}
+
+@test "config.env is parsed, not executed" {
+    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$MOTHER_ROOT"
+    printf 'MOTHER_CONCURRENCY="3"\nMOTHER_EVIL=$(touch %s/pwned)\n' "$BATS_TEST_TMPDIR" > "$MOTHER_ROOT/config.env"
+    run _runner_effective
+    [ "$output" = "3|config file" ]
+    [ ! -e "$BATS_TEST_TMPDIR/pwned" ]
+}
+
+@test "mother status reports effective concurrency and its source" {
+    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$MOTHER_ROOT"
+    echo "MOTHER_CONCURRENCY=3" > "$MOTHER_ROOT/config.env"
+    run env -u MOTHER_CONCURRENCY MOTHER_ROOT="$MOTHER_ROOT" "$PLUGIN_DIR/bin/mother" status --format json
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.concurrency.value')" = "3" ]
+    [ "$(printf '%s' "$output" | jq -r '.concurrency.source')" = "config file" ]
+}

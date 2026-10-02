@@ -51,6 +51,12 @@ if [ "$(uname -s)" = "Darwin" ] && command -v plutil >/dev/null 2>&1; then
     echo ""
 fi
 
+# --- effective concurrency (advisory) ---
+if command -v mother >/dev/null 2>&1; then
+    _conc=$(mother status --format json 2>/dev/null | jq -r '.concurrency | "\(.value) (source: \(.source))"' 2>/dev/null)
+    [ -z "$_conc" ] || { echo "concurrency:"; printf '  • %s\n' "$_conc"; echo ""; }
+fi
+
 # --- plugin cache freshness (advisory — never affects exit status) ---
 # The UserPromptSubmit hook and CLI the plugin manager serves come from a
 # cached copy of this repo. If that copy is older than the checkout the daemon

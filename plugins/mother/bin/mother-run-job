@@ -74,6 +74,14 @@ type prd_owner_repo_from_url >/dev/null 2>&1 || prd_owner_repo_from_url() {
 type mother_autostash_restore >/dev/null 2>&1 || mother_autostash_restore() { echo '{"outcome":"none"}'; }
 type mother_autostash_event_detail >/dev/null 2>&1 || mother_autostash_event_detail() { return 1; }
 
+# Best-effort RWX sandbox lifecycle helpers (mother_rwx_gate / mother_rwx_sandbox).
+# Sourced pre-SOURCE_ONLY-guard so _rwx_pre_spawn / _rwx_post_exit are
+# bats-callable. A missing lib degrades to "gate says disabled".
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/rwx.sh" ] && source "$MOTHER_LIB_DIR/rwx.sh"
+type mother_rwx_gate    >/dev/null 2>&1 || mother_rwx_gate()    { echo disabled; return 1; }
+type mother_rwx_sandbox >/dev/null 2>&1 || mother_rwx_sandbox() { echo '{"outcome":"skipped","reason":"no_lib"}'; return 0; }
+
 # _restore_auto_stash — put the operator's main-dir working tree back and
 # record what happened. No-op unless isolation is main-dir and a stash marker
 # path is set. Idempotent: mother_autostash_restore removes the marker, so a
@@ -364,6 +372,77 @@ BASELINE_PV_EOF
     if [ "$pr_open" = "true" ] || [ -n "$run_remote_sha_at_start" ]; then
         run_had_artifact_at_start=true
     fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# RWX sandbox lifecycle (best-effort; never changes a job's outcome).
+#
+# Repos that commit .rwx/sandbox.yml run tests in an RWX cloud sandbox. A
+# sandbox's identity is (git branch, config path), so a retried job on the same
+# branch/worktree reconnects to a stale one: reset at the start of each fresh
+# attempt. Stop it when the worker exits so it stops billing. Only events are
+# emitted here — never _transition. Defined pre-SOURCE_ONLY-guard for bats.
+# ---------------------------------------------------------------------------
+_rwx_active=0
+_rwx_post_exit_done=0
+
+# Resets the sandbox when this spawn starts a fresh attempt. The attempt key is
+# "<escalation_count>:<retry_count>"; an unchanged key means resume,
+# idle-timeout continuation, adherence rework or a later pipeline phase, which
+# keep the sandbox. The key is stored even when the reset fails, so a broken
+# RWX doesn't add the reset timeout to every resume.
+_rwx_pre_spawn() {
+    _rwx_active=0
+    local gate; gate=$(mother_rwx_gate "${work_dir:-}") || true
+    case "$gate" in
+        ok) ;;
+        disabled|no_cli)
+            _append_event "rwx_sandbox_reset" \
+                "$(jq -nc --arg r "$gate" '{outcome: "skipped", reason: $r}')" 2>/dev/null || true
+            return 0 ;;
+        *) return 0 ;;
+    esac
+    _rwx_active=1
+
+    local key stored result outcome
+    key=$(jq -r '"\(.escalation_count // 0):\(.retry_count // 0)"' "$job_file" 2>/dev/null) || key=""
+    [ -n "$key" ] || key="0:0"
+    stored=$(jq -r '.rwx_sandbox.reset_key // empty' "$job_file" 2>/dev/null) || stored=""
+    [ "$key" != "$stored" ] || return 0
+
+    result=$(mother_rwx_sandbox reset "$work_dir" 2>/dev/null) || result=""
+    printf '%s' "$result" | jq -e 'type == "object"' >/dev/null 2>&1 \
+        || result='{"action":"reset","outcome":"error","exit_code":1,"output_tail":"no result from mother_rwx_sandbox"}'
+    outcome=$(printf '%s' "$result" | jq -r '.outcome // "error"')
+    _append_event "rwx_sandbox_reset" "$result" 2>/dev/null || true
+    _job_update ".rwx_sandbox = $(jq -nc --arg k "$key" --arg at "$(iso_now)" --arg o "$outcome" \
+        '{reset_key: $k, reset_at: $at, last_reset_outcome: $o}')" 2>/dev/null || true
+    return 0
+}
+
+# Stops this run's sandbox. Idempotent (the EXIT trap calls it too). Must run
+# while the job branch is still checked out and the workspace lock is held: the
+# stop is cwd+branch-keyed, and a main-dir stash-restore or lock release would
+# let it hit the operator's (or another job's) sandbox.
+_rwx_post_exit() {
+    [ "${_rwx_active:-0}" = "1" ] || return 0
+    [ "${_rwx_post_exit_done:-0}" = "0" ] || return 0
+    _rwx_post_exit_done=1
+
+    local result
+    # Stale-supervisor guard: a newer worker owns the worktree (and sandbox).
+    # Only meaningful once this run spawned a worker of its own.
+    if [ -n "${worker_pid:-}" ] && \
+       [ "$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)" != "$worker_pid" ]; then
+        _append_event "rwx_sandbox_stop" \
+            '{"outcome":"skipped","reason":"newer_worker"}' 2>/dev/null || true
+        return 0
+    fi
+    result=$(mother_rwx_sandbox stop "${work_dir:-}" 2>/dev/null) || result=""
+    printf '%s' "$result" | jq -e 'type == "object"' >/dev/null 2>&1 \
+        || result='{"action":"stop","outcome":"error","exit_code":1,"output_tail":"no result from mother_rwx_sandbox"}'
+    _append_event "rwx_sandbox_stop" "$result" 2>/dev/null || true
     return 0
 }
 
@@ -881,6 +960,9 @@ _runner_died_trap() {
         _transition failed "$(jq -nc --argjson rc "$rc" \
             '{reason: "runner_died_early", exit_code: $rc}')" 2>/dev/null || true
     fi
+    # Stop the RWX sandbox first (idempotent; best-effort) — before the
+    # main-dir restore switches the checkout away from the job branch.
+    _rwx_post_exit 2>/dev/null || true
     # Regardless of state: never leave the operator's main-dir changes in the
     # stash list or the workspace lock held (set -u crashes, later-added
     # `exit 1` paths, SIGTERM/SIGINT). Idempotent.
@@ -1042,6 +1124,9 @@ _job_update ".work_dir = \"$work_dir\""
 # Snapshot what already exists on origin / as a PR, so the terminal verify can
 # tell "this run shipped something" from "an earlier run did".
 _capture_run_baseline
+
+# Reset the RWX sandbox if this is a fresh attempt (best-effort, bounded).
+_rwx_pre_spawn
 
 # Record the resolved work_dir on the job. If we were started from `ready`
 # (via `mother run --once`), also emit the running transition; if the daemon
@@ -1726,6 +1811,12 @@ exit_code=0
 # See _finalize_pr_url's definition (above the SOURCE_ONLY guard) for the
 # full contract. Sets the global `pr_url`.
 _finalize_pr_url
+
+# Stop the RWX sandbox now: before the main-dir stash-restore below switches the
+# checkout back to the operator's branch, and before the lock release lets
+# another main-dir job check out a different one. Covers every post-exit path
+# (awaiting, continuation, succeeded, failed, cancelled). Best-effort.
+_rwx_post_exit
 
 # Release main-dir lock if we took one. Before releasing, restore any
 # auto-stash to the operator's original branch so their pre-job working

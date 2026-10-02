@@ -97,6 +97,7 @@ plan-adherence review. Here's what was added and how to work with it.
 | `failure_routed` | bool\|null | Set `true` by `mother route-failure` when it deliberately leaves a job `failed` (`left_failed`) so the runner stops re-examining it. Cleared by the next `failed` transition. |
 | `auto_retry_count` | int | Number of as-is (no tier bump) automatic retries the failure router has granted (max 1). Reset to `0` by `mother resume` — an operator resuming the job is a fresh chance, not a continuation of the failed retry budget. |
 | `operator_hold` | object\|null | `{failure_reason, sub_reason, detail, held_at}` — present while a job is held (`activity: operator_hold`). Cleared (set to `null`) by `mother retry`, `mother reconcile`, and `mother resume`. |
+| `rwx_sandbox` | object | `{reset_key, reset_at, last_reset_outcome}` — audit only. `reset_key` is the attempt key `"<escalation_count>:<retry_count>"`: a spawn whose key equals the stored one (resume, continuation, adherence rework, later pipeline phase) skips the reset; `mother retry` and escalation change the key and trigger one. Stored even when the reset failed. |
 | `current_run.*` (baseline) | object | In addition to `log_offset`/`spawned_at`/`session_id`: `head_sha_at_start`, `remote_ref`, `remote_sha_at_start`, `pr_url_at_start`, `had_artifact_at_start` — what already existed on origin/as a PR when this run began (audit fields for the rework-advance check). |
 
 ### State machine
@@ -171,6 +172,8 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_EVENTS_MAX_AGE_HOURS=N` — age floor (default: 6) for `mother events --since-cursor`, the query the `UserPromptSubmit` hook (`hooks/mother-inject.sh`) uses to inject a queue-update banner into interactive sessions. No event older than this is ever surfaced on the `--since-cursor` path, no matter how stale a syntactically valid cursor is. `0` disables the floor. Plain `mother events` and `mother events --since <ts>` are never floored. This is defense in depth on top of a hard contract in `cmd_events`: an unreadable or non-ISO session cursor (missing file, zero-byte, non-JSON, missing/`null` `.last_seen`, or a `.last_seen` that isn't an ISO-8601 instant) is always treated as a brand-new session — bootstrap the cursor to now, emit nothing — and must never degrade into a full-history replay of `$EVENTS_DIR` (which retains orphaned `.jsonl` files for long-archived jobs; see the resolved 2026-07-14 bug report).
 - `MOTHER_RETENTION_SWEEP_ENABLED=0` — disable the orphaned atomic-write temp file sweep (reserved as the shared gate for future retention steps — see "Orphaned temp file sweep" below).
 - `MOTHER_TEMP_ORPHAN_MINUTES=N` — age threshold in minutes before an orphaned `*.tmp.*` / `*.bak.*` state file is removed (default: 60). This gate is what prevents deleting an in-flight write's temp file out from under its own writer.
+- `MOTHER_RWX_SANDBOX_ENABLED=0` — disable the RWX sandbox lifecycle (default: `1`). When a job's work_dir has `.rwx/sandbox.yml` and `rwx` is on PATH, `mother-run-job` runs `rwx sandbox reset` before the first spawn of each fresh attempt and `rwx sandbox stop` after every worker exit (`lib/rwx.sh`). Best-effort: failures, hangs and a missing CLI are events only (`rwx_sandbox_reset` / `rwx_sandbox_stop`) and never change the job's state or `failure_reason`. Repos without `.rwx/sandbox.yml` see no calls and no events.
+- `MOTHER_RWX_RESET_TIMEOUT=N` / `MOTHER_RWX_STOP_TIMEOUT=N` — watchdog seconds for the reset (default: 90) and stop (default: 60); on expiry the call is killed, the event says `outcome: "timeout"`, and the job proceeds.
 - `MOTHER_WORKER_MCP_SCOPE=0` — restore the pre-cost-visibility behavior of every `claude` invocation loading the operator's full personal MCP config. Default `1`: workers, `review-phase`, and `adherence-review` all pass `--strict-mcp-config --mcp-config "$MOTHER_WORKER_MCP_CONFIG"` (default `templates/worker-mcp.json`, an empty allowlist). See "Bishop budget posture" section's sibling, the cost-visibility feature's CHANGELOG entry, for the measured before/after.
 - `MOTHER_WORKER_MCP_CONFIG=PATH` — override the MCP allowlist file passed to every headless `claude` invocation. Put servers a background worker genuinely needs here; default is an empty `{"mcpServers": {}}`.
 - `MOTHER_USAGE_CHECK_INTERVAL=N` — seconds between live usage/cost-cap checks in `mother-run-job`'s poll loop (default: 120).
@@ -189,6 +192,21 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_NOTIFY_SCAN_INTERVAL=N` — seconds between the daemon's awaiting scans (default: 60).
 - `MOTHER_AWAITING_REMIND_HOURS=N` — reminder cadence for a job left `awaiting` (default: 24; open-ended).
 - `MOTHER_SHARED_RATES_PATH=PATH` — destination `mother-usage publish-rates` writes the rate table to (default: `~/.claude/model-rates.json`), for Bishop or other tools to read the same per-model pricing Mother uses.
+
+### Durable daemon config (`config.env`)
+
+The launchd plist is re-rendered from `launchd/com.thehammer.mother.plist` on
+every `mother daemon install`, so env vars hand-added to the installed plist are
+lost. Durable settings (notably `MOTHER_CONCURRENCY`) live in
+`$MOTHER_ROOT/config.env` instead — `KEY=VALUE` lines for `MOTHER_*` names,
+parsed (never sourced) by `lib/config.sh`'s `mother_config_load`, which
+`bin/mother-runner` calls before applying its defaults. Real env vars always win
+over the file. `_daemon_install` first runs `mother_config_migrate_plist` to copy
+the installed plist's `MOTHER_CONCURRENCY` into `config.env` (an existing file
+value is only replaced by a higher plist value — a reinstall never lowers it).
+The runner publishes the effective value and its source (`env` / `config file` /
+`default`) to `runner/effective-config.json`; `mother status` and
+`scripts/doctor.sh` display it.
 
 ### Orphaned temp file sweep
 
