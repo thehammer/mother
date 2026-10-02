@@ -19,6 +19,16 @@ mother_config_file() {
     echo "${MOTHER_ROOT:-$HOME/.mother}/config.env"
 }
 
+# _config_unquote <val> — strip one pair of surrounding single or double quotes.
+_config_unquote() {
+    local val="$1"
+    case "$val" in
+        \"*\") val="${val#\"}"; val="${val%\"}" ;;
+        \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    printf '%s' "$val"
+}
+
 # mother_config_load — export every MOTHER_* assignment in config.env that is
 # not already set in the environment.
 mother_config_load() {
@@ -33,10 +43,7 @@ mother_config_load() {
         key="${line%%=*}"
         case "$key" in *[!A-Z0-9_]*) continue ;; esac
         val="${line#*=}"
-        case "$val" in
-            \"*\") val="${val#\"}"; val="${val%\"}" ;;
-            \'*\') val="${val#\'}"; val="${val%\'}" ;;
-        esac
+        val=$(_config_unquote "$val")
         # Env wins: skip anything already set (even to the empty string).
         if eval "[ \"\${$key+set}\" = set ]"; then
             continue
@@ -70,10 +77,7 @@ mother_config_get() {
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in "$1="*) val="${line#*=}" ;; esac
     done <"$file"
-    case "$val" in
-        \"*\") val="${val#\"}"; val="${val%\"}" ;;
-        \'*\') val="${val#\'}"; val="${val%\'}" ;;
-    esac
+    val=$(_config_unquote "$val")
     printf '%s' "$val"
 }
 
