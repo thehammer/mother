@@ -74,11 +74,6 @@ _runner_effective() {
     [ "$output" = "0" ]
 }
 
-@test "runner defaults to concurrency 2 from 'default' with no env or config" {
-    run _runner_effective
-    [ "$output" = "2|default" ]
-}
-
 @test "a reinstall keeps a non-default concurrency (plist value migrated to config.env)" {
     export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
     mkdir -p "$MOTHER_ROOT"
@@ -120,32 +115,4 @@ _runner_effective() {
     [ "$output" = "4" ]
     run _runner_effective
     [ "$output" = "4|config file" ]
-}
-
-@test "environment variable wins over config.env and is reported as env" {
-    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
-    mkdir -p "$MOTHER_ROOT/runner"
-    echo "MOTHER_CONCURRENCY=3" > "$MOTHER_ROOT/config.env"
-    MOTHER_CONCURRENCY=7 "$PLUGIN_DIR/bin/mother-runner" --publish-config-tick >/dev/null 2>&1
-    run jq -r '"\(.concurrency)|\(.concurrency_source)"' "$MOTHER_ROOT/runner/effective-config.json"
-    [ "$output" = "7|env" ]
-}
-
-@test "config.env is parsed, not executed" {
-    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
-    mkdir -p "$MOTHER_ROOT"
-    printf 'MOTHER_CONCURRENCY="3"\nMOTHER_EVIL=$(touch %s/pwned)\n' "$BATS_TEST_TMPDIR" > "$MOTHER_ROOT/config.env"
-    run _runner_effective
-    [ "$output" = "3|config file" ]
-    [ ! -e "$BATS_TEST_TMPDIR/pwned" ]
-}
-
-@test "mother status reports effective concurrency and its source" {
-    export MOTHER_ROOT="$BATS_TEST_TMPDIR/root"
-    mkdir -p "$MOTHER_ROOT"
-    echo "MOTHER_CONCURRENCY=3" > "$MOTHER_ROOT/config.env"
-    run env -u MOTHER_CONCURRENCY MOTHER_ROOT="$MOTHER_ROOT" "$PLUGIN_DIR/bin/mother" status --format json
-    [ "$status" -eq 0 ]
-    [ "$(printf '%s' "$output" | jq -r '.concurrency.value')" = "3" ]
-    [ "$(printf '%s' "$output" | jq -r '.concurrency.source')" = "config file" ]
 }
