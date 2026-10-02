@@ -91,3 +91,23 @@ track_child() {
 
     assert_job_field "job-fresh-spawn" '.state' "running"
 }
+
+@test "orphan recovery: stops the RWX sandbox of a reaped worktree job (reason: orphan)" {
+    local wd="$BATS_TEST_TMPDIR/wt"
+    mkdir -p "$wd/.rwx"
+    printf 'base: ubuntu\n' > "$wd/.rwx/sandbox.yml"
+    cat > "$_MOCK_BIN/rwx" <<'RWX'
+#!/usr/bin/env bash
+printf '%s|%s\n' "$(pwd -P)" "$*" >> "$MOTHER_ROOT/rwx-calls.log"
+RWX
+    chmod +x "$_MOCK_BIN/rwx"
+    make_job "job-rwx-orphan" "running" \
+        ".worker_pid = null | .tmux_window = null | .started_at = \"2000-01-01T00:00:00Z\" | .work_dir = \"$wd\""
+
+    run mother-runner --recover-orphans-tick 60
+    [ "$status" -eq 0 ]
+    grep -q "|sandbox stop" "$MOTHER_ROOT/rwx-calls.log"
+    run jq -s -r '[.[] | select(.kind == "rwx_sandbox_stop")] | .[0].detail.reason' \
+        "$EVENTS_DIR/job-rwx-orphan.jsonl"
+    [ "$output" = "orphan" ]
+}

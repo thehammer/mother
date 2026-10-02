@@ -52,6 +52,7 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/notify.sh" ]        && source "$MOTHER_LIB_DIR/notify.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/autostash.sh" ]     && source "$MOTHER_LIB_DIR/autostash.sh"
+[ -r "$MOTHER_LIB_DIR/rwx.sh" ]           && source "$MOTHER_LIB_DIR/rwx.sh"
 
 # Durable operator settings (${MOTHER_ROOT}/config.env) fill in anything the
 # environment doesn't set, so they survive `mother daemon install` re-rendering
@@ -441,6 +442,21 @@ _recover_orphans() {
         _log "auto-stash restore for orphaned $_rid: $_routcome"
     }
 
+    # A SIGKILLed supervisor never ran _rwx_post_exit, so its RWX sandbox keeps
+    # billing until the sandbox's own inactivity timeout. Stop it best-effort.
+    # Worktree jobs only: the stop is cwd+branch-keyed, and a main-dir checkout
+    # may be on the operator's branch by now.
+    _orphan_rwx_stop() {
+        local _sid="$1" _sjf="$2" _swd _sres
+        declare -F mother_rwx_sandbox >/dev/null || return 0
+        [ "$(jq -r '.isolation // empty' "$_sjf" 2>/dev/null)" = "worktree" ] || return 0
+        _swd=$(jq -r '.work_dir // empty' "$_sjf" 2>/dev/null)
+        [ -d "$_swd" ] && mother_rwx_gate "$_swd" >/dev/null || return 0
+        _sres=$(mother_rwx_sandbox stop "$_swd" 2>/dev/null) || return 0
+        printf '%s' "$_sres" | jq -e 'type == "object"' >/dev/null 2>&1 || return 0
+        _append_event "$_sid" "rwx_sandbox_stop" "$(printf '%s' "$_sres" | jq -c '. + {reason: "orphan"}')"
+    }
+
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state' "$f" 2>/dev/null) || continue
@@ -476,6 +492,7 @@ _recover_orphans() {
                 _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
                 _orphan_restore_autostash "$id" "$f"
+                _orphan_rwx_stop "$id" "$f"
             fi
         elif [ -n "$window" ]; then
             # Legacy path: jobs recorded before the headless-worker migration.
@@ -488,6 +505,7 @@ _recover_orphans() {
                 _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
                 _orphan_restore_autostash "$id" "$f"
+                _orphan_rwx_stop "$id" "$f"
             fi
         else
             # No worker_pid AND no tmux_window. Supervisor either died before
@@ -526,6 +544,7 @@ _recover_orphans() {
             _orphan_record_usage_row "$id" "$f" "$terminal_state"
             _job_transition "$id" "$terminal_state" "$terminal_reason"
             _orphan_restore_autostash "$id" "$f"
+            _orphan_rwx_stop "$id" "$f"
         fi
     done
 }

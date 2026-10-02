@@ -421,6 +421,11 @@ _rwx_pre_spawn() {
     return 0
 }
 
+# Known gap: this does not run if mother-run-job is SIGKILLed (OOM, `kill -9`,
+# host crash); the sandbox then bills until its own --inactivity-timeout (10m in
+# admin-portal's sandbox.yml). mother-runner's orphan reaper stops it for
+# worktree jobs (event reason: "orphan"); a host crash is bounded by the timeout.
+#
 # Stops this run's sandbox. Idempotent (the EXIT trap calls it too). Must run
 # while the job branch is still checked out and the workspace lock is held: the
 # stop is cwd+branch-keyed, and a main-dir stash-restore or lock release would
