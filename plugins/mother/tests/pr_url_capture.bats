@@ -1011,7 +1011,7 @@ _gate_bind() {
     make_job "$_gid" "running" \
         ".branch = \"$_gbranch\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$_grepo\""
     _va_bind_context "$_gid" "$_gbranch" "main" "worktree" "$_grepo"
-    pr_url=""; _pr_rejected_urls=""
+    pr_url=""; _pr_rejected_urls=""; _pr_transient_failures=""
     log_path="$MOTHER_ROOT/$_gid.log"; : > "$log_path"
     log_offset_at_spawn=0
 }
@@ -1147,6 +1147,88 @@ _gate_bind() {
 
     [ "$(_gate_event_count gate-job-4 pr_url_rejected)" = "1" ]
     [ "$(wc -l < "$MOTHER_ROOT/gh-calls.log")" -eq "$calls_after_first" ]
+}
+
+@test "live capture: a transient gh failure is retried on the next poll and the PR is then recorded (pr_opened once, one transient event)" {
+    local repo="$MOTHER_ROOT/gate-repo-t1"
+    _fin_make_repo "$repo" "feature/gate-t1" "main"
+    local pr="https://github.com/thehammer/mother/pull/970"
+    _gate_stub_gh "$pr|OPEN|feature/gate-t1"
+    # Wrap the stub: fail while the flag file exists.
+    mv "$_MOCK_BIN/gh" "$_MOCK_BIN/gh.real"
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+[ -e "$MOTHER_ROOT/gh-fail" ] && { echo "gh call: \$*" >> "$MOTHER_ROOT/gh-calls.log"; exit 1; }
+exec "$_MOCK_BIN/gh.real" "\$@"
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    _gate_bind "gate-job-t1" "$repo" "feature/gate-t1"
+    jq -nc --arg c "$pr" \
+        '{type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:"toolu_t1",content:$c}]}}' >> "$log_path"
+
+    touch "$MOTHER_ROOT/gh-fail"
+    _live_capture_pr_url
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
+
+    rm -f "$MOTHER_ROOT/gh-fail"
+    _live_capture_pr_url
+
+    run jq -r '.pr_url' "$job_file"
+    [ "$output" = "$pr" ]
+    [ "$(_gate_event_count gate-job-t1 pr_opened)" = "1" ]
+    [ "$(_gate_event_count gate-job-t1 pr_url_rejected)" = "1" ]
+    run grep '"pr_url_rejected"' "$EVENTS_DIR/gate-job-t1.jsonl"
+    [[ "$output" =~ "\"reason\":\"pr_unresolved\"" ]]
+    [[ "$output" =~ "\"transient\":true" ]]
+}
+
+@test "live capture: a definitive mismatch is remembered — later polls make no further gh calls for that URL" {
+    local repo="$MOTHER_ROOT/gate-repo-t2"
+    _fin_make_repo "$repo" "feature/gate-t2" "main"
+    local other="https://github.com/thehammer/mother/pull/5084"
+    _gate_stub_gh "$other|OPEN|chore/other-branch"
+    export GATE_GH_COMMITS="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+    _gate_bind "gate-job-t2" "$repo" "feature/gate-t2"
+    _gate_log_read_result "$log_path" "$other"
+
+    _live_capture_pr_url
+    local calls; calls=$(wc -l < "$MOTHER_ROOT/gh-calls.log")
+    [ "$calls" -gt 0 ]
+    _live_capture_pr_url
+    _live_capture_pr_url
+
+    [ "$(wc -l < "$MOTHER_ROOT/gh-calls.log")" -eq "$calls" ]
+    [ "$(_gate_event_count gate-job-t2 pr_url_rejected)" = "1" ]
+    run grep '"pr_url_rejected"' "$EVENTS_DIR/gate-job-t2.jsonl"
+    [[ "$output" != *transient* ]]
+}
+
+@test "live capture: transient failures past the retry cap stop retrying, with at most one transient event" {
+    local repo="$MOTHER_ROOT/gate-repo-t3"
+    _fin_make_repo "$repo" "feature/gate-t3" "main"
+    local pr="https://github.com/thehammer/mother/pull/971"
+    # gh always fails: every gate attempt is transient (pr_unresolved).
+    : > "$MOTHER_ROOT/gh-calls.log"
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$MOTHER_ROOT/gh-calls.log"
+exit 1
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    _gate_bind "gate-job-t3" "$repo" "feature/gate-t3"
+    _gate_log_read_result "$log_path" "$pr"
+
+    local i
+    for i in $(seq 1 15); do _live_capture_pr_url; done
+
+    [ "$(wc -l < "$MOTHER_ROOT/gh-calls.log")" -eq "$_PR_TRANSIENT_RETRY_CAP" ]
+    [ "$(_gate_event_count gate-job-t3 pr_url_rejected)" = "1" ]
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
 }
 
 @test "live capture: with gh missing nothing is recorded (the raw scrape is never trusted)" {

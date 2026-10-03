@@ -574,14 +574,19 @@ gate accepts only when GitHub-side evidence ties the PR to this job — its
 and always rejects a MERGED/CLOSED PR while the job has no commits beyond
 `base_ref`. Candidates are tried newest-first, so an unrelated URL read later
 can't shadow the real one. Rejections emit `pr_url_rejected` and record nothing;
-the live path remembers rejected URLs per spawn (`_pr_rejected_urls`), so a
-rejected URL is neither re-queried nor re-reported. With `gh` missing the live
+the live path remembers *definitively* rejected URLs per spawn
+(`_pr_rejected_urls`), so they are neither re-queried nor re-reported. Transient
+failures (`pr_unresolved`, `evidence_indeterminate`, `gh_unavailable` — `gh`/network
+trouble, not evidence) are not remembered: the next poll tick retries, the event
+(`transient: true`) is emitted once per URL, and after
+`MOTHER_PR_TRANSIENT_RETRY_CAP` (default 10) failures the live path stops
+retrying that URL for the spawn and leaves it to finalization. With `gh` missing the live
 path records nothing; finalization keeps its pre-gate offline behavior and
 emits `pr_url_unverified`.
 
 | Event | Detail fields | When emitted |
 |---|---|---|
-| `pr_url_rejected` | `{url, reason}` — reason is `head_branch_mismatch`, `merged_before_job_commits`, `closed_before_job_commits`, `pr_unresolved`, `evidence_indeterminate` or `gh_unavailable` | A scraped PR URL failed the evidence gate; once per URL per spawn |
+| `pr_url_rejected` | `{url, reason[, transient: true]}` — definitive reasons: `head_branch_mismatch`, `merged_before_job_commits`, `closed_before_job_commits`; transient (`transient: true`, retried): `pr_unresolved`, `evidence_indeterminate`, `gh_unavailable` | A scraped PR URL failed the evidence gate; once per URL per spawn |
 | `pr_url_unverified` | `{url, reason: "gh_unavailable", note}` | Finalization recorded a scraped URL without verification because `gh` is missing |
 
 **`no_pr: true` jobs get their own, separate verification**
