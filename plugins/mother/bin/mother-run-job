@@ -132,13 +132,17 @@ _job_owner_repo() {
 }
 
 # Scrape a log file for pull-request URLs belonging to the given owner/repo,
-# ignoring foreign-repo placeholders. Echoes the last matching URL, or empty.
-# Usage: _scrape_pr_url_filtered <log_file> <owner_repo> [offset_bytes]
+# ignoring foreign-repo placeholders. Echoes every distinct matching URL, newest
+# (last occurrence) first, one per line — or nothing. A raw scrape is NOT
+# evidence the job opened the PR: any doc, plan, `gh pr list` or `git log`
+# output the worker reads can mention one. Callers must pass each URL through
+# _accept_scraped_pr_url before recording it.
+# Usage: _scrape_pr_urls_filtered <log_file> <owner_repo> [offset_bytes]
 # When offset_bytes > 0, only bytes past that offset are scanned (escalation
 # safety — prior runs are written at the head of a shared log file).
-_scrape_pr_url_filtered() {
+_scrape_pr_urls_filtered() {
     local _log="$1" _or="$2" _offset="${3:-0}"
-    [ -f "$_log" ] || { echo ""; return; }
+    [ -f "$_log" ] || return 0
     local matches
     if [ "${_offset:-0}" -gt 0 ]; then
         matches=$(tail -c "+$((_offset + 1))" "$_log" 2>/dev/null \
@@ -146,12 +150,220 @@ _scrape_pr_url_filtered() {
     else
         matches=$(grep -Eo 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' "$_log" 2>/dev/null || true)
     fi
-    [ -n "$matches" ] || { echo ""; return; }
+    [ -n "$matches" ] || return 0
     if [ -n "$_or" ]; then
-        echo "$matches" | grep -F "https://github.com/${_or}/pull/" | tail -1 || true
-    else
-        echo "$matches" | tail -1 || true
+        matches=$(echo "$matches" | grep -F "https://github.com/${_or}/pull/" || true)
     fi
+    [ -n "$matches" ] || return 0
+    echo "$matches" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--)print a[i]}' | awk '!seen[$0]++'
+}
+
+# Last (newest) matching URL only. Same contract as before; unvalidated.
+# Usage: _scrape_pr_url_filtered <log_file> <owner_repo> [offset_bytes]
+_scrape_pr_url_filtered() {
+    _scrape_pr_urls_filtered "$@" | head -1
+}
+
+# URLs already rejected (and event-logged) by _accept_scraped_pr_url's callers
+# during this spawn — newline-separated. Reset at each spawn. Lets the live
+# poll loop skip a rejected URL without re-querying gh or re-emitting
+# pr_url_rejected on every tick.
+_pr_rejected_urls=""
+
+_pr_url_was_rejected() {
+    case "
+${_pr_rejected_urls:-}
+" in *"
+$1
+"*) return 0 ;; esac
+    return 1
+}
+
+# Transient gate failures (gh/network trouble rather than evidence) are NOT
+# remembered as rejections — the next poll tick retries. One line per failure,
+# so a URL's failure count is its line count. Capped per URL per spawn so a
+# persistently broken gh can't be hammered forever; finalization takes over.
+_pr_transient_failures=""
+_PR_TRANSIENT_RETRY_CAP="${MOTHER_PR_TRANSIENT_RETRY_CAP:-10}"
+
+_pr_gate_reason_is_transient() {
+    case "$1" in
+        pr_unresolved|evidence_indeterminate|gh_unavailable) return 0 ;;
+    esac
+    return 1
+}
+
+_pr_transient_count() {
+    local n
+    n=$(printf '%s\n' "${_pr_transient_failures:-}" | grep -cxF -- "$1") || n=0
+    echo "$n"
+}
+
+# True when the live loop should not evaluate this URL again this spawn:
+# definitively rejected, or transient failures hit the retry cap.
+_pr_url_skip_live() {
+    _pr_url_was_rejected "$1" && return 0
+    [ "$(_pr_transient_count "$1")" -ge "$_PR_TRANSIENT_RETRY_CAP" ]
+}
+
+# Records a rejection and emits pr_url_rejected, once per URL per spawn.
+# Definitive reasons are remembered (never re-queried); transient reasons are
+# only counted, and the event carries transient: true.
+# Usage: _reject_scraped_pr_url <url> <reason>
+_reject_scraped_pr_url() {
+    local transient=false
+    _pr_url_was_rejected "$1" && return 0
+    if _pr_gate_reason_is_transient "$2"; then
+        transient=true
+        local n; n=$(_pr_transient_count "$1")
+        _pr_transient_failures="${_pr_transient_failures:-}${_pr_transient_failures:+
+}$1"
+        [ "$n" -eq 0 ] || return 0
+    else
+        _pr_rejected_urls="${_pr_rejected_urls:-}${_pr_rejected_urls:+
+}$1"
+    fi
+    _append_event "pr_url_rejected" "$(jq -nc --arg url "$1" --arg reason "$2" --argjson transient "$transient" \
+        'if $transient then {url: $url, reason: $reason, transient: true} else {url: $url, reason: $reason} end')"
+}
+
+# Gate for any PR URL scraped out of the worker transcript. Accepts the URL
+# only when GitHub-side evidence ties the PR to THIS job:
+#   - the PR's head branch is the job's branch, or expect_branch_mismatch is set
+#     on the job, or the PR contains one of the job's own commits
+#     (prd_pr_contains_sha over commits ahead of base_ref);
+#   - and a PR that is already MERGED/CLOSED is rejected while the job has no
+#     commits of its own beyond base_ref (a stale PR picked up at minute zero).
+# Return codes: 0 accepted; 1 rejected; 2 gh missing (cannot verify at all).
+# On non-zero, _pr_gate_reason holds the reason: gh_unavailable,
+# pr_unresolved, merged_before_job_commits, closed_before_job_commits,
+# head_branch_mismatch, evidence_indeterminate.
+# Reads job_file, work_dir, branch, base_ref at call time. Emits no events —
+# callers decide how to report.
+# Usage: _accept_scraped_pr_url <url>
+_accept_scraped_pr_url() {
+    local url="$1" pv pv_state pv_head ahead cands sha rc indeterminate expect_mismatch
+    _pr_gate_reason=""
+
+    if ! command -v gh >/dev/null 2>&1; then
+        _pr_gate_reason="gh_unavailable"
+        return 2
+    fi
+
+    pv=$(gh pr view "$url" --json state,headRefName --jq '(.state)+"\t"+(.headRefName)' 2>/dev/null || true)
+    if [ -z "$pv" ]; then
+        _pr_gate_reason="pr_unresolved"
+        return 1
+    fi
+    pv_state=""; pv_head=""
+    IFS=$'\t' read -r pv_state pv_head <<GATE_PV_EOF
+$pv
+GATE_PV_EOF
+
+    ahead=""
+    if [ -n "${work_dir:-}" ] && [ -d "$work_dir" ] && [ -n "${base_ref:-}" ]; then
+        ahead=$(cd "$work_dir" && git rev-list --count "${base_ref}..HEAD" 2>/dev/null || true)
+    fi
+    case "$ahead" in ''|*[!0-9]*) ahead="" ;; esac
+
+    if [ "$pv_state" != "OPEN" ] && [ "$ahead" = "0" ]; then
+        case "$pv_state" in
+            MERGED) _pr_gate_reason="merged_before_job_commits" ;;
+            *)      _pr_gate_reason="closed_before_job_commits" ;;
+        esac
+        return 1
+    fi
+
+    [ "$pv_head" = "${branch:-}" ] && return 0
+
+    expect_mismatch=$(jq -r '.expect_branch_mismatch // false' "$job_file" 2>/dev/null)
+    [ "$expect_mismatch" = "true" ] && return 0
+
+    # No commits of its own: nothing can be "contained", and HEAD is just the
+    # base commit (which a recently merged PR may well contain).
+    if [ "$ahead" = "0" ]; then
+        _pr_gate_reason="head_branch_mismatch"
+        return 1
+    fi
+
+    cands=$(prd_candidate_shas "${work_dir:-}" "${branch:-}" "${base_ref:-}" 2>/dev/null)
+    indeterminate=0
+    if [ -n "$cands" ]; then
+        while IFS= read -r sha; do
+            [ -n "$sha" ] || continue
+            prd_pr_contains_sha "$url" "$sha"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+                return 0
+            elif [ "$rc" -eq 2 ]; then
+                indeterminate=1
+            fi
+        done <<GATE_CAND_EOF
+$cands
+GATE_CAND_EOF
+    fi
+
+    if [ "$indeterminate" -eq 1 ]; then
+        _pr_gate_reason="evidence_indeterminate"
+    else
+        _pr_gate_reason="head_branch_mismatch"
+    fi
+    return 1
+}
+
+# Live capture: called from the poll loop while the worker runs. Records the
+# newest scraped URL that passes _accept_scraped_pr_url (job file .pr_url +
+# one pr_opened event); every other URL is rejected once (pr_url_rejected) and
+# never re-queried this spawn. Without gh nothing is recorded — a raw scrape
+# is never trusted live; the post-run _finalize_pr_url covers that case.
+_live_capture_pr_url() {
+    local urls url
+    urls=$(_scrape_pr_urls_filtered "$log_path" "$(_job_owner_repo)" "${log_offset_at_spawn:-0}")
+    [ -n "$urls" ] || return 0
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        _pr_url_skip_live "$url" && continue
+        if _accept_scraped_pr_url "$url"; then
+            _job_update ".pr_url = \"$url\""
+            _append_event "pr_opened" "$(jq -nc --arg url "$url" '{url: $url}')"
+            return 0
+        fi
+        _reject_scraped_pr_url "$url" "$_pr_gate_reason"
+    done <<LIVE_URLS_EOF
+$urls
+LIVE_URLS_EOF
+    return 0
+}
+
+# Finalization fallback: echoes the newest scraped URL that passes the gate, or
+# nothing. With gh missing the gate cannot run, so — to keep today's offline
+# behavior — the newest scraped URL is returned as-is, flagged by a
+# pr_url_unverified event.
+# Usage: _finalize_scrape_pr_url
+_finalize_scrape_pr_url() {
+    local urls url rc
+    urls=$(_scrape_pr_urls_filtered "$log_path" "$(_job_owner_repo)" "${log_offset_at_spawn:-0}")
+    [ -n "$urls" ] || return 0
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        rc=0
+        _accept_scraped_pr_url "$url" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            echo "$url"
+            return 0
+        fi
+        if [ "$rc" -eq 2 ]; then
+            url=$(echo "$urls" | head -1)
+            _append_event "pr_url_unverified" "$(jq -nc --arg url "$url" --arg reason "$_pr_gate_reason" \
+                '{url: $url, reason: $reason, note: "gh unavailable; scraped PR URL recorded without verification"}')"
+            echo "$url"
+            return 0
+        fi
+        _reject_scraped_pr_url "$url" "$_pr_gate_reason"
+    done <<FIN_URLS_EOF
+$urls
+FIN_URLS_EOF
+    return 0
 }
 
 # Authoritative: ask GitHub which open PR has the given branch as head in the
@@ -696,7 +908,7 @@ PV_EOF
         hit=$(prd_detect_pr "$work_dir" "$branch" "$base_ref" 2>/dev/null)
         _split_pr_hit "$hit"
         if [ -z "$hit_url" ] && [ -f "$log_path" ]; then
-            hit_url=$(_scrape_pr_url_filtered "$log_path" "$(_job_owner_repo)" "$log_offset_at_spawn")
+            hit_url=$(_finalize_scrape_pr_url)
             hit_kind="scrape"
         fi
         if [ -n "$hit_url" ]; then
@@ -1550,6 +1762,8 @@ chmod +x "$wrapper"
 # `mother await` call) and immediately start the post-result-grace timer,
 # reaping the worker 5 min later regardless of what it's actually doing.
 log_offset_at_spawn=0
+_pr_rejected_urls=""   # rejected-scrape memory is per spawn (see _reject_scraped_pr_url)
+_pr_transient_failures=""
 if [ -f "$log_path" ]; then
     log_offset_at_spawn=$(stat -f %z "$log_path" 2>/dev/null \
         || stat -c %s "$log_path" 2>/dev/null \
@@ -1673,11 +1887,7 @@ while [ ! -f "$marker_file" ]; do
             # Only scan log content written by THIS worker (past log_offset_at_spawn)
             # to avoid picking up PR URLs left by previous runs on the same log file
             # (e.g. escalation retries on the same job ID).
-            _live_pr_url=$(_scrape_pr_url_filtered "$log_path" "$(_job_owner_repo)" "$log_offset_at_spawn")
-            if [ -n "$_live_pr_url" ]; then
-                _job_update ".pr_url = \"$_live_pr_url\""
-                _append_event "pr_opened" "$(jq -nc --arg url "$_live_pr_url" '{url: $url}')"
-            fi
+            _live_capture_pr_url
         fi
 
         if [ "$final_result_epoch" -eq 0 ]; then

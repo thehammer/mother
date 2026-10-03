@@ -48,6 +48,26 @@ Operator-facing signals made trustworthy.
 
 ### Fixed
 
+- **Scraped PR URLs are verified before they are recorded.** The live poll-loop
+  capture and the finalization fallback used to take any same-repo
+  `github.com/<owner>/<repo>/pull/N` URL out of the worker transcript — so a doc
+  the worker merely *read* (e.g. a Read `tool_result` linking an already-merged
+  PR from another branch) became the job's `pr_url` and emitted `pr_opened`
+  seconds after `started`. Both paths now go through `_accept_scraped_pr_url`,
+  which accepts a URL only when the PR's head branch is the job's branch
+  (`expect_branch_mismatch` jobs accept any head) or the PR contains one of the
+  job's own commits, and always rejects a MERGED/CLOSED PR while the job has no
+  commits beyond `base_ref`. A rejection records nothing and emits
+  `pr_url_rejected {url, reason}` once per URL per spawn. Definitive reasons
+  (`head_branch_mismatch`, `merged_before_job_commits`,
+  `closed_before_job_commits`) are remembered — the live loop doesn't re-query
+  `gh`. Transient reasons (`pr_unresolved`, `evidence_indeterminate`,
+  `gh_unavailable`) carry `transient: true`, are not remembered, and are retried
+  on the next poll tick, up to 10 failures per URL per spawn
+  (`MOTHER_PR_TRANSIENT_RETRY_CAP`), after which finalization decides. With `gh` missing the
+  live path records nothing; finalization keeps its offline behavior and emits
+  `pr_url_unverified`. All candidate URLs are now tried newest-first, so a
+  valid PR isn't shadowed by an unrelated URL read later.
 - Teardown: healthy `pr_open`/`pr_open_live` waits no longer increment
   `deferrals` or write a `teardown_deferred` event every sweep.
 - Teardown: a job that never created a worktree (empty `work_dir`, no worktree

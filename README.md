@@ -378,7 +378,11 @@ Mother last looked (even if the `pr_url` it originally recorded has since
 been merged or closed) similarly defers as `pr_open_live`. A job whose worker
 shipped real work that Mother failed to detect can be recovered without a
 re-run via `mother reconcile <id> [--pr-url URL] [--auto] [--yes]` — see
-`CLAUDE.md`'s "PR detection" section for the full contract.
+`CLAUDE.md`'s "PR detection" section for the full contract. A PR URL that only
+appears in a worker's transcript (a doc it read, `gh pr list` output) is never
+recorded on its own: scraped URLs must be tied to the job by head branch or
+commit content, or they are dropped with a `pr_url_rejected` event (transient `gh` failures are
+flagged `transient: true` and retried rather than dropped for good).
 
 Teardown eligibility is independent of `MOTHER_ARCHIVE_OLDER_THAN`: the
 bulk sweep gives every terminal job a teardown attempt on every pass,
