@@ -561,6 +561,29 @@ second argument) — a HEAD identical to base is already on origin by
 construction, so without this precondition a worker that committed nothing
 would pass the check vacuously and report `succeeded` for no work at all.
 
+**Scraped URLs are gated, never trusted.** Both transcript-scrape paths — the
+live poll-loop capture (`_live_capture_pr_url`) and `_finalize_pr_url`'s
+last-resort fallback (`_finalize_scrape_pr_url`) — pass each candidate URL
+through `_accept_scraped_pr_url` (`bin/mother-run-job`). A URL in the log is not
+evidence the worker opened that PR: any doc, plan, `gh pr list` or `git log`
+output the worker reads can mention one (the 2026-10-03 incident: a Read
+`tool_result` linking an already-merged PR was recorded 23s after start). The
+gate accepts only when GitHub-side evidence ties the PR to this job — its
+`headRefName` equals the job's branch, `expect_branch_mismatch` is set, or
+`prd_pr_contains_sha` finds one of the job's commits **ahead of `base_ref`** —
+and always rejects a MERGED/CLOSED PR while the job has no commits beyond
+`base_ref`. Candidates are tried newest-first, so an unrelated URL read later
+can't shadow the real one. Rejections emit `pr_url_rejected` and record nothing;
+the live path remembers rejected URLs per spawn (`_pr_rejected_urls`), so a
+rejected URL is neither re-queried nor re-reported. With `gh` missing the live
+path records nothing; finalization keeps its pre-gate offline behavior and
+emits `pr_url_unverified`.
+
+| Event | Detail fields | When emitted |
+|---|---|---|
+| `pr_url_rejected` | `{url, reason}` — reason is `head_branch_mismatch`, `merged_before_job_commits`, `closed_before_job_commits`, `pr_unresolved`, `evidence_indeterminate` or `gh_unavailable` | A scraped PR URL failed the evidence gate; once per URL per spawn |
+| `pr_url_unverified` | `{url, reason: "gh_unavailable", note}` | Finalization recorded a scraped URL without verification because `gh` is missing |
+
 **`no_pr: true` jobs get their own, separate verification**
 (`_verify_no_pr_commits_or_fail`, called from `_verify_artifact_or_fail`
 instead of the push/PR logic above): a captured `pr_url` still short-circuits

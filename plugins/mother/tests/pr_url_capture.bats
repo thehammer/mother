@@ -946,3 +946,302 @@ GHEOF
     [[ "$output" =~ '"matched_sha":null' ]]
     [[ "$output" =~ '"expected":true' ]]
 }
+
+# ---------------------------------------------------------------------------
+# Scraped PR URLs must be tied to THIS job by evidence — _accept_scraped_pr_url
+# gates both the live poll-loop capture (_live_capture_pr_url) and the
+# finalization fallback (_finalize_scrape_pr_url). A URL that merely appears in
+# the transcript (e.g. in a Read tool_result for a doc that links an unrelated
+# PR) is not evidence the worker opened it. Bug: a job recorded an already-
+# merged PR from another branch 23s after starting.
+# ---------------------------------------------------------------------------
+
+# A repo whose feature branch has ZERO commits beyond base.
+# Usage: _gate_make_repo_no_commits <dir> <branch>
+_gate_make_repo_no_commits() {
+    local dir="$1" branch="$2"
+    git init -q "$dir"
+    git -C "$dir" config user.email "test@test.com"
+    git -C "$dir" config user.name "Test"
+    git -C "$dir" commit -q --allow-empty -m init
+    git -C "$dir" branch -M main
+    git -C "$dir" checkout -q -b "$branch"
+    git -C "$dir" remote add origin "https://github.com/thehammer/mother.git"
+}
+
+# Stub gh for the gate: every `pr view <url> --json state,headRefName` answers
+# "<state>\t<head>" for the URL's PR (given as url|state|head triples), every
+# `pr view <url> --json commits` answers the oids given in GATE_GH_COMMITS, and
+# every invocation is appended to $MOTHER_ROOT/gh-calls.log.
+# Usage: _gate_stub_gh "<url>|<STATE>|<head>" ...
+_gate_stub_gh() {
+    : > "$MOTHER_ROOT/gh-calls.log"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'echo "$*" >> "'"$MOTHER_ROOT"'/gh-calls.log"'
+        echo 'case "$*" in'
+        local spec url state head
+        for spec in "$@"; do
+            IFS='|' read -r url state head <<<"$spec"
+            echo "    *\"pr view $url --json state,headRefName\"*) printf '%s\\t%s\\n' '$state' '$head' ;;"
+            echo "    *\"pr view $url --json commits\"*) printf '%s\\n' \"\${GATE_GH_COMMITS:-}\" ;;"
+        done
+        echo '    *) exit 1 ;;'
+        echo 'esac'
+    } > "$_MOCK_BIN/gh"
+    chmod +x "$_MOCK_BIN/gh"
+}
+
+# Appends a stream-json tool_result event whose content mentions $2.
+# Usage: _gate_log_read_result <log> <url>
+_gate_log_read_result() {
+    jq -nc --arg c "| job | PR |
+| rwx stack | $2 |" \
+        '{type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:"toolu_1",content:$c}]}}' >> "$1"
+}
+
+_gate_event_count() {
+    local n
+    n=$(grep -c "\"kind\":\"$2\"" "$EVENTS_DIR/$1.jsonl" 2>/dev/null) || n=0
+    echo "$n"
+}
+
+_gate_bind() {
+    local _gid="$1" _grepo="$2" _gbranch="$3"
+    make_job "$_gid" "running" \
+        ".branch = \"$_gbranch\" | .base_ref = \"main\" | .isolation = \"worktree\" | .work_dir = \"$_grepo\""
+    _va_bind_context "$_gid" "$_gbranch" "main" "worktree" "$_grepo"
+    pr_url=""; _pr_rejected_urls=""
+    log_path="$MOTHER_ROOT/$_gid.log"; : > "$log_path"
+    log_offset_at_spawn=0
+}
+
+@test "live capture: a PR URL that only appears in a Read tool_result for a different branch's PR is rejected, not recorded" {
+    local repo="$MOTHER_ROOT/gate-repo-1"
+    _fin_make_repo "$repo" "feature/gate-1" "main"
+    local other="https://github.com/thehammer/mother/pull/5083"
+    _gate_stub_gh "$other|MERGED|chore/other-branch"
+    export GATE_GH_COMMITS="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+    _gate_bind "gate-job-1" "$repo" "feature/gate-1"
+    _gate_log_read_result "$log_path" "$other"
+
+    _live_capture_pr_url
+
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
+    [ "$(_gate_event_count gate-job-1 pr_opened)" = "0" ]
+    [ "$(_gate_event_count gate-job-1 pr_url_rejected)" = "1" ]
+    run grep '"pr_url_rejected"' "$EVENTS_DIR/gate-job-1.jsonl"
+    [[ "$output" =~ "\"url\":\"$other\"" ]]
+    [[ "$output" =~ "\"reason\":\"head_branch_mismatch\"" ]]
+}
+
+@test "live capture: a merged PR scraped while the job has no commits of its own is rejected (merged_before_job_commits)" {
+    local repo="$MOTHER_ROOT/gate-repo-2"
+    _gate_make_repo_no_commits "$repo" "feature/gate-2"
+    # Even the job's own branch name doesn't rescue a MERGED PR before any commit.
+    local pr="https://github.com/thehammer/mother/pull/5083"
+    _gate_stub_gh "$pr|MERGED|feature/gate-2"
+
+    _gate_bind "gate-job-2" "$repo" "feature/gate-2"
+    _gate_log_read_result "$log_path" "$pr"
+
+    _live_capture_pr_url
+
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
+    [ "$(_gate_event_count gate-job-2 pr_opened)" = "0" ]
+    run grep '"pr_url_rejected"' "$EVENTS_DIR/gate-job-2.jsonl"
+    [[ "$output" =~ "\"reason\":\"merged_before_job_commits\"" ]]
+}
+
+@test "live capture: a PR from another branch is rejected when the job has no commits, even if it contains the base commit" {
+    local repo="$MOTHER_ROOT/gate-repo-2b"
+    _gate_make_repo_no_commits "$repo" "feature/gate-2b"
+    local head_sha; head_sha=$(git -C "$repo" rev-parse HEAD)
+    local pr="https://github.com/thehammer/mother/pull/5083"
+    _gate_stub_gh "$pr|OPEN|chore/other"
+    export GATE_GH_COMMITS="$head_sha"
+
+    _gate_bind "gate-job-2b" "$repo" "feature/gate-2b"
+    _gate_log_read_result "$log_path" "$pr"
+
+    _live_capture_pr_url
+
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
+    run grep '"pr_url_rejected"' "$EVENTS_DIR/gate-job-2b.jsonl"
+    [[ "$output" =~ "\"reason\":\"head_branch_mismatch\"" ]]
+}
+
+@test "live capture: a gh pr create result whose head branch is the job's branch is captured and emits pr_opened once" {
+    local repo="$MOTHER_ROOT/gate-repo-3"
+    _fin_make_repo "$repo" "feature/gate-3" "main"
+    local pr="https://github.com/thehammer/mother/pull/900"
+    _gate_stub_gh "$pr|OPEN|feature/gate-3"
+
+    _gate_bind "gate-job-3" "$repo" "feature/gate-3"
+    jq -nc --arg c "$pr" \
+        '{type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:"toolu_2",content:$c}]}}' >> "$log_path"
+
+    _live_capture_pr_url
+
+    run jq -r '.pr_url' "$job_file"
+    [ "$output" = "$pr" ]
+    [ "$(_gate_event_count gate-job-3 pr_opened)" = "1" ]
+    [ "$(_gate_event_count gate-job-3 pr_url_rejected)" = "0" ]
+}
+
+@test "live capture: a PR on another branch is still accepted when it contains one of the job's own commits" {
+    local repo="$MOTHER_ROOT/gate-repo-3b"
+    _fin_make_repo "$repo" "feature/gate-3b" "main"
+    local head_sha; head_sha=$(git -C "$repo" rev-parse HEAD)
+    local pr="https://github.com/thehammer/mother/pull/901"
+    _gate_stub_gh "$pr|OPEN|landed-on-other-branch"
+    export GATE_GH_COMMITS="$head_sha"
+
+    _gate_bind "gate-job-3b" "$repo" "feature/gate-3b"
+    _gate_log_read_result "$log_path" "$pr"
+
+    _live_capture_pr_url
+
+    run jq -r '.pr_url' "$job_file"
+    [ "$output" = "$pr" ]
+}
+
+@test "live capture: a valid PR is not shadowed by an unrelated PR URL read later in the log" {
+    local repo="$MOTHER_ROOT/gate-repo-3c"
+    _fin_make_repo "$repo" "feature/gate-3c" "main"
+    local mine="https://github.com/thehammer/mother/pull/902"
+    local other="https://github.com/thehammer/mother/pull/5083"
+    _gate_stub_gh "$mine|OPEN|feature/gate-3c" "$other|MERGED|chore/other"
+    export GATE_GH_COMMITS="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+    _gate_bind "gate-job-3c" "$repo" "feature/gate-3c"
+    _gate_log_read_result "$log_path" "$mine"
+    _gate_log_read_result "$log_path" "$other"
+
+    _live_capture_pr_url
+
+    run jq -r '.pr_url' "$job_file"
+    [ "$output" = "$mine" ]
+    [ "$(_gate_event_count gate-job-3c pr_url_rejected)" = "1" ]
+}
+
+@test "live capture: repeated polls over the same rejected URL emit pr_url_rejected once and don't re-query gh" {
+    local repo="$MOTHER_ROOT/gate-repo-4"
+    _fin_make_repo "$repo" "feature/gate-4" "main"
+    local other="https://github.com/thehammer/mother/pull/5083"
+    _gate_stub_gh "$other|MERGED|chore/other-branch"
+    export GATE_GH_COMMITS="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+    _gate_bind "gate-job-4" "$repo" "feature/gate-4"
+    _gate_log_read_result "$log_path" "$other"
+
+    _live_capture_pr_url
+    local calls_after_first; calls_after_first=$(wc -l < "$MOTHER_ROOT/gh-calls.log")
+    _live_capture_pr_url
+    _live_capture_pr_url
+    _live_capture_pr_url
+
+    [ "$(_gate_event_count gate-job-4 pr_url_rejected)" = "1" ]
+    [ "$(wc -l < "$MOTHER_ROOT/gh-calls.log")" -eq "$calls_after_first" ]
+}
+
+@test "live capture: with gh missing nothing is recorded (the raw scrape is never trusted)" {
+    local repo="$MOTHER_ROOT/gate-repo-5"
+    _fin_make_repo "$repo" "feature/gate-5" "main"
+    local pr="https://github.com/thehammer/mother/pull/950"
+    rm -f "$_MOCK_BIN/gh"
+    command() {
+        if [ "${1:-}" = "-v" ] && [ "${2:-}" = "gh" ]; then return 1; fi
+        builtin command "$@"
+    }
+
+    _gate_bind "gate-job-5" "$repo" "feature/gate-5"
+    _gate_log_read_result "$log_path" "$pr"
+
+    _live_capture_pr_url
+
+    unset -f command
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
+    [ "$(_gate_event_count gate-job-5 pr_opened)" = "0" ]
+    run grep '"pr_url_rejected"' "$EVENTS_DIR/gate-job-5.jsonl"
+    [[ "$output" =~ "\"reason\":\"gh_unavailable\"" ]]
+}
+
+@test "_finalize_pr_url: a scraped URL for an unrelated PR is rejected (pr_url_rejected) and not recorded" {
+    local repo="$MOTHER_ROOT/gate-repo-6"
+    _fin_make_repo "$repo" "feature/gate-6" "main"
+    local other="https://github.com/thehammer/mother/pull/5083"
+    _gate_stub_gh "$other|MERGED|chore/other-branch"
+    export GATE_GH_COMMITS="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+    _gate_bind "gate-job-6" "$repo" "feature/gate-6"
+    _gate_log_read_result "$log_path" "$other"
+
+    _finalize_pr_url
+
+    [ "$pr_url" = "" ]
+    run jq -r '.pr_url // "null"' "$job_file"
+    [ "$output" = "null" ]
+    [ "$(_gate_event_count gate-job-6 pr_opened)" = "0" ]
+    [ "$(_gate_event_count gate-job-6 pr_url_rejected)" = "1" ]
+}
+
+@test "_finalize_pr_url: a scraped URL whose head branch is the job's branch is still captured via the fallback" {
+    local repo="$MOTHER_ROOT/gate-repo-7"
+    _fin_make_repo "$repo" "feature/gate-7" "main"
+    local pr="https://github.com/thehammer/mother/pull/960"
+    # `pr list` (prd_detect_pr's branch query) finds nothing; the scrape is
+    # the only route to the URL.
+    cat > "$_MOCK_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+    *"pr view $pr --json state,headRefName"*) printf 'OPEN\tfeature/gate-7\n' ;;
+    *"pr view $pr --json headRefName"*) echo "feature/gate-7" ;;
+    *) exit 0 ;;
+esac
+GHEOF
+    chmod +x "$_MOCK_BIN/gh"
+
+    _gate_bind "gate-job-7" "$repo" "feature/gate-7"
+    _gate_log_read_result "$log_path" "$pr"
+
+    _finalize_pr_url
+
+    [ "$pr_url" = "$pr" ]
+    [ "$(_gate_event_count gate-job-7 pr_opened)" = "1" ]
+    [ "$(_gate_event_count gate-job-7 pr_url_rejected)" = "0" ]
+}
+
+@test "_finalize_pr_url: with gh missing the scrape fallback behaves as before, plus a pr_url_unverified event" {
+    local repo="$MOTHER_ROOT/gate-repo-8"
+    _fin_make_repo "$repo" "feature/gate-8" "main"
+    local pr="https://github.com/thehammer/mother/pull/970"
+    rm -f "$_MOCK_BIN/gh"
+    command() {
+        if [ "${1:-}" = "-v" ] && [ "${2:-}" = "gh" ]; then return 1; fi
+        builtin command "$@"
+    }
+
+    _gate_bind "gate-job-8" "$repo" "feature/gate-8"
+    _gate_log_read_result "$log_path" "$pr"
+
+    # Offline, the scraped URL is picked up exactly as it was before the gate
+    # existed — (which then fails to resolve and is cleared, as it always was).
+    local picked; picked=$(_finalize_scrape_pr_url)
+    [ "$picked" = "$pr" ]
+
+    _finalize_pr_url
+    unset -f command
+
+    [ "$(_gate_event_count gate-job-8 pr_url_unverified)" -ge 1 ]
+    [ "$(_gate_event_count gate-job-8 pr_url_rejected)" = "0" ]
+    run grep '"pr_url_unverified"' "$EVENTS_DIR/gate-job-8.jsonl"
+    [[ "$output" =~ "\"url\":\"$pr\"" ]]
+    [[ "$output" =~ "\"reason\":\"gh_unavailable\"" ]]
+    assert_event_kind "gate-job-8" "pr_url_unresolved"
+}
