@@ -344,7 +344,7 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_ROOT` | `$HOME/.mother` | State dir (jobs, events, logs, locks) |
 | `MOTHER_WORKER_AGENT` | (auto) | Force a specific worker agent name |
 | `MOTHER_PREAMBLE_PATH` | `<plugin>/templates/preamble.md` | Capabilities preamble prepended to every worker's prompt; point at `/dev/null` to disable |
-| `MOTHER_CONCURRENCY` | `2` | Max parallel jobs |
+| `MOTHER_CONCURRENCY` | `2` | Max parallel jobs. Any `MOTHER_*` variable can also be set in `$MOTHER_ROOT/config.env` (`KEY=VALUE` lines; the environment wins) — unlike a hand-edited launchd plist, that survives `mother daemon install`. `mother status` shows the effective value and its source |
 | `MOTHER_POLL_INTERVAL` | `2` | Daemon tick interval (seconds) |
 | `MOTHER_SHUTDOWN_GRACE` | `30` | Seconds the daemon waits for children before exiting |
 | `MOTHER_ORPHAN_GRACE` | `60` | Seconds before treating a `running` job with no `worker_pid` as crashed |

@@ -52,6 +52,15 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/notify.sh" ]        && source "$MOTHER_LIB_DIR/notify.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/autostash.sh" ]     && source "$MOTHER_LIB_DIR/autostash.sh"
+[ -r "$MOTHER_LIB_DIR/rwx.sh" ]           && source "$MOTHER_LIB_DIR/rwx.sh"
+
+# Durable operator settings (${MOTHER_ROOT}/config.env) fill in anything the
+# environment doesn't set, so they survive `mother daemon install` re-rendering
+# the launchd plist. Must run before the defaults below.
+# shellcheck source=/dev/null
+source "$MOTHER_LIB_DIR/config.sh"
+mother_config_load
+MOTHER_CONCURRENCY_SOURCE=$(mother_config_source MOTHER_CONCURRENCY)
 
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
@@ -106,6 +115,16 @@ _publish_cli_path() {
     local cli="$MOTHER_BIN_DIR/mother" dir
     dir=$(cd "$(dirname "$cli")" 2>/dev/null && pwd -P) || return 0
     _atomic_write "$RUNNER_DIR/cli-path" "$dir/$(basename "$cli")"
+}
+
+# Publish the effective concurrency and where it came from (env | config file |
+# default) to $RUNNER_DIR/effective-config.json for `mother status`. Written
+# atomically at startup.
+_publish_effective_config() {
+    _atomic_write "$RUNNER_DIR/effective-config.json" "$(jq -nc \
+        --argjson pid "$$" --arg at "$(_iso_now)" \
+        --arg c "$MOTHER_CONCURRENCY" --arg src "$MOTHER_CONCURRENCY_SOURCE" \
+        '{pid: $pid, started_at: $at, concurrency: ($c | tonumber? // $c), concurrency_source: $src}')"
 }
 
 _remove_pidfile() {
@@ -423,6 +442,21 @@ _recover_orphans() {
         _log "auto-stash restore for orphaned $_rid: $_routcome"
     }
 
+    # A SIGKILLed supervisor never ran _rwx_post_exit, so its RWX sandbox keeps
+    # billing until the sandbox's own inactivity timeout. Stop it best-effort.
+    # Worktree jobs only: the stop is cwd+branch-keyed, and a main-dir checkout
+    # may be on the operator's branch by now.
+    _orphan_rwx_stop() {
+        local _sid="$1" _sjf="$2" _swd _sres
+        declare -F mother_rwx_sandbox >/dev/null || return 0
+        [ "$(jq -r '.isolation // empty' "$_sjf" 2>/dev/null)" = "worktree" ] || return 0
+        _swd=$(jq -r '.work_dir // empty' "$_sjf" 2>/dev/null)
+        [ -d "$_swd" ] && mother_rwx_gate "$_swd" >/dev/null || return 0
+        _sres=$(mother_rwx_sandbox stop "$_swd" 2>/dev/null) || return 0
+        printf '%s' "$_sres" | jq -e 'type == "object"' >/dev/null 2>&1 || return 0
+        _append_event "$_sid" "rwx_sandbox_stop" "$(printf '%s' "$_sres" | jq -c '. + {reason: "orphan"}')"
+    }
+
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state' "$f" 2>/dev/null) || continue
@@ -458,6 +492,7 @@ _recover_orphans() {
                 _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
                 _orphan_restore_autostash "$id" "$f"
+                _orphan_rwx_stop "$id" "$f"
             fi
         elif [ -n "$window" ]; then
             # Legacy path: jobs recorded before the headless-worker migration.
@@ -470,6 +505,7 @@ _recover_orphans() {
                 _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
                 _orphan_restore_autostash "$id" "$f"
+                _orphan_rwx_stop "$id" "$f"
             fi
         else
             # No worker_pid AND no tmux_window. Supervisor either died before
@@ -508,6 +544,7 @@ _recover_orphans() {
             _orphan_record_usage_row "$id" "$f" "$terminal_state"
             _job_transition "$id" "$terminal_state" "$terminal_reason"
             _orphan_restore_autostash "$id" "$f"
+            _orphan_rwx_stop "$id" "$f"
         fi
     done
 }
@@ -1482,8 +1519,9 @@ main() {
     _singleton_guard
     _write_pidfile
     _publish_cli_path
+    _publish_effective_config
     trap '_on_signal' TERM INT
-    _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY, poll=${MOTHER_POLL_INTERVAL}s)"
+    _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY [$MOTHER_CONCURRENCY_SOURCE], poll=${MOTHER_POLL_INTERVAL}s)"
     _recover_stale_locks
     _prune_temps_startup
     _recover_orphans
@@ -1500,6 +1538,13 @@ main() {
 # the daemon loop. Used by pipeline_driver.bats.
 # Usage: mother-runner --driver-tick
 case "${1:-}" in
+    --publish-config-tick)
+        # Test entry point: publish effective-config.json and exit without
+        # starting the daemon loop. Used by config.bats / launchd_plist.bats.
+        # Usage: mother-runner --publish-config-tick
+        _publish_effective_config
+        exit 0
+        ;;
     --driver-tick)
         _run_pipeline_job
         exit 0

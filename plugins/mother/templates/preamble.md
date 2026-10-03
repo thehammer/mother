@@ -114,6 +114,39 @@ Do not tear containers down yourself at the end of the job, and do not run
 `docker system prune` or anything like it — other Mother jobs and the
 operator's own interactive containers share this daemon.
 
+## RWX sandboxes (tests off the laptop)
+
+If the worktree has `.rwx/sandbox.yml`, run tests, lint and static analysis in that repo's RWX
+sandbox instead of the local Docker stack: `rwx sandbox exec -- <command>`. The repo's sandbox
+doc (linked from its `CLAUDE.md`) has the exact commands, timings and gotchas. Read it first.
+
+- Mother reset this worktree's sandbox when your attempt started and stops it when you exit.
+  Don't run `rwx sandbox stop` (never `--all`). Use `rwx sandbox reset --wait` only when the
+  repo doc says to (dependency or schema changes) or the sandbox is wedged. If you were resumed
+  or continued, the previous worker's exit stopped the sandbox, so your first exec starts a
+  fresh one (about 3 minutes cold); that is expected.
+- Local files are the source of truth: they sync up before each exec and the sandbox's changes
+  sync back after. **One exec at a time, and no file edits (yours or a subagent's) while an
+  exec runs.**
+- A patch-conflict error or `*.rej` file after an exec means your local version won. Read the
+  `.rej` (the sandbox's change), re-apply it by hand if you want it, delete the `.rej` files and
+  `.rwx/sandboxes/patch-rejected.diff`, and re-run. Never commit a `.rej`.
+- Give long execs `timeout: 600000` on the Bash call. Anything longer than ~10 minutes belongs
+  in an `rwx run`, not one exec.
+- **Before opening a PR**, run the repo's pre-PR RWX check (the repo doc names it; otherwise
+  `rwx run .rwx/pr-checks.yml --wait --fail-fast`). If the wait outlives your Bash call,
+  re-attach with `rwx results <run-id> --wait --fail-fast`. Fix real failures; list known
+  flakes you hit in the PR body.
+- **If RWX is unavailable** (`rwx` missing, `rwx whoami` fails, sandbox setup fails twice): say
+  so in your final message and the PR body ("tests not run in RWX: <error>"). Use the local
+  Docker stack only if it works, and say that you did. If you can't run tests anywhere,
+  `mother await` instead of shipping untested code.
+- **Egress policy (stated, not enforced; sandboxes have open internet):** reach only the hosts
+  the repo's sandbox doc allows. No partner APIs, no Carefeed staging/demo/production hosts,
+  no sending repo content or secrets anywhere. Tests fake HTTP.
+- When you delegate to Redd or Marty, tell them the worktree has an RWX sandbox and that these
+  rules apply.
+
 ---
 
 The rest of this prompt is your actual plan. Read on.

@@ -26,6 +26,23 @@ Operator-facing signals made trustworthy.
 - `--depends-on` waits for the dependency's **PR to merge** (or a `no_pr`
   dependency); `dep_wait` job field, `dependency_waiting` / `dependency_blocked`
   / `dependency_satisfied` events. Blocked dependents are never auto-cancelled.
+- **Durable daemon config** (`lib/config.sh`): `mother-runner` reads
+  `$MOTHER_ROOT/config.env` (`MOTHER_*=value` lines, parsed not sourced, env
+  vars win) before applying defaults, so `MOTHER_CONCURRENCY` survives
+  `mother daemon install` re-rendering the launchd plist. The installer moves an
+  existing plist's `MOTHER_CONCURRENCY` into `config.env` first (never lowering
+  it). `mother status` (and `scripts/doctor.sh`) print the effective
+  concurrency and its source (`env` / `config file` / `default`), published by
+  the runner to `runner/effective-config.json`.
+- **RWX sandbox lifecycle** (`lib/rwx.sh`): for repos that commit
+  `.rwx/sandbox.yml`, `mother-run-job` resets the job's RWX sandbox before the
+  first spawn of each fresh attempt (attempt key `escalation_count:retry_count`;
+  resume/continuation/rework/later pipeline phases keep it) and stops it after
+  every worker exit, before the main-dir stash restore and lock release.
+  Best-effort and time-bounded (`MOTHER_RWX_RESET_TIMEOUT` / `MOTHER_RWX_STOP_TIMEOUT`,
+  kill switch `MOTHER_RWX_SANDBOX_ENABLED=0`); recorded as `rwx_sandbox_reset` /
+  `rwx_sandbox_stop` events and the audit-only `rwx_sandbox` job field, never
+  affecting job outcome. The job preamble gains an "RWX sandboxes" section.
 - `mother-runner` publishes its CLI path to `runner/cli-path`; the hook prefers it.
 - `scripts/doctor.sh` warns when the plugin cache differs from the checkout.
 
