@@ -21,7 +21,7 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 # the same way. Responsibilities:
 #   - Resolve the target working directory (worktree or main dir).
 #   - Acquire a workspace lock if isolation=main-dir.
-#   - Spawn `claude --agent <worker_agent> -p "$(cat <plan>)"` as a headless
+#   - Spawn `claude --agent <worker_agent> -p < <plan>` (prompt on stdin, never argv) as a headless
 #     background process (nohup + disown) at that cwd, tee'd to the job log.
 #     The worker agent defaults to `cody` if the user has one in
 #     $work_dir/.claude/agents/ or ~/.claude/agents/ (so personal
@@ -1730,12 +1730,15 @@ echo
 # to the wrapper unblocks claude (gracefully on a healthy session, after
 # SIGKILL escalation from mother-run-job on a wedged one), 'wait' returns
 # its real exit code, and the marker file is written normally.
+# The prompt is fed on stdin from the plan file (never argv: argv is visible
+# to \`ps\` and EDR command-line scanners). The explicit redirect matters:
+# bash would otherwise give a backgrounded job /dev/null as stdin.
 claude_pid=""
 _forward_signal() {
     [ -n "\$claude_pid" ] && kill -TERM "\$claude_pid" 2>/dev/null || true
 }
 trap _forward_signal TERM INT
-claude --dangerously-skip-permissions --agent "$worker_agent" --model "$worker_model"$extra_claude_args_quoted$settings_args_quoted --session-id "$session_id" -p "\$(cat "$resolved_plan_path")" --output-format stream-json --verbose &
+claude --dangerously-skip-permissions --agent "$worker_agent" --model "$worker_model"$extra_claude_args_quoted$settings_args_quoted --session-id "$session_id" -p --output-format stream-json --verbose < "$resolved_plan_path" &
 claude_pid=\$!
 # wait may be interrupted by the trap (signal raises EINTR and bash returns
 # 128+sig); loop until claude is actually gone before recording its real

@@ -88,7 +88,7 @@ into `~/Library/LaunchAgents/`).
   - Main-dir jobs for a given repo serialize via `locks.sh` (`<repo>:workspace`).
 - Spawn executor:
   - **local-tmux** (v1): call `worktree_create` if isolation is worktree, open a new
-    tmux window at the target path, run `claude --agent mother:cody -p "$PLAN"` with
+    tmux window at the target path, run `claude --agent mother:cody -p < "$PLAN_FILE"` with
     `--max-cost` and `--output-format stream-json`, tee output to `logs/<id>.log`.
   - Parse the stream for known signals (PR URL created, cost updates, errors) and emit
     corresponding events.

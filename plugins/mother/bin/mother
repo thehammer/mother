@@ -2422,7 +2422,7 @@ EOF
     local review_log
     review_log="$LOGS_DIR/$id.review-${reviewer}-c$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null).log"
     ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" \
-        "${MOTHER_CLAUDE_ARGS[@]}" -p "$review_prompt" --output-format stream-json --verbose ) \
+        "${MOTHER_CLAUDE_ARGS[@]}" -p --output-format stream-json --verbose <<< "$review_prompt" ) \
         > "$review_log" 2>/dev/null || true
     # findings_extract/verdict text want the reviewer's plain-text response;
     # extract it from the last result event when the stream is stream-json,
@@ -2614,7 +2614,7 @@ cmd_adherence_review() {
     local adherence_log="$LOGS_DIR/$id.adherence-${adherence_attempt}.log"
     local raw_verdict
     claude --dangerously-skip-permissions --agent archie --model "$archie_model" \
-        "${MOTHER_CLAUDE_ARGS[@]}" -p "$review_prompt" --output-format stream-json --verbose \
+        "${MOTHER_CLAUDE_ARGS[@]}" -p --output-format stream-json --verbose <<< "$review_prompt" \
         > "$adherence_log" 2>/dev/null || true
 
     # Prefer the last stream-json result event's text; fall back to the raw
