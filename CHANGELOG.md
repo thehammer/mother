@@ -4,6 +4,11 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-04
+
+Version bump so `claude plugin update` refreshes caches that already hold 0.2.0. It picks up
+prompts-on-stdin (#43, listed under 0.2.0 Security below) and everything else merged since.
+
 ## [0.2.0] - unreleased
 
 Operator-facing signals made trustworthy.
