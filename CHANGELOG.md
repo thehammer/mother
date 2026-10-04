@@ -8,6 +8,15 @@ All notable changes to Mother are documented here. Format based on
 
 Operator-facing signals made trustworthy.
 
+### Security
+
+- **Prompts go to `claude` on stdin, never argv.** Workers (`mother-run-job`),
+  `review-phase` and `adherence-review` previously passed the whole plan/diff
+  as `-p "<text>"`, exposing it to `ps`, EDR command-line scanners (a diff
+  containing a curl probe tripped a ThreatDown alert) and `E2BIG`. They now
+  run `claude -p --output-format stream-json --verbose` with the prompt on
+  stdin. The plugin cache must be refreshed for the fix to take effect.
+
 ### Added
 
 - **Needs-attention list** (`lib/attention.sh`): `mother status` with no id now

@@ -4,6 +4,7 @@
 # Controlled by env vars:
 #   MOCK_CLAUDE_EXIT           exit code (default 0)
 #   MOCK_CLAUDE_ARGS_FILE      file to record args to (default: /tmp/mock-claude-args)
+#   MOCK_CLAUDE_STDIN_FILE     if set, the mock's stdin (the prompt) is recorded here
 #   MOCK_CLAUDE_STDOUT         text to print to stdout (optional)
 #   MOCK_CLAUDE_STDOUT_FILE    file whose contents are printed to stdout (optional).
 #                              Takes precedence over MOCK_CLAUDE_STDOUT when both are
@@ -18,6 +19,10 @@
 
 args_file="${MOCK_CLAUDE_ARGS_FILE:-/tmp/mock-claude-args}"
 exit_code="${MOCK_CLAUDE_EXIT:-0}"
+
+# Record stdin (the prompt) when asked. Only read it on request so a mock
+# invoked without redirected stdin can never block on a terminal.
+[ -n "${MOCK_CLAUDE_STDIN_FILE:-}" ] && cat > "$MOCK_CLAUDE_STDIN_FILE"
 
 # Record the full argument list.
 printf '%s\n' "$@" >> "$args_file"

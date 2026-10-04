@@ -46,8 +46,8 @@ between you and your agents, and never runs without explicit consent.
   and spawns workers. Managed via launchd on macOS.
 - `mother-run-job` **worker spawner** — sets up the worktree, composes the
   worker's prompt (capabilities preamble + resume context if applicable +
-  user's plan), spawns `claude --agent "$MOTHER_WORKER_AGENT" -p <prompt>`
-  (default: your local `cody` if you have one, else the plugin-shipped
+  user's plan), spawns `claude --agent "$MOTHER_WORKER_AGENT" -p < <prompt-file>`
+  (prompt on stdin, never argv; default agent: your local `cody` if you have one, else the plugin-shipped
   `mother:cody`) as a headless background process, tees the log, polls for
   completion. Verifies the artifact (PR URL or pushed branch) before
   marking succeeded — see _Reliability behaviors_ below.
