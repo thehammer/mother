@@ -46,8 +46,13 @@ teardown() {
 }
 
 _assert_prompt_on_stdin_only() {
+    # The mock ran and received the prompt on stdin.
+    [ -s "$MOCK_CLAUDE_ARGS_FILE" ]
     grep -q "$SENTINEL" "$MOCK_CLAUDE_STDIN_FILE"
-    ! grep -q "$SENTINEL" "$MOCK_CLAUDE_ARGS_FILE"
+    # `! cmd` never fails a bats test (errexit ignores negated commands), so assert explicitly.
+    if grep -q "$SENTINEL" "$MOCK_CLAUDE_ARGS_FILE"; then
+        echo "sentinel found on argv" >&2; return 1
+    fi
     # -p is a bare flag now: no prompt argument follows it.
     grep -qx -- "-p" "$MOCK_CLAUDE_ARGS_FILE"
 }
