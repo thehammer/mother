@@ -372,6 +372,25 @@ The `_pipeline_cycles_json` helper uses these events for timestamps. If they're 
   the raw job JSON passthrough — no Go change needed; the field reaches clients
   automatically once W4 writes it.
 
+## Preview stacks (lifecycle hooks)
+
+`lib/preview.sh` holds all preview logic (`mother preview …`, the stop function, the backend seam).
+Teardown hooks, all best-effort, watchdog-bounded and event-only (`preview_stop`, never `_transition`):
+
+| Hook | Where | Reason |
+|---|---|---|
+| `_preview_pre_spawn` | `mother-run-job`, right after `_rwx_pre_spawn` | `attempt_start`: only when a previous worker left a non-stopped `.preview` |
+| `_preview_post_exit` | `mother-run-job`, right after `_rwx_post_exit`, and in `_runner_died_trap` | `worker_exit`: after EVERY worker exit; skipped with `reason: newer_worker` when `.worker_pid` isn't ours |
+| `_orphan_preview_stop` | `mother-runner` orphan reaper, next to `_orphan_rwx_stop` | `orphan`: every isolation (a stack stop isn't keyed to a worktree) |
+
+`mother_preview_stop <job_id> <reason>` reads only the job record, never the worktree. It's a no-op
+without `.preview` or when already `stopped`, treats CLI `down` exit 2 as ok, writes `status`
+`stopped`/`stop_failed`, removes `$RUNNER_DIR/<job>.preview-secrets.json`, and appends `preview_stop
+{outcome: ok|error|timeout|skipped, backend, reason, exit_code, duration_s, output_tail}`. A failed
+`up` leaves a provisional record so the hooks still stop a launch that was dispatched before the CLI
+failed or timed out. `_preview_backend_up` / `_preview_backend_stop` are the only functions that know
+how to launch/stop; the operations backend is deferred behind them (see `docs/design.md`).
+
 ## Resume-answer continuity
 
 An operator's `mother resume <id> "<answer>"` reply to a `mother await` question

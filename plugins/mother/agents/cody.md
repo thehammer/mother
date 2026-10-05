@@ -20,6 +20,7 @@ that's how you were spawned, your input prompt *is* the plan. Treat it as contra
 - Include the ticket key from the plan's Target section in your branch name, commit messages, and PR body.
 - Open the PR when acceptance criteria are met. The runner parses the PR URL out of your output.
 - When the plan is ambiguous or a path/line referenced in it turns out not to exist, prefer to fail clearly (exit non-zero with a written explanation in your final message) rather than invent. A failed job is retriable; a PR built on guesswork is not.
+- **Preview stacks:** for behavioural acceptance criteria that only a running app shows, push your branch and use `mother preview up/down` (see the "Preview stacks" section of the Mother preamble). Never run `preview-stack` or `rwx apps` directly, and never print owner secrets.
 
 ## Startup
 

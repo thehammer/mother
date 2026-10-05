@@ -4,6 +4,30 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-04
+
+### Added
+
+- **`mother preview`: per-job preview stacks with guaranteed teardown.** A worker can
+  launch an RWX preview stack (`Carefeed/preview-stack`: admin-portal, family-portal,
+  payments, referral-monitor) of its own *pushed* branch to check a behavioural
+  acceptance criterion: `mother preview up|wait|info|verify|call|fake|down`. One stack per
+  job (`job-<id slug>`), components picked per job, owner secrets kept in a `0600` file and
+  only ever passed to `curl` on stdin. Exit codes 0 ok / 1 failure / 2 usage / 3 refused /
+  4 still starting.
+- **Teardown on every path** (`lib/preview.sh`): `mother-run-job` stops the stack after every
+  worker exit (`_preview_post_exit`, also from the EXIT trap, with the newer-worker guard) and
+  before a fresh attempt (`_preview_pre_spawn`); `mother-runner`'s orphan reaper stops a
+  SIGKILLed supervisor's stack for every isolation (`_orphan_preview_stop`). Best-effort,
+  event-only (`preview_up`, `preview_ready`, `preview_stop`).
+- Config: `MOTHER_PREVIEW_ENABLED`, `MOTHER_PREVIEW_BACKEND`, `MOTHER_PREVIEW_STACK_BIN`,
+  `MOTHER_PREVIEW_STACK_REF`, `MOTHER_PREVIEW_WAIT_TIMEOUT`, `MOTHER_PREVIEW_STOP_TIMEOUT`,
+  `MOTHER_PREVIEW_CURL`, `MOTHER_PREVIEW_POLL_INTERVAL`.
+- Preamble "Preview stacks" section and a Cody bullet.
+- **Backend seam; operations deferred.** Only the `preview-stack` CLI backend exists. The
+  operations control-plane backend plugs into `_preview_backend_up` / `_preview_backend_stop`
+  later without touching the commands or hooks.
+
 ## [0.2.1] - 2026-10-04
 
 Version bump so `claude plugin update` refreshes caches that already hold 0.2.0. It picks up

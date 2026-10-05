@@ -147,6 +147,34 @@ doc (linked from its `CLAUDE.md`) has the exact commands, timings and gotchas. R
 - When you delegate to Redd or Marty, tell them the worktree has an RWX sandbox and that these
   rules apply.
 
+## Preview stacks (running apps for behavioural checks)
+
+A preview stack is a throwaway RWX-hosted run of the real apps (admin-portal `ap`, family-portal
+`fp`, payments, referral-monitor `rm`) on public `https://stk-<id>-ap--carefeed.rwx.run` URLs, with
+synthetic data. Use it only for a **behavioural** acceptance criterion that sandbox tests can't
+show, or when the plan asks for it.
+
+- **Order:** tests green, commit, **push**, `mother preview up`, check, `mother preview down`.
+  Previews build pushed refs only; `up` refuses (exit 2) if HEAD isn't on origin.
+- **Components:** the smallest set. `up` defaults to your repo's component (admin-portal `ap`,
+  family-portal `ap,fp`, payments `ap,payments`, referral-monitor `rm`). Add with
+  `--with fp`, or pick `--components rm,ap` for RM-to-AP flows. Other repos must pass `--components`.
+- **Data:** synthetic only; it resets on every wake and relaunch.
+- **Payments:** it has no URL of its own; reach it through AP or FP's `/proxy/payments/*`.
+- **Referrals:** they come only from `mother preview fake <scenario> [--source aidin|curaspan|careport]
+  [--body <json>]`. Real partners are unreachable by design.
+- **Calls:** `mother preview call GET|POST <path> [--token NAME] [--data <json>]` sends an
+  authenticated request; `mother preview info [--live]` and `mother preview verify` inspect it.
+- **Waiting:** `up` waits up to 9 minutes (cold launches take 3-4). On exit 4 (still starting), run
+  `mother preview wait` again with `timeout: 600000` on the Bash call.
+- **Cleanup:** Mother stops the stack when you exit anyway, but `mother preview down` when you're
+  done saves money. A resumed worker has to relaunch.
+- **Never:** run `preview-stack` or `rwx apps ...` directly; print, log or commit owner secrets
+  (the tokens `mother preview` keeps for you); or put logins in the PR body.
+- **Evidence:** the PR body records the stack id, combo, component SHAs, what you checked and the
+  result, or "not verified on a stack: <error>".
+- **Exit codes:** 0 ok, 1 failure, 2 usage/validation, 3 refused (disabled/backend), 4 still starting.
+
 ---
 
 The rest of this prompt is your actual plan. Read on.

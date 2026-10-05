@@ -53,6 +53,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/autostash.sh" ]     && source "$MOTHER_LIB_DIR/autostash.sh"
 [ -r "$MOTHER_LIB_DIR/rwx.sh" ]           && source "$MOTHER_LIB_DIR/rwx.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/preview.sh" ]       && source "$MOTHER_LIB_DIR/preview.sh"
 
 # Durable operator settings (${MOTHER_ROOT}/config.env) fill in anything the
 # environment doesn't set, so they survive `mother daemon install` re-rendering
@@ -366,6 +368,9 @@ _recover_orphans() {
     fi
 
     local now_epoch; now_epoch=$(date +%s)
+    # Seconds this tick has spent stopping orphan preview stacks (capped by
+    # MOTHER_PREVIEW_SWEEP_BUDGET so a slow `down` can't stall the runner).
+    local _pv_spent=0 _pv_budget="${MOTHER_PREVIEW_SWEEP_BUDGET:-60}"
     local f state pid window id started_at started_at_sec started_epoch cancel_req
     local terminal_state terminal_reason
 
@@ -457,6 +462,33 @@ _recover_orphans() {
         _append_event "$_sid" "rwx_sandbox_stop" "$(printf '%s' "$_sres" | jq -c '. + {reason: "orphan"}')"
     }
 
+    # A SIGKILLed supervisor never ran _preview_post_exit, so a preview stack
+    # the worker launched is still up (it idles out after 10 minutes, but stop
+    # it now). Every isolation: a stack stop isn't keyed to a working directory
+    # and reads only the job record.
+    _orphan_preview_stop() {
+        local _pid="$1" _pjf="$2" _pt0=$SECONDS
+        declare -F mother_preview_stop >/dev/null || return 0
+        _orphan_has_live_preview "$_pjf" || return 0
+        mother_preview_stop "$_pid" orphan 2>/dev/null || true
+        _pv_spent=$((_pv_spent + SECONDS - _pt0))
+    }
+
+    _orphan_has_live_preview() {
+        [ -n "$(jq -r 'select(.preview != null and .preview.status != "stopped") | .id' "$1" 2>/dev/null)" ]
+    }
+
+    # True (and logged) when this tick's stop budget is spent and the job still
+    # has a live stack. The caller skips the job entirely: it stays `running`,
+    # so the next tick reaps it and stops its stack then.
+    _orphan_preview_defer() {
+        declare -F mother_preview_stop >/dev/null || return 1
+        [ "$_pv_spent" -ge "$_pv_budget" ] || return 1
+        _orphan_has_live_preview "$2" || return 1
+        _log "preview sweep budget (${_pv_budget}s) spent; leaving orphan $1 for the next tick"
+        return 0
+    }
+
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state' "$f" 2>/dev/null) || continue
@@ -488,11 +520,13 @@ _recover_orphans() {
                 if _supervisor_alive_for_job "$id"; then
                     continue
                 fi
+                if _orphan_preview_defer "$id" "$f"; then continue; fi
                 _log "marking $id $terminal_state (pid $pid gone; cancel_requested=$cancel_req)"
                 _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
                 _orphan_restore_autostash "$id" "$f"
                 _orphan_rwx_stop "$id" "$f"
+                _orphan_preview_stop "$id" "$f"
             fi
         elif [ -n "$window" ]; then
             # Legacy path: jobs recorded before the headless-worker migration.
@@ -501,11 +535,13 @@ _recover_orphans() {
                 continue
             fi
             if ! grep -Fxq "$window" <<< "$windows"; then
+                if _orphan_preview_defer "$id" "$f"; then continue; fi
                 _log "marking $id $terminal_state (window $window gone; cancel_requested=$cancel_req)"
                 _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
                 _orphan_restore_autostash "$id" "$f"
                 _orphan_rwx_stop "$id" "$f"
+                _orphan_preview_stop "$id" "$f"
             fi
         else
             # No worker_pid AND no tmux_window. Supervisor either died before
@@ -540,11 +576,13 @@ _recover_orphans() {
             if _supervisor_alive_for_job "$id"; then
                 continue
             fi
+            if _orphan_preview_defer "$id" "$f"; then continue; fi
             _log "marking $id $terminal_state (no worker_pid or tmux_window; cancel_requested=$cancel_req)"
             _orphan_record_usage_row "$id" "$f" "$terminal_state"
             _job_transition "$id" "$terminal_state" "$terminal_reason"
             _orphan_restore_autostash "$id" "$f"
             _orphan_rwx_stop "$id" "$f"
+            _orphan_preview_stop "$id" "$f"
         fi
     done
 }
