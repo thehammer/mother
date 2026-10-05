@@ -1012,6 +1012,28 @@ _rm_job() { _pv_job "$1" referral-monitor "feature/$1"; }
     grep -qF -- "|verify $(_url pvv1 ap)" "$PV_LOG"
 }
 
+@test "stopped stack: wait, call and verify exit 2 quickly without calling the CLI or HTTP" {
+    _pv_job pvx1 admin-portal feature/pvx1
+    _up_nowait
+    run mother preview down
+    [ "$status" -eq 0 ]
+    local cli_before; cli_before=$(_cli_calls)
+    local http_before; http_before=$(_http_calls)
+    local started=$SECONDS
+    run mother preview wait
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"stopped"* ]]
+    run mother preview call GET /x
+    [ "$status" -eq 2 ]
+    run mother preview verify
+    [ "$status" -eq 2 ]
+    run mother preview info --live
+    [ "$status" -eq 2 ]
+    [ $((SECONDS - started)) -lt 3 ]
+    [ "$(_cli_calls)" = "$cli_before" ]
+    [ "$(_http_calls)" = "$http_before" ]
+}
+
 @test "down stops the stack now (reason explicit), marks it stopped, and is idempotent" {
     _pv_job pvd1 admin-portal feature/pvd1
     _up_nowait
