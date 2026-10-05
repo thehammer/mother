@@ -140,8 +140,16 @@ _preview_tmp() {
     local dir; dir=$(_preview_runner_dir)
     mkdir -p "$dir" 2>/dev/null
     # Fall back to an unpredictable name in TMPDIR, never a fixed /tmp path.
-    (umask 077; mktemp "$dir/preview-out.tmp.XXXXXX" 2>/dev/null \
-        || mktemp "${TMPDIR:-/tmp}/preview-out.tmp.XXXXXX")
+    # The sibling .err file is created here too (0600) so CLI stderr never
+    # lands in a default-umask file.
+    (
+        umask 077
+        local t
+        t=$(mktemp "$dir/preview-out.tmp.XXXXXX" 2>/dev/null \
+            || mktemp "${TMPDIR:-/tmp}/preview-out.tmp.XXXXXX") || exit 1
+        : >"$t.err"
+        printf '%s' "$t"
+    )
 }
 
 # ---------------------------------------------------------------------------
@@ -201,7 +209,11 @@ _preview_backend_up() {
                 local sf; sf=$(_preview_secrets_file "${_pv_job_id:-unknown}")
                 mkdir -p "$(dirname "$sf")" 2>/dev/null
                 rm -f "$sf"
-                ( umask 077; jq -c '.owner_secrets' "$tmp" >"$sf.tmp.$$" ) && mv "$sf.tmp.$$" "$sf"
+                if ! { ( umask 077; jq -c '.owner_secrets' "$tmp" >"$sf.tmp.$$" ) 2>/dev/null \
+                        && mv "$sf.tmp.$$" "$sf" 2>/dev/null; }; then
+                    rm -f "$sf.tmp.$$" 2>/dev/null
+                    echo "mother preview: warning: could not write the owner-secrets file; 'call --token' and 'fake' will not work" >&2
+                fi
             fi
             jq -c --arg backend "$backend" '
                 {stack_id: .stack_id, backend: $backend, combo: .combo,

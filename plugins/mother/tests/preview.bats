@@ -1013,6 +1013,30 @@ _rm_job() { _pv_job "$1" referral-monitor "feature/$1"; }
     grep -qF -- "|verify $(_url pvv1 ap)" "$PV_LOG"
 }
 
+@test "a failed owner-secrets write warns on stderr and the launch still succeeds" {
+    _pv_job pvs9 referral-monitor feature/pvs9
+    # A neutral mv shim that refuses to place the secrets file.
+    cat > "$_MOCK_BIN/mv" <<'SHIM'
+#!/bin/sh
+for last; do :; done
+case "$last" in *.preview-secrets.json) exit 1 ;; esac
+exec /bin/mv "$@"
+SHIM
+    chmod +x "$_MOCK_BIN/mv"
+    run --separate-stderr mother preview up --components rm --no-wait
+    [ "$status" -eq 0 ]
+    [[ "$stderr" == *"owner-secrets"* ]]
+    [ ! -e "$RUNNER_DIR/pvs9.preview-secrets.json" ]
+}
+
+@test "_preview_tmp creates the captured-stderr file 0600 even under a permissive umask" {
+    umask 022
+    run bash -c 'source "$MOTHER_LIB_DIR/preview.sh"; umask 022; t=$(_preview_tmp); stat -f %Lp "$t.err" 2>/dev/null || stat -c %a "$t.err"; stat -f %Lp "$t" 2>/dev/null || stat -c %a "$t"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "600" ]
+    [ "${lines[1]}" = "600" ]
+}
+
 @test "verify that hangs is killed at MOTHER_PREVIEW_VERIFY_TIMEOUT and exits non-zero" {
     _pv_job pvv2 admin-portal feature/pvv2
     _up_nowait
