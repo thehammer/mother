@@ -21,12 +21,9 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 # the same way. Responsibilities:
 #   - Resolve the target working directory (worktree or main dir).
 #   - Acquire a workspace lock if isolation=main-dir.
-#   - Spawn `claude --agent <worker_agent> -p < <plan>` (prompt on stdin, never argv) as a headless
-#     background process (nohup + disown) at that cwd, tee'd to the job log.
-#     The worker agent defaults to `cody` if the user has one in
-#     $work_dir/.claude/agents/ or ~/.claude/agents/ (so personal
-#     customizations win), falling back to the plugin-shipped `mother:cody`
-#     for fresh installs. Override either way via MOTHER_WORKER_AGENT.
+#   - Spawn `claude --agent <worker_agent> -p` with the plan on stdin (never
+#     argv), nohup'd in the background at that cwd, tee'd to the job log. The
+#     worker agent defaults to the user's `cody` (else `mother:cody`); override: MOTHER_WORKER_AGENT.
 #     The pid is recorded on the job as `worker_pid`.
 #   - Poll a status-marker file; transition the job on exit.
 #   - On cancellation: SIGTERM the worker, wait 10s, then SIGKILL.

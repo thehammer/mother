@@ -11,6 +11,13 @@
 # These are pure helpers — no job-state writes, no events. The callers in
 # bin/mother-run-job own state and events. Sourced under `set -u`, bash 3.2.
 #
+# proc.sh (mother_kill_tree) lives next to this file. Resolve it from this file's own
+# location so it never depends on MOTHER_LIB_DIR being set; fail loudly if it's missing.
+_mother_rwx_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=proc.sh
+source "$_mother_rwx_lib_dir/proc.sh" || { echo "rwx.sh: cannot load $_mother_rwx_lib_dir/proc.sh" >&2; return 1 2>/dev/null || exit 1; }
+unset _mother_rwx_lib_dir
+
 # Sandbox identity is (current git branch, absolute config path), so every
 # call runs in a subshell cd'd to the job's work_dir.
 
@@ -81,12 +88,12 @@ mother_rwx_sandbox() {
     (
         sleep "$timeout"
         : >"$tmp.timeout"
-        _rwx_kill_tree "$probe_pid"
+        mother_kill_tree "$probe_pid"
     ) >/dev/null 2>&1 </dev/null &
     local watchdog_pid=$!
 
     wait "$probe_pid" 2>/dev/null
-    _rwx_kill_tree "$watchdog_pid"
+    mother_kill_tree "$watchdog_pid"
     wait "$watchdog_pid" 2>/dev/null
 
     local duration=$((SECONDS - started)) outcome exit_code=0
@@ -118,17 +125,5 @@ mother_rwx_sandbox() {
         --argjson exit_code "$exit_code" --argjson duration "$duration" --arg tail "$tail_text" \
         '{action: $action, command: $command, outcome: $outcome, exit_code: $exit_code,
           duration_s: $duration, output_tail: $tail}'
-    return 0
-}
-
-# _rwx_kill_tree <pid> — SIGKILL a background subshell and all its descendants
-# (the rwx process and whatever it spawned, or the watchdog's `sleep`),
-# children first. Never fails.
-_rwx_kill_tree() {
-    local pid="$1" kid
-    for kid in $(pgrep -P "$pid" 2>/dev/null); do
-        _rwx_kill_tree "$kid"
-    done
-    kill -9 "$pid" 2>/dev/null
     return 0
 }

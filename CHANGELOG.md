@@ -4,6 +4,20 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-05
+
+### Changed
+
+- `lib/preview.sh` no longer re-implements the kill-tree helper or the event/job-file
+  writers: `mother_kill_tree` now lives in `lib/proc.sh` (shared with `lib/rwx.sh`), and
+  `_preview_event` / `_preview_job_update` delegate to the state.sh primitives
+  (`mother_event_append` / `mother_job_update`, the latter now accepting extra jq args). No behaviour change.
+- Trimmed the `mother-run-job` header comment (prompts are on stdin).
+
+### Added
+
+- Test that the plugin, marketplace and changelog versions agree.
+
 ## [0.3.0] - 2026-10-04
 
 ### Added
