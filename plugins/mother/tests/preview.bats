@@ -35,7 +35,7 @@ FAKE_SHA="1111111111111111111111111111111111111111"
 setup() {
     setup_mother_env
     unset MOTHER_JOB_ID MOTHER_PREVIEW_ENABLED MOTHER_PREVIEW_BACKEND MOTHER_PREVIEW_STACK_REF
-    unset FAKE_PS_EXIT_UP FAKE_PS_EXIT_DOWN FAKE_PS_EXIT_VERIFY FAKE_PS_SLEEP_UP FAKE_PS_SLEEP_DOWN \
+    unset FAKE_PS_EXIT_UP FAKE_PS_EXIT_DOWN FAKE_PS_EXIT_VERIFY FAKE_PS_SLEEP_UP FAKE_PS_SLEEP_DOWN FAKE_PS_SLEEP_VERIFY MOTHER_PREVIEW_VERIFY_TIMEOUT \
           FAKE_PS_STDERR_UP FAKE_PS_TEXT_DOWN FAKE_RWX_RUN_STATUS
 
     export MOTHER_PREVIEW_STACK_BIN="$_MOCK_BIN/fake-preview-stack"
@@ -132,6 +132,7 @@ case "$sub" in
     exit "$ec"
     ;;
   verify)
+    [ "$sl" != "0" ] && exec sleep "$sl"
     echo "verify-output-marker ${2:-}"
     exit "$ec"
     ;;
@@ -1010,6 +1011,17 @@ _rm_job() { _pv_job "$1" referral-monitor "feature/$1"; }
     [ "$status" -eq 1 ]
     [[ "$output" == *"verify-output-marker $(_url pvv1 ap)"* ]]
     grep -qF -- "|verify $(_url pvv1 ap)" "$PV_LOG"
+}
+
+@test "verify that hangs is killed at MOTHER_PREVIEW_VERIFY_TIMEOUT and exits non-zero" {
+    _pv_job pvv2 admin-portal feature/pvv2
+    _up_nowait
+    export FAKE_PS_SLEEP_VERIFY=30 MOTHER_PREVIEW_VERIFY_TIMEOUT=2
+    local started=$SECONDS
+    run mother preview verify
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"timed out after 2s"* ]]
+    [ $((SECONDS - started)) -lt 15 ]
 }
 
 @test "stopped stack: wait, call and verify exit 2 quickly without calling the CLI or HTTP" {

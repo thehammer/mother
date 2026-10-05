@@ -732,7 +732,18 @@ mother_preview_verify() {
     _preview_need_record || return $?
     local bin
     bin=$(_preview_stack_bin) || { _preview_die 1 "preview-stack CLI not found (set MOTHER_PREVIEW_STACK_BIN)"; return 1; }
-    "$bin" verify "$_pv_url" </dev/null
+    local tmp rc=0 limit
+    limit=$(_preview_cfg MOTHER_PREVIEW_VERIFY_TIMEOUT 600)
+    tmp=$(_preview_tmp)
+    _preview_bounded "$limit" "." "$tmp" "$tmp.err" "$bin" verify "$_pv_url" || rc=$?
+    cat "$tmp" 2>/dev/null
+    cat "$tmp.err" >&2 2>/dev/null
+    rm -f "$tmp" "$tmp.err"
+    if [ "$rc" = "124" ]; then
+        _preview_die 1 "preview-stack verify timed out after ${limit}s"
+        return 1
+    fi
+    return "$rc"
 }
 
 mother_preview_call() {
