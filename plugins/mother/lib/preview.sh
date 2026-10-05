@@ -139,7 +139,9 @@ _preview_bounded() {
 _preview_tmp() {
     local dir; dir=$(_preview_runner_dir)
     mkdir -p "$dir" 2>/dev/null
-    (umask 077; mktemp "$dir/preview-out.tmp.XXXXXX" 2>/dev/null) || printf '/tmp/preview-out.tmp.%s' "$$"
+    # Fall back to an unpredictable name in TMPDIR, never a fixed /tmp path.
+    (umask 077; mktemp "$dir/preview-out.tmp.XXXXXX" 2>/dev/null \
+        || mktemp "${TMPDIR:-/tmp}/preview-out.tmp.XXXXXX")
 }
 
 # ---------------------------------------------------------------------------
