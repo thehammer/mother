@@ -30,6 +30,8 @@
 
 # config.env lookups (mother_config_get); lib/config.sh is only sourced by
 # bin/mother and bin/mother-runner, so pull it in for mother-run-job too.
+# shellcheck source=/dev/null
+[ -r "${MOTHER_LIB_DIR:-}/proc.sh" ] && source "$MOTHER_LIB_DIR/proc.sh"
 type mother_config_get >/dev/null 2>&1 \
     || { [ -r "${MOTHER_LIB_DIR:-}/config.sh" ] && source "$MOTHER_LIB_DIR/config.sh"; }
 
@@ -65,40 +67,16 @@ _preview_stack_bin() {
     printf '%s' "$bin"
 }
 
-# _preview_event <job_id> <kind> <detail-json> — append one event line.
-_preview_event() {
-    local jid="$1" kind="$2" detail="${3:-}" line path
-    [ -n "$detail" ] || detail='{}'
-    line=$(jq -nc --arg ts "$(_preview_now)" --arg kind "$kind" --argjson detail "$detail" \
-        '{ts: $ts, kind: $kind, detail: $detail}' 2>/dev/null) || return 1
-    path="$(_preview_events_dir)/$jid.jsonl"
-    _with_lock "$path" _append_line "$path" "$line"
-}
-
-# _preview_job_update <job_id> <jq-filter> [jq args...] — atomic job-file edit.
-_preview_job_update() {
-    local jid="$1" filter="$2" jf merged
-    shift 2
-    jf=$(_preview_job_file "$jid")
-    [ -f "$jf" ] || return 1
-    merged=$(jq "$@" "$filter" "$jf") || return 1
-    _atomic_write "$jf" "$merged"
-}
+# _preview_event / _preview_job_update are the shared state.sh primitives
+# (mother-run-job's own _append_event/_job_update are job-scoped, so use the
+# mother_* names).
+_preview_event()      { mother_event_append "$@"; }
+_preview_job_update() { mother_job_update "$@"; }
 
 # _preview_strip_tail <file...> — combined output, ANSI stripped, last 300 chars.
 _preview_strip_tail() {
     local esc; esc=$(printf '\033')
     cat "$@" 2>/dev/null | tr -d '\r' | sed "s/${esc}\\[[0-9;]*[A-Za-z]//g" | tail -c 300
-}
-
-# _preview_kill_tree <pid> — SIGKILL a background subshell and its descendants.
-_preview_kill_tree() {
-    local pid="$1" kid
-    for kid in $(pgrep -P "$pid" 2>/dev/null); do
-        _preview_kill_tree "$kid"
-    done
-    kill -9 "$pid" 2>/dev/null
-    return 0
 }
 
 # _preview_bounded <timeout_s> <cwd> <outfile> <errfile> <cmd> [args...]
@@ -118,11 +96,11 @@ _preview_bounded() {
     (
         sleep "$timeout"
         : >"$flag"
-        _preview_kill_tree "$pid"
+        mother_kill_tree "$pid"
     ) >/dev/null 2>&1 </dev/null &
     local wd=$!
     wait "$pid" 2>/dev/null
-    _preview_kill_tree "$wd"
+    mother_kill_tree "$wd"
     wait "$wd" 2>/dev/null
     if [ -f "$flag" ]; then
         rc=124

@@ -121,7 +121,11 @@ _append_line() {
 # Note: don't use ${3:-{\}} as the default — zsh parses the brace-escape
 # differently than bash, which fails with `command not found: jq` when
 # sourced into a zsh-run context (e.g. Claude Code's Bash tool on macOS).
-_append_event() {
+_append_event() { mother_event_append "$@"; }
+
+# Same as _append_event; the stable name for callers sourced into scripts that
+# define their own job-scoped `_append_event` (mother-run-job, lib/preview.sh).
+mother_event_append() {
     local id="$1" kind="$2" detail="${3:-}"
     [ -z "$detail" ] && detail='{}'
     local ev _eventpath
@@ -134,13 +138,17 @@ _append_event() {
 _job_exists() { [ -f "$(_job_path "$1")" ]; }
 
 # Merge a JSON patch into the job file (atomic read-modify-write).
-# Usage: _job_update <id> <jq-filter>
-_job_update() {
+# Usage: _job_update <id> <jq-filter> [jq args...]
+_job_update() { mother_job_update "$@"; }
+
+# Same as _job_update; stable name for the same reason as mother_event_append.
+mother_job_update() {
     local id="$1" filter="$2"
+    shift 2
     local _jobpath merged
     _jobpath=$(_job_path "$id")
     [ -f "$_jobpath" ] || { echo "mother: no such job: $id" >&2; return 1; }
-    merged=$(jq "$filter" "$_jobpath") || return 1
+    merged=$(jq "$@" "$filter" "$_jobpath") || return 1
     _atomic_write "$_jobpath" "$merged"
 }
 
