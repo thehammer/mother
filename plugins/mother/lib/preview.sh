@@ -384,6 +384,12 @@ _preview_need_record() {
         _preview_die 2 "no preview stack for this job (run 'mother preview up')"
         return 2
     fi
+    case "$(printf '%s' "$_pv_rec" | jq -r '.status // empty')" in
+        stopped|stop_failed)
+            _preview_die 2 "stack was stopped; run 'mother preview up'"
+            return 2
+            ;;
+    esac
     _pv_url=$(printf '%s' "$_pv_rec" | jq -r '.urls.stack // empty')
     if [ -z "$_pv_url" ]; then
         _preview_die 1 "the stack never finished launching: run 'mother preview up' again"
