@@ -209,3 +209,35 @@ _orphan_base_filter() {
     assert_job_field "$id" '.state' "failed"
     [ ! -s "$MOTHER_ROOT/preview-cli.log" ]
 }
+
+@test "orphan recovery: the preview sweep stops once its budget is spent and leaves the rest for the next tick" {
+    cat > "$_MOCK_BIN/fake-preview-stack" <<'FAKEPS'
+#!/usr/bin/env bash
+printf '%s|%s\n' "$(pwd -P)" "$*" >> "$MOTHER_ROOT/preview-cli.log"
+sleep 2
+exit 0
+FAKEPS
+    chmod +x "$_MOCK_BIN/fake-preview-stack"
+    export MOTHER_PREVIEW_STACK_BIN="$_MOCK_BIN/fake-preview-stack"
+    export MOTHER_PREVIEW_SWEEP_BUDGET=1
+    local a="pvbudgeta" b="pvbudgetb"
+    for id in "$a" "$b"; do
+        make_job "$id" "running" "$(_orphan_base_filter) | .isolation = \"worktree\" | $(_orphan_preview_rec "$id")"
+    done
+
+    run mother-runner --recover-orphans-tick 60
+    [ "$status" -eq 0 ]
+    # First orphan stopped (and reaped); the second is untouched this tick.
+    assert_job_field "$a" '.state' "failed"
+    assert_job_field "$a" '.preview.status' "stopped"
+    assert_job_field "$b" '.state' "running"
+    assert_job_field "$b" '.preview.status' "ready"
+    [ "$(grep -cF "|down job-$b" "$MOTHER_ROOT/preview-cli.log")" = "0" ]
+
+    # Next tick picks it up.
+    run mother-runner --recover-orphans-tick 60
+    [ "$status" -eq 0 ]
+    assert_job_field "$b" '.state' "failed"
+    assert_job_field "$b" '.preview.status' "stopped"
+    [ "$(grep -cF "|down job-$b" "$MOTHER_ROOT/preview-cli.log")" = "1" ]
+}
