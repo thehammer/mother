@@ -26,6 +26,7 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 #   mother cancel <id>
 #   mother retry <id>
 #   mother await [<id>] --question "..."
+#   mother preview up|wait|info|verify|call|fake|down
 #   mother resume <id> "<answer>" | --from-file <path> | -
 #   mother events [--since-cursor <session-id>] [--since <iso-ts>]
 #   mother drafts list|show <id>|rm <id>
@@ -63,6 +64,9 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/failure-route.sh" ]  && source "$MOTHER_LIB_DIR/failure-route.sh"
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/config.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/preview.sh" ]       && source "$MOTHER_LIB_DIR/preview.sh"
+type mother_preview_main >/dev/null 2>&1 || mother_preview_main() { echo "mother preview: lib/preview.sh is missing" >&2; return 1; }
 
 # ---------- CLI-only helpers ----------
 
@@ -2722,6 +2726,15 @@ cmd_adherence_review() {
 # Job id may be passed as a positional arg or via $MOTHER_JOB_ID — the
 # wrapper exports the latter so agents can call this without bookkeeping.
 
+# ---------- preview ----------
+#
+# `mother preview up|wait|info|verify|call|fake|down` — a per-job preview stack
+# for behavioural checks, stopped automatically when the worker exits. All the
+# logic lives in lib/preview.sh.
+cmd_preview() {
+    mother_preview_main "$@"
+}
+
 cmd_await() {
     local id="${MOTHER_JOB_ID:-}" question=""
     while [ $# -gt 0 ]; do
@@ -3728,6 +3741,8 @@ Usage:
   mother review-phase ID --reviewer AGENT    (run one pipeline reviewer: ada|archie|perri)
   mother merge-findings ID                   (merge per-reviewer findings into one array; stdout only)
   mother await [ID] --question TEXT          (worker-side: pause for operator input)
+  mother preview up|wait|info|verify|call|fake|down   (worker-side: per-job preview stack;
+                                              see "Preview stacks" below)
   mother resume ID ANSWER | --from-file PATH | -    (operator-side: answer + resume)
                                               [--max-cost USD|none]  (required to resume a
                                                cost-cap pause; also allowed on any resume)
@@ -3775,6 +3790,22 @@ Plan file requirements:
   model+effort for cody, redd, marty, perri (or skip: true). Valid models:
   haiku | sonnet | opus. Valid efforts: low | medium | high | xhigh | max.
   Downgrading below sonnet/medium requires "downgrade:" prefix in rationale.
+
+Preview stacks (for behavioural checks; Mother always stops them):
+  mother preview up [--components c,c] [--with c,c] [--ap|--fp|--payments|--rm REF]
+                    [--no-wait] [--json]   launch a stack of the job's PUSHED branch
+                                           (components: ap, fp, payments, rm; default
+                                           by repo) and wait until it is ready
+  mother preview wait [--timeout S]        keep waiting after exit 4 (still starting)
+  mother preview info [--live] | verify    inspect the stack
+  mother preview call GET|POST PATH [--token NAME] [--data JSON]
+  mother preview fake SCENARIO [--source aidin|curaspan|careport] [--body JSON]
+  mother preview down                      stop it now
+  Needs MOTHER_JOB_ID (operators: --job ID). Exit: 0 ok, 1 failure, 2 usage /
+  validation, 3 refused (disabled or backend unavailable), 4 still starting.
+  Stopped automatically after every worker exit, before a fresh attempt, and by
+  the runner's orphan sweep. Config (env or config.env): MOTHER_PREVIEW_ENABLED,
+  _BACKEND (cli), _STACK_BIN, _STACK_REF, _WAIT_TIMEOUT, _STOP_TIMEOUT.
 
 Escalation tier ladder:
   tier_0: sonnet/medium  →  tier_1: sonnet/high  →  tier_2: sonnet/xhigh
@@ -3977,6 +4008,7 @@ main() {
         review-phase)      cmd_review_phase "$@" ;;
         merge-findings)    _merge_reviewer_findings "${1:-}" ;;
         await)             cmd_await "$@" ;;
+        preview)           cmd_preview "$@" ;;
         resume)            cmd_resume "$@" ;;
         events)            cmd_events "$@" ;;
         drafts)            cmd_drafts "$@" ;;

@@ -155,6 +155,51 @@ mother resume <id> "Use option B (LRU). The traffic pattern is recency-skewed."
 Or, from inside tmux: hit your bound key (default `prefix Space`) and use the
 switcher.
 
+## Preview stacks (`mother preview`)
+
+A worker that has to check a *behavioural* acceptance criterion (something only a
+running app shows) can launch a **preview stack** of its own pushed branch, check
+it, and have Mother stop it however the job ends. A preview stack is an RWX app run
+from `Carefeed/preview-stack`: admin-portal (`ap`), family-portal (`fp`), payments
+and referral-monitor (`rm`) on public `https://stk-<id>-ap--carefeed.rwx.run` URLs
+with synthetic data. One stack per job, id `job-<job id slug>`, components picked per
+job, **pushed refs only** (never local patches).
+
+```
+mother preview up [--components c,c] [--with c,c] [--ap|--fp|--payments|--rm <ref>] [--no-wait] [--json]
+mother preview wait [--timeout <s>]        # keep waiting after exit 4
+mother preview info [--live]               # record (and the stack's /__stack/info)
+mother preview verify                      # preview-stack verify, exit code passed through
+mother preview call GET|POST <path> [--token <NAME>] [--data <json>]
+mother preview fake <scenario> [--source aidin|curaspan|careport] [--body <json>]
+mother preview down
+```
+
+Needs `MOTHER_JOB_ID` (workers have it) or `--job <id>`. `up` defaults the components
+from the job's repo (`admin-portal` → `ap`, `family-portal` → `ap,fp`, `payments` →
+`ap,payments`, `referral-monitor` → `rm`), refuses to launch unless HEAD is pushed, and
+waits until the stack's health endpoint reports this launch and the job's own component
+runs the expected SHA. Owner secrets (rm stacks) go to a `0600` file under
+`$MOTHER_ROOT/runner/` and are only ever handed to `curl` on stdin by
+`mother preview call` / `fake`; they never reach job JSON, events, argv or output.
+
+Exit codes: `0` ok, `1` failure, `2` usage/validation, `3` refused (disabled or backend
+unavailable), `4` still starting (run `mother preview wait`).
+
+**Teardown is guaranteed in layers:** `mother preview down`; `mother-run-job` stops the
+stack after *every* worker exit (success, failure, cancel, awaiting, continuation, crash);
+a fresh attempt stops a leftover stack before spawning; `mother-runner`'s orphan sweep stops
+a SIGKILLed supervisor's stack; and the stack idles out on its own after 10 minutes.
+Stops are best-effort, watchdog-bounded and emit `preview_stop` events only — they never
+change a job's state. A resumed worker has to relaunch (about 3-4 minutes).
+
+Config (env or `config.env`): `MOTHER_PREVIEW_ENABLED` (default `1`; `0` makes `up` exit 3,
+stops still run), `MOTHER_PREVIEW_BACKEND` (`cli`, the only value), `MOTHER_PREVIEW_STACK_BIN`
+(default `preview-stack` on PATH, else `~/Code/preview-stack/bin/preview-stack`),
+`MOTHER_PREVIEW_STACK_REF` (`main`), `MOTHER_PREVIEW_WAIT_TIMEOUT` (`540`),
+`MOTHER_PREVIEW_STOP_TIMEOUT` (`120`), `MOTHER_PREVIEW_CURL` (`curl`, a test seam),
+`MOTHER_PREVIEW_POLL_INTERVAL` (`10`, test seam).
+
 ## Works well with
 
 - **Redd** and **Marty** — optional companion agents for test-first and

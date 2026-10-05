@@ -370,6 +370,25 @@ Each phase is independently useful.
   now (mother-runner owns spawning for queued jobs). Launchers remain for
   deploying services and non-queue tmux orchestration.
 
+### Preview stacks
+
+`lib/preview.sh` backs `mother preview`: a per-job RWX preview stack
+(`Carefeed/preview-stack`) that a worker launches for behavioural checks and that
+Mother always stops. The record lives on the job as `.preview`
+(`{stack_id, backend, combo, components, refs, urls, run_id, run_url, launched_at, status,
+expected_sha, launches, stopped_at}`), with `preview_up` / `preview_ready` / `preview_stop`
+events. Teardown layers: `mother preview down`, `_preview_post_exit` after every worker exit
+(with the same newer-worker guard as the RWX sandbox stop), `_preview_pre_spawn` before a fresh
+attempt, and the runner's `_orphan_preview_stop` (every isolation).
+
+**Backend seam.** Only `_preview_backend_up` and `_preview_backend_stop` know how a stack is
+launched or stopped; the commands, hooks and runner go through them and the record stores
+`backend`. Only `cli` (the `preview-stack` CLI with `--via dispatch`) exists. The **operations
+control-plane backend is deferred** (`P4a-ops.md` plus a later Mother follow-up): it would add an
+`operations)` arm to each `case` and nothing else. Until then operations still sees these stacks
+through its discoverer (source `cli`, purpose `job`, `job-` id prefix) and its reconciler
+auto-stops `job` stacks after an hour asleep, a backstop behind Mother's own layers.
+
 ---
 
 ## Broker / IPC protocol (W1 + W2)

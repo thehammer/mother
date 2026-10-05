@@ -53,6 +53,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/autostash.sh" ]     && source "$MOTHER_LIB_DIR/autostash.sh"
 [ -r "$MOTHER_LIB_DIR/rwx.sh" ]           && source "$MOTHER_LIB_DIR/rwx.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/preview.sh" ]       && source "$MOTHER_LIB_DIR/preview.sh"
 
 # Durable operator settings (${MOTHER_ROOT}/config.env) fill in anything the
 # environment doesn't set, so they survive `mother daemon install` re-rendering
@@ -457,6 +459,17 @@ _recover_orphans() {
         _append_event "$_sid" "rwx_sandbox_stop" "$(printf '%s' "$_sres" | jq -c '. + {reason: "orphan"}')"
     }
 
+    # A SIGKILLed supervisor never ran _preview_post_exit, so a preview stack
+    # the worker launched is still up (it idles out after 10 minutes, but stop
+    # it now). Every isolation: a stack stop isn't keyed to a working directory
+    # and reads only the job record.
+    _orphan_preview_stop() {
+        local _pid="$1" _pjf="$2"
+        declare -F mother_preview_stop >/dev/null || return 0
+        [ -n "$(jq -r 'select(.preview != null and .preview.status != "stopped") | .id' "$_pjf" 2>/dev/null)" ] || return 0
+        mother_preview_stop "$_pid" orphan 2>/dev/null || true
+    }
+
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state' "$f" 2>/dev/null) || continue
@@ -493,6 +506,7 @@ _recover_orphans() {
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
                 _orphan_restore_autostash "$id" "$f"
                 _orphan_rwx_stop "$id" "$f"
+                _orphan_preview_stop "$id" "$f"
             fi
         elif [ -n "$window" ]; then
             # Legacy path: jobs recorded before the headless-worker migration.
@@ -506,6 +520,7 @@ _recover_orphans() {
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
                 _orphan_restore_autostash "$id" "$f"
                 _orphan_rwx_stop "$id" "$f"
+                _orphan_preview_stop "$id" "$f"
             fi
         else
             # No worker_pid AND no tmux_window. Supervisor either died before
@@ -545,6 +560,7 @@ _recover_orphans() {
             _job_transition "$id" "$terminal_state" "$terminal_reason"
             _orphan_restore_autostash "$id" "$f"
             _orphan_rwx_stop "$id" "$f"
+            _orphan_preview_stop "$id" "$f"
         fi
     done
 }

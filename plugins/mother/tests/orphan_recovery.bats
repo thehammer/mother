@@ -111,3 +111,101 @@ RWX
         "$EVENTS_DIR/job-rwx-orphan.jsonl"
     [ "$output" = "orphan" ]
 }
+
+# ---------------------------------------------------------------------------
+# Preview stacks: a SIGKILLed supervisor never ran _preview_post_exit, so the
+# runner's orphan sweep stops the stack (reason: orphan) — for EVERY isolation,
+# because `down` is keyed by stack id and never needs the worktree.
+
+_install_fake_preview_stack() {
+    cat > "$_MOCK_BIN/fake-preview-stack" <<'FAKEPS'
+#!/usr/bin/env bash
+printf '%s|%s\n' "$(pwd -P)" "$*" >> "$MOTHER_ROOT/preview-cli.log"
+exit 0
+FAKEPS
+    chmod +x "$_MOCK_BIN/fake-preview-stack"
+    export MOTHER_PREVIEW_STACK_BIN="$_MOCK_BIN/fake-preview-stack"
+}
+
+# jq assignment for a live (non-stopped) preview record on stack job-<id>.
+_orphan_preview_rec() {
+    local id="$1" status="${2:-ready}"
+    printf '%s' '.preview = {
+        stack_id: "job-'"$id"'", backend: "cli", combo: "ap", components: ["ap"],
+        refs: {ap: {ref: "feature/x", sha: "1111111111111111111111111111111111111111"}},
+        urls: {stack: "https://stk-job-'"$id"'-ap.example.invalid"},
+        run_id: "run-test-1", run_url: "https://cloud.example.invalid/runs/run-test-1",
+        launched_at: "2026-10-04T17:25:28Z", status: "'"$status"'", expected_sha: {},
+        launches: 1, stopped_at: null }'
+}
+
+_orphan_base_filter() {
+    printf '%s' '.worker_pid = null | .tmux_window = null | .started_at = "2000-01-01T00:00:00Z"'
+}
+
+@test "orphan recovery: stops the preview stack of a reaped worktree job (reason: orphan)" {
+    _install_fake_preview_stack
+    local id="pvorphanwt"
+    # The worktree is already gone: stopping a stack must not need it.
+    make_job "$id" "running" \
+        "$(_orphan_base_filter) | .isolation = \"worktree\" | .work_dir = \"$BATS_TEST_TMPDIR/gone-worktree\" | $(_orphan_preview_rec "$id")"
+    printf '{"seed":"x","tokens":{"ADMIN_API_TOKEN":"planted"}}' > "$RUNNER_DIR/$id.preview-secrets.json"
+
+    run mother-runner --recover-orphans-tick 60
+    [ "$status" -eq 0 ]
+
+    assert_job_field "$id" '.state' "failed"
+    [ "$(grep -cF "|down job-$id" "$MOTHER_ROOT/preview-cli.log")" = "1" ]
+    run jq -s -r '[.[] | select(.kind == "preview_stop")] | .[0].detail | "\(.reason) \(.outcome) \(.backend)"' \
+        "$EVENTS_DIR/$id.jsonl"
+    [ "$output" = "orphan ok cli" ]
+    assert_job_field "$id" '.preview.status' "stopped"
+    [ ! -e "$RUNNER_DIR/$id.preview-secrets.json" ]
+}
+
+@test "orphan recovery: stops the preview stack of a reaped main-dir job (reason: orphan)" {
+    _install_fake_preview_stack
+    local id="pvorphanmd"
+    local wd="$BATS_TEST_TMPDIR/maindir"
+    mkdir -p "$wd"
+    make_job "$id" "running" \
+        "$(_orphan_base_filter) | .isolation = \"main-dir\" | .work_dir = \"$wd\" | .repo_path = \"$wd\" | $(_orphan_preview_rec "$id")"
+    printf '{"seed":"x","tokens":{"ADMIN_API_TOKEN":"planted"}}' > "$RUNNER_DIR/$id.preview-secrets.json"
+
+    run mother-runner --recover-orphans-tick 60
+    [ "$status" -eq 0 ]
+
+    assert_job_field "$id" '.state' "failed"
+    [ "$(grep -cF "|down job-$id" "$MOTHER_ROOT/preview-cli.log")" = "1" ]
+    run jq -s -r '[.[] | select(.kind == "preview_stop")] | .[0].detail.reason' "$EVENTS_DIR/$id.jsonl"
+    [ "$output" = "orphan" ]
+    assert_job_field "$id" '.preview.status' "stopped"
+    [ ! -e "$RUNNER_DIR/$id.preview-secrets.json" ]
+}
+
+@test "orphan recovery: a reaped job that never launched a preview gets no stop call and no preview_stop event" {
+    _install_fake_preview_stack
+    local id="pvorphannone"
+    make_job "$id" "running" "$(_orphan_base_filter) | .isolation = \"worktree\""
+
+    run mother-runner --recover-orphans-tick 60
+    [ "$status" -eq 0 ]
+
+    assert_job_field "$id" '.state' "failed"
+    [ ! -s "$MOTHER_ROOT/preview-cli.log" ]
+    run jq -s '[.[] | select(.kind == "preview_stop")] | length' "$EVENTS_DIR/$id.jsonl"
+    [ "$output" = "0" ]
+}
+
+@test "orphan recovery: an already-stopped preview record is not stopped again" {
+    _install_fake_preview_stack
+    local id="pvorphandone"
+    make_job "$id" "running" \
+        "$(_orphan_base_filter) | .isolation = \"worktree\" | $(_orphan_preview_rec "$id" stopped)"
+
+    run mother-runner --recover-orphans-tick 60
+    [ "$status" -eq 0 ]
+
+    assert_job_field "$id" '.state' "failed"
+    [ ! -s "$MOTHER_ROOT/preview-cli.log" ]
+}
