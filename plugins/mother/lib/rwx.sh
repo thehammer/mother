@@ -11,8 +11,12 @@
 # These are pure helpers — no job-state writes, no events. The callers in
 # bin/mother-run-job own state and events. Sourced under `set -u`, bash 3.2.
 #
-# shellcheck source=/dev/null
-[ -r "${MOTHER_LIB_DIR:-}/proc.sh" ] && source "$MOTHER_LIB_DIR/proc.sh"
+# proc.sh (mother_kill_tree) lives next to this file. Resolve it from this file's own
+# location so it never depends on MOTHER_LIB_DIR being set; fail loudly if it's missing.
+_mother_rwx_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=proc.sh
+source "$_mother_rwx_lib_dir/proc.sh" || { echo "rwx.sh: cannot load $_mother_rwx_lib_dir/proc.sh" >&2; return 1 2>/dev/null || exit 1; }
+unset _mother_rwx_lib_dir
 
 # Sandbox identity is (current git branch, absolute config path), so every
 # call runs in a subshell cd'd to the job's work_dir.
