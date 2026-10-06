@@ -1727,6 +1727,7 @@ cmd_retry() {
         | .adherence_status = null
         | .adherence_notes = null
         | .adherence_attempts = 0
+        | .adherence_runs = 0
         | .failure_routed = null
         | (if $hold == 1 then .activity = null | .operator_hold = null else . end)
     ' "$job_file") || _die "retry: jq update failed"
@@ -1818,6 +1819,7 @@ cmd_escalate() {
         | .adherence_status = null
         | .adherence_notes = null
         | .adherence_attempts = 0
+        | .adherence_runs = 0
         | .force_start = null
     ' "$job_file") || _die "escalate: jq update failed"
     _atomic_write "$job_file" "$merged"
@@ -1985,6 +1987,7 @@ HITEOF
         | .adherence_status = null
         | .adherence_notes = null
         | .adherence_attempts = 0
+        | .adherence_runs = 0
         | .failure_reason = null
         | .failure_routed = null
         ' "$job_file") || _die "reconcile: jq update failed"
@@ -2534,7 +2537,15 @@ _merge_reviewer_findings() {
 # Reads the plan from events/<id>-plan.md, fetches the PR diff and CI summary,
 # constructs a structured prompt, and calls claude --agent archie in headless mode.
 # Parses the verdict (pass/fail) and stores it on the job JSON.
-# Returns 0 on pass, 1 on fail, 2 on error.
+# Returns 0 on pass, 1 on fail, 2 on error, 3 if the result could not be persisted.
+
+# Notes must reach jq via --arg; interpolating them into the filter broke on backslashes.
+_adherence_persist() {
+    local id="$1"; shift
+    _job_update "$id" "$@" && return 0
+    echo "mother: adherence-review: failed to persist result for $id" >&2
+    return 3
+}
 
 cmd_adherence_review() {
     local id="${1:-}"
@@ -2670,8 +2681,9 @@ cmd_adherence_review() {
 
     if [ "$verdict" = "pass" ]; then
         adherence_status="passed"
-        _job_update "$id" \
-            ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$(printf '%s' "$notes" | sed 's/"/\\"/g')\" | .adherence_pending = false | .adherence_attempts = $new_attempts"
+        _adherence_persist "$id" \
+            '.adherence_status = $status | .adherence_notes = $notes | .adherence_pending = false | .adherence_attempts = $attempts' \
+            --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts" || return 3
         _append_event "$id" "adherence_reviewed" \
             "$(jq -nc --arg verdict "pass" --arg notes "$notes" --argjson attempts "$new_attempts" \
                 '{verdict: $verdict, notes: $notes, attempts: $attempts}')"
@@ -2682,9 +2694,9 @@ cmd_adherence_review() {
         if [ "$esc_attempts" -eq 0 ]; then
             adherence_status="failed_first"
             # Store notes and pending_answer; runner re-queues with activity=cody_rework.
-            local notes_escaped; notes_escaped=$(printf '%s' "$notes" | sed 's/"/\\"/g')
-            _job_update "$id" \
-                ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$notes_escaped\" | .adherence_attempts = $new_attempts | .pending_answer = \"$notes_escaped\""
+            _adherence_persist "$id" \
+                '.adherence_status = $status | .adherence_notes = $notes | .adherence_attempts = $attempts | .pending_answer = $notes' \
+                --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts" || return 3
             _append_event "$id" "adherence_reviewed" \
                 "$(jq -nc --arg verdict "fail" --arg notes "$notes" --argjson attempts "$new_attempts" --arg status "$adherence_status" \
                     '{verdict: $verdict, notes: $notes, attempts: $attempts, status: $status}')"
@@ -2693,9 +2705,9 @@ cmd_adherence_review() {
         else
             adherence_status="blocked_for_human"
             # Transition to awaiting so the operator sees it in the statusline ?-count.
-            local notes_escaped; notes_escaped=$(printf '%s' "$notes" | sed 's/"/\\"/g')
-            _job_update "$id" \
-                ".adherence_status = \"$adherence_status\" | .adherence_notes = \"$notes_escaped\" | .adherence_attempts = $new_attempts | .adherence_pending = false | .activity = \"adherence_blocked\" | .state = \"awaiting\" | .paused_at = \"$(_iso_now)\" | .paused_reason = \"adherence_blocked\""
+            _adherence_persist "$id" \
+                '.adherence_status = $status | .adherence_notes = $notes | .adherence_attempts = $attempts | .adherence_pending = false | .activity = "adherence_blocked" | .state = "awaiting" | .paused_at = $paused_at | .paused_reason = "adherence_blocked"' \
+                --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts" --arg paused_at "$(_iso_now)" || return 3
             _append_event "$id" "adherence_reviewed" \
                 "$(jq -nc --arg verdict "fail" --arg notes "$notes" --argjson attempts "$new_attempts" --arg status "$adherence_status" \
                     '{verdict: $verdict, notes: $notes, attempts: $attempts, status: $status}')"

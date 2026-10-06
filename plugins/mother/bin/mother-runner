@@ -66,6 +66,7 @@ MOTHER_CONCURRENCY_SOURCE=$(mother_config_source MOTHER_CONCURRENCY)
 
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
+MOTHER_ADHERENCE_MAX_RUNS="${MOTHER_ADHERENCE_MAX_RUNS:-3}"  # review invocations per job before giving up
 MOTHER_SHUTDOWN_GRACE="${MOTHER_SHUTDOWN_GRACE:-30}"
 MOTHER_ARCHIVE_INTERVAL="${MOTHER_ARCHIVE_INTERVAL:-3600}"   # seconds between retention sweeps
 MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
@@ -991,7 +992,7 @@ _run_adherence_pending() {
     [ "$MOTHER_ADHERENCE_ENABLED" = "1" ] || return 0
 
     # Mark jobs that just succeeded with a PR url as adherence-pending.
-    local f state pr adherence_pending adherence_attempts id
+    local f state pr adherence_pending adherence_attempts adherence_status adherence_runs merged id
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
@@ -1003,7 +1004,7 @@ _run_adherence_pending() {
         adherence_status=$(jq -r '.adherence_status // empty' "$f" 2>/dev/null)
         # Skip if already reviewed or blocked.
         case "$adherence_status" in
-            passed|blocked_for_human) continue ;;
+            passed|blocked_for_human|error) continue ;;
         esac
         # Mark as pending if not already.
         if [ "$adherence_pending" != "true" ]; then
@@ -1059,6 +1060,17 @@ _run_adherence_pending() {
                 break  # one review-or-skip decision per tick, same as the review path
             fi
 
+            # Circuit breaker: count every invocation, even if the review never persists.
+            adherence_runs=$(jq -r '.adherence_runs // 0' "$f" 2>/dev/null)
+            if [ "$adherence_runs" -ge "$MOTHER_ADHERENCE_MAX_RUNS" ]; then
+                _log "adherence: $id hit review cap ($adherence_runs/$MOTHER_ADHERENCE_MAX_RUNS) without a recorded result — abandoning"
+                merged=$(jq '.adherence_pending = false | .adherence_status = "error"' "$f") && _atomic_write "$f" "$merged"
+                _append_event "$id" "adherence_error" \
+                    "$(jq -nc --argjson runs "$adherence_runs" '{reason: "review_cap_reached", runs: $runs}')"
+                break
+            fi
+            merged=$(jq '.adherence_runs = ((.adherence_runs // 0) + 1)' "$f") && _atomic_write "$f" "$merged"
+
             _log "running adherence review for $id (attempt=$adherence_attempts)"
             # NOTE: without `pipefail`, `if cmd | while read ...; then` tests the
             # exit status of the `while read` loop (the last command in the
@@ -1087,7 +1099,8 @@ _run_adherence_pending() {
                             | .pause_requested = null
                             | .final_result_at = null
                             | .force_start = null
-                        ' "$JOBS_DIR/$id.json") && _atomic_write "$JOBS_DIR/$id.json" "$merged"
+                        ' "$JOBS_DIR/$id.json") && _atomic_write "$JOBS_DIR/$id.json" "$merged" \
+                            || _log "adherence: failed to re-queue $id for cody_rework"
                         _append_event "$id" "adherence_rework_kicked" \
                             "$(jq -nc --arg id "$id" '{id: $id, note: "adherence failed first attempt; re-queuing with activity=cody_rework"}')"
                         _log "adherence failed for $id (first attempt) — re-queuing (activity=cody_rework)"
