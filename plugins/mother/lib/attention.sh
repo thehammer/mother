@@ -45,10 +45,16 @@ _attention_teardown_items() {
                 {kind: "teardown_stalled", job_id: .id, repo: (.repo // ""), branch: (.branch // ""),
                  reason: $reason, since: (.deferred_at // ""),
                  detail: {stall_deferrals: (.stall_deferrals // 0), deferrals: (.deferrals // 0),
-                          cap: $limit, work_dir: (.work_dir // ""), pr_url: (.pr_url // "")},
+                          cap: $limit, work_dir: (.work_dir // ""), pr_url: (.pr_url // ""),
+                          docker_pending: (.docker_pending // false),
+                          worktree_removed: (.worktree_removed // false)},
                  hint: ("mother teardowns  (pending teardown is stalled: " + $reason + ")"
                         + (if $reason == "unsafe_worktree" and (.work_dir // "") != ""
-                           then " — inspect " + .work_dir + " for unpushed/uncommitted work" else "" end))}
+                           then " — inspect " + .work_dir + " for unpushed/uncommitted work" else "" end)
+                        + (if (.docker_pending // false) == true
+                           then (if (.worktree_removed // false) == true then " — worktree already removed; " else " — " end)
+                                + "Docker resources are still pending (is Docker running?)"
+                           else "" end))}
               elif $healthy then
                 ((.open_pr.created_at // .open_pr.first_seen_open_at // "") as $since
                  | if $since != "" then
@@ -63,6 +69,36 @@ _attention_teardown_items() {
                    else empty end)
               else empty end' "$f" 2>/dev/null
     done
+}
+
+# Residue directories a teardown could not remove (root-owned files left by a
+# container, say). One item per record whose directory still exists; the hint
+# carries the suggested manual command. Mother never runs it (and never sudo).
+_attention_residue_items() {
+    local f
+    for f in "$RESIDUE_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local path; path=$(jq -r '.path // ""' "$f" 2>/dev/null)
+        [ -n "$path" ] && [ -d "$path" ] || continue
+        jq -c '{kind: "teardown_residue", job_id: .id, repo: (.repo // ""), branch: (.branch // ""),
+                reason: "residue_not_removable", since: (.since // ""),
+                detail: {path: .path, sub: (.sub // "")},
+                hint: ("could not remove " + .path + " — run: " + .command)}' "$f" 2>/dev/null
+    done
+}
+
+# Dispatch is paused while the volume holding the next job's repo is below
+# MOTHER_MIN_FREE_GB; mother-runner writes $RUNNER_DIR/low-disk.json while that
+# holds and removes it when space recovers.
+_attention_low_disk_items() {
+    local f="$RUNNER_DIR/low-disk.json"
+    [ -f "$f" ] || return 0
+    jq -c '{kind: "low_disk", job_id: "", repo: "", branch: "",
+            reason: ("Low disk: " + (.free_gb | tostring) + " GB free, dispatch paused"),
+            since: (.since // ""),
+            detail: {free_gb: .free_gb, threshold_gb: .threshold_gb, path: (.path // ""), repo_path: (.repo_path // "")},
+            hint: ("free space (mother gc, empty caches); dispatch resumes automatically above "
+                   + (.threshold_gb | tostring) + " GB — running jobs are not affected")}' "$f" 2>/dev/null
 }
 
 _attention_job_items() {
@@ -142,6 +178,8 @@ _attention_plugin_cache_items() {
 # mother_attention_items — print the needs-attention list as a JSON array.
 mother_attention_items() {
     { _attention_teardown_items
+      _attention_residue_items
+      _attention_low_disk_items
       _attention_job_items
       _attention_stash_items
       _attention_plugin_cache_items

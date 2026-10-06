@@ -352,10 +352,12 @@ GH
 NOTES:
 All good."
 
+    # The prompt reaches claude on stdin, not argv.
+    export MOCK_CLAUDE_STDIN_FILE="$MOTHER_ROOT/mock-claude-stdin"
     run mother adherence-review "adh-resume-15"
     [ "$status" -eq 0 ]
 
-    run cat "$MOCK_CLAUDE_ARGS_FILE"
+    run cat "$MOCK_CLAUDE_STDIN_FILE"
     [[ "$output" == *"## Operator Answers"* ]]
     [[ "$output" == *"Use envelope-first precedence, full stop."* ]]
 }
@@ -367,10 +369,11 @@ All good."
 NOTES:
 All good."
 
+    export MOCK_CLAUDE_STDIN_FILE="$MOTHER_ROOT/mock-claude-stdin"
     run mother adherence-review "adh-resume-16"
     [ "$status" -eq 0 ]
 
-    run cat "$MOCK_CLAUDE_ARGS_FILE"
+    run cat "$MOCK_CLAUDE_STDIN_FILE"
     [[ "$output" == *"(none recorded"* ]]
 }
 

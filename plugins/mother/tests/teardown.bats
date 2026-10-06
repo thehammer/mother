@@ -27,7 +27,7 @@
 #   6  isolation main-dir -> skipped main_dir         "isolation=main-dir never removes the checkout..."
 #   7  --dry-run                                      "--dry-run leaves worktree, pending queue..."
 #   8  drain via bulk archive                         "bulk archive drains a pending teardown record..."
-#   9  docker unreachable -> deferred                 "docker daemon unreachable defers teardown..."
+#   9  docker unreachable -> worktree removed, docker parked   "docker daemon unreachable no longer blocks worktree removal..."
 #   10 kill switch MOTHER_TEARDOWN_ENABLED=0          "MOTHER_TEARDOWN_ENABLED=0 skips teardown..."
 #   11 mother_compose_project sanitization             (unit tests, below)
 #   12 repo_path missing -> archive still exits 0     "archiving a job whose repo_path no longer exists..."
@@ -788,7 +788,7 @@ teardown() {
 
 # ---- 9. docker unreachable -> deferred ----
 
-@test "docker daemon unreachable defers teardown so the worktree survives for its compose state" {
+@test "docker daemon unreachable no longer blocks worktree removal; the docker half is parked as docker_pending" {
     export MOCK_GH_STATE="MERGED"
     export MOCK_DOCKER_INFO_EXIT=1
     local wt_dir
@@ -797,12 +797,16 @@ teardown() {
     run mother archive "e2e-docker-down"
     [ "$status" -eq 0 ]
 
-    [ -d "$wt_dir" ]
+    # The worktree (the disk hog) is gone even though docker is down...
+    [ ! -d "$wt_dir" ]
+    # ...and only the docker part is still pending.
     [ -f "$TEARDOWN_DIR/e2e-docker-down.json" ]
+    [ "$(jq -r '.docker_pending' "$TEARDOWN_DIR/e2e-docker-down.json")" = "true" ]
+    [ "$(jq -r '.worktree_removed' "$TEARDOWN_DIR/e2e-docker-down.json")" = "true" ]
 
     local events_file
     events_file=$(_find_events_file "e2e-docker-down")
-    run grep -F '"reason":"docker_unreachable"' "$events_file"
+    run grep -F '"reason":"docker_unreachable_worktree_done"' "$events_file"
     [ "$status" -eq 0 ]
 }
 

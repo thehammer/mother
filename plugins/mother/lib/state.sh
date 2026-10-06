@@ -18,6 +18,7 @@
 : "${RUNNER_DIR:=$MOTHER_ROOT/runner}"
 : "${ARCHIVE_DIR:=$MOTHER_ROOT/archive}"
 : "${TEARDOWN_DIR:=$MOTHER_ROOT/teardown-pending}"
+: "${RESIDUE_DIR:=$MOTHER_ROOT/teardown-residue}"   # unremovable worktree leftovers (see lib/teardown.sh)
 
 mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" "$CURSORS_DIR" "$RUNNER_DIR" "$ARCHIVE_DIR" "$TEARDOWN_DIR"
 

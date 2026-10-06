@@ -401,6 +401,9 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_TEARDOWN_DOCKER_ENABLED` | `1` | Include the job-scoped docker sweep in teardown |
 | `MOTHER_TEARDOWN_MAX_DEFERRALS` | `30` | Stalled deferrals (gh/docker unreachable, races, worktree errors — a still-open PR doesn't count) before a teardown is flagged for attention (never auto-deleted) |
 | `MOTHER_TEARDOWN_ALLOW_UNSAFE` | `0` | Restore unconditional force-removal, bypassing the unrecovered-work guard (uncommitted changes or commits on no remote) below |
+| `MOTHER_MIN_FREE_GB` | `20` | Pause dispatch (never running jobs) while the volume holding the next job's repo has less than this many GB free; shows as a `low_disk` needs-attention item and triggers one `mother gc` sweep (at most every `MOTHER_LOWDISK_GC_INTERVAL`, default 600s). `0` disables. Resumes automatically |
+| `MOTHER_GOCACHE_MAX_GB` | `10` | `mother gc` runs `go clean -cache` when the Go build cache is larger than this and no job is running |
+| `MOTHER_GC_ENABLED` | `1` | Run `mother gc` in the hourly sweep and on low disk (`0` to disable) |
 | `MOTHER_RECONCILE_ENABLED` | `1` | Let the daemon try `mother reconcile --auto` on a failed job before escalating it |
 | `MOTHER_RATE_LIMIT_CACHE` | `$MOTHER_ROOT/rate-limits.json` | Where the statusline writes 5h/7d quota state |
 | `MOTHER_QUOTA_CAP_5H_PCT` | `90` | Refuse new dispatches when the 5h window is at or over this percentage |
@@ -435,6 +438,31 @@ regardless of age, and only its JSON *record* waits for the age cutoff
 before moving into `archive/YYYY-MM/`. A job's worktree can be gone within
 the hour its PR merges even though the record it belongs to won't archive
 for another 30 days.
+
+### Teardown without Docker, and disk hygiene
+
+Worktree removal does not need Docker, so an unreachable Docker daemon no
+longer blocks it: teardown removes the worktree (the same unsafe-worktree and
+race checks apply) and parks the job as `docker_unreachable_worktree_done`
+with `docker_pending: true`. A later `mother teardowns --drain` or the hourly
+sweep retries only the Docker part. `mother teardowns` and `mother status`
+say "worktree removed; docker pending". After a worktree is removed, any
+leftover non-git directory (ignored/generated files) is deleted too; if that
+fails (e.g. root-owned files from a container) a `teardown_residue` event and
+a needs-attention item name the path and a suggested
+`docker run --rm -v <dir>:/x alpine rm -rf /x/<sub>` command. Mother never
+runs sudo.
+
+`mother gc [--dry-run]` is the hygiene sweep (also run hourly with the archive
+sweep and, rate-limited, when dispatch is paused for low disk). It removes
+Xcode DerivedData folders whose `WorkspacePath` no longer exists, runs
+`go clean -cache` when the Go cache exceeds `MOTHER_GOCACHE_MAX_GB` and no job
+is running (it skips, with a logged reason, when `go` is unavailable — e.g. an
+asdf shim with no version set), removes `$MOTHER_ROOT/tmp/<job-id>` for jobs
+that no longer have a live record, and reports (never touches) main-checkout
+Cargo `target/` dirs over 10 GB. Every worker runs with a job-scoped
+`TMPDIR=$MOTHER_ROOT/tmp/<job-id>`, removed at teardown. `/private/tmp` is
+never swept.
 
 ## Design
 

@@ -78,6 +78,22 @@ gate reason is `pr_merged` (content demonstrably reached upstream already) or
 when `MOTHER_TEARDOWN_ALLOW_UNSAFE=1` is set. See
 `.claude/bugs/resolved/2026-06-13-merged-job-worktrees-never-gc-d-target-dirs-exhaust-disk.md`.
 
+**Docker down does not block the worktree.** `_teardown_execute` runs
+`_teardown_docker` first but, when it returns 2 (unreachable), still runs
+`_teardown_worktree` (unsafe/race checks unchanged). It then parks the job with
+`docker_pending: true` + `worktree_removed` on the pending record — reason
+`docker_unreachable_worktree_done` if the worktree was removed this pass, legacy
+`docker_unreachable` if it was skipped. A pending record with `docker_pending`
+is drained by `_teardown_execute_docker_only`: no gate/race/unsafe/worktree
+steps, silent while Docker stays down, `teardown_completed` (`docker_completed:
+true`) when it finishes. After removal, `_teardown_remove_residue` deletes a
+leftover non-git dir (also an unregistered recorded `work_dir` with no `.git`);
+if `rm -rf` fails it is reported via `teardown_residue` + `$RESIDUE_DIR/<id>.json`
+(attention kind `teardown_residue`, suggested docker/sudo command, never run).
+`_teardown_remove_job_tmp` removes `$MOTHER_ROOT/tmp/<id>` (the worker's
+job-scoped `TMPDIR`) once the worktree step is done. `mother gc` (`lib/gc.sh`)
+is the separate hygiene sweep.
+
 **Container convention:** `mother-run-job` exports `COMPOSE_PROJECT_NAME`
 (job-scoped, derived by `mother_compose_project` in `lib/state.sh`) into
 every worker, so a plain `docker compose up` needs zero convention-following

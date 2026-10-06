@@ -23,8 +23,10 @@
 # sets TEARDOWN_LAST_STATUS (torn_down|deferred|skipped|failed) and
 # TEARDOWN_LAST_REASON in the caller's scope, in addition to its return code.
 # _teardown_worktree sets TEARDOWN_WORKTREE_SKIP_REASON (main_dir|already_absent)
-# when it returns 1. _teardown_drain sets TEARDOWN_DRAIN_IDS (space-delimited
-# job ids it attempted this pass) so cmd_archive's bulk loop can avoid a
+# when it returns 1, and TEARDOWN_RESIDUE_PATH/_SUB when a leftover non-git
+# directory could not be removed (see _teardown_remove_residue).
+# _teardown_drain sets TEARDOWN_DRAIN_IDS (space-delimited job ids it
+# attempted this pass) so cmd_archive's bulk loop can avoid a
 # second _teardown_execute for a job the drain already handled this sweep —
 # consulted by BOTH of that loop's branches: the teardown-only branch skips the
 # job entirely, and the archive branch still moves the record but tells
@@ -371,6 +373,19 @@ _teardown_worktree() {
     if [ -z "$real_target" ] \
         || ! (cd "$repo_path" && git worktree list --porcelain 2>/dev/null | grep -Fxq "worktree $real_target"); then
         ( cd "$repo_path" && worktree_prune ) >/dev/null 2>&1 || true
+        # Not a registered worktree. If a directory Mother recorded as this
+        # job's work_dir is still on disk with no .git (ignored/generated
+        # files left behind by an earlier removal), it is residue: clear it.
+        # Only a RECORDED work_dir qualifies — a path derived from the branch
+        # name is a guess, and a dir with a .git entry is never touched.
+        if [ -n "$work_dir" ] && [ -n "$real_target" ] && [ ! -e "$target/.git" ]; then
+            if [ "$dry_run" -eq 1 ]; then
+                echo "[dry-run] would remove residue directory $target"
+                return 0
+            fi
+            _teardown_remove_residue "$target" "$repo_path"
+            return 0
+        fi
         TEARDOWN_WORKTREE_SKIP_REASON="already_absent"
         return 1
     fi
@@ -386,7 +401,100 @@ _teardown_worktree() {
     ( cd "$repo_path" && worktree_remove "$target" true ) >/dev/null 2>&1
     ( cd "$repo_path" && worktree_prune )               >/dev/null 2>&1 || true
 
-    [ -d "$target" ] && return 2
+    if [ -d "$target" ]; then
+        # Still registered, or still a git checkout: the removal genuinely
+        # failed. Anything else is non-git residue (ignored/generated files).
+        if [ -e "$target/.git" ] \
+            || (cd "$repo_path" && git worktree list --porcelain 2>/dev/null | grep -Fxq "worktree $real_target"); then
+            return 2
+        fi
+        _teardown_remove_residue "$target" "$repo_path"
+    fi
+    return 0
+}
+
+# _teardown_remove_residue <dir> <repo_path> — rm -rf the non-git directory a
+# removed worktree left behind. Sets TEARDOWN_RESIDUE_PATH / TEARDOWN_RESIDUE_SUB
+# (both empty when the directory was fully removed). Never fails the caller: a
+# directory that cannot be removed (root-owned files from a container) is
+# reported through those variables so _teardown_execute can emit the residue
+# event and attention record. Never uses sudo.
+#
+# Refuses to remove (and reports the directory as residue instead) a path that
+# is not absolute, has `.`/`..`/empty components, is a symlink, or is / $HOME /
+# the repo / $MOTHER_ROOT or an ancestor of them: those are never directories
+# Mother created for a job.
+_teardown_remove_residue() {
+    local dir="$1" repo_path="$2"
+    TEARDOWN_RESIDUE_PATH=""; TEARDOWN_RESIDUE_SUB=""
+    while [ "${#dir}" -gt 1 ] && [ "${dir%/}" != "$dir" ]; do dir="${dir%/}"; done
+    local refuse=0 guard
+    case "$dir" in
+        /*) ;;
+        *) refuse=1 ;;
+    esac
+    case "$dir" in
+        */../*|*/./*|*/..|*/.|*//*) refuse=1 ;;
+    esac
+    for guard in "/" "${HOME:-/}" "$repo_path" "$MOTHER_ROOT"; do
+        [ -n "$guard" ] || continue
+        case "$guard/" in "$dir"/*) refuse=1 ;; esac
+    done
+    [ -L "$dir" ] && refuse=1
+    # A refused path is never removed, but it is not claimed as removed either:
+    # it is reported as residue so the operator sees it.
+    [ "$refuse" -eq 1 ] || rm -rf "$dir" >/dev/null 2>&1
+    if [ -d "$dir" ]; then
+        TEARDOWN_RESIDUE_PATH="$dir"
+        TEARDOWN_RESIDUE_SUB=$(ls -A "$dir" 2>/dev/null | head -1)
+    fi
+    return 0
+}
+
+# _teardown_residue_command <dir> <sub> — the suggested manual cleanup for a
+# residue directory Mother could not remove. Text only; Mother never runs it.
+# Names are shell-quoted (printf %q): <sub> is a file name from inside the
+# directory and is pasted by the operator.
+_teardown_residue_command() {
+    local dir="$1" sub="$2"
+    local qdir qsub
+    qdir=$(printf '%q' "$dir"); qsub=$(printf '%q' "$sub")
+    printf 'docker run --rm -v %s:/x alpine rm -rf /x/%s   (fallback: sudo rm -rf %s/%s)' \
+        "$qdir" "$qsub" "$qdir" "$qsub"
+}
+
+# _teardown_note_residue <facts_json> — if the last _teardown_worktree left
+# unremovable residue, emit a teardown_residue event and write the durable
+# record lib/attention.sh renders. No-op otherwise.
+_teardown_note_residue() {
+    local facts="$1"
+    [ -n "${TEARDOWN_RESIDUE_PATH:-}" ] || return 0
+    local id dir sub cmd
+    id=$(_facts_get "$facts" '.id')
+    dir="$TEARDOWN_RESIDUE_PATH"; sub="${TEARDOWN_RESIDUE_SUB:-}"
+    cmd=$(_teardown_residue_command "$dir" "$sub")
+    _teardown_event "$facts" "teardown_residue" \
+        "$(jq -nc --arg p "$dir" --arg s "$sub" --arg c "$cmd" '{path: $p, sub: $s, command: $c}')"
+    mkdir -p "$RESIDUE_DIR"
+    _atomic_write "$RESIDUE_DIR/$id.json" "$(printf '%s' "$facts" | jq -c \
+        --arg p "$dir" --arg s "$sub" --arg c "$cmd" --arg now "$(_iso_now)" \
+        '{id: .id, repo: (.repo // ""), branch: (.branch // ""), path: $p, sub: $s, since: $now, command: $c}')"
+}
+
+# _teardown_remove_job_tmp <facts_json> <dry_run> — remove the job-scoped
+# worker TMPDIR ($MOTHER_ROOT/tmp/<id>, created by mother-run-job). Only ever
+# that one directory: the id must be a plain name.
+_teardown_remove_job_tmp() {
+    local facts="$1" dry_run="${2:-0}" id
+    id=$(_facts_get "$facts" '.id // empty')
+    case "$id" in ''|*/*|.|..) return 0 ;; esac
+    local dir="$MOTHER_ROOT/tmp/$id"
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+    if [ "$dry_run" -eq 1 ]; then
+        echo "[dry-run] would remove job temp dir $dir"
+    else
+        rm -rf "$dir" 2>/dev/null || true
+    fi
     return 0
 }
 
@@ -643,6 +751,76 @@ _teardown_park() {
 
 # ---------- orchestrator ----------
 
+# _teardown_docker_counts <docker_summary_json> — echo "containers volumes
+# networks" from a _teardown_docker summary ("0 0 0" when it is empty or
+# unparseable). Read with: read -r c v n <<< "$(_teardown_docker_counts "$s")".
+_teardown_docker_counts() {
+    local summary="${1:-}" c=0 v=0 n=0
+    if [ -n "$summary" ]; then
+        c=$(printf '%s' "$summary" | jq -r '.containers // 0' 2>/dev/null) || c=0
+        v=$(printf '%s' "$summary" | jq -r '.volumes // 0' 2>/dev/null) || v=0
+        n=$(printf '%s' "$summary" | jq -r '.networks // 0' 2>/dev/null) || n=0
+    fi
+    echo "${c:-0} ${v:-0} ${n:-0}"
+}
+
+# _teardown_execute_docker_only <facts_json> <dry_run> -> 0 completed, 1 deferred.
+# Retry for a pending record with docker_pending=true (the worktree step was
+# finished or skipped on an earlier pass). Runs only _teardown_docker.
+#   docker reachable   -> teardown_completed event, pending record cleared
+#   still unreachable  -> stays parked, with NO new event (the first park
+#                         already reported it; a daemon retrying hourly for
+#                         days must not write thousands of identical events)
+#   docker skipped     -> (disabled / no docker CLI) nothing left to do: completed
+_teardown_execute_docker_only() {
+    local facts="$1" dry_run="${2:-0}"
+    local id; id=$(_facts_get "$facts" '.id')
+    if [ "$dry_run" -eq 1 ]; then
+        echo "[dry-run] would retry docker teardown for $id (worktree already removed)"
+        _teardown_docker "$facts" 1 >/dev/null 2>&1
+        TEARDOWN_LAST_STATUS="torn_down"; TEARDOWN_LAST_REASON="docker_pending_drained"
+        return 1
+    fi
+
+    # A retry/escalation re-uses the job id (and so the compose project): if
+    # the job is live again, its containers are not ours to remove. Wait until
+    # it is terminal again. (Quiet, like any other docker-pending re-park.)
+    local live_state=""
+    [ -f "$JOBS_DIR/$id.json" ] && live_state=$(jq -r '.state // ""' "$JOBS_DIR/$id.json" 2>/dev/null)
+    case "$live_state" in
+        ''|succeeded|failed|cancelled) ;;
+        *)
+            _teardown_park "$facts" "deferred" "job_active" "teardown_deferred" '{}' "" 0
+            return 1
+            ;;
+    esac
+
+    local docker_summary docker_status
+    docker_summary=$(_teardown_docker "$facts" 0)
+    docker_status=$?
+    if [ "$docker_status" -eq 2 ]; then
+        local reason="docker_unreachable"
+        [ "$(_facts_get "$facts" '.worktree_removed // false')" = "true" ] \
+            && reason="docker_unreachable_worktree_done"
+        _teardown_park "$facts" "deferred" "$reason" "teardown_deferred" '{}' "" 0
+        return 1
+    fi
+
+    local project work_dir wr containers volumes networks
+    project=$(mother_compose_project "$id")
+    work_dir=$(_facts_get "$facts" '.work_dir // ""')
+    wr=$(_facts_get "$facts" '.worktree_removed // false')
+    read -r containers volumes networks <<< "$(_teardown_docker_counts "${docker_summary:-}")"
+    TEARDOWN_LAST_STATUS="torn_down"; TEARDOWN_LAST_REASON="docker_pending_drained"
+    _teardown_event "$facts" "teardown_completed" \
+        "$(jq -nc --arg wp "$work_dir" --argjson wr "$wr" \
+            --arg cp "$project" --argjson c "${containers:-0}" --argjson v "${volumes:-0}" --argjson n "${networks:-0}" \
+            '{worktree_path: $wp, worktree_removed: $wr, docker_completed: true,
+              compose_project: $cp, containers: $c, volumes: $v, networks: $n}')"
+    _teardown_clear_pending "$id"
+    return 0
+}
+
 # _teardown_execute <facts_json> <dry_run> -> 0 completed, 1 deferred/skipped.
 # Sequence: enabled check -> gate -> race check -> docker -> worktree.
 # Dry run passes through every check but emits no events, writes no pending
@@ -664,6 +842,15 @@ _teardown_execute() {
         fi
         _teardown_park "$facts" "skipped" "disabled" "teardown_skipped" '{"reason":"disabled"}'
         return 1
+    fi
+
+    # The worktree was already removed on an earlier pass and only the Docker
+    # part is outstanding: retry just that. No gate / race / unsafe probe —
+    # nothing in the worktree is at risk any more and the compose project is
+    # job-scoped, so a branch reused by another job cannot be affected.
+    if [ "$(_facts_get "$facts" '.docker_pending // false')" = "true" ]; then
+        _teardown_execute_docker_only "$facts" "$dry_run"
+        return $?
     fi
 
     local gate reason gate_url=""
@@ -750,6 +937,7 @@ _teardown_execute() {
         echo "[dry-run] gate passed ($reason) for $id; would tear down docker + worktree"
         _teardown_docker "$facts" 1 >/dev/null 2>&1
         _teardown_worktree "$facts" 1 >/dev/null 2>&1
+        _teardown_remove_job_tmp "$facts" 1
         TEARDOWN_LAST_STATUS="torn_down"; TEARDOWN_LAST_REASON="$reason"
         return 1
     fi
@@ -757,21 +945,40 @@ _teardown_execute() {
     _teardown_event "$facts" "teardown_started" \
         "$(jq -nc --arg r "$reason" --arg pr "$pr_url" '{gate_reason: $r, pr_url: $pr}')"
 
+    # Docker first (a compose file it needs may live in the worktree), but an
+    # unreachable daemon no longer holds the worktree hostage: worktree removal
+    # does not need Docker, and a wedged Docker is exactly when disk is scarce.
     local docker_summary docker_status
     docker_summary=$(_teardown_docker "$facts" 0)
     docker_status=$?
-    if [ "$docker_status" -eq 2 ]; then
-        _teardown_park "$facts" "deferred" "docker_unreachable" "teardown_deferred" '{"reason":"docker_unreachable"}'
-        return 1
-    fi
 
     TEARDOWN_WORKTREE_SKIP_REASON=""
+    TEARDOWN_RESIDUE_PATH=""; TEARDOWN_RESIDUE_SUB=""
     local wt_status
     _teardown_worktree "$facts" 0
     wt_status=$?
 
     if [ "$wt_status" -eq 2 ]; then
         _teardown_park "$facts" "failed" "worktree_error" "teardown_failed" '{"stage":"worktree"}'
+        return 1
+    fi
+
+    _teardown_note_residue "$facts"
+    _teardown_remove_job_tmp "$facts" 0
+
+    if [ "$docker_status" -eq 2 ]; then
+        # Docker unreachable: park so that only the Docker part is retried.
+        local wt_removed=false park_reason="docker_unreachable"
+        if [ "$wt_status" -eq 0 ]; then
+            wt_removed=true; park_reason="docker_unreachable_worktree_done"
+        fi
+        local work_dir_p; work_dir_p=$(_facts_get "$facts" '.work_dir // ""')
+        local pending_facts
+        pending_facts=$(printf '%s' "$facts" | jq -c --argjson wr "$wt_removed" \
+            '. + {docker_pending: true, worktree_removed: $wr}')
+        _teardown_park "$pending_facts" "deferred" "$park_reason" "teardown_deferred" \
+            "$(jq -nc --arg r "$park_reason" --argjson wr "$wt_removed" --arg wp "$work_dir_p" \
+                '{reason: $r, worktree_removed: $wr, docker_pending: true, worktree_path: $wp}')"
         return 1
     fi
 
@@ -787,13 +994,7 @@ _teardown_execute() {
     local project work_dir containers volumes networks
     project=$(mother_compose_project "$id")
     work_dir=$(_facts_get "$facts" '.work_dir // ""')
-    if [ -n "${docker_summary:-}" ]; then
-        containers=$(printf '%s' "$docker_summary" | jq -r '.containers // 0' 2>/dev/null) || containers=0
-        volumes=$(printf '%s' "$docker_summary" | jq -r '.volumes // 0' 2>/dev/null) || volumes=0
-        networks=$(printf '%s' "$docker_summary" | jq -r '.networks // 0' 2>/dev/null) || networks=0
-    else
-        containers=0; volumes=0; networks=0
-    fi
+    read -r containers volumes networks <<< "$(_teardown_docker_counts "${docker_summary:-}")"
 
     TEARDOWN_LAST_STATUS="torn_down"; TEARDOWN_LAST_REASON="$reason"
     _teardown_event "$facts" "teardown_completed" \

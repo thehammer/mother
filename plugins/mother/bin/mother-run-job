@@ -1712,6 +1712,14 @@ wrapper="$RUNNER_DIR/$id.wrap"
 # state.sh). Computed here, not inside the heredoc, so it interpolates at
 # generation time like $branch/$worker_agent below.
 compose_project=$(mother_compose_project "$id")
+# Job-scoped TMPDIR for the worker: temp files (build scratch, test
+# fixtures, tool sockets) land under $MOTHER_ROOT/tmp/<id> instead of the
+# shared system temp dir, so teardown / `mother gc` can remove exactly this
+# job's leftovers and nothing else. Empty (no TMPDIR export) if it can't be made.
+job_tmp="$MOTHER_ROOT/tmp/$id"
+mkdir -p "$job_tmp" 2>/dev/null || job_tmp=""
+job_tmp_export=""
+[ -n "$job_tmp" ] && job_tmp_export="export TMPDIR=$(printf '%q' "$job_tmp")"
 
 # --effort + MCP-scope args (lib/usage.sh). Rendered at generation time
 # (the wrapper is a plain generated script, not a live shell) with printf
@@ -1754,6 +1762,8 @@ export MOTHER_ROOT="$MOTHER_ROOT"
 # zero convention-following required by the plan or the agent. Mother tears
 # this project down once the job's PR is merged/closed (see lib/teardown.sh).
 export COMPOSE_PROJECT_NAME="$compose_project"
+# Job-scoped scratch dir (created above; removed at teardown / by \`mother gc\`).
+$job_tmp_export
 # Export effort for agents that honor MOTHER_EFFORT (e.g. to set thinking budgets).
 export MOTHER_EFFORT="$worker_effort"
 echo "=== mother job $id starting at \$(date) ==="
