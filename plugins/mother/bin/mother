@@ -58,6 +58,7 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/usage.sh" ]         && source "$MOTHER_LIB_DIR/usage.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/teardown.sh" ]      && source "$MOTHER_LIB_DIR/teardown.sh"
+[ -r "$MOTHER_LIB_DIR/gc.sh" ]            && source "$MOTHER_LIB_DIR/gc.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/attention.sh" ]     && source "$MOTHER_LIB_DIR/attention.sh"
 # shellcheck source=/dev/null
@@ -3490,6 +3491,21 @@ cmd_prune_temps() {
     _prune_orphan_temps "$dry_run"
 }
 
+# `mother gc [--dry-run]` — the disk hygiene sweep (lib/gc.sh): orphaned Xcode
+# DerivedData, an oversized Go build cache, job-scoped temp dirs of archived
+# jobs. Also run by the daemon's hourly ride-along and, rate-limited, whenever
+# dispatch is paused for low disk.
+cmd_gc() {
+    local dry_run=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) dry_run=1; shift ;;
+            *) _die "unknown flag for gc: $1" ;;
+        esac
+    done
+    mother_gc "$dry_run"
+}
+
 # Archive terminal-state jobs. Two modes:
 #   mother archive <id>                    — archive one specific job now
 #   mother archive [--older-than DAYS] [--dry-run]  — bulk sweep by age
@@ -3632,8 +3648,16 @@ cmd_teardowns() {
             *)
                 cap="${MOTHER_TEARDOWN_MAX_DEFERRALS:-30}"
                 [ "$reason" = "worktree_probe_failed" ] && cap="${MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS:-2}"
-                printf '%-40s %-30s reason=%-24s stalls=%s/%s deferrals=%-4s deferred_at=%s\n' \
-                    "$id" "$branch" "$reason" "$stalls" "$cap" "$deferrals" "$deferred_at"
+                local dp_note=""
+                if [ "$(jq -r '.docker_pending // false' "$f")" = "true" ]; then
+                    if [ "$(jq -r '.worktree_removed // false' "$f")" = "true" ]; then
+                        dp_note="  [docker pending; worktree removed]"
+                    else
+                        dp_note="  [docker pending]"
+                    fi
+                fi
+                printf '%-40s %-30s reason=%-24s stalls=%s/%s deferrals=%-4s deferred_at=%s%s\n' \
+                    "$id" "$branch" "$reason" "$stalls" "$cap" "$deferrals" "$deferred_at" "$dp_note"
                 ;;
         esac
     done
@@ -3752,6 +3776,8 @@ Usage:
   mother broker status | path                (IPC broker diagnostics)
   mother archive [--older-than DAYS] [--dry-run]
   mother prune-temps [--dry-run]              (remove orphaned *.tmp.*/*.bak.* state files)
+  mother gc [--dry-run]                       (disk hygiene: orphaned Xcode DerivedData, oversized Go
+                                              build cache, archived jobs' temp dirs; reports big Cargo targets)
   mother teardowns [--drain] [--dry-run]      (list/retry pending worktree+docker teardowns)
   mother retro --since 60d|2w|36h|YYYY-MM-DD [--format table|json] [--backfill]
                                               (cost/outcome/failure retrospective report)
@@ -3826,6 +3852,15 @@ Daemon env vars:
                                                  failed job before escalating it
   MOTHER_ADHERENCE_ENABLED     (default: 1)    auto-adherence-review succeeded jobs (0 to disable)
   MOTHER_BROKER_ENABLED        (default: 1)    supervise the IPC broker sidecar (0 to disable)
+  MOTHER_MIN_FREE_GB           (default: 20)   pause dispatch (never running jobs) while the
+                                                 volume holding the next job's repo has less
+                                                 than this many GB free; one `mother gc` sweep
+                                                 is triggered at most every
+                                                 MOTHER_LOWDISK_GC_INTERVAL (600) seconds.
+                                                 0 disables the guard.
+  MOTHER_GOCACHE_MAX_GB        (default: 10)   `mother gc` runs `go clean -cache` when the Go
+                                                 build cache is larger and no job is running
+  MOTHER_GC_ENABLED            (default: 1)    run `mother gc` in the hourly sweep (0 to disable)
 
 Hook / events env vars:
   MOTHER_EVENTS_MAX_AGE_HOURS  (default: 6)    age floor for
@@ -4016,6 +4051,7 @@ main() {
         broker)            cmd_broker "$@" ;;
         archive)           cmd_archive "$@" ;;
         prune-temps)       cmd_prune_temps "$@" ;;
+        gc)                cmd_gc "$@" ;;
         teardowns)         cmd_teardowns "$@" ;;
         retro)             cmd_retro "$@" ;;
         run)               cmd_run "$@" ;;

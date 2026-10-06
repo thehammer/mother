@@ -16,6 +16,10 @@
 #                              Lets a test keep the "worker" alive long enough for
 #                              mother-run-job's poll loop to observe a few ticks
 #                              (e.g. cost-cap breach detection) before it exits.
+#   MOCK_CLAUDE_ENV_FILE       if set, the worker environment is recorded here as
+#                              KEY=VALUE lines (TMPDIR, TMPDIR_EXISTS=yes|no — whether
+#                              $TMPDIR is an existing directory at worker start —,
+#                              MOTHER_JOB_ID, PWD). Opt-in; used by job_tmpdir.bats.
 
 args_file="${MOCK_CLAUDE_ARGS_FILE:-/tmp/mock-claude-args}"
 exit_code="${MOCK_CLAUDE_EXIT:-0}"
@@ -23,6 +27,21 @@ exit_code="${MOCK_CLAUDE_EXIT:-0}"
 # Record stdin (the prompt) when asked. Only read it on request so a mock
 # invoked without redirected stdin can never block on a terminal.
 [ -n "${MOCK_CLAUDE_STDIN_FILE:-}" ] && cat > "$MOCK_CLAUDE_STDIN_FILE"
+
+# Record selected environment on request (opt-in; never touches a test that
+# does not set MOCK_CLAUDE_ENV_FILE).
+if [ -n "${MOCK_CLAUDE_ENV_FILE:-}" ]; then
+    {
+        echo "TMPDIR=${TMPDIR-}"
+        if [ -n "${TMPDIR-}" ] && [ -d "${TMPDIR-}" ]; then
+            echo "TMPDIR_EXISTS=yes"
+        else
+            echo "TMPDIR_EXISTS=no"
+        fi
+        echo "MOTHER_JOB_ID=${MOTHER_JOB_ID-}"
+        echo "PWD=$PWD"
+    } > "$MOCK_CLAUDE_ENV_FILE"
+fi
 
 # Record the full argument list.
 printf '%s\n' "$@" >> "$args_file"

@@ -63,6 +63,7 @@ source "$MOTHER_LIB_DIR/state.sh"
 source "$MOTHER_LIB_DIR/config.sh"
 mother_config_load
 MOTHER_CONCURRENCY_SOURCE=$(mother_config_source MOTHER_CONCURRENCY)
+MOTHER_MIN_FREE_GB_SOURCE=$(mother_config_source MOTHER_MIN_FREE_GB)
 
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
@@ -71,6 +72,10 @@ MOTHER_ARCHIVE_INTERVAL="${MOTHER_ARCHIVE_INTERVAL:-3600}"   # seconds between r
 MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
 MOTHER_ARCHIVE_TIMEOUT="${MOTHER_ARCHIVE_TIMEOUT:-300}"      # seconds before a stuck sweep is killed
 MOTHER_ATTENTION_INTERVAL="${MOTHER_ATTENTION_INTERVAL:-60}" # seconds between attention.json refreshes
+MOTHER_MIN_FREE_GB="${MOTHER_MIN_FREE_GB:-20}"               # pause dispatch below this much free disk (0 disables)
+MOTHER_LOWDISK_GC_INTERVAL="${MOTHER_LOWDISK_GC_INTERVAL:-600}" # min seconds between low-disk-triggered `mother gc` sweeps
+MOTHER_GC_ENABLED="${MOTHER_GC_ENABLED:-1}"                   # run `mother gc` hourly and on low disk (0 to disable)
+MOTHER_GC_TIMEOUT="${MOTHER_GC_TIMEOUT:-300}"                 # seconds before a stuck `mother gc` is killed
 MOTHER_NOTIFY_ENABLED="${MOTHER_NOTIFY_ENABLED:-1}"           # push when a job enters `awaiting` (0 to disable)
 MOTHER_NOTIFY_SCAN_INTERVAL="${MOTHER_NOTIFY_SCAN_INTERVAL:-60}" # seconds between awaiting scans
 MOTHER_AWAITING_REMIND_HOURS="${MOTHER_AWAITING_REMIND_HOURS:-24}" # reminder cadence for a job left awaiting
@@ -126,7 +131,9 @@ _publish_effective_config() {
     _atomic_write "$RUNNER_DIR/effective-config.json" "$(jq -nc \
         --argjson pid "$$" --arg at "$(_iso_now)" \
         --arg c "$MOTHER_CONCURRENCY" --arg src "$MOTHER_CONCURRENCY_SOURCE" \
-        '{pid: $pid, started_at: $at, concurrency: ($c | tonumber? // $c), concurrency_source: $src}')"
+        --arg mf "$MOTHER_MIN_FREE_GB" --arg mfsrc "$MOTHER_MIN_FREE_GB_SOURCE" \
+        '{pid: $pid, started_at: $at, concurrency: ($c | tonumber? // $c), concurrency_source: $src,
+          min_free_gb: ($mf | tonumber? // $mf), min_free_gb_source: $mfsrc}')"
 }
 
 _remove_pidfile() {
@@ -293,6 +300,114 @@ _pick_next_forced_ready() {
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | while read -r f; do
         jq -r 'select(.state == "ready" and (.force_start == true)) | .created_at + "\t" + .id' "$f"
     done | sort | head -1 | cut -f2
+}
+
+# ---------- low-disk dispatch guard ----------
+
+# _free_kb_for <path> — available KB on the volume holding <path> (nearest
+# existing parent when the path is gone; $MOTHER_ROOT as a last resort). Echoes
+# nothing and returns 1 when df can't tell us.
+_free_kb_for() {
+    local p="$1" kb
+    while [ -n "$p" ] && [ ! -d "$p" ] && [ "$p" != "/" ]; do p=$(dirname "$p"); done
+    [ -d "$p" ] || p="$MOTHER_ROOT"
+    kb=$(df -kP "$p" 2>/dev/null | tail -1 | awk '{print $4}')
+    case "${kb:-}" in ''|*[!0-9]*) return 1 ;; esac
+    echo "$kb"
+}
+
+# _run_gc_bounded — run `mother gc` under a watchdog (same pattern as
+# _maybe_archive: `_loop` is single-threaded, a wedged sweep must not stall it).
+_run_gc_bounded() {
+    [ "${MOTHER_GC_ENABLED:-1}" = "1" ] || return 0
+    local flag="$RUNNER_DIR/gc-timed-out.flag"
+    rm -f "$flag"
+    (
+        "$MOTHER_BIN_DIR/mother" gc 2>&1 | while read -r line; do _log "gc: $line"; done
+    ) &
+    local gc_pid=$!
+    (
+        sleep "$MOTHER_GC_TIMEOUT"
+        kill -9 "$gc_pid" 2>/dev/null && : > "$flag"
+    ) &
+    local watchdog_pid=$!
+    wait "$gc_pid" 2>/dev/null
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    if [ -f "$flag" ]; then
+        _log "gc: sweep exceeded ${MOTHER_GC_TIMEOUT}s, killed pid $gc_pid"
+        rm -f "$flag"
+    fi
+}
+
+# Hygiene sweep triggered by low disk: at most once per MOTHER_LOWDISK_GC_INTERVAL.
+_lowdisk_gc() {
+    [ "${MOTHER_GC_ENABLED:-1}" = "1" ] || return 0
+    local marker="$RUNNER_DIR/last-lowdisk-gc.ts" now last=0
+    now=$(date +%s)
+    [ -f "$marker" ] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ $((now - last)) -ge "${MOTHER_LOWDISK_GC_INTERVAL:-600}" ]; then
+        echo "$now" > "$marker"
+        _log "low disk: running hygiene sweep (mother gc)"
+        _run_gc_bounded
+    fi
+}
+
+# _disk_check <repo_path> -> 0 dispatch OK, 1 low disk (dispatch paused).
+# Maintains $RUNNER_DIR/low-disk.json (read by lib/attention.sh): written while
+# low, removed when space recovers. Only dispatch is gated — nothing here ever
+# touches a running job. Fails open when free space can't be read.
+_disk_check() {
+    local repo_path="$1"
+    local state="$RUNNER_DIR/low-disk.json"
+    local min_gb="${MOTHER_MIN_FREE_GB:-20}"
+    case "$min_gb" in ''|*[!0-9]*) min_gb=20 ;; esac
+
+    local kb=""
+    if [ "$min_gb" -gt 0 ]; then
+        kb=$(_free_kb_for "$repo_path") || kb=""
+    fi
+    if [ -z "$kb" ] || [ "$kb" -ge $((min_gb * 1048576)) ]; then
+        if [ -f "$state" ]; then
+            rm -f "$state"
+            _log "low disk: cleared — dispatch resumed"
+            type mother_attention_write >/dev/null 2>&1 && mother_attention_write 2>/dev/null
+        fi
+        return 0
+    fi
+
+    local free_gb=$((kb / 1048576)) since="" announce=0
+    if [ -f "$state" ]; then
+        since=$(jq -r '.since // ""' "$state" 2>/dev/null)
+    else
+        announce=1
+    fi
+    [ -n "$since" ] || since=$(_iso_now)
+    _atomic_write "$state" "$(jq -nc --argjson free "$free_gb" --argjson thr "$min_gb" \
+        --arg path "$repo_path" --arg since "$since" --arg now "$(_iso_now)" \
+        '{free_gb: $free, threshold_gb: $thr, path: $path, repo_path: $path, since: $since, checked_at: $now}')"
+    if [ "$announce" -eq 1 ]; then
+        _log "low disk: ${free_gb} GB free (< ${min_gb} GB) — dispatch paused; running jobs untouched"
+        type mother_attention_write >/dev/null 2>&1 && mother_attention_write 2>/dev/null
+    fi
+    _lowdisk_gc
+    return 1
+}
+
+# _disk_dispatch_ok <job_id> — the guard for one about-to-be-spawned job.
+_disk_dispatch_ok() {
+    local repo_path
+    repo_path=$(jq -r '.repo_path // ""' "$JOBS_DIR/$1.json" 2>/dev/null)
+    _disk_check "$repo_path"
+}
+
+# With nothing ready to dispatch, still re-check a standing low-disk pause so
+# the attention item clears once space recovers.
+_disk_recheck_idle() {
+    local state="$RUNNER_DIR/low-disk.json"
+    [ -f "$state" ] || return 0
+    _disk_check "$(jq -r '.repo_path // ""' "$state" 2>/dev/null)" || true
 }
 
 # ---------- spawning ----------
@@ -654,6 +769,10 @@ _maybe_archive() {
         if [ -f "$timeout_flag" ]; then
             _log "archive: sweep exceeded ${MOTHER_ARCHIVE_TIMEOUT}s, killed pid $sweep_pid — dispatch resumes; it will retry next interval"
             rm -f "$timeout_flag"
+        else
+            # Disk hygiene rides along with the retention sweep (own watchdog).
+            # Skipped after a wedged archive: something is already stuck.
+            _run_gc_bounded
         fi
     fi
 }
@@ -1481,6 +1600,28 @@ _run_pipeline_job() {
     rmdir "$_PIPELINE_DRIVER_LOCK" 2>/dev/null || true
 }
 
+# One dispatch pass: spawn ready jobs up to MOTHER_CONCURRENCY. Gated by the
+# quota cap (over cap: forced jobs only, and running jobs may be paused) and by
+# the low-disk guard (low disk: nothing new starts; running jobs are untouched).
+_dispatch_ready_jobs() {
+    local picker=_pick_next_ready over_cap=0 next
+    if ! _quota_check; then
+        picker=_pick_next_forced_ready
+        over_cap=1
+    fi
+    while [ "$(_count_running_children)" -lt "$MOTHER_CONCURRENCY" ]; do
+        next=$($picker)
+        if [ -z "$next" ]; then
+            _disk_recheck_idle
+            break
+        fi
+        _disk_dispatch_ok "$next" || break
+        _spawn_job "$next"
+    done
+    [ "$over_cap" -eq 1 ] && _maybe_pause_running
+    return 0
+}
+
 _loop() {
     while [ "$SHUTDOWN" -eq 0 ]; do
         _reap_children
@@ -1502,24 +1643,7 @@ _loop() {
         # succeeded state is fully settled before the driver sees it.
         [ "${MOTHER_PIPELINE_ENABLED:-1}" = "1" ] && _run_pipeline_job
 
-        if _quota_check; then
-            # Under cap — normal dispatch.
-            while [ "$(_count_running_children)" -lt "$MOTHER_CONCURRENCY" ]; do
-                local next
-                next=$(_pick_next_ready)
-                [ -n "$next" ] || break
-                _spawn_job "$next"
-            done
-        else
-            # Over cap — only forced ready jobs may dispatch; pause the rest.
-            while [ "$(_count_running_children)" -lt "$MOTHER_CONCURRENCY" ]; do
-                local next
-                next=$(_pick_next_forced_ready)
-                [ -n "$next" ] || break
-                _spawn_job "$next"
-            done
-            _maybe_pause_running
-        fi
+        _dispatch_ready_jobs
 
         _maybe_archive
         _maybe_refresh_attention
@@ -1605,6 +1729,13 @@ case "${1:-}" in
         # behaviorally, instead of grepping this script's source for strings.
         # Usage: mother-runner --auto-escalate-tick
         _auto_escalate_failed
+        exit 0
+        ;;
+    --dispatch-tick)
+        # Test entry point: run one _dispatch_ready_jobs pass and exit without
+        # starting the daemon loop. Used by low_disk_guard.bats.
+        # Usage: mother-runner --dispatch-tick
+        _dispatch_ready_jobs
         exit 0
         ;;
     --archive-tick)

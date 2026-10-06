@@ -4,6 +4,34 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-10-06
+
+### Added
+
+- **`mother gc [--dry-run]`**: disk hygiene sweep, also run in the hourly archive
+  ride-along. Removes orphaned Xcode DerivedData (workspace path gone), runs
+  `go clean -cache` over `MOTHER_GOCACHE_MAX_GB` (default 10) when no job is running (skips
+  with a reason if `go` is unusable), removes `$MOTHER_ROOT/tmp/<job-id>` of jobs with no live
+  record, and reports (never removes) main-checkout Cargo `target/` dirs over 10 GB.
+  `MOTHER_GC_ENABLED=0` disables the scheduled runs.
+- **Low-disk dispatch guard**: below `MOTHER_MIN_FREE_GB` (default 20, `0` disables, also in
+  `config.env`) free on the next job's volume, the runner stops dispatching (running jobs are
+  never touched), shows a `low_disk` needs-attention item and triggers one `mother gc`
+  (at most every `MOTHER_LOWDISK_GC_INTERVAL`, 600s). Dispatch resumes on its own.
+- Each worker runs with a job-scoped `TMPDIR` (`$MOTHER_ROOT/tmp/<job-id>`), removed at teardown.
+- `teardown_residue` event and needs-attention item for a worktree directory that could not be
+  fully removed, with a suggested manual command (never sudo).
+
+### Changed
+
+- **Teardown no longer waits on Docker.** With Docker unreachable the worktree is still
+  removed (unsafe-worktree and race checks unchanged) and the job is parked as
+  `docker_unreachable_worktree_done` (`docker_pending: true`); later drains retry only the Docker
+  part, silently, and emit `teardown_completed` when it finishes. Previously ~4,300 deferrals
+  left every worktree in place while Docker was down.
+- Leftover non-git residue directories are removed after worktree removal instead of failing the
+  teardown with `worktree_error`.
+
 ## [0.3.1] - 2026-10-05
 
 ### Changed
