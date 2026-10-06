@@ -544,3 +544,143 @@ GH
     [ "$output" = "cody_rework" ]
     assert_event_kind "job-loop-open" "adherence_rework_kicked"
 }
+
+# ---------------------------------------------------------------------------
+# Notes containing backslashes / quotes / $() / backticks / newlines must
+# persist verbatim. Incident: jq-filter interpolation of Archie's notes failed
+# to compile on `\d`, `\u`, `\x41`, `\'`, so the job file was never updated and
+# the runner re-reviewed the same job forever.
+
+# Writes a verdict file ($1 = pass|fail) with hostile notes; sets $NASTY_NOTES.
+_write_nasty_verdict() {
+    local verdict="$1"
+    local nasty_file="$MOTHER_ROOT/nasty-notes.txt"
+    cat > "$nasty_file" <<'NOTES'
+Duration regex `\d+m\d+s` is wrong; also `\u` and `\x41` and \' and \\ here.
+He said "quoted" and `backticks` and $(echo pwned) and $HOME.
+Last line after a blank line:
+
+end.
+NOTES
+    NASTY_NOTES=$(cat "$nasty_file")
+    {
+        printf 'ADHERENCE: %s\nNOTES:\n' "$verdict"
+        cat "$nasty_file"
+    } > "$MOTHER_ROOT/nasty-verdict.txt"
+    export MOCK_CLAUDE_STDOUT_FILE="$MOTHER_ROOT/nasty-verdict.txt"
+}
+
+@test "adherence-review: pass with backslash-laden notes persists passed status and exact notes" {
+    _make_succeeded_job "job-nasty-pass"
+    _write_nasty_verdict pass
+
+    run mother adherence-review "job-nasty-pass"
+    [ "$status" -eq 0 ]
+
+    run jq -r '.adherence_status' "$JOBS_DIR/job-nasty-pass.json"
+    [ "$output" = "passed" ]
+    run jq -r '.adherence_pending' "$JOBS_DIR/job-nasty-pass.json"
+    [ "$output" = "false" ]
+    run jq -r '.adherence_attempts' "$JOBS_DIR/job-nasty-pass.json"
+    [ "$output" = "1" ]
+
+    local stored; stored=$(jq -j '.adherence_notes' "$JOBS_DIR/job-nasty-pass.json")
+    [ "$stored" = "$NASTY_NOTES" ]
+}
+
+@test "adherence-review: first fail with backslash-laden notes persists failed_first, notes and pending_answer exact" {
+    _make_succeeded_job "job-nasty-fail1"
+    _write_nasty_verdict fail
+
+    run mother adherence-review "job-nasty-fail1"
+    [ "$status" -eq 1 ]
+
+    run jq -r '.adherence_status' "$JOBS_DIR/job-nasty-fail1.json"
+    [ "$output" = "failed_first" ]
+    run jq -r '.adherence_attempts' "$JOBS_DIR/job-nasty-fail1.json"
+    [ "$output" = "1" ]
+
+    local notes answer
+    notes=$(jq -j '.adherence_notes' "$JOBS_DIR/job-nasty-fail1.json")
+    answer=$(jq -j '.pending_answer' "$JOBS_DIR/job-nasty-fail1.json")
+    [ "$notes" = "$NASTY_NOTES" ]
+    [ "$answer" = "$NASTY_NOTES" ]
+}
+
+@test "adherence-review: second fail with backslash-laden notes blocks for human with exact notes" {
+    _make_succeeded_job "job-nasty-fail2"
+    merged=$(jq '.adherence_attempts = 1 | .adherence_status = "failed_first"' "$JOBS_DIR/job-nasty-fail2.json") \
+        && printf '%s' "$merged" > "$JOBS_DIR/job-nasty-fail2.json"
+    _write_nasty_verdict fail
+
+    run mother adherence-review "job-nasty-fail2"
+    [ "$status" -eq 1 ]
+
+    run jq -r '.adherence_status' "$JOBS_DIR/job-nasty-fail2.json"
+    [ "$output" = "blocked_for_human" ]
+    run jq -r '.state' "$JOBS_DIR/job-nasty-fail2.json"
+    [ "$output" = "awaiting" ]
+    run jq -r '.adherence_attempts' "$JOBS_DIR/job-nasty-fail2.json"
+    [ "$output" = "2" ]
+
+    local notes; notes=$(jq -j '.adherence_notes' "$JOBS_DIR/job-nasty-fail2.json")
+    [ "$notes" = "$NASTY_NOTES" ]
+}
+
+@test "adherence-review: exits non-zero and does not claim PASS when job state cannot be written" {
+    [ "$(id -u)" -ne 0 ] || skip "root ignores directory permissions"
+    _make_succeeded_job "job-nowrite"
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: pass
+NOTES:
+All good."
+
+    # Read-only jobs dir: the atomic write's temp file cannot be created.
+    chmod 555 "$JOBS_DIR"
+    run mother adherence-review "job-nowrite"
+    local rc="$status" out="$output"
+    chmod 755 "$JOBS_DIR"
+
+    [ "$rc" -ne 0 ]
+    [[ "$out" != *"adherence review: PASS"* ]]
+
+    run jq -r '.adherence_status' "$JOBS_DIR/job-nowrite.json"
+    [ "$output" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# Runner circuit breaker: if a review "succeeds" but never records a result,
+# the loop must give up after a few tries. Terminal state contract:
+# adherence_pending == false and adherence_status == "error".
+
+@test "adherence loop: review that never persists is retried a bounded number of times, then abandoned" {
+    _make_succeeded_job "job-loop-stuck"
+
+    # Stub CLI: counts invocations, claims success, persists nothing.
+    local stub_dir="$MOTHER_ROOT/stub-bin"
+    local count_file="$MOTHER_ROOT/review-count"
+    mkdir -p "$stub_dir"
+    : > "$count_file"
+    cat > "$stub_dir/mother" <<STUB
+#!/usr/bin/env bash
+echo x >> "$count_file"
+echo "\$2: adherence review: PASS"
+exit 0
+STUB
+    chmod +x "$stub_dir/mother"
+    export MOTHER_BIN_DIR="$stub_dir"
+
+    local i
+    for i in 1 2 3 4 5 6 7 8; do
+        run mother-runner --adherence-tick
+        [ "$status" -eq 0 ]
+    done
+
+    local calls; calls=$(wc -l < "$count_file" | tr -d ' ')
+    [ "$calls" -ge 1 ]
+    [ "$calls" -le 3 ]
+
+    run jq -r '.adherence_pending' "$JOBS_DIR/job-loop-stuck.json"
+    [ "$output" = "false" ]
+    run jq -r '.adherence_status' "$JOBS_DIR/job-loop-stuck.json"
+    [ "$output" = "error" ]
+}
