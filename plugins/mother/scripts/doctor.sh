@@ -57,6 +57,20 @@ if command -v mother >/dev/null 2>&1; then
     [ -z "$_conc" ] || { echo "concurrency:"; printf '  • %s\n' "$_conc"; echo ""; }
 fi
 
+# --- looping adherence reviews (advisory — never affects exit status) ---
+# More than 5 adherence reviews on one job in the last hour means the review is
+# looping (see CHANGELOG 0.3.3); the same list feeds the statusline's ⚑ count.
+if command -v mother >/dev/null 2>&1; then
+    _loops=$(mother status --format json 2>/dev/null \
+        | jq -r '(.needs_attention // [])[] | select(.kind == "adherence_loop") | "  ✗ adherence    \(.job_id): \(.reason)"' 2>/dev/null)
+    if [ -n "$_loops" ]; then
+        echo "adherence reviews:"
+        printf '%s\n' "$_loops"
+        echo "               Fix: investigate the job (mother status <id>); MOTHER_ADHERENCE_ENABLED=0 stops reviews"
+        echo ""
+    fi
+fi
+
 # --- plugin cache freshness (advisory — never affects exit status) ---
 # The UserPromptSubmit hook and CLI the plugin manager serves come from a
 # cached copy of this repo. If that copy is older than the checkout the daemon

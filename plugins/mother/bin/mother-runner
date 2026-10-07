@@ -84,6 +84,9 @@ MOTHER_AWAITING_REMIND_HOURS="${MOTHER_AWAITING_REMIND_HOURS:-24}" # reminder ca
 MOTHER_ESCALATION_ENABLED="${MOTHER_ESCALATION_ENABLED:-1}"
 MOTHER_RECONCILE_ENABLED="${MOTHER_RECONCILE_ENABLED:-1}"
 MOTHER_ADHERENCE_ENABLED="${MOTHER_ADHERENCE_ENABLED:-1}"
+# Max adherence review spawns per job per PR head SHA before the runner stops
+# and raises a needs-attention item instead (loop guard; see _run_adherence_pending).
+MOTHER_ADHERENCE_MAX_RUNS_PER_SHA="${MOTHER_ADHERENCE_MAX_RUNS_PER_SHA:-3}"
 MOTHER_BROKER_ENABLED="${MOTHER_BROKER_ENABLED:-1}"
 MOTHER_PIPELINE_ENABLED="${MOTHER_PIPELINE_ENABLED:-1}"
 MOTHER_PIPELINE_CYCLE_CAP="${MOTHER_PIPELINE_CYCLE_CAP:-3}"
@@ -1124,6 +1127,10 @@ _run_adherence_pending() {
         case "$adherence_status" in
             passed|blocked_for_human) continue ;;
         esac
+        # A job the loop guard capped stays out until the operator acts
+        # (retry/escalate/reconcile clear the flag); otherwise it would be
+        # re-marked pending and re-capped on every tick.
+        [ "$(jq -r '((.needs_attention | objects | .reason) // "")' "$f" 2>/dev/null)" = "adherence_loop_capped" ] && continue
         # Mark as pending if not already.
         if [ "$adherence_pending" != "true" ]; then
             merged=$(jq '.adherence_pending = true' "$f") && _atomic_write "$f" "$merged"
@@ -1177,6 +1184,52 @@ _run_adherence_pending() {
                         '{reason: "pr_already_merged", pr_url: $pr_url}')"
                 break  # one review-or-skip decision per tick, same as the review path
             fi
+
+            # Loop guard. A review is keyed on the PR head SHA: an unchanged head is
+            # never re-reviewed once it passed, and any head gets at most
+            # MOTHER_ADHERENCE_MAX_RUNS_PER_SHA spawns (verdict-less/erroring
+            # reviews used to re-run every tick, forever — 1532 Opus reviews on one
+            # job). Past the cap, flag the job for the operator instead of looping.
+            local head_sha reviewed_sha sha_runs adherence_status_now
+            head_sha=""
+            if [ -n "$adherence_pr_url" ] && command -v gh >/dev/null 2>&1; then
+                head_sha=$(gh pr view "$adherence_pr_url" --json headRefOid -q .headRefOid 2>/dev/null) || head_sha=""
+            fi
+            [ -n "$head_sha" ] || head_sha="unknown"
+            reviewed_sha=$(jq -r '.adherence_reviewed_sha // ""' "$f" 2>/dev/null)
+            sha_runs=$(jq -r '.adherence_sha_runs // 0' "$f" 2>/dev/null)
+            adherence_status_now=$(jq -r '.adherence_status // ""' "$f" 2>/dev/null)
+
+            if [ "$head_sha" != "unknown" ] && [ "$head_sha" = "$reviewed_sha" ] \
+                    && [ "$adherence_status_now" = "passed" ]; then
+                _job_update "$id" '.adherence_pending = false' || true
+                _append_event "$id" "adherence_skipped" \
+                    "$(jq -nc --arg sha "$head_sha" '{reason: "head_unchanged", head_sha: $sha}')"
+                _log "adherence: $id: head $head_sha already reviewed and passed — not re-reviewing"
+                break
+            fi
+
+            if [ "$head_sha" = "$reviewed_sha" ]; then
+                sha_runs=$((sha_runs + 1))
+            else
+                sha_runs=1
+            fi
+
+            if [ "$sha_runs" -gt "$MOTHER_ADHERENCE_MAX_RUNS_PER_SHA" ]; then
+                _job_update "$id" \
+                    '.adherence_pending = false
+                    | .needs_attention = {reason: "adherence_loop_capped",
+                        note: ("adherence review ran " + ($cap | tostring) + " times on head " + $sha + " without settling; not re-running. Review the PR by hand, then `mother retry` or ignore."),
+                        since: $now}' \
+                    --argjson cap "$MOTHER_ADHERENCE_MAX_RUNS_PER_SHA" --arg sha "$head_sha" --arg now "$(_iso_now)" || true
+                _append_event "$id" "adherence_capped" \
+                    "$(jq -nc --arg sha "$head_sha" --argjson cap "$MOTHER_ADHERENCE_MAX_RUNS_PER_SHA" \
+                        '{head_sha: $sha, cap: $cap}')"
+                _log "adherence: $id: hit the cap of $MOTHER_ADHERENCE_MAX_RUNS_PER_SHA reviews on head $head_sha — flagged for attention"
+                break
+            fi
+            _job_update "$id" '.adherence_reviewed_sha = $sha | .adherence_sha_runs = $runs' \
+                --arg sha "$head_sha" --argjson runs "$sha_runs" || true
 
             _log "running adherence review for $id (attempt=$adherence_attempts)"
             # NOTE: without `pipefail`, `if cmd | while read ...; then` tests the

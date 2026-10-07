@@ -4,6 +4,28 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-10-07
+
+### Fixed
+
+- **Adherence review no longer loops on a succeeded job** (one job got 1532 Opus reviews in
+  ~15.7h). Root cause: the verdict notes were interpolated into a jq filter string, so notes
+  containing a backslash (e.g. `App\Support\...`) made the state write fail silently; the job
+  stayed `adherence_pending` and was re-reviewed every tick, starving other jobs' reviews. Notes
+  are now passed with `jq --arg`.
+- Loop guard: reviews are keyed on the PR head SHA (`adherence_reviewed_sha`,
+  `adherence_sha_runs`). A passed head is never re-reviewed, and any head gets at most
+  `MOTHER_ADHERENCE_MAX_RUNS_PER_SHA` (default 3) spawns, which covers verdict-less or erroring
+  reviews too. At the cap the runner stops, emits `adherence_capped` and sets a
+  `needs_attention` (`adherence_loop_capped`) flag instead of looping. `mother retry`,
+  `escalate` and `reconcile` reset the counter and clear that flag.
+
+### Added
+
+- `adherence_loop` needs-attention item (statusline `⚑`, `mother status`) and a `mother doctor`
+  section for any job with more than `MOTHER_ADHERENCE_LOOP_THRESHOLD` (default 5)
+  adherence reviews in the last hour.
+
 ## [0.3.2] - 2026-10-06
 
 ### Added
