@@ -515,17 +515,80 @@ _event_count() {
 # ---------------------------------------------------------------------------
 # operator escape hatch
 
-@test "force-start: an operator can push a blocked queued dependent through" {
+@test "force-start --ignore-deps: an operator can push a blocked queued dependent through" {
     make_job "dep-a" "failed" '.reason = "x"'
     _make_dependent "child" "dep-a"
     run _st "_promote_ready"
     assert_job_field "child" '.dep_wait.status' "blocked"
 
-    run mother force-start "child" --yes
+    run mother force-start "child" --ignore-deps --yes
     [ "$status" -eq 0 ]
+    [[ "$output" =~ "bypassing dependency gates" ]]
     assert_job_field "child" '.force_start' "true"
+    assert_job_field "child" '.force_ignore_deps' "true"
 
     # After the next promotion pass the job is dispatchable (ready).
     run _st "_promote_ready"
     assert_job_field "child" '.state' "ready"
+    [ "$(_event_count child dependency_gate_bypassed)" -ge 1 ]
+}
+
+@test "force-start: plain force-start leaves a blocked dependent queued" {
+    make_job "dep-a" "failed" '.reason = "x"'
+    _make_dependent "child" "dep-a"
+    run _st "_promote_ready"
+
+    run mother force-start "child" --yes
+    [ "$status" -eq 0 ]
+    assert_job_field "child" '.force_start' "true"
+    assert_job_field "child" '.force_ignore_deps // "absent"' "absent"
+
+    run _st "_promote_ready"
+    assert_job_field "child" '.state' "queued"
+    assert_job_field "child" '.dep_wait.status' "blocked"
+}
+
+@test "force-start: quota override on a dependent with an unmerged dep waits, then promotes once merged" {
+    export MOTHER_DEP_PR_POLL_INTERVAL=1
+    _make_dep_with_pr "dep-a"
+    _make_dependent "child" "dep-a"
+
+    MOCK_GH_STATE=OPEN run mother force-start "child" --yes
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "quota override set; still waiting on dep-a" ]]
+    assert_job_field "child" '.force_start' "true"
+    assert_job_field "child" '.force_ignore_deps // "absent"' "absent"
+
+    MOCK_GH_STATE=OPEN run _st "_promote_ready"
+    assert_job_field "child" '.state' "queued"
+    assert_job_field "child" '.dep_wait.status' "wait"
+
+    sleep 2
+    MOCK_GH_STATE=MERGED run _st "_promote_ready"
+    assert_job_field "child" '.state' "ready"
+    assert_job_field "child" '.force_start' "true"
+    [ "$(_event_count child dependency_satisfied)" -ge 1 ]
+    [ "$(_event_count child dependency_gate_bypassed)" -eq 0 ]
+}
+
+@test "force-start: force_ignore_deps is cleared on terminal transition" {
+    make_job "child" "running" '.force_start = true | .force_ignore_deps = true'
+    run _st "_job_transition child succeeded '{}'"
+    [ "$status" -eq 0 ]
+    assert_job_field "child" '.force_start // "absent"' "absent"
+    assert_job_field "child" '.force_ignore_deps // "absent"' "absent"
+}
+
+@test "force-start: every place that clears force_start also clears force_ignore_deps" {
+    # mother-run-job has its own _transition (not lib/state.sh's), so a behavioural test of one
+    # does not cover the other. Guard the invariant across all binaries and libs instead.
+    local root="$BATS_TEST_DIRNAME/.."
+    local f bad=""
+    while IFS= read -r f; do
+        local n_fs n_fid
+        n_fs=$(grep -c 'force_start = null' "$f" || true)
+        n_fid=$(grep -c 'force_ignore_deps = null' "$f" || true)
+        [ "$n_fs" -eq "$n_fid" ] || bad="$bad $f(force_start=$n_fs,ignore_deps=$n_fid)"
+    done < <(grep -rl 'force_start = null' "$root/bin" "$root/lib")
+    [ -z "$bad" ] || { echo "mismatch:$bad"; false; }
 }

@@ -1134,7 +1134,7 @@ _install_core_job_helpers() {
             running)    _job_update ".started_at = \"$(iso_now)\"" ;;
             succeeded|failed|cancelled)
                         _job_update ".finished_at = \"$(iso_now)\""
-                        _job_update ".force_start = null"
+                        _job_update ".force_start = null | .force_ignore_deps = null"
                         type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$id" ;;
         esac
         _append_event "$new" "$detail"

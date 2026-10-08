@@ -199,7 +199,7 @@ _job_transition() {
         running)    _job_update "$id" ".started_at = \"$(_iso_now)\"" ;;
         succeeded|failed|cancelled)
                     _job_update "$id" ".finished_at = \"$(_iso_now)\""
-                    _job_update "$id" ".force_start = null"
+                    _job_update "$id" ".force_start = null | .force_ignore_deps = null"
                     type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$id" ;;
     esac
     _append_event "$id" "$new" "$detail"
@@ -896,11 +896,11 @@ _promote_ready() {
         local deps; deps=$(jq -c '.depends_on' "$f")
         local id; id=$(jq -r .id "$f")
         local blocked=0 first_dep="" first_gate="" forced=0
-        # `mother force-start <id>` is the operator override for a queued job
-        # stuck behind its dependency gate: it sets force_start and the gate is
-        # skipped (the job is promoted on this tick, and force_start then
-        # carries through dispatch as it does for any ready job).
-        [ "$(jq -r '.force_start // false' "$f")" = "true" ] && forced=1
+        # `mother force-start <id>` alone is a quota override and does NOT skip
+        # the dependency gate. Only `mother force-start <id> --ignore-deps`
+        # (which also sets force_ignore_deps) skips it: the job is promoted on
+        # this tick, and force_start then carries through dispatch as usual.
+        [ "$(jq -r '.force_ignore_deps // false' "$f")" = "true" ] && forced=1
         if [ "$forced" -eq 0 ]; then
             for dep in $(echo "$deps" | jq -r '.[]'); do
                 local gate; gate=$(_dep_gate "$dep")
@@ -937,7 +937,7 @@ _promote_ready() {
             _job_transition "$id" ready '{}'
             if [ "$forced" -eq 1 ]; then
                 _append_event "$id" "dependency_gate_bypassed" \
-                    "$(jq -nc --argjson d "$deps" '{dep_ids: $d, by: "force_start"}')"
+                    "$(jq -nc --argjson d "$deps" '{dep_ids: $d, by: "force_start_ignore_deps"}')"
             elif [ "${had_deps:-0}" -gt 0 ]; then
                 _append_event "$id" "dependency_satisfied" \
                     "$(jq -nc --argjson d "$deps" '{dep_ids: $d}')"

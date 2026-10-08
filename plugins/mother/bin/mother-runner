@@ -1259,6 +1259,7 @@ _run_adherence_pending() {
                             | .pause_requested = null
                             | .final_result_at = null
                             | .force_start = null
+                            | .force_ignore_deps = null
                         ' "$JOBS_DIR/$id.json") && _atomic_write "$JOBS_DIR/$id.json" "$merged"
                         _append_event "$id" "adherence_rework_kicked" \
                             "$(jq -nc --arg id "$id" '{id: $id, note: "adherence failed first attempt; re-queuing with activity=cody_rework"}')"
