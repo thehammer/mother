@@ -119,6 +119,37 @@ _attention_job_items() {
     done
 }
 
+# A job whose adherence review has been spawned more than
+# MOTHER_ADHERENCE_LOOP_THRESHOLD (default 5) times in the last hour is almost
+# certainly looping (see the 1532-review incident) — whatever the cause. Reads
+# only the job's local events file; the cheap grep pre-filter keeps the common
+# no-adherence-events case to one grep per job.
+_attention_adherence_loop_items() {
+    local f id events_file
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        id=$(basename "$f" .json)
+        events_file=$(_events_path "$id")
+        [ -f "$events_file" ] || continue
+        grep -F '"adherence_review_spawned"' "$events_file" 2>/dev/null \
+            | jq -cs --arg id "$id" \
+                --arg repo "$(jq -r '.repo // ""' "$f" 2>/dev/null)" \
+                --arg branch "$(jq -r '.branch // ""' "$f" 2>/dev/null)" \
+                --argjson threshold "${MOTHER_ADHERENCE_LOOP_THRESHOLD:-5}" \
+                --argjson now "$(date +%s)" '
+                def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+                [ .[] | select(.kind == "adherence_review_spawned")
+                      | select((try (.ts | epoch) catch 0) > ($now - 3600)) ] as $recent
+                | if ($recent | length) > $threshold then
+                    {kind: "adherence_loop", job_id: $id, repo: $repo, branch: $branch,
+                     reason: ("adherence review ran " + ($recent | length | tostring) + " times in the last hour"),
+                     since: $recent[0].ts,
+                     detail: {runs_last_hour: ($recent | length)},
+                     hint: ("mother status " + $id + "  (the review is likely looping; MOTHER_ADHERENCE_ENABLED=0 stops all reviews)")}
+                  else empty end' 2>/dev/null
+    done
+}
+
 # Auto-stash entries (`mother:auto-stash:<id>`, written by mother-run-job when
 # it stashes an operator's dirty main-dir tree) whose owning job is no longer
 # active. Display only — never pops or drops anything.
@@ -181,6 +212,7 @@ mother_attention_items() {
       _attention_residue_items
       _attention_low_disk_items
       _attention_job_items
+      _attention_adherence_loop_items
       _attention_stash_items
       _attention_plugin_cache_items
     } | jq -cs '.' 2>/dev/null || echo '[]'

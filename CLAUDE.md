@@ -66,6 +66,7 @@ plan-adherence review. Here's what was added and how to work with it.
 | `adherence_pending` | bool | True when a succeeded job awaits adherence review. |
 | `adherence_status` | string | `passed`, `failed_first`, `blocked_for_human`. Audit trail only — do not use for operational logic. `mother list` renders an `[ADHERENCE-BLOCKED]` marker in the STATE column from `blocked_for_human` — display only. |
 | `adherence_notes` | string | Archie's notes from the last review (populated on fail). |
+| `adherence_reviewed_sha` / `adherence_sha_runs` | string / int | Loop guard. The PR head SHA at the last adherence-review spawn (`unknown` when `gh` couldn't say) and how many reviews have been spawned on it. A passed head is never re-reviewed; past `MOTHER_ADHERENCE_MAX_RUNS_PER_SHA` the runner stops, emits `adherence_capped` and sets `needs_attention.reason = adherence_loop_capped`. A new head resets the count; `retry`/`escalate`/`reconcile` reset it too. |
 | `activity` | string | Optional sub-state: `cody_rework` (re-running after adherence fail) or `adherence_blocked` (awaiting human) or `pipeline_phase` / `pipeline_review` / `pipeline_blocked` (pipeline jobs). Cleared on resume. |
 | `cost_model` | string | Account billing mode at enqueue time: `subscription`, `metered`, or `unknown`. Clients suppress dollar displays when `subscription`. |
 | `force_start` | bool | Per-job override flag. When `true`: job dispatches even over quota cap, is exempt from mid-flight quota pause, and posture bias is bypassed (runs at `suggested_config`-resolved tier; metrics record `posture_bias_applied="forced"`). Cleared on every terminal transition, escalation re-queue, and adherence-rework re-queue. Set via `mother force-start <id> [--yes]`. |
@@ -168,6 +169,7 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_COST_CAP_GRACE_SECONDS=N` — seconds a job with `max_cost_usd` set is given, after crossing the cap, for a cooperative `mother await` before the runner force-pauses it (default: 300).
 - `MOTHER_FAILURE_ROUTING_ENABLED=0` — restore the pre-routing behavior: every `failed` job takes the legacy reconcile-then-escalate path in `_auto_escalate_failed`, regardless of `.failure_reason` (default: `1`).
 - `MOTHER_REWORK_ADVANCE_CHECK_ENABLED=0` — disable `_verify_run_advanced_or_fail` (default: `1`), so a run that starts with an existing PR/pushed branch can report `succeeded` without pushing anything new.
+- `MOTHER_ADHERENCE_MAX_RUNS_PER_SHA=N` — adherence review spawns per job per PR head SHA before the runner flags the job for attention instead of looping (default: 3). `MOTHER_ADHERENCE_LOOP_THRESHOLD=N` (default 5) — reviews per hour on one job above which the `adherence_loop` needs-attention item / `mother doctor` warning appears.
 - `MOTHER_ADHERENCE_EFFORT=<low|medium|high|xhigh|max>` — pass `--effort` to the adherence-review `claude` invocation. Unset (default) means no `--effort` flag, i.e. today's behavior.
 - `MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS=N` — stalled passes before a `worktree_probe_failed` teardown is flagged (default: 2, about two hourly sweeps). Other stall reasons use `MOTHER_TEARDOWN_MAX_DEFERRALS`.
 - `MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS=N` — days a teardown may wait on an open PR before it is listed under needs-attention (default: 7).
@@ -351,7 +353,8 @@ hourly teardown sweep or the dependency poller and stored where it can read it.
 Kinds: `teardown_stalled`, `pr_open_stale`, `dependency_blocked`,
 `teardown_residue` (a worktree directory teardown could not fully remove; record in `$RESIDUE_DIR`), `low_disk` (dispatch paused, see `MOTHER_MIN_FREE_GB`), `auto_stash_unrestored` (a `mother:auto-stash:<id>` git stash whose job is no
 longer running/ready/awaiting — display only, nothing is ever popped),
-`job_flagged` (a job carrying the `needs_attention` field), and
+`job_flagged` (a job carrying the `needs_attention` field), `adherence_loop`
+(more than 5 adherence reviews on one job in the last hour), and
 `plugin_cache_stale`. `mother_attention_write` publishes the list atomically to
 `$MOTHER_ROOT/attention.json` (always valid JSON). Renderers: `mother status`
 with no id (queue overview, awaiting jobs, needs-attention section;
