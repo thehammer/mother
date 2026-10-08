@@ -110,7 +110,7 @@ _attention_job_items() {
              | {kind: "dependency_blocked", job_id: .id, repo: (.repo // ""), branch: (.branch // ""),
                 reason: (.dep_wait.reason // ""), since: (.dep_wait.checked_at // ""),
                 detail: {dep_id: (.dep_wait.dep_id // ""), pr_url: (.dep_wait.pr_url // "")},
-                hint: ("mother force-start " + .id + "  (release it anyway)  or  mother cancel " + .id)}),
+                hint: ("mother force-start " + .id + " --ignore-deps  (release it anyway)  or  mother cancel " + .id)}),
             (select(.needs_attention != null and (.needs_attention | type) == "object")
              | {kind: "job_flagged", job_id: .id, repo: (.repo // ""), branch: (.branch // ""),
                 reason: (.needs_attention.reason // ""), since: (.needs_attention.since // ""),

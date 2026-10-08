@@ -975,7 +975,7 @@ cmd_status() {
             echo "${dep_wait_line%|*}"
             if [ "${dep_wait_line##*|}" = "blocked" ]; then
                 echo "   This dependency will not resolve on its own; the job stays queued (never auto-cancelled)."
-                echo "   Run: mother force-start $id  (release it anyway)"
+                echo "   Run: mother force-start $id --ignore-deps  (release it anyway)"
                 echo "   Or:  mother cancel $id"
             fi
             echo ""
@@ -1517,15 +1517,22 @@ HITEOF
 # pause_requested/auto_resume_at) and THEN set force_start=true so the
 # runner's next tick dispatches it immediately and doesn't just re-pause it.
 #
-# Usage: mother force-start <id> [--yes]
+# force-start is a QUOTA override only: a queued job with unmet `--depends-on`
+# gates stays queued ("quota override set; still waiting on <dep ids>") and
+# dispatches once they're satisfied, even over cap. `--ignore-deps` also sets
+# force_ignore_deps, which makes `_promote_ready` skip the gates.
+#
+# Usage: mother force-start <id> [--yes] [--ignore-deps]
+#   --ignore-deps  Also bypass the dependency gates (prints which).
 #   --yes  Skip the interactive confirmation prompt (required in non-interactive
 #          contexts such as the broker and tmux popup).
 
 cmd_force_start() {
-    local id="" yes=0
+    local id="" yes=0 ignore_deps=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --yes) yes=1; shift ;;
+            --ignore-deps) ignore_deps=1; shift ;;
             --) shift; break ;;
             -*) _die "force-start: unknown flag: $1" ;;
             *) [ -z "$id" ] && id="$1" || _die "force-start: unexpected argument: $1"; shift ;;
@@ -1569,17 +1576,20 @@ cmd_force_start() {
         case "$posture" in conservative|normal|elevated|flush) ;; *) posture="normal" ;; esac
     fi
 
-    # A queued job may also be held behind an unsatisfied `--depends-on`
-    # dependency (see `_dep_gate`/`_promote_ready` in state.sh). force-start
-    # skips that gate entirely for a queued job, releasing it whether the
-    # dependency is merely still running/waiting on its PR to merge (a
-    # "wait" status) or stuck needing operator intervention (a "blocked"
-    # status) — so the confirm prompt below must call that out; quota/
-    # posture context alone understates what forcing actually does here.
-    local dep_wait_id="" dep_wait_reason=""
+    # A queued job may be held behind unsatisfied `--depends-on` gates (see
+    # `_dep_gate`/`_promote_ready` in state.sh). Plain force-start leaves them
+    # in force; --ignore-deps bypasses them, so list which ones are unmet.
+    local dep_wait_id="" dep_wait_reason="" unmet_deps="" dep gate
     if [ "$state" = "queued" ]; then
         dep_wait_id=$(jq -r '.dep_wait.dep_id // ""' "$job_file")
         dep_wait_reason=$(jq -r '.dep_wait.reason // ""' "$job_file")
+        for dep in $(jq -r '.depends_on[]?' "$job_file"); do
+            gate=$(_dep_gate "$dep")
+            [ "$gate" = "satisfied" ] || unmet_deps="${unmet_deps:+$unmet_deps, }$dep ($gate)"
+        done
+    fi
+    if [ "$ignore_deps" -eq 1 ] && [ -n "$unmet_deps" ]; then
+        echo "--ignore-deps: bypassing dependency gates: $unmet_deps"
     fi
 
     # Confirmation gate.
@@ -1593,8 +1603,8 @@ cmd_force_start() {
         local summary=""
         if [ "$quota_paused" -eq 1 ]; then
             summary="Job is paused for quota (awaiting, paused_reason=$paused_reason) — forcing will resume it immediately and dispatch despite the quota gate."
-        elif [ -n "$dep_wait_id" ]; then
-            summary="Job is queued behind dependency $dep_wait_id ($dep_wait_reason) — forcing will release it past the dependency gate."
+        elif [ "$ignore_deps" -eq 1 ] && [ -n "$unmet_deps" ]; then
+            summary="Job is queued behind dependencies: $unmet_deps — --ignore-deps will release it past the dependency gate."
         elif [ "$over_cap" -eq 1 ] && [ "$posture" = "conservative" ]; then
             summary="Quota is over cap AND posture is conservative — forcing will dispatch this job immediately at full configured strength, bypassing both guards."
         elif [ "$over_cap" -eq 1 ]; then
@@ -1633,13 +1643,21 @@ cmd_force_start() {
             "$(jq -nc --arg r "$paused_reason" '{from_paused_reason: $r, forced: true}')"
     fi
 
-    _job_update "$id" '.force_start = true'
+    if [ "$ignore_deps" -eq 1 ]; then
+        _job_update "$id" '.force_start = true | .force_ignore_deps = true'
+    else
+        _job_update "$id" '.force_start = true'
+    fi
     _append_event "$id" "force_start_requested" \
         "$(jq -nc \
             --argjson oc "$over_cap" \
             --arg p "$posture" \
-            '{over_cap: $oc, posture: $p}')"
+            --argjson id "$ignore_deps" \
+            '{over_cap: $oc, posture: $p, ignore_deps: ($id == 1)}')"
     echo "$id: force_start set (over_cap=$over_cap, posture=$posture)"
+    if [ "$ignore_deps" -ne 1 ] && [ -n "$unmet_deps" ]; then
+        echo "quota override set; still waiting on $unmet_deps"
+    fi
 }
 
 # ---------- retry ----------
@@ -1824,6 +1842,7 @@ cmd_escalate() {
         | .adherence_sha_runs = 0
         | (if ((.needs_attention | objects | .reason) // "") == "adherence_loop_capped" then .needs_attention = null else . end)
         | .force_start = null
+        | .force_ignore_deps = null
     ' "$job_file") || _die "escalate: jq update failed"
     _atomic_write "$job_file" "$merged"
     _append_event "$id" "escalated" \
@@ -1986,6 +2005,7 @@ HITEOF
         | .state = "succeeded"
         | (if ((.finished_at // "") == "") then .finished_at = $ts else . end)
         | .force_start = null
+        | .force_ignore_deps = null
         | .adherence_pending = null
         | .adherence_status = null
         | .adherence_notes = null
@@ -3769,7 +3789,7 @@ Usage:
   mother attach ID
   mother plan ID
   mother cancel ID
-  mother force-start ID [--yes]              (force dispatch even when over quota cap)
+  mother force-start ID [--yes] [--ignore-deps]  (override quota cap; --ignore-deps also skips dependency gates)
   mother retry ID [--yes]
   mother escalate ID [--yes]                 (bump failed job to next model tier)
   mother reconcile ID [--pr-url URL] [--auto] [--yes] [--dry-run]
@@ -3807,7 +3827,7 @@ Add options:
                            needs no merge). Never auto-cancelled: a failed /
                            cancelled / closed-unmerged / missing dependency
                            keeps it queued and lists it under `mother status`
-                           needs-attention. `mother force-start ID` releases a
+                           needs-attention. `mother force-start ID --ignore-deps` releases a
                            queued job past its dependency gate.
   --title TEXT         (default: first heading of plan file)
   --format json|text   (default: text — prints job id only)

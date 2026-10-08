@@ -4,6 +4,17 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-10-08
+
+### Fixed
+
+- **`mother force-start` is now a quota override only.** It no longer bypasses `--depends-on`
+  gates: a forced queued job with unmet dependencies stays `queued` ("quota override set; still
+  waiting on <dep ids>") and dispatches once they merge, even over the quota cap.
+  The old release-past-the-gate behaviour is now the explicit `mother force-start <id> --ignore-deps`
+  (prints which gates it bypasses; sets `force_ignore_deps`, emits `dependency_gate_bypassed`).
+  The `force_ignore_deps` field is additive; it is cleared wherever `force_start` is.
+
 ## [0.3.3] - 2026-10-07
 
 ### Fixed
