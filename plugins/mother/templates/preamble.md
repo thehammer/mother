@@ -159,6 +159,8 @@ show, or when the plan asks for it.
 - **Components:** the smallest set. `up` defaults to your repo's component (admin-portal `ap`,
   family-portal `ap,fp`, payments `ap,payments`, referral-monitor `rm`). Add with
   `--with fp`, or pick `--components rm,ap` for RM-to-AP flows. Other repos must pass `--components`.
+- **preview-stack jobs:** to run your own branch of preview-stack itself, push it and use
+  `mother preview up --components ap --stack @worktree` (or `--stack <pushed ref>`).
 - **Data:** synthetic only; it resets on every wake and relaunch.
 - **Payments:** it has no URL of its own; reach it through AP or FP's `/proxy/payments/*`.
 - **Referrals:** they come only from `mother preview fake <scenario> [--source aidin|curaspan|careport]
