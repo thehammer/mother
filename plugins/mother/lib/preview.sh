@@ -142,13 +142,15 @@ _preview_tmp() {
 # Context: _preview_backend_up reads the globals _pv_job_id and _pv_work_dir
 # (set by _preview_load_job).
 
-# _preview_backend_up <backend> <stack_id> <components> <refs>
+# _preview_backend_up <backend> <stack_id> <components> <refs> [stack_ref]
+#   stack_ref: the preview-stack source ref (already validated); default
+#   MOTHER_PREVIEW_STACK_REF, else main.
 #   components: comma list (ap,fp). refs: space-separated "<c>=<ref>" tokens.
 # Prints the normalised record JSON on stdout (no owner secrets: they are
 # written to the 0600 secrets file here). Exit: 0 ok, 2 usage, 3 refused,
 # 1 anything else; diagnostics on stderr.
 _preview_backend_up() {
-    local backend="$1" stack_id="$2" components="$3" refs="$4"
+    local backend="$1" stack_id="$2" components="$3" refs="$4" stack_override="${5:-}"
     case "$backend" in
         cli)
             local bin tmp stack_ref rc c ref
@@ -156,7 +158,8 @@ _preview_backend_up() {
                 echo "mother preview: preview-stack CLI not found (set MOTHER_PREVIEW_STACK_BIN)" >&2
                 return 1
             }
-            stack_ref=$(_preview_cfg MOTHER_PREVIEW_STACK_REF main)
+            stack_ref="$stack_override"
+            [ -n "$stack_ref" ] || stack_ref=$(_preview_cfg MOTHER_PREVIEW_STACK_REF main)
             local -a args
             args=(up --via dispatch --stack "$stack_ref" --purpose job --id "$stack_id" --components "$components")
             for c in $(printf '%s' "$components" | tr ',' ' '); do
@@ -398,7 +401,7 @@ _preview_usage() {
 mother preview — per-job preview stacks (stopped automatically when you exit)
 
   mother preview up [--components c,c] [--with c,c] [--ap|--fp|--payments|--rm <ref>]
-                    [--no-wait] [--json]
+                    [--stack <ref>|@worktree] [--no-wait] [--json]
   mother preview wait [--timeout <s>]
   mother preview info [--live]
   mother preview verify
@@ -407,6 +410,8 @@ mother preview — per-job preview stacks (stopped automatically when you exit)
   mother preview down
 
 Components: ap, fp (needs ap), payments (needs ap), rm.
+--stack: the preview-stack source ref to run (a pushed branch, tag or sha; default main).
+@worktree (jobs on the preview-stack repo only) means this job's branch, which must be pushed.
 Needs MOTHER_JOB_ID (or --job <id>). Exit: 0 ok, 1 failure, 2 usage/validation,
 3 refused (disabled/backend), 4 still starting.
 EOF
@@ -417,6 +422,18 @@ _preview_valid_component() {
     return 1
 }
 
+# _preview_valid_ref <ref> — a plain git ref/sha: no leading dash, no "..", no
+# trailing "/" or ".lock", only [A-Za-z0-9._/-], at most 200 chars.
+_preview_valid_ref() {
+    local r="$1"
+    [ -n "$r" ] && [ "${#r}" -le 200 ] || return 1
+    case "$r" in
+        -*|*..*|*/|*.lock|/*|*//*) return 1 ;;
+        *[!A-Za-z0-9._/-]*) return 1 ;;
+    esac
+    return 0
+}
+
 # _preview_has <comma-list> <component>
 _preview_has() {
     case ",$1," in *",$2,"*) return 0 ;; esac
@@ -425,7 +442,7 @@ _preview_has() {
 
 mother_preview_up() {
     local components_arg="" with_arg="" no_wait=0 json=0
-    local ref_ap="" ref_fp="" ref_payments="" ref_rm=""
+    local ref_ap="" ref_fp="" ref_payments="" ref_rm="" stack_arg="" stack_given=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --components) components_arg="${2:-}"; shift 2 || { _preview_die 2 "--components needs a value"; return 2; } ;;
@@ -434,6 +451,7 @@ mother_preview_up() {
             --fp)         ref_fp="${2:-}"; shift 2 || { _preview_die 2 "--fp needs a ref"; return 2; } ;;
             --payments)   ref_payments="${2:-}"; shift 2 || { _preview_die 2 "--payments needs a ref"; return 2; } ;;
             --rm)         ref_rm="${2:-}"; shift 2 || { _preview_die 2 "--rm needs a ref"; return 2; } ;;
+            --stack)      stack_given=1; stack_arg="${2:-}"; shift 2 || { _preview_die 2 "--stack needs a ref or @worktree"; return 2; } ;;
             --no-wait)    no_wait=1; shift ;;
             --json)       json=1; shift ;;
             *) _preview_die 2 "unknown option for up: $1"; return 2 ;;
@@ -452,6 +470,29 @@ mother_preview_up() {
     fi
 
     _preview_load_job || return $?
+
+    # --stack: validated here, never interpolated into a shell. @worktree is
+    # this job's own (pushed) branch, and only makes sense on preview-stack.
+    local stack_ref="" stack_expected=0
+    if [ "$stack_given" -eq 1 ]; then
+        if [ "$stack_arg" = "@worktree" ]; then
+            if [ "$_pv_repo" != "preview-stack" ]; then
+                _preview_die 2 "--stack @worktree is only for jobs on the preview-stack repo (this job is on '$_pv_repo'): pass a pushed ref"
+                return 2
+            fi
+            if [ -z "$_pv_branch" ]; then
+                _preview_die 2 "--stack @worktree: the job has no branch"
+                return 2
+            fi
+            stack_ref="$_pv_branch"
+            stack_expected=1
+        elif _preview_valid_ref "$stack_arg"; then
+            stack_ref="$stack_arg"
+        else
+            _preview_die 2 "invalid --stack ref '$stack_arg' (use a pushed branch, tag or sha, or @worktree)"
+            return 2
+        fi
+    fi
 
     # Components: --components (else the repo's default) plus --with, deduped in order.
     local own list="" c ref
@@ -500,7 +541,7 @@ mother_preview_up() {
         fi
         refs="${refs:+$refs }$c=$ref"
     done
-    if [ -n "$expected_c" ]; then
+    if [ -n "$expected_c" ] || [ "$stack_expected" -eq 1 ]; then
         local remote_sha head_sha
         remote_sha=$(git -C "$_pv_work_dir" ls-remote origin "refs/heads/$_pv_branch" 2>/dev/null | awk 'NR==1{print $1}')
         head_sha=$(git -C "$_pv_work_dir" rev-parse HEAD 2>/dev/null)
@@ -510,7 +551,7 @@ mother_preview_up() {
             _preview_die 2 "push first: previews build pushed refs (origin has $origin_has, HEAD is $(_preview_sha7 "$head_sha"))"
             return 2
         fi
-        expected_sha="$head_sha"
+        [ -z "$expected_c" ] || expected_sha="$head_sha"
     fi
 
     # Launch through the backend seam.
@@ -523,7 +564,7 @@ mother_preview_up() {
     _preview_job_update "$_pv_job_id" '.preview = {stack_id: $s, backend: $b, components: ($l | split(",")),
         status: "launching", urls: {}, expected_sha: {}, launches: $n, stopped_at: null}' \
         --arg s "$_pv_stack_id" --arg b "$backend" --arg l "$list" --argjson n "$launches" 2>/dev/null || true
-    rec=$(_preview_backend_up "$backend" "$_pv_stack_id" "$list" "$refs") || rc=$?
+    rec=$(_preview_backend_up "$backend" "$_pv_stack_id" "$list" "$refs" "$stack_ref") || rc=$?
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 2 ] || [ "$rc" -eq 3 ]; then
             # The CLI refused: nothing launched, so put the old record back.

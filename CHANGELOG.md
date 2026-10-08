@@ -4,6 +4,16 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-10-08
+
+### Added
+
+- **`mother preview up --stack <ref|@worktree>`.** Passes the preview-stack source ref through to
+  `preview-stack up --stack` (default unchanged: `MOTHER_PREVIEW_STACK_REF`, else `main`), so a job that
+  changes preview-stack itself can verify its branch live. Refs are validated (no leading `-`, `..`,
+  whitespace or shell metacharacters) and never shell-interpolated. `@worktree` is only accepted for jobs on
+  the `preview-stack` repo and resolves to the job's branch, which must be pushed (same "push first" check).
+
 ## [0.3.5] - 2026-10-08
 
 ### Added

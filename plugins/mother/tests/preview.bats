@@ -556,6 +556,60 @@ _assert_no_secret_in_argv() {
     [ "$(_http_calls)" = "0" ]
 }
 
+@test "up --stack <ref> passes the ref through to the CLI's --stack" {
+    _pv_job pvstk1 admin-portal feature/pvstk1
+    _up_nowait --stack feature/ps-fix
+    grep -qF -- 'up --via dispatch --stack feature/ps-fix --purpose job' "$PV_LOG"
+}
+
+@test "up without --stack still uses MOTHER_PREVIEW_STACK_REF/main" {
+    _pv_job pvstk2 admin-portal feature/pvstk2
+    _up_nowait
+    grep -qF -- '--stack main --purpose job' "$PV_LOG"
+}
+
+@test "up --stack @worktree on a preview-stack job uses the pushed job branch" {
+    _pv_job pvstk3 preview-stack feature/pvstk3
+    _up_nowait --components ap --stack @worktree
+    grep -qF -- 'up --via dispatch --stack feature/pvstk3 --purpose job' "$PV_LOG"
+}
+
+@test "up --stack @worktree on an unpushed preview-stack branch exits 2 with 'push first'" {
+    _mk_branch feature/pvstk4
+    _make_pv_job pvstk4 preview-stack feature/pvstk4
+    export MOTHER_JOB_ID=pvstk4
+    run mother preview up --components ap --stack @worktree --no-wait
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"push first"* ]]
+    _assert_nothing_launched
+}
+
+@test "up --stack @worktree on a non-preview-stack repo exits 2 and launches nothing" {
+    _pv_job pvstk5 admin-portal feature/pvstk5
+    run mother preview up --stack @worktree --no-wait
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"preview-stack"* ]]
+    _assert_nothing_launched
+}
+
+@test "up --stack rejects unsafe refs (exit 2, nothing launched)" {
+    _pv_job pvstk6 admin-portal feature/pvstk6
+    local bad
+    for bad in '--evil' 'a b' 'a;touch x' '$(id)' 'a`id`' 'a..b' 'x/' 'x.lock' '/abs' 'a//b' ''; do
+        run mother preview up --stack "$bad" --no-wait
+        [ "$status" -eq 2 ]
+        _assert_nothing_launched
+    done
+    [ ! -e x ]
+}
+
+@test "up --stack with no value exits 2" {
+    _pv_job pvstk7 admin-portal feature/pvstk7
+    run mother preview up --stack
+    [ "$status" -eq 2 ]
+    _assert_nothing_launched
+}
+
 @test "up records .preview on the job and appends an identical preview_up event" {
     _pv_job pvup2 admin-portal feature/pvup2
     local sha; sha=$(_head)
