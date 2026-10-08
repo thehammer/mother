@@ -923,7 +923,8 @@ _notify_awaiting() {
             [ -n "$question" ] && body="$body — $question"
             body="$body
 mother resume $id \"…\""
-            if mother_notify "$ptitle" "$body" "$id"; then ok=true; else ok=false; fi
+            local pr_url; pr_url=$(jq -r '.pr_url // ""' "$JOBS_DIR/$id.json" 2>/dev/null || true)
+            if mother_notify "$ptitle" "$body" "$id" "$pr_url"; then ok=true; else ok=false; fi
         fi
         count=$((count + 1))
         # Only touch our own field, and only while the job is still awaiting.

@@ -51,6 +51,14 @@ if [ "$(uname -s)" = "Darwin" ] && command -v plutil >/dev/null 2>&1; then
     echo ""
 fi
 
+# --- notification click target (macOS only; advisory) ---
+if [ "$(uname -s)" = "Darwin" ] && ! command -v terminal-notifier >/dev/null 2>&1; then
+    echo "notifications:"
+    printf '  ✗ %-12s not found — clicks will open Script Editor.\n' "terminal-notifier"
+    printf '               Fix: brew install terminal-notifier\n'
+    echo ""
+fi
+
 # --- effective concurrency (advisory) ---
 if command -v mother >/dev/null 2>&1; then
     _conc=$(mother status --format json 2>/dev/null | jq -r '.concurrency | "\(.value) (source: \(.source))"' 2>/dev/null)

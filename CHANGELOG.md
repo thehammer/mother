@@ -4,6 +4,16 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-10-08
+
+### Added
+
+- **Clickable notifications.** The `terminal-notifier` transport now sends `-group mother-<id>`
+  and a click action: `-open <pr_url>` when the job has a PR, otherwise `-execute` opening
+  Terminal on `mother status <id>` (override with `MOTHER_NOTIFY_CLICK_COMMAND`, run as
+  `<cmd> <id>`). Bodies stay argv-only. `mother_notify` takes an optional 4th `pr_url` arg.
+- `mother doctor` warns on macOS when `terminal-notifier` is missing (clicks open Script Editor).
+
 ## [0.3.4] - 2026-10-08
 
 ### Fixed

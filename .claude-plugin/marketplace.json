@@ -15,7 +15,7 @@
         "url": "https://github.com/thehammer"
       },
       "source": "./plugins/mother",
-      "version": "0.3.4",
+      "version": "0.3.5",
       "category": "productivity",
       "tags": ["queue", "background", "automation", "tmux", "worktree"]
     }

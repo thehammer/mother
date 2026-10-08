@@ -2,12 +2,17 @@
 #
 # Sourced by bin/mother-runner. Does not set shell options; inherits `set -u`.
 #
-# One entry point: mother_notify <title> <body> [<job_id>]. Call sites never
+# One entry point: mother_notify <title> <body> [<job_id> [<pr_url>]]. Call sites never
 # know which transport is in use; MOTHER_NOTIFY_TRANSPORT picks it:
 #
 #   auto (default)     terminal-notifier if on PATH, else osascript on Darwin,
 #                      else none
-#   terminal-notifier  terminal-notifier -title … -message …
+#   terminal-notifier  terminal-notifier -title … -message … -group mother-<id>
+#                      plus a click action: -open <pr_url> when the job has an
+#                      http(s) PR, else -execute "<click command> <id>" (job ids
+#                      only; the body never reaches -execute). The click command
+#                      is MOTHER_NOTIFY_CLICK_COMMAND, default: open Terminal
+#                      running `mother status <id>`.
 #   osascript          display notification, with title/body passed as ARGV to
 #                      an `on run argv` handler — NEVER interpolated into the
 #                      AppleScript source. The body carries worker-authored
@@ -42,14 +47,37 @@ _notify_resolve_transport() {
     echo "$t"
 }
 
+# Fills the global array _NOTIFY_CLICK with terminal-notifier's click-action
+# args for a job (built as an array, never serialized, so no value can split
+# into extra flags). Only a validated job id and a whitespace-free http(s) URL
+# are ever used.
+_notify_click_args() {
+    local job_id="$1" pr_url="$2"
+    _NOTIFY_CLICK=()
+    [ -n "$job_id" ] || return 0
+    case "$job_id" in *[!A-Za-z0-9_.-]*) return 0 ;; esac
+    _NOTIFY_CLICK=(-group "mother-$job_id")
+    case "$pr_url" in
+        *[[:space:][:cntrl:]]*) pr_url="" ;;
+        http://*|https://*) _NOTIFY_CLICK+=(-open "$pr_url"); return 0 ;;
+    esac
+    local cmd="${MOTHER_NOTIFY_CLICK_COMMAND:-}"
+    if [ -n "$cmd" ]; then
+        _NOTIFY_CLICK+=(-execute "$cmd $job_id")
+    else
+        _NOTIFY_CLICK+=(-execute "/usr/bin/osascript -e 'tell application \"Terminal\" to activate' -e 'tell application \"Terminal\" to do script \"mother status $job_id\"'")
+    fi
+}
+
 mother_notify() {
-    local title="$1" body="$2" job_id="${3:-}"
+    local title="$1" body="$2" job_id="${3:-}" pr_url="${4:-}"
     local transport secs="${MOTHER_NOTIFY_TIMEOUT:-5}"
     transport=$(_notify_resolve_transport)
     MOTHER_NOTIFY_LAST_TRANSPORT="$transport"
     case "$transport" in
         terminal-notifier)
-            _bounded_run "$secs" - terminal-notifier -title "$title" -message "$body"
+            _notify_click_args "$job_id" "$pr_url"
+            _bounded_run "$secs" - terminal-notifier -title "$title" -message "$body" ${_NOTIFY_CLICK[@]+"${_NOTIFY_CLICK[@]}"}
             ;;
         osascript)
             _bounded_run "$secs" - osascript \
