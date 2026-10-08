@@ -578,3 +578,17 @@ _event_count() {
     assert_job_field "child" '.force_start // "absent"' "absent"
     assert_job_field "child" '.force_ignore_deps // "absent"' "absent"
 }
+
+@test "force-start: every place that clears force_start also clears force_ignore_deps" {
+    # mother-run-job has its own _transition (not lib/state.sh's), so a behavioural test of one
+    # does not cover the other. Guard the invariant across all binaries and libs instead.
+    local root="$BATS_TEST_DIRNAME/.."
+    local f bad=""
+    while IFS= read -r f; do
+        local n_fs n_fid
+        n_fs=$(grep -c 'force_start = null' "$f" || true)
+        n_fid=$(grep -c 'force_ignore_deps = null' "$f" || true)
+        [ "$n_fs" -eq "$n_fid" ] || bad="$bad $f(force_start=$n_fs,ignore_deps=$n_fid)"
+    done < <(grep -rl 'force_start = null' "$root/bin" "$root/lib")
+    [ -z "$bad" ] || { echo "mismatch:$bad"; false; }
+}
