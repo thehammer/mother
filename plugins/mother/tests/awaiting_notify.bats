@@ -518,3 +518,111 @@ CMD
     [ -f "$MOTHER_ROOT/terminal-notifier-argv" ]
     [ ! -f "$MOTHER_ROOT/osascript-argv" ]
 }
+
+# ---------------------------------------------------------------------------
+# terminal-notifier click actions (group / open / execute)
+
+_tn_argv() { cat "$MOTHER_ROOT/terminal-notifier-argv"; }
+
+@test "mother_notify: terminal-notifier with a job and https PR url groups by job and opens the PR, with no -execute" {
+    _fake_bin terminal-notifier
+    export MOTHER_NOTIFY_TRANSPORT=terminal-notifier
+    run _notify "T" "B" "job-z" "https://github.com/o/r/pull/7"
+    [ "$status" -eq 0 ]
+    grep -qxF "ARG=-group" "$MOTHER_ROOT/terminal-notifier-argv"
+    grep -qxF "ARG=mother-job-z" "$MOTHER_ROOT/terminal-notifier-argv"
+    grep -qxF "ARG=-open" "$MOTHER_ROOT/terminal-notifier-argv"
+    grep -qxF "ARG=https://github.com/o/r/pull/7" "$MOTHER_ROOT/terminal-notifier-argv"
+    if grep -qxF "ARG=-execute" "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
+}
+
+@test "mother_notify: terminal-notifier without a PR url executes a click command that shows mother status for the job" {
+    _fake_bin terminal-notifier
+    export MOTHER_NOTIFY_TRANSPORT=terminal-notifier
+    run _notify "T" "B" "job-z"
+    [ "$status" -eq 0 ]
+    grep -qxF "ARG=-group" "$MOTHER_ROOT/terminal-notifier-argv"
+    grep -qxF "ARG=mother-job-z" "$MOTHER_ROOT/terminal-notifier-argv"
+    if grep -qxF "ARG=-open" "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
+    local exec_val
+    exec_val=$(grep -A1 -xF "ARG=-execute" "$MOTHER_ROOT/terminal-notifier-argv" | tail -1)
+    [[ "$exec_val" == ARG=*"mother status job-z"* ]]
+}
+
+@test "mother_notify: MOTHER_NOTIFY_CLICK_COMMAND overrides the click command and receives the job id" {
+    _fake_bin terminal-notifier
+    export MOTHER_NOTIFY_TRANSPORT=terminal-notifier
+    export MOTHER_NOTIFY_CLICK_COMMAND="/opt/click-me"
+    run _notify "T" "B" "job-z"
+    [ "$status" -eq 0 ]
+    grep -qxF "ARG=-execute" "$MOTHER_ROOT/terminal-notifier-argv"
+    grep -qxF "ARG=/opt/click-me job-z" "$MOTHER_ROOT/terminal-notifier-argv"
+}
+
+@test "mother_notify: a hostile body reaches terminal-notifier verbatim as one argument and never the -execute value" {
+    _fake_bin terminal-notifier
+    export MOTHER_NOTIFY_TRANSPORT=terminal-notifier
+    local body="it's \"quoted\" \$(touch $MOTHER_ROOT/pwned) \`touch $MOTHER_ROOT/pwned2\` ; done"
+    run _notify "T" "$body" "job-z"
+    [ "$status" -eq 0 ]
+    grep -qxF "ARG=$body" "$MOTHER_ROOT/terminal-notifier-argv"
+    [ "$(grep -cF 'touch' "$MOTHER_ROOT/terminal-notifier-argv")" -eq 1 ]
+    local exec_val
+    exec_val=$(grep -A1 -xF "ARG=-execute" "$MOTHER_ROOT/terminal-notifier-argv" | tail -1)
+    [[ "$exec_val" != *touch* ]]
+    [[ "$exec_val" != *quoted* ]]
+    [ ! -e "$MOTHER_ROOT/pwned" ]
+    [ ! -e "$MOTHER_ROOT/pwned2" ]
+}
+
+@test "mother_notify: a non-http PR url is never passed to -open" {
+    _fake_bin terminal-notifier
+    export MOTHER_NOTIFY_TRANSPORT=terminal-notifier
+    run _notify "T" "B" "job-z" "javascript:alert(1)"
+    [ "$status" -eq 0 ]
+    if grep -qxF "ARG=-open" "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
+    if grep -qF "javascript:" "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
+}
+
+@test "mother_notify: a job id with unsafe characters gets no -group and no -execute" {
+    _fake_bin terminal-notifier
+    export MOTHER_NOTIFY_TRANSPORT=terminal-notifier
+    run _notify "T" "B" 'a;b'
+    [ "$status" -eq 0 ]
+    grep -qxF "ARG=T" "$MOTHER_ROOT/terminal-notifier-argv"
+    if grep -qxF "ARG=-group" "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
+    if grep -qxF "ARG=-execute" "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
+    if grep -qF 'a;b' "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
+}
+
+@test "mother_notify: terminal-notifier without a job id passes only title and message" {
+    _fake_bin terminal-notifier
+    export MOTHER_NOTIFY_TRANSPORT=terminal-notifier
+    run _notify "T" "B"
+    [ "$status" -eq 0 ]
+    [ "$(grep -c '^ARG=' "$MOTHER_ROOT/terminal-notifier-argv")" -eq 4 ]
+    grep -qxF "ARG=-title" "$MOTHER_ROOT/terminal-notifier-argv"
+    grep -qxF "ARG=-message" "$MOTHER_ROOT/terminal-notifier-argv"
+}
+
+@test "mother_notify: auto with neither terminal-notifier nor osascript available resolves to none" {
+    local bare="$MOTHER_ROOT/barebin"
+    mkdir -p "$bare"
+    ln -s "$(command -v uname)" "$bare/uname"
+    export MOTHER_NOTIFY_TRANSPORT=auto
+    local bash_bin; bash_bin=$(command -v bash)
+    run env PATH="$bare" "$bash_bin" -c "set -u; source '$_LIB_DIR/notify.sh'; mother_notify T B job-z; rc=\$?; echo \"transport=\$MOTHER_NOTIFY_LAST_TRANSPORT rc=\$rc\""
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"transport=none rc=0"* ]]
+}
+
+@test "mother_notify: a PR url containing newlines cannot smuggle extra terminal-notifier arguments" {
+    _fake_bin terminal-notifier
+    export MOTHER_NOTIFY_TRANSPORT=terminal-notifier
+    local url=$'https://example.com/pull/1\n-execute\ntouch '"$MOTHER_ROOT"/pwned
+    run _notify "T" "B" "job-z" "$url"
+    [ "$status" -eq 0 ]
+    # No argument may be a bare -execute carrying the smuggled command.
+    if grep -qF "touch $MOTHER_ROOT/pwned" "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
+    [ ! -e "$MOTHER_ROOT/pwned" ]
+}
