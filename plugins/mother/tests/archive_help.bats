@@ -19,3 +19,23 @@ setup() { setup_mother_env; }
     [[ "$output" == *"whole number of days"* ]]
     [[ "$output" != *"syntax error"* ]]
 }
+
+@test "archive --older-than with no value fails fast instead of hanging" {
+    mother archive --older-than >"$BATS_TEST_TMPDIR/out" 2>&1 &
+    local pid=$!
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null || true
+        echo "archive --older-than hung" >&2
+        false
+    fi
+    local rc=0
+    wait "$pid" || rc=$?
+    [ "$rc" -ne 0 ]
+    grep -q -- "--older-than" "$BATS_TEST_TMPDIR/out"
+}

@@ -3571,7 +3571,7 @@ cmd_archive() {
     local older_than=30 dry_run=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --older-than) older_than="${2:-}"; shift 2 || true ;;
+            --older-than) [ $# -ge 2 ] || _die "archive: --older-than requires a value"; older_than="$2"; shift 2 ;;
             --dry-run)    dry_run=1; shift ;;
             *) _die "unknown flag for archive: $1" ;;
         esac
