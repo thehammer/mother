@@ -4,6 +4,15 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-10-09
+
+### Changed
+
+- Documented `mother archive <id>` (single-job archive) in `mother --help`, the Mother skill and the README;
+  clarified that the bulk form sweeps all sessions' jobs.
+- `mother archive --older-than` now rejects a non-integer value with a one-line error instead of a bash
+  arithmetic error.
+
 ## [0.3.6] - 2026-10-08
 
 ### Added
