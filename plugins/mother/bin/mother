@@ -3543,6 +3543,8 @@ cmd_gc() {
 #   mother archive <id>                    — archive one specific job now
 #   mother archive [--older-than DAYS] [--dry-run]  — bulk sweep by age
 #
+# The bulk form sweeps EVERY eligible job in the queue, including jobs enqueued
+# by other sessions; DAYS must be an integer.
 # Single-id form intentionally ignores age — the user asked for it explicitly.
 # Useful from the fzf switcher's ctrl-d binding to clean up a failed job
 # without waiting 30 days.
@@ -3569,11 +3571,20 @@ cmd_archive() {
     local older_than=30 dry_run=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --older-than) older_than="$2"; shift 2 ;;
+            --older-than) [ $# -ge 2 ] || _die "archive: --older-than requires a value"; older_than="$2"; shift 2 ;;
             --dry-run)    dry_run=1; shift ;;
             *) _die "unknown flag for archive: $1" ;;
         esac
     done
+    case "$older_than" in
+        ''|*[!0-9]*) _die "archive: --older-than expects a whole number of days, got '$older_than'" ;;
+    esac
+    # Digits only is not enough for $(( ... )): "08"/"09" are invalid octal (raw bash
+    # error), "030" would silently read as octal (24 days, not 30), and a very long
+    # number overflows to an empty or FUTURE cutoff, which could archive every finished
+    # job, including other sessions'. Bound the length, then force base 10.
+    [ "${#older_than}" -le 5 ] || _die "archive: --older-than is too large: '$older_than' (max 99999 days)"
+    older_than=$((10#$older_than))
 
     # Drain the pending-teardown queue first, so records deferred during this
     # same run are not immediately re-checked below. Archiving proceeds
@@ -3807,7 +3818,13 @@ Usage:
   mother drafts list | save --plan-file PATH | show ID | rm ID
   mother daemon start [--foreground] | stop | status | install | uninstall
   mother broker status | path                (IPC broker diagnostics)
+  mother archive <id> [--dry-run]             (archive ONE terminal-state job now: ignores age; runs
+                                              worktree/container teardown when eligible)
   mother archive [--older-than DAYS] [--dry-run]
+                                              (bulk sweep: archives EVERY eligible terminal job older
+                                              than DAYS, default 30, 0 = everything finished,
+                                              including jobs enqueued by other sessions; DAYS must
+                                              be an integer)
   mother prune-temps [--dry-run]              (remove orphaned *.tmp.*/*.bak.* state files)
   mother gc [--dry-run]                       (disk hygiene: orphaned Xcode DerivedData, oversized Go
                                               build cache, archived jobs' temp dirs; reports big Cargo targets)

@@ -69,6 +69,10 @@ mother logs <id> --follow
 mother cancel <id>
 mother retry <id>
 
+# Archive finished jobs
+mother archive <id> [--dry-run]                   # one terminal-state job (ignores age; runs teardown when eligible, e.g. once its PR is merged)
+mother archive [--older-than DAYS] [--dry-run]    # bulk sweep of ALL finished jobs older than DAYS (default 30)
+
 # Attach to a running worker's log in a new tmux window (opt-in)
 mother attach <id>
 
@@ -76,6 +80,11 @@ mother attach <id>
 # occasionally call it manually if the user asks "what's new?")
 mother events --since-cursor <session-id>
 ```
+
+Use `mother archive <id>` for a job you started from this session and are done
+with. The bulk form is whole-queue housekeeping: it also archives other
+sessions' finished jobs (and `--older-than 0` archives everything finished), so
+don't use it to tidy your own jobs. `DAYS` must be an integer.
 
 `origin.session` is auto-captured from `$CLAUDE_SESSION_ID` at enqueue time
 (overridable with `--origin-session` or `$MOTHER_ORIGIN_SESSION`), so a

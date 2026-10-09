@@ -409,6 +409,16 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_QUOTA_CAP_5H_PCT` | `90` | Refuse new dispatches when the 5h window is at or over this percentage |
 | `MOTHER_QUOTA_CAP_7D_PCT` | `90` | Same for the 7d window |
 
+### Archiving
+
+- `mother archive <id> [--dry-run]` archives exactly one terminal-state job
+  (`succeeded`, `failed`, `cancelled`) now, ignoring its age, and runs its
+  worktree/docker teardown. This is what Ctrl-D does in the fzf popup.
+- `mother archive [--older-than DAYS] [--dry-run]` is the bulk sweep the daemon
+  runs hourly: it archives **every** eligible terminal job older than `DAYS`
+  (integer, default 30; `0` = everything finished), including jobs enqueued by
+  other sessions. Prefer the single-id form to clean up your own jobs.
+
 Resource teardown rides along with the archive sweep (`mother archive`,
 whether the daemon's periodic sweep or a one-off `mother archive <id>`):
 once a job's PR is merged or closed (or the job never opened one), Mother
