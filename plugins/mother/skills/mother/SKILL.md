@@ -70,7 +70,7 @@ mother cancel <id>
 mother retry <id>
 
 # Archive finished jobs
-mother archive <id> [--dry-run]                   # one terminal-state job (ignores age; tears down its worktree)
+mother archive <id> [--dry-run]                   # one terminal-state job (ignores age; runs teardown when eligible, e.g. once its PR is merged)
 mother archive [--older-than DAYS] [--dry-run]    # bulk sweep of ALL finished jobs older than DAYS (default 30)
 
 # Attach to a running worker's log in a new tmux window (opt-in)

@@ -3579,6 +3579,12 @@ cmd_archive() {
     case "$older_than" in
         ''|*[!0-9]*) _die "archive: --older-than expects a whole number of days, got '$older_than'" ;;
     esac
+    # Digits only is not enough for $(( ... )): "08"/"09" are invalid octal (raw bash
+    # error), "030" would silently read as octal (24 days, not 30), and a very long
+    # number overflows to an empty or FUTURE cutoff, which could archive every finished
+    # job, including other sessions'. Bound the length, then force base 10.
+    [ "${#older_than}" -le 5 ] || _die "archive: --older-than is too large: '$older_than' (max 99999 days)"
+    older_than=$((10#$older_than))
 
     # Drain the pending-teardown queue first, so records deferred during this
     # same run are not immediately re-checked below. Archiving proceeds
@@ -3812,8 +3818,8 @@ Usage:
   mother drafts list | save --plan-file PATH | show ID | rm ID
   mother daemon start [--foreground] | stop | status | install | uninstall
   mother broker status | path                (IPC broker diagnostics)
-  mother archive <id> [--dry-run]             (archive ONE terminal-state job now: ignores age; tears
-                                              down its worktree/containers)
+  mother archive <id> [--dry-run]             (archive ONE terminal-state job now: ignores age; runs
+                                              worktree/container teardown when eligible)
   mother archive [--older-than DAYS] [--dry-run]
                                               (bulk sweep: archives EVERY eligible terminal job older
                                               than DAYS, default 30, 0 = everything finished,
