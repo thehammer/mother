@@ -221,6 +221,23 @@ _nasty_verdict() {
     [ "$(_spawns nasty-fail)" = "1" ]
 }
 
+@test "adherence loop: a first-attempt failure emits a STATE event (ready) so event-following clients see the rework" {
+    _make_succeeded_job "rework-state-ev"
+    export MOCK_CLAUDE_STDOUT
+    MOCK_CLAUDE_STDOUT="$(_nasty_verdict fail)"
+
+    _tick
+    assert_job_field "rework-state-ev" '.state' "ready"
+    assert_event_kind "rework-state-ev" "adherence_rework_kicked"
+
+    # The broker classifies adherence_* events as activity, so without a state event a client that
+    # follows the stream keeps the job SUCCEEDED while `mother list` says ready [cody_rework].
+    local kinds
+    kinds=$(jq -r '.kind' "$EVENTS_DIR/rework-state-ev.jsonl" | tr '\n' ' ')
+    [[ "$kinds" == *"adherence_rework_kicked ready"* ]]
+    [ "$(jq -r 'select(.kind == "ready") | .detail.reason' "$EVENTS_DIR/rework-state-ev.jsonl" | tail -n1)" = "adherence_rework" ]
+}
+
 # ---------------------------------------------------------------------------
 # 2. Fix-up jobs sharing a PR: each reviewed once, neither starved
 

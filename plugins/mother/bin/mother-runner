@@ -1264,6 +1264,12 @@ _run_adherence_pending() {
                         ' "$JOBS_DIR/$id.json") && _atomic_write "$JOBS_DIR/$id.json" "$merged"
                         _append_event "$id" "adherence_rework_kicked" \
                             "$(jq -nc --arg id "$id" '{id: $id, note: "adherence failed first attempt; re-queuing with activity=cody_rework"}')"
+                        # The job file now says state=ready, but the broker classifies every
+                        # `adherence_*` event as activity: clients that follow the event stream
+                        # (the Nostromo Mother panel) would keep showing the job as SUCCEEDED while
+                        # `mother list` says ready [cody_rework]. Emit the state event too.
+                        _append_event "$id" "ready" \
+                            "$(jq -nc '{reason: "adherence_rework"}')"
                         _log "adherence failed for $id (first attempt) — re-queuing (activity=cody_rework)"
                         ;;
                     blocked_for_human)
@@ -1545,6 +1551,9 @@ _run_pipeline_review() {
                         --argjson cycle "$next_cycle" \
                         --argjson pending_agents "$pending_json" \
                         '{review_cycle: $cycle, pending_agents: $pending_agents}')"
+                # state flipped back to ready above: say so as a STATE event (pipeline_* events are
+                # classified as activity, so event-following clients would miss it).
+                _append_event "$id" "ready" "$(jq -nc '{reason: "pipeline_cycle_continued"}')"
                 # W5 lifecycle event: start the first build phase of the new cycle.
                 _append_event "$id" "phase_started" \
                     "$(jq -nc \
@@ -1610,6 +1619,8 @@ _run_pipeline_job() {
                     _append_event "$id" "pipeline_phase_advance" \
                         "$(jq -nc --arg from "$pipeline_phase" --arg to "$next_phase" \
                             '{from: $from, to: $to}')"
+                    # state flipped back to ready above: emit the STATE event (pipeline_* is activity).
+                    _append_event "$id" "ready" "$(jq -nc '{reason: "pipeline_phase_advance"}')"
                     # W5 lifecycle events: complete the old phase, start the new one.
                     _append_event "$id" "phase_completed" \
                         "$(jq -nc \
