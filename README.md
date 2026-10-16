@@ -404,7 +404,7 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_MIN_FREE_GB` | `20` | Pause dispatch (never running jobs) while the volume holding the next job's repo has less than this many GB free; shows as a `low_disk` needs-attention item and triggers one `mother gc` sweep (at most every `MOTHER_LOWDISK_GC_INTERVAL`, default 600s). `0` disables. Resumes automatically |
 | `MOTHER_GOCACHE_MAX_GB` | `10` | `mother gc` runs `go clean -cache` when the Go build cache is larger than this and no job is running |
 | `MOTHER_GC_ENABLED` | `1` | Run `mother gc` in the hourly sweep and on low disk (`0` to disable) |
-| `MOTHER_CARGO_TARGET_PURGE` | `1` | `mother gc` deletes the `target/` of a Cargo job worktree once every job on it is `succeeded`/`failed`/`cancelled` (none adherence-pending or in pipeline review). `0` only reports |
+| `MOTHER_CARGO_TARGET_PURGE` | `1` | `mother gc` deletes the `target/` of a Cargo job worktree once every job on it is `succeeded`/`failed`/`cancelled` (none adherence-pending or in pipeline review). `0`/`false`/`no`/`off` (or any unrecognised value) only reports |
 | `MOTHER_CARGO_TARGET_IDLE_MINUTES` | `10` | A worktree `target/` with anything modified within this many minutes is kept |
 | `MOTHER_CARGO_TARGET_PURGE_EXCLUDE` | (empty) | Job `repo` names (space or comma separated) whose worktree `target/` dirs are never purged |
 | `MOTHER_RECONCILE_ENABLED` | `1` | Let the daemon try `mother reconcile --auto` on a failed job before escalating it |

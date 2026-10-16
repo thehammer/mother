@@ -10,9 +10,12 @@ All notable changes to Mother are documented here. Format based on
 
 - **`mother gc` reclaims idle Rust `target/` dirs in job worktrees.** A Cargo job worktree's `target/`
   (9-14 GB each) is deleted once every job on the worktree is `succeeded`/`failed`/`cancelled`, none is
-  adherence-pending or in pipeline review, and nothing in it changed for `MOTHER_CARGO_TARGET_IDLE_MINUTES`
-  (default 10). Fail-closed: only a real `target/` dir holding `CACHEDIR.TAG` next to a `Cargo.toml`, never
-  a symlink, a main checkout or a main-dir job. Settings: `MOTHER_CARGO_TARGET_PURGE` (`0` = report only),
+  adherence-pending or in pipeline review, and nothing anywhere in it changed for `MOTHER_CARGO_TARGET_IDLE_MINUTES`
+  (default 10). Fail-closed: only a real `target/` dir holding `CACHEDIR.TAG` next to a `Cargo.toml` in a
+  linked worktree (`.git` is a file), never a symlink, a main checkout or a main-dir job. A queued/dispatched
+  job that has no `work_dir` yet protects the worktree its branch will use (the whole repo if that can't be
+  derived); the in-use check is repeated right before the `rm`. The job list is read once per pass.
+  Settings: `MOTHER_CARGO_TARGET_PURGE` (`0`/`false`/`no`/`off` or an unrecognised value = report only),
   `MOTHER_CARGO_TARGET_IDLE_MINUTES`, `MOTHER_CARGO_TARGET_PURGE_EXCLUDE`. It runs in the hourly sweep and
   when the low-disk gate trips. Deliberately not a shared `CARGO_TARGET_DIR`: cargo's freshness check can
   silently reuse another checkout's binaries.

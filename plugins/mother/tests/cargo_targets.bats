@@ -6,14 +6,30 @@
 #     isolation is "worktree" and whose work_dir is not the repo_path. The
 #     directory <work_dir>/target is deleted (rm -rf) only when ALL hold:
 #       - <work_dir>/Cargo.toml exists
-#       - target is a real directory (not a symlink) that contains CACHEDIR.TAG
+#       - <work_dir>/.git is a regular FILE (a linked worktree): a main checkout
+#         (.git directory), a symlinked .git, or no .git at all is never touched
+#       - target is a real directory (not a symlink) that contains CACHEDIR.TAG,
+#         and its physical path is <physical work_dir>/target
 #       - no job referencing that work_dir is live: queued|ready|running|awaiting,
 #         activity pipeline_review, adherence_pending == true, or an unreadable /
 #         unknown state (fail closed). succeeded|failed|cancelled are idle.
-#       - nothing under target (maxdepth 3) changed within
-#         MOTHER_CARGO_TARGET_IDLE_MINUTES (default 10; non-numeric -> 10)
-#       - MOTHER_CARGO_TARGET_PURGE != 0 and the job's repo is not listed in
-#         MOTHER_CARGO_TARGET_PURGE_EXCLUDE (space or comma separated)
+#         Any unreadable job record in $JOBS_DIR keeps every target.
+#       - no unplaced job could land there: a non-terminal worktree-isolation job
+#         with no work_dir yet counts against the worktree its path derives to
+#         (<dirname repo_path>/<basename repo_path>-<branch, / -> ->, as
+#         worktree_get_path); when that path cannot be derived (empty branch or
+#         repo_path) it blocks every worktree of the same repo name, and never
+#         another repo. Terminal and main-dir jobs without a work_dir never block.
+#       - nothing anywhere under target (the WHOLE tree, not a fixed depth)
+#         changed within MOTHER_CARGO_TARGET_IDLE_MINUTES (default 10;
+#         non-numeric -> 10; 0 disables the check)
+#       - MOTHER_CARGO_TARGET_PURGE is not a disabled value and the job's repo is
+#         not listed in MOTHER_CARGO_TARGET_PURGE_EXCLUDE (space or comma
+#         separated). PURGE: unset/empty or 1|true|yes|on (any case) purge;
+#         0|false|no|off (any case) report only; anything else is treated as
+#         disabled AND the output says the value is "unrecognised".
+#       - immediately before the rm the job records are re-read and the in-use and
+#         activity checks repeated, and the dir's mtime must be unchanged
 #   * Only target/ goes: Cargo.toml and src/ stay. A failed rm never fails gc.
 #   * The same pass writes $RUNNER_DIR/cargo-targets.json (also on --dry-run).
 #   * `mother status` shows a "Rust build dirs:" line from that cache, and
@@ -55,7 +71,7 @@ _wt() { echo "$MOTHER_ROOT/wt/$1"; }
 # Push every mtime under <dir> far enough into the past to count as idle.
 _backdate() { find "$1" -exec touch -t 202601010000 {} +; }
 
-# A fake Rust worktree: Cargo.toml, src/, and a cargo-style target/ (CACHEDIR.TAG
+# A fake Rust worktree: Cargo.toml, src/, a .git file, and a cargo-style target/ (CACHEDIR.TAG
 # plus three 1 MB blobs under debug/deps), all back-dated.
 # Usage: _fake_worktree <name>
 _fake_worktree() {
@@ -63,6 +79,7 @@ _fake_worktree() {
     mkdir -p "$dir/src" "$dir/target/debug/deps"
     echo '[package]' > "$dir/Cargo.toml"
     echo 'fn main() {}' > "$dir/src/main.rs"
+    echo "gitdir: $MOTHER_ROOT/fake-main/.git/worktrees/$1" > "$dir/.git"   # linked worktree: .git is a FILE
     echo 'Signature: 8a477f597d28d172789f06886806bc55' > "$dir/target/CACHEDIR.TAG"
     local i
     for i in 1 2 3; do
@@ -339,6 +356,10 @@ _assert_kept_for_state() {
     mkdir -p "$MOTHER_ROOT/elsewhere"
     mv "$(_wt linked)/target" "$dest"
     ln -s "$dest" "$(_wt linked)/target"
+    # A fresh symlink would be kept by the 10 minute activity guard alone; age
+    # the link itself and its destination so only the symlink guard is left.
+    _backdate "$dest"
+    touch -h -t 202601010000 "$(_wt linked)/target"
     _wt_job "ct-linked" "succeeded" linked
 
     run mother gc
@@ -347,6 +368,7 @@ _assert_kept_for_state() {
     [ -L "$(_wt linked)/target" ]
     [ -f "$dest/CACHEDIR.TAG" ]
     [ -f "$dest/debug/deps/blob1" ]
+    _assert_output_lacks "removed "
 }
 
 @test "a main-dir job (work_dir is the repo itself) never has its target/ removed" {
@@ -599,4 +621,590 @@ _seed_cache() {
     run mother status --format json
     [ "$status" -eq 0 ]
     printf '%s' "$output" | jq -e 'has("rust_build_dirs") and .rust_build_dirs == null' >/dev/null
+}
+
+# ===========================================================================
+# Review fix-ups
+#
+# `mother gc` deletes directories, so every guard below must fail closed, and
+# each test is written so that it fails if the guard it names is removed.
+# ===========================================================================
+
+# A job that already has a worktree. The worktree's <main> checkout and branch
+# determine the path a later, not-yet-placed job of the same repo/branch gets:
+#   <dirname repo_path>/<basename repo_path>-<branch with / -> ->   (worktree_get_path)
+# Usage: _placed_job <id> <state> <worktree-name> <main-name> <branch> [repo] [extra jq]
+_placed_job() {
+    local id="$1" state="$2" name="$3" main="$4" branch="$5" repo="${6:-testrepo}" extra="${7:-.}"
+    make_job "$id" "$state" \
+        ".work_dir = \"$(_wt "$name")\" | .repo_path = \"$(_wt "$main")\" | .branch = \"$branch\" | .repo = \"$repo\" | $extra"
+}
+
+# A job that has NOT been given a work_dir yet (queued, or dispatched but the
+# worker has not recorded one). Its eventual worktree is <main>-<branch>.
+# Usage: _unplaced_job <id> <state> <main-name> <branch> [repo] [extra jq]
+_unplaced_job() {
+    local id="$1" state="$2" main="$3" branch="$4" repo="${5:-testrepo}" extra="${6:-.}"
+    make_job "$id" "$state" \
+        "del(.work_dir) | .repo_path = \"$(_wt "$main")\" | .branch = \"$branch\" | .repo = \"$repo\" | $extra"
+}
+
+# --- jobs that have no work_dir yet ----------------------------------------
+
+@test "a queued job with no work_dir that will land on this worktree keeps its target/" {
+    _fake_worktree main-fix
+    _placed_job "ct-u1-done" succeeded main-fix main fix
+    _unplaced_job "ct-u1-next" queued main fix
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept main-fix
+    _assert_sources_intact main-fix
+    _assert_output_lacks "removed testrepo worktree target"
+    _assert_output_has "job still active or awaiting review"
+}
+
+@test "a running job with no work_dir that will land on this worktree keeps its target/" {
+    _fake_worktree main-fix
+    _placed_job "ct-u2-done" succeeded main-fix main fix
+    _unplaced_job "ct-u2-next" running main fix
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept main-fix
+    _assert_output_lacks "removed testrepo worktree target"
+}
+
+@test "a ready job with no work_dir that will land on this worktree keeps its target/" {
+    _fake_worktree main-fix
+    _placed_job "ct-u2-done" succeeded main-fix main fix
+    _unplaced_job "ct-u2-next" ready main fix
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept main-fix
+    _assert_output_lacks "removed testrepo worktree target"
+}
+
+@test "an awaiting job with no work_dir that will land on this worktree keeps its target/" {
+    _fake_worktree main-fix
+    _placed_job "ct-u2-done" succeeded main-fix main fix
+    _unplaced_job "ct-u2-next" awaiting main fix
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept main-fix
+}
+
+@test "a slash in an unplaced job's branch maps to the dashed worktree name (feat/x -> main-feat-x)" {
+    _fake_worktree main-feat-x
+    _placed_job "ct-u3-done" succeeded main-feat-x main feat/x
+    _unplaced_job "ct-u3-next" queued main feat/x
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept main-feat-x
+    _assert_output_lacks "removed testrepo worktree target"
+}
+
+@test "an unplaced job on a different branch of the same repo does not block this worktree" {
+    _fake_worktree main-fix
+    _placed_job "ct-u3b-done" succeeded main-fix main fix
+    _unplaced_job "ct-u3b-next" queued main other-branch
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed main-fix
+    _assert_sources_intact main-fix
+}
+
+@test "an unplaced job in another repo does not block an unrelated worktree" {
+    _fake_worktree main-fix
+    _placed_job "ct-u4-done" succeeded main-fix main fix testrepo
+    _unplaced_job "ct-u4-next" queued other feature-z otherrepo
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed main-fix
+    _assert_sources_intact main-fix
+    _assert_output_has "cargo targets: reclaimed 1 dir(s)"
+}
+
+@test "an unplaced job whose branch is empty blocks every worktree of the same repo but no other repo" {
+    _fake_worktree same-a
+    _fake_worktree same-b
+    _fake_worktree elsewhere
+    _placed_job "ct-u5-a" succeeded same-a main a testrepo
+    _placed_job "ct-u5-b" succeeded same-b main b testrepo
+    _placed_job "ct-u5-x" succeeded elsewhere other x otherrepo
+    _unplaced_job "ct-u5-next" queued main "" testrepo
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept same-a
+    _assert_target_kept same-b
+    _assert_target_removed elsewhere
+}
+
+@test "an unplaced job whose repo_path is empty blocks every worktree of the same repo but no other repo" {
+    _fake_worktree same-a
+    _fake_worktree elsewhere
+    _placed_job "ct-u5b-a" succeeded same-a main a testrepo
+    _placed_job "ct-u5b-x" succeeded elsewhere other x otherrepo
+    make_job "ct-u5b-next" queued 'del(.work_dir) | .repo_path = "" | .branch = "fix" | .repo = "testrepo"'
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept same-a
+    _assert_target_removed elsewhere
+}
+
+@test "once the queued job is placed on the worktree and finishes, the target/ is reclaimable" {
+    _fake_worktree main-fix
+    _placed_job "ct-u6-done" succeeded main-fix main fix
+    _unplaced_job "ct-u6-next" queued main fix
+
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_kept main-fix
+
+    # The same job is now dispatched into the worktree and finishes.
+    _placed_job "ct-u6-next" succeeded main-fix main fix
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed main-fix
+    _assert_sources_intact main-fix
+}
+
+@test "finished jobs with no work_dir never block, even when their worktree path cannot be derived" {
+    _fake_worktree main-fix
+    _placed_job "ct-u7-done" succeeded main-fix main fix
+    _unplaced_job "ct-u7-ok" succeeded main fix
+    _unplaced_job "ct-u7-failed" failed main fix
+    _unplaced_job "ct-u7-cancelled" cancelled main fix
+    _unplaced_job "ct-u7-nobranch" cancelled main ""
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed main-fix
+}
+
+@test "a succeeded job with no work_dir that still awaits adherence review keeps the worktree" {
+    _fake_worktree main-fix
+    _placed_job "ct-u7b-done" succeeded main-fix main fix
+    _unplaced_job "ct-u7b-adh" succeeded main fix testrepo '.adherence_pending = true'
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept main-fix
+}
+
+@test "a queued main-dir job with no work_dir does not block a worktree" {
+    _fake_worktree main-fix
+    _placed_job "ct-u8-done" succeeded main-fix main fix
+    _unplaced_job "ct-u8-main" queued main fix testrepo '.isolation = "main-dir"'
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed main-fix
+}
+
+# --- the second look immediately before deletion ---------------------------
+#
+# A job can be enqueued or dispatched between gc's first check and the rm.
+# These tests inject that change at a deterministic point: the first activity
+# probe (`find ... -mmin`) of the pass, which runs after the first in-use check
+# and before the delete. The shim fires once and then behaves like real find.
+
+_install_find_hook() {
+    export FIND_REAL; FIND_REAL=$(command -v find)
+    export FIND_HOOK_MARK="$MOTHER_ROOT/find-hook-fired"
+    export FIND_HOOK_CMD="$1"
+    cat > "$_MOCK_BIN/find" <<'SHIM'
+#!/usr/bin/env bash
+case " $* " in *" -mmin "*) ;; *) exec "$FIND_REAL" "$@" ;; esac
+[ ! -e "$FIND_HOOK_MARK" ] || exec "$FIND_REAL" "$@"
+: > "$FIND_HOOK_MARK"
+out=$("$FIND_REAL" "$@" 2>/dev/null); rc=$?
+eval "$FIND_HOOK_CMD"
+[ -z "$out" ] || printf '%s\n' "$out"
+exit $rc
+SHIM
+    chmod +x "$_MOCK_BIN/find"
+}
+
+_assert_find_hook_fired() {
+    [ -e "$FIND_HOOK_MARK" ] || {
+        echo "race hook never fired: gc no longer probes activity with find -mmin; update _install_find_hook's injection point" >&2
+        return 1
+    }
+}
+
+@test "a job queued for this worktree after the first check but before the delete keeps the target/" {
+    _fake_worktree main-fix
+    _placed_job "ct-r1-done" succeeded main-fix main fix
+    _unplaced_job "ct-r1-late" queued main fix
+    mv "$JOBS_DIR/ct-r1-late.json" "$MOTHER_ROOT/late-job.json"
+    _install_find_hook 'mv "$MOTHER_ROOT/late-job.json" "$JOBS_DIR/ct-r1-late.json"'
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_find_hook_fired
+    _assert_target_kept main-fix
+    _assert_output_lacks "removed testrepo worktree target"
+}
+
+@test "a job started on this worktree after the first check but before the delete keeps the target/" {
+    _fake_worktree main-fix
+    _placed_job "ct-r2-done" succeeded main-fix main fix
+    _placed_job "ct-r2-late" running main-fix main fix
+    mv "$JOBS_DIR/ct-r2-late.json" "$MOTHER_ROOT/late-job.json"
+    _install_find_hook 'mv "$MOTHER_ROOT/late-job.json" "$JOBS_DIR/ct-r2-late.json"'
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_find_hook_fired
+    _assert_target_kept main-fix
+}
+
+@test "a target/ whose directory changes between the first check and the delete is kept" {
+    _fake_worktree main-fix
+    _placed_job "ct-r3-done" succeeded main-fix main fix
+    # Still old enough to count as idle, but different from what gc first saw.
+    _install_find_hook 'touch -t 202602020000 "$1"'
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_find_hook_fired
+    _assert_target_kept main-fix
+    _assert_output_lacks "removed testrepo worktree target"
+}
+
+# --- unreadable job records -------------------------------------------------
+
+@test "a malformed job record anywhere in the queue keeps every target/ (fail closed)" {
+    _fake_worktree idle
+    _wt_job "ct-bad-ok" succeeded idle
+    echo '{this is not json' > "$JOBS_DIR/ct-bad-garbage.json"
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept idle
+    _assert_output_lacks "removed testrepo worktree target"
+}
+
+@test "a job record that is not a JSON object keeps every target/ (fail closed)" {
+    _fake_worktree idle
+    _wt_job "ct-bad-ok" succeeded idle
+    echo '["not","a","job"]' > "$JOBS_DIR/ct-bad-array.json"
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept idle
+}
+
+@test "an empty (zero-byte) job record keeps every target/ (fail closed)" {
+    _fake_worktree idle
+    _wt_job "ct-bad-ok" succeeded idle
+    : > "$JOBS_DIR/ct-bad-empty.json"
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept idle
+}
+
+@test "a job record whose fields have the wrong type keeps every target/ (fail closed)" {
+    _fake_worktree idle
+    _wt_job "ct-bad-ok" succeeded idle
+    make_job "ct-bad-types" succeeded '.work_dir = 42'
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept idle
+}
+
+@test "removing the malformed job record lets the idle target/ be reclaimed again" {
+    _fake_worktree idle
+    _wt_job "ct-bad-ok" succeeded idle
+    echo '{this is not json' > "$JOBS_DIR/ct-bad-garbage.json"
+
+    run mother gc
+    _assert_target_kept idle
+
+    rm -f "$JOBS_DIR/ct-bad-garbage.json"
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_removed idle
+}
+
+# --- hardening: what counts as a removable target/ -------------------------
+
+@test "a main checkout (.git is a directory) recorded as a job worktree is never touched" {
+    _fake_worktree maincheckout
+    local dir; dir=$(_wt maincheckout)
+    rm -f "$dir/.git"
+    mkdir -p "$dir/.git/objects"
+    _backdate "$dir"
+    make_job "ct-h1" succeeded \
+        ".work_dir = \"$dir\" | .repo_path = \"$MOTHER_ROOT/somewhere-else\" | .isolation = \"worktree\""
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept maincheckout
+    _assert_sources_intact maincheckout
+    _assert_output_lacks "removed "
+    _assert_output_lacks "would remove"
+}
+
+@test "a directory with no .git at all recorded as a job worktree is never touched" {
+    _fake_worktree nogit
+    rm -f "$(_wt nogit)/.git"
+    _backdate "$(_wt nogit)"
+    _wt_job "ct-h1b" succeeded nogit
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept nogit
+    _assert_output_lacks "removed "
+}
+
+@test "a .git that is a symlink recorded as a job worktree is never touched" {
+    _fake_worktree gitlink
+    local dir; dir=$(_wt gitlink)
+    mv "$dir/.git" "$MOTHER_ROOT/real-dot-git-file"
+    ln -s "$MOTHER_ROOT/real-dot-git-file" "$dir/.git"
+    _backdate "$dir"
+    touch -h -t 202601010000 "$dir/.git"
+    _wt_job "ct-h1c" succeeded gitlink
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept gitlink
+    _assert_output_lacks "removed "
+}
+
+@test "a back-dated target/ symlink is kept on the symlink alone and its destination is intact" {
+    _fake_worktree backlinked
+    local dest="$MOTHER_ROOT/elsewhere/real-target"
+    mkdir -p "$MOTHER_ROOT/elsewhere"
+    mv "$(_wt backlinked)/target" "$dest"
+    ln -s "$dest" "$(_wt backlinked)/target"
+    _backdate "$dest"
+    touch -h -t 202601010000 "$(_wt backlinked)/target"
+    _wt_job "ct-h2" succeeded backlinked
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    [ -L "$(_wt backlinked)/target" ]
+    [ -f "$dest/CACHEDIR.TAG" ]
+    [ -f "$dest/debug/deps/blob1" ]
+    _assert_output_lacks "removed "
+}
+
+@test "a work_dir whose .. segment crosses a symlink to a different directory than it names is kept" {
+    # wt/link -> wt/real/sub, so the kernel resolves wt/link/../b to wt/real/b,
+    # while a purely textual reading gives wt/b. The job's path is not a
+    # trustworthy name for the directory that would be deleted.
+    _fake_worktree real/b
+    mkdir -p "$MOTHER_ROOT/wt/real/sub" "$MOTHER_ROOT/wt/b"
+    ln -s "$MOTHER_ROOT/wt/real/sub" "$MOTHER_ROOT/wt/link"
+    _backdate "$MOTHER_ROOT/wt/real"
+    make_job "ct-h3" succeeded ".work_dir = \"$MOTHER_ROOT/wt/link/../b\""
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept real/b
+    _assert_sources_intact real/b
+    _assert_output_lacks "removed "
+}
+
+@test "a work_dir reached through a symlinked parent directory is still reclaimed" {
+    _fake_worktree realparent/wtx
+    ln -s "$MOTHER_ROOT/wt/realparent" "$MOTHER_ROOT/wt/alias"
+    make_job "ct-h4" succeeded ".work_dir = \"$MOTHER_ROOT/wt/alias/wtx\""
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed realparent/wtx
+    _assert_sources_intact realparent/wtx
+    _assert_output_has "cargo targets: reclaimed 1 dir(s)"
+}
+
+@test "a work_dir with a plain .. segment that resolves consistently is still reclaimed" {
+    _fake_worktree b
+    mkdir -p "$MOTHER_ROOT/wt/x"
+    make_job "ct-h4b" succeeded ".work_dir = \"$MOTHER_ROOT/wt/x/../b\""
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed b
+    _assert_sources_intact b
+}
+
+@test "a live job recorded through a different path to the same worktree still keeps its target/" {
+    _fake_worktree realparent/wtx
+    ln -s "$MOTHER_ROOT/wt/realparent" "$MOTHER_ROOT/wt/alias"
+    make_job "ct-h4c-done" succeeded ".work_dir = \"$MOTHER_ROOT/wt/alias/wtx\""
+    make_job "ct-h4c-live" running ".work_dir = \"$MOTHER_ROOT/wt/realparent/wtx\""
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept realparent/wtx
+    _assert_output_lacks "removed testrepo worktree target"
+}
+
+# --- activity guard covers the whole tree ----------------------------------
+
+@test "a file modified recently six levels deep keeps the target/; once it is old the target/ goes" {
+    _fake_worktree deep
+    local d; d="$(_wt deep)/target/a/b/c/d/e/f"
+    mkdir -p "$d"
+    echo x > "$d/file"
+    _backdate "$(_wt deep)/target"
+    touch "$d/file"
+    _wt_job "ct-act-deep" succeeded deep
+
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_kept deep
+    _assert_output_lacks "removed testrepo worktree target"
+
+    _backdate "$(_wt deep)/target"
+
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_removed deep
+    _assert_sources_intact deep
+}
+
+# --- MOTHER_CARGO_TARGET_PURGE parsing -------------------------------------
+
+# Fresh fixture, one gc pass. Usage: _purge_case <value|UNSET> <removed|kept>
+_purge_case() {
+    local value="$1" expect="$2"
+    rm -rf "$MOTHER_ROOT/wt" "$JOBS_DIR"
+    mkdir -p "$MOTHER_ROOT/wt" "$JOBS_DIR"
+    _fake_worktree p
+    _wt_job "ct-purge" succeeded p
+    if [ "$value" = "UNSET" ]; then unset MOTHER_CARGO_TARGET_PURGE; else export MOTHER_CARGO_TARGET_PURGE="$value"; fi
+
+    run mother gc
+    [ "$status" -eq 0 ] || { echo "PURGE='$value': gc exited $status" >&2; return 1; }
+    if [ "$expect" = "removed" ]; then
+        [ ! -e "$(_wt p)/target" ] || { echo "PURGE='$value': target should have been removed" >&2; return 1; }
+    else
+        [ -f "$(_wt p)/target/debug/deps/blob1" ] || { echo "PURGE='$value': target should have been kept" >&2; return 1; }
+        _assert_output_lacks "removed testrepo worktree target" || return 1
+    fi
+    _assert_sources_intact p
+}
+
+@test "MOTHER_CARGO_TARGET_PURGE accepts 0 false no off in any case as disabled: nothing is deleted" {
+    local v
+    for v in 0 false no off FALSE Off NO; do
+        _purge_case "$v" kept || return 1
+        # Recognised values are not complained about.
+        _assert_output_lacks "unrecognised" || return 1
+    done
+}
+
+@test "MOTHER_CARGO_TARGET_PURGE accepts 1 true yes on in any case as enabled: the target/ is removed" {
+    local v
+    for v in 1 true yes on TRUE Yes ON; do
+        _purge_case "$v" removed || return 1
+        _assert_output_lacks "unrecognised" || return 1
+    done
+}
+
+@test "MOTHER_CARGO_TARGET_PURGE unset or empty still purges" {
+    _purge_case UNSET removed || return 1
+    _purge_case "" removed || return 1
+}
+
+@test "an unrecognised MOTHER_CARGO_TARGET_PURGE deletes nothing and says so" {
+    local v line
+    for v in maybe 2 enable 00; do
+        _purge_case "$v" kept || return 1
+        line=$(printf '%s\n' "$output" | grep -F "MOTHER_CARGO_TARGET_PURGE" | grep -F "unrecognised")
+        [ -n "$line" ] || { echo "PURGE='$v': no unrecognised-value warning in output" >&2; echo "$output" >&2; return 1; }
+    done
+}
+
+@test "an unrecognised MOTHER_CARGO_TARGET_PURGE also deletes nothing on --dry-run and never says would-remove" {
+    _fake_worktree p
+    _wt_job "ct-purge-dry" succeeded p
+    export MOTHER_CARGO_TARGET_PURGE=maybe
+
+    run mother gc --dry-run
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept p
+    _assert_output_lacks "would remove testrepo worktree target"
+    _assert_output_has "unrecognised"
+}
+
+# --- scale and awkward paths ------------------------------------------------
+
+@test "thirty idle worktrees are all reclaimed in one pass, and a live one among them is untouched" {
+    local i
+    for i in $(seq 1 30); do
+        _fake_worktree "many-$i"
+        _wt_job "ct-many-$i" succeeded "many-$i"
+    done
+    _fake_worktree many-live
+    _wt_job "ct-many-live" running many-live
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    for i in $(seq 1 30); do
+        _assert_target_removed "many-$i" || return 1
+        _assert_sources_intact "many-$i" || return 1
+    done
+    _assert_target_kept many-live
+    _assert_output_has "cargo targets: reclaimed 30 dir(s)"
+}
+
+@test "a work_dir containing a space is reclaimed when idle and kept when live" {
+    _fake_worktree "idle tree"
+    _fake_worktree "busy tree"
+    _wt_job "ct-sp-idle" succeeded "idle tree"
+    _wt_job "ct-sp-busy" running "busy tree"
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed "idle tree"
+    _assert_sources_intact "idle tree"
+    _assert_target_kept "busy tree"
+    _assert_output_has "wt/idle tree/target"
 }

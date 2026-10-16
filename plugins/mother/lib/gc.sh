@@ -26,7 +26,7 @@
 #   MOTHER_GOCACHE_MAX_GB        default 10
 #   MOTHER_GC_CODE_DIR           default ~/Code (scanned for */target next to Cargo.toml)
 #   MOTHER_GC_TARGET_REPORT_GB   default 10
-#   MOTHER_CARGO_TARGET_PURGE    default 1; 0 = only report job-worktree target/ dirs
+#   MOTHER_CARGO_TARGET_PURGE    default 1; 0/false/no/off (any case) or an unrecognised value = only report
 #   MOTHER_CARGO_TARGET_IDLE_MINUTES  default 10; a target/ touched more recently is kept
 #   MOTHER_CARGO_TARGET_PURGE_EXCLUDE job `repo` names (space/comma separated) never purged
 
@@ -137,16 +137,17 @@ _gc_find_go() {
 # _gc_running_jobs — number of jobs currently running (state `running`, or a
 # pipeline job in `pipeline_review`).
 _gc_running_jobs() {
-    local f n=0 row id st act rest
-    for f in "$JOBS_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        # Fail closed: an unreadable record counts as running.
-        row=$(_gc_job_row "$f") || row="|running|"
-        IFS='|' read -r id st act rest <<< "$row"
+    _gc_ensure_jobs
+    # Fail closed: an unreadable record counts as running.
+    [ "$_GC_JOBS_OK" -eq 1 ] || { echo 1; return 0; }
+    local line n=0 id st act rest
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS="$_GC_US" read -r id st act rest <<< "$line"
         if [ "$st" = "running" ] || [ "$act" = "pipeline_review" ]; then
             n=$((n + 1))
         fi
-    done
+    done <<< "$_GC_JOBS"
     echo "$n"
 }
 
@@ -196,56 +197,129 @@ _gc_canon() {
     ( cd "$1" 2>/dev/null && pwd -P )
 }
 
-# _gc_job_row <job-file> — "id|state|activity|adherence_pending|isolation|repo|repo_path|work_dir"
-# (work_dir last: it is the only field allowed to contain `|`). Fails on an
-# unreadable record.
-_gc_job_row() {
-    jq -er '[.id // "", .state // "", .activity // "", ((.adherence_pending // false) | tostring),
-             .isolation // "", .repo // "", .repo_path // "", .work_dir // ""] | join("|")' "$1" 2>/dev/null
+# Job-record cache. `jq`-per-file and a subshell per comparison made every gc
+# pass quadratic in the job count, so the job list is read once per pass
+# (_gc_load_jobs, a single jq over every record) into _GC_JOBS: one record per
+# line, fields separated by US (\x1f, which can't appear in a path we accept):
+#   id st act adh iso repo repo_path branch work_dir canon_work_dir derived_path
+# canon_work_dir is the physical work_dir ("" when it can't be resolved);
+# derived_path is where a not-yet-placed job's worktree will be created.
+# _GC_JOBS_OK=0 means some record was unreadable: callers fail closed.
+_GC_US=$'\x1f'
+_GC_JOBS=""
+_GC_JOBS_OK=1
+_GC_JOBS_LOADED=0
+
+# _gc_job_may_use_cache <state> <activity> <adherence_pending> — 0 unless the job
+# is finished for good (succeeded|failed|cancelled, no adherence review pending,
+# not in pipeline review).
+_gc_job_may_use_cache() {
+    case "$1" in succeeded|failed|cancelled) ;; *) return 0 ;; esac
+    [ "$2" = "pipeline_review" ] && return 0
+    [ "$3" = "true" ]
 }
 
-# _gc_same_dir <a> <b> — 0 when both name the same directory.
-_gc_same_dir() {
-    [ "$1" = "$2" ] && return 0
-    local ca cb
-    ca=$(_gc_canon "$1") || return 1
-    cb=$(_gc_canon "$2") || return 1
-    [ -n "$ca" ] && [ "$ca" = "$cb" ]
+# _gc_derived_worktree <repo_path> <branch> — the path mother-run-job will give
+# this job's worktree (worktree_get_path), or nothing when it can't be derived.
+_gc_derived_worktree() {
+    local rp="$1" br="$2" out parent
+    [ -n "$rp" ] && [ -n "$br" ] || return 0
+    # shellcheck disable=SC1091
+    out=$( ( type worktree_get_path >/dev/null 2>&1 || source "${MOTHER_LIB_DIR:-}/worktree.sh" >/dev/null 2>&1
+             worktree_get_path "$br" "$rp" ) 2>/dev/null ) || out=""
+    [ -n "$out" ] || return 0
+    # Physical form of the parent so a symlinked checkout location compares equal.
+    parent=$(_gc_canon "${out%/*}") || parent=""
+    if [ -n "$parent" ]; then printf '%s/%s' "$parent" "${out##*/}"; else printf '%s' "$out"; fi
 }
+
+# _gc_load_jobs — (re)read every job record into the cache.
+_gc_load_jobs() {
+    local raw f n=0 line id st act adh iso repo rp br wd canon derived out=""
+    _GC_JOBS=""; _GC_JOBS_OK=1; _GC_JOBS_LOADED=1
+    for f in "$JOBS_DIR"/*.json; do [ -f "$f" ] && n=$((n + 1)); done
+    [ "$n" -gt 0 ] || return 0
+    # Fail closed on anything we can't trust: a jq failure, a record jq can't
+    # evaluate (non-object JSON), a field holding a newline/US or a non-string,
+    # and a record that yields no line at all (a zero-byte file; jq exits 0 on
+    # it, and on a mid-list evaluation error it only reports the last file).
+    raw=$(jq -r '
+        try (
+          [.id // "", .state // "", .activity // "", ((.adherence_pending // false) | tostring),
+           .isolation // "", .repo // "", .repo_path // "", .branch // "", .work_dir // ""] as $f
+          | if ($f | map(type != "string" or test("[\n\u001f]")) | any) then "UNREADABLE"
+            else $f | join("\u001f") end
+        ) catch "UNREADABLE"' "$JOBS_DIR"/*.json 2>/dev/null) || { _GC_JOBS_OK=0; return 0; }
+    [ "$(printf '%s\n' "$raw" | grep -c .)" -eq "$n" ] || { _GC_JOBS_OK=0; return 0; }
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if [ "$line" = "UNREADABLE" ]; then _GC_JOBS_OK=0; return 0; fi
+        IFS="$_GC_US" read -r id st act adh iso repo rp br wd <<< "$line"
+        canon=""; derived=""
+        [ -z "$wd" ] || canon=$(_gc_canon "$wd") || canon=""
+        if [ -z "$wd" ] && [ "$iso" != "main-dir" ] && _gc_job_may_use_cache "$st" "$act" "$adh"; then
+            derived=$(_gc_derived_worktree "$rp" "$br")
+        fi
+        out="${out}${id}${_GC_US}${st}${_GC_US}${act}${_GC_US}${adh}${_GC_US}${iso}${_GC_US}${repo}${_GC_US}${rp}${_GC_US}${br}${_GC_US}${wd}${_GC_US}${canon}${_GC_US}${derived}
+"
+    done <<< "$raw"
+    _GC_JOBS="$out"
+}
+
+_gc_ensure_jobs() { [ "$_GC_JOBS_LOADED" -eq 1 ] || _gc_load_jobs; }
 
 # _gc_worktree_rows — one "canon|id|repo|work_dir" row per job that runs in its
 # own git worktree (isolation=worktree, work_dir set and not the main checkout).
 _gc_worktree_rows() {
-    local f row id st act adh iso repo rp wd canon
-    for f in "$JOBS_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        row=$(_gc_job_row "$f") || continue
-        IFS='|' read -r id st act adh iso repo rp wd <<< "$row"
+    _gc_ensure_jobs
+    local line id st act adh iso repo rp br wd canon der rpc
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS="$_GC_US" read -r id st act adh iso repo rp br wd canon der <<< "$line"
         [ "$iso" = "worktree" ] && [ -n "$wd" ] || continue
-        [ -d "$wd" ] || continue
-        if [ -n "$rp" ] && _gc_same_dir "$wd" "$rp"; then continue; fi
-        canon=$(_gc_canon "$wd") || continue
+        [ -d "$wd" ] && [ -n "$canon" ] || continue
+        if [ -n "$rp" ]; then
+            rpc=$(_gc_canon "$rp") || rpc=""
+            { [ "$wd" = "$rp" ] || { [ -n "$rpc" ] && [ "$rpc" = "$canon" ]; }; } && continue
+        fi
         printf '%s|%s|%s|%s\n' "$canon" "$id" "$repo" "$wd"
-    done
+    done <<< "$_GC_JOBS"
 }
 
-# _gc_worktree_in_use <work_dir> — 0 when any job record pointing at this
-# directory could still use its build cache; fails closed: only records that
-# are all succeeded|failed|cancelled, not adherence-pending and not in pipeline
-# review make it idle. Any record that can't be parsed counts as in use.
+# _gc_worktree_in_use <work_dir> <repo> — 0 when any job could still use this
+# worktree's build cache. Fails closed: only records that are all
+# succeeded|failed|cancelled, not adherence-pending and not in pipeline review
+# make it idle. Also in use: any unreadable record; and any non-terminal
+# worktree job with no work_dir yet (queued, or dispatched but the worker has
+# not recorded one) whose derived worktree path is this one — or, when that
+# path can't be derived, any such job of the same repo. A job in another repo
+# never blocks this one.
 _gc_worktree_in_use() {
-    local want="$1" f row id st act adh iso repo rp wd
-    for f in "$JOBS_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        # Unreadable record: its work_dir is unknowable, so assume the worst.
-        row=$(_gc_job_row "$f") || return 0
-        IFS='|' read -r id st act adh iso repo rp wd <<< "$row"
-        [ -n "$wd" ] || continue
-        _gc_same_dir "$wd" "$want" || continue
-        case "$st" in succeeded|failed|cancelled) ;; *) return 0 ;; esac
-        [ "$act" = "pipeline_review" ] && return 0
-        [ "$adh" = "true" ] && return 0
-    done
+    local want="$1" want_repo="${2:-}" wcanon
+    _gc_ensure_jobs
+    [ "$_GC_JOBS_OK" -eq 1 ] || return 0
+    wcanon=$(_gc_canon "$want") || wcanon=""
+    local line id st act adh iso repo rp br wd canon der
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS="$_GC_US" read -r id st act adh iso repo rp br wd canon der <<< "$line"
+        if [ -n "$wd" ]; then
+            [ "$wd" = "$want" ] || { [ -n "$canon" ] && [ -n "$wcanon" ] && [ "$canon" = "$wcanon" ]; } || continue
+        else
+            # No work_dir recorded.
+            _gc_job_may_use_cache "$st" "$act" "$adh" || continue
+            [ "$iso" = "main-dir" ] && continue
+            if [ -n "$der" ]; then
+                [ "$der" = "$want" ] || { [ -n "$wcanon" ] && [ "$der" = "$wcanon" ]; } || continue
+            else
+                # Can't tell which worktree it will use: block the whole repo
+                # (by name; an unnamed repo on either side blocks everything).
+                [ -z "$repo" ] || [ -z "$want_repo" ] || [ "$repo" = "$want_repo" ] || continue
+            fi
+            return 0
+        fi
+        _gc_job_may_use_cache "$st" "$act" "$adh" && return 0
+    done <<< "$_GC_JOBS"
     return 1
 }
 
@@ -259,6 +333,28 @@ _gc_is_job_worktree() {
     return 1
 }
 
+# _gc_purge_mode — echoes "on", "off" or "invalid" for MOTHER_CARGO_TARGET_PURGE.
+# Unset or empty means on; 1/true/yes/on enable; 0/false/no/off disable (any
+# case); anything else is unrecognised ("invalid": the caller treats it as off).
+_gc_purge_mode() {
+    local v
+    v=$(printf '%s' "${MOTHER_CARGO_TARGET_PURGE:-1}" | tr '[:upper:]' '[:lower:]')
+    case "$v" in
+        1|true|yes|on) echo on ;;
+        0|false|no|off) echo off ;;
+        *) echo invalid ;;
+    esac
+}
+
+# _gc_mtime <path> — mtime in epoch seconds of the path itself (BSD, then GNU
+# stat); nothing when it can't be read.
+_gc_mtime() {
+    local m
+    m=$(stat -f %m "$1" 2>/dev/null) || m=$(stat -c %Y "$1" 2>/dev/null) || m=""
+    case "$m" in ''|*[!0-9]*) return 0 ;; esac
+    echo "$m"
+}
+
 # _gc_keep_reason <busy> <target> <repo> <purge> <idle_min> <exclude> — echoes
 # why this target/ must be kept, or nothing when it is safe to remove. Checked
 # in order: in use, purge disabled, repo excluded, recently touched.
@@ -266,15 +362,17 @@ _gc_keep_reason() {
     local busy="$1" t="$2" repo="$3" purge="$4" idle_min="$5" exclude="$6" recent=""
     if [ "$busy" -eq 1 ]; then
         echo "job still active or awaiting review"
-    elif [ "$purge" = "0" ]; then
-        echo "MOTHER_CARGO_TARGET_PURGE=0"
+    elif [ "$purge" != "on" ]; then
+        echo "MOTHER_CARGO_TARGET_PURGE is off"
     elif case "$exclude" in *" $repo "*) true ;; *) false ;; esac; then
         echo "repo $repo is excluded"
     else
         # Fail closed: a find error counts as recent activity. (`-mmin -0`
-        # is not "never" on BSD find, so 0 skips the guard explicitly.)
+        # is not "never" on BSD find, so 0 skips the guard explicitly.) The
+        # whole tree is searched — a long single-crate compile writes deep —
+        # but the search stops at the first hit.
         if [ "$idle_min" -gt 0 ]; then
-            recent=$(find "$t" -maxdepth 3 -mmin -"$idle_min" -print 2>/dev/null) || recent="unreadable"
+            recent=$(find "$t" -mmin -"$idle_min" -print -quit 2>/dev/null) || recent="unreadable"
         fi
         [ -z "$recent" ] || echo "touched in the last ${idle_min} min (or unreadable)"
     fi
@@ -284,22 +382,32 @@ _gc_keep_reason() {
 # nobody is using, and write the inventory cache ($RUNNER_DIR/cargo-targets.json,
 # read by `mother status` and the low-disk message). Only ever removes
 # <worktree>/target, and only when every guard below holds:
-#   * Cargo.toml beside it; target is a real directory (not a symlink) holding
-#     cargo's CACHEDIR.TAG; its physical path is <physical worktree>/target
-#   * repo not in MOTHER_CARGO_TARGET_PURGE_EXCLUDE; MOTHER_CARGO_TARGET_PURGE != 0
+#   * Cargo.toml beside it; the worktree is a LINKED worktree (its .git is a
+#     file, never a directory: a main checkout is never touched); target is a
+#     real directory (not a symlink) holding cargo's CACHEDIR.TAG; its physical
+#     path is <physical worktree>/target
+#   * repo not in MOTHER_CARGO_TARGET_PURGE_EXCLUDE; purge not disabled
 #   * no job on that worktree is queued/ready/running/awaiting, adherence-pending
-#     or in pipeline review (_gc_worktree_in_use)
-#   * nothing in it modified within MOTHER_CARGO_TARGET_IDLE_MINUTES
+#     or in pipeline review, and no unplaced (no work_dir yet) job could land
+#     there (_gc_worktree_in_use)
+#   * nothing anywhere in it modified within MOTHER_CARGO_TARGET_IDLE_MINUTES
+# Immediately before the rm the job list is re-read and the in-use and activity
+# checks repeated, and the dir's mtime must be unchanged (second look).
 _gc_cargo_job_targets() {
     local dry_run="$1"
-    local purge="${MOTHER_CARGO_TARGET_PURGE:-1}"
+    local purge; purge=$(_gc_purge_mode)
+    if [ "$purge" = "invalid" ]; then
+        echo "cargo targets: unrecognised MOTHER_CARGO_TARGET_PURGE='${MOTHER_CARGO_TARGET_PURGE:-}' — treating as disabled (use 1/true/yes/on or 0/false/no/off)"
+        purge=off
+    fi
     local idle_min="${MOTHER_CARGO_TARGET_IDLE_MINUTES:-10}"
     case "$idle_min" in ''|*[!0-9]*) idle_min=10 ;; esac
     local exclude
     exclude=" $(printf '%s' "${MOTHER_CARGO_TARGET_PURGE_EXCLUDE:-}" | tr ',' ' ') "
 
-    local rows canon_list canon first work_dir repo ids t kb reason busy
+    local rows canon_list canon first work_dir repo ids t kb reason busy mtime1 mtime2
     local seen=0 reclaimed=0 would=0 reclaimed_kb=0 entries=""
+    _gc_load_jobs
     rows=$(_gc_worktree_rows)
     canon_list=$(printf '%s\n' "$rows" | cut -d'|' -f1 | sort -u)
     while IFS= read -r canon; do
@@ -311,28 +419,41 @@ _gc_cargo_job_targets() {
         t="$work_dir/target"
 
         [ -f "$work_dir/Cargo.toml" ] || continue
+        [ -f "$work_dir/.git" ] && [ ! -L "$work_dir/.git" ] || continue
         [ -d "$t" ] && [ ! -L "$t" ] && [ -f "$t/CACHEDIR.TAG" ] || continue
         [ "$(_gc_canon "$t")" = "$canon/target" ] || continue
 
         seen=$((seen + 1))
         kb=$(_gc_dir_kb "$t")
         busy=0
-        if _gc_worktree_in_use "$work_dir"; then busy=1; fi
+        if _gc_worktree_in_use "$work_dir" "$repo"; then busy=1; fi
+        mtime1=$(_gc_mtime "$t")
         reason=$(_gc_keep_reason "$busy" "$t" "$repo" "$purge" "$idle_min" "$exclude")
 
-        if [ -z "$reason" ]; then
-            if [ "$dry_run" -eq 1 ]; then
-                echo "[dry-run] would remove $repo worktree target $t ($(_gc_human_kb "$kb"))"
-                would=$((would + 1))
-            elif rm -rf -- "$t" 2>/dev/null && [ ! -e "$t" ]; then
-                echo "removed $repo worktree target $t ($(_gc_human_kb "$kb")) — job(s) $ids finished"
-                reclaimed=$((reclaimed + 1)); reclaimed_kb=$((reclaimed_kb + kb))
-                continue
-            else
-                echo "$repo worktree target $t: could not remove (left in place)"
+        if [ -z "$reason" ] && [ "$dry_run" -eq 0 ]; then
+            # Second look: a job may have been queued or dispatched since the
+            # first one. Re-read the records and repeat the checks.
+            _gc_load_jobs
+            busy=0
+            if _gc_worktree_in_use "$work_dir" "$repo"; then busy=1; fi
+            mtime2=$(_gc_mtime "$t")
+            reason=$(_gc_keep_reason "$busy" "$t" "$repo" "$purge" "$idle_min" "$exclude")
+            if [ -z "$reason" ] && { [ -z "$mtime1" ] || [ "$mtime1" != "$mtime2" ]; }; then
+                reason="changed while being examined"
             fi
-        else
+        fi
+
+        if [ -n "$reason" ]; then
             echo "cargo targets: kept $repo worktree target $t ($(_gc_human_kb "$kb")) — $reason"
+        elif [ "$dry_run" -eq 1 ]; then
+            echo "[dry-run] would remove $repo worktree target $t ($(_gc_human_kb "$kb"))"
+            would=$((would + 1))
+        elif rm -rf -- "$t" 2>/dev/null && [ ! -e "$t" ]; then
+            echo "removed $repo worktree target $t ($(_gc_human_kb "$kb")) — job(s) $ids finished"
+            reclaimed=$((reclaimed + 1)); reclaimed_kb=$((reclaimed_kb + kb))
+            continue
+        else
+            echo "$repo worktree target $t: could not remove (left in place)"
         fi
         entries="${entries}$(jq -nc --arg path "$t" --arg repo "$repo" --argjson kb "$kb" --argjson in_use "$([ "$busy" -eq 1 ] && echo true || echo false)" \
             '{path: $path, repo: $repo, kb: $kb, in_use: $in_use}')
@@ -439,6 +560,7 @@ _gc_residue_records() {
 # mother_gc <dry_run> — the whole sweep.
 mother_gc() {
     local dry_run="${1:-0}"
+    _gc_load_jobs
     _gc_derived_data "$dry_run"
     _gc_gocache "$dry_run"
     _gc_job_tmp "$dry_run"

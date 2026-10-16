@@ -3941,7 +3941,8 @@ Daemon env vars:
                                                  build cache is larger and no job is running
   MOTHER_GC_ENABLED            (default: 1)    run `mother gc` in the hourly sweep (0 to disable)
   MOTHER_CARGO_TARGET_PURGE    (default: 1)    `mother gc` deletes the target/ of a Cargo job worktree once no
-                                                 job uses it (0: report only)
+                                                 job uses it (0/false/no/off: report only;
+                                                 an unrecognised value also disables it)
   MOTHER_CARGO_TARGET_IDLE_MINUTES (default: 10) skip a target/ modified within this many minutes
   MOTHER_CARGO_TARGET_PURGE_EXCLUDE (default: empty) job repo names (space/comma separated) never purged
 
