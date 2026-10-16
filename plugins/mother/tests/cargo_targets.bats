@@ -6,8 +6,11 @@
 #     isolation is "worktree" and whose work_dir is not the repo_path. The
 #     directory <work_dir>/target is deleted (rm -rf) only when ALL hold:
 #       - <work_dir>/Cargo.toml exists
-#       - <work_dir>/.git is a regular FILE (a linked worktree): a main checkout
-#         (.git directory), a symlinked .git, or no .git at all is never touched
+#       - <work_dir>/.git is a regular FILE (a linked worktree) whose first line is
+#         `gitdir: <path>` with <path> an existing directory named
+#         .../worktrees/<name>: a main checkout (.git directory), a symlinked
+#         .git, no .git, or an empty/garbage/submodule-style/dangling pointer
+#         is never touched
 #       - target is a real directory (not a symlink) that contains CACHEDIR.TAG,
 #         and its physical path is <physical work_dir>/target
 #       - no job referencing that work_dir is live: queued|ready|running|awaiting,
@@ -17,9 +20,11 @@
 #       - no unplaced job could land there: a non-terminal worktree-isolation job
 #         with no work_dir yet counts against the worktree its path derives to
 #         (<dirname repo_path>/<basename repo_path>-<branch, / -> ->, as
-#         worktree_get_path); when that path cannot be derived (empty branch or
-#         repo_path) it blocks every worktree of the same repo name, and never
-#         another repo. Terminal and main-dir jobs without a work_dir never block.
+#         worktree_path_for_repo, the helper mother-run-job uses: cd repo_path,
+#         then worktree_get_path); when that path cannot be derived (empty branch
+#         or repo_path, repo_path missing / not a git repo / not its own
+#         `git rev-parse --show-toplevel`, e.g. a symlink or subdirectory) it
+#         blocks every worktree of the same repo name, and never another repo. Terminal and main-dir jobs without a work_dir never block.
 #       - nothing anywhere under target (the WHOLE tree, not a fixed depth)
 #         changed within MOTHER_CARGO_TARGET_IDLE_MINUTES (default 10;
 #         non-numeric -> 10; 0 disables the check)
@@ -79,7 +84,9 @@ _fake_worktree() {
     mkdir -p "$dir/src" "$dir/target/debug/deps"
     echo '[package]' > "$dir/Cargo.toml"
     echo 'fn main() {}' > "$dir/src/main.rs"
-    echo "gitdir: $MOTHER_ROOT/fake-main/.git/worktrees/$1" > "$dir/.git"   # linked worktree: .git is a FILE
+    local gname="${1//\//_}"   # the pointer target is <something>/worktrees/<flat name>
+    mkdir -p "$MOTHER_ROOT/fake-main/.git/worktrees/$gname"
+    echo "gitdir: $MOTHER_ROOT/fake-main/.git/worktrees/$gname" > "$dir/.git"   # linked worktree: .git is a FILE
     echo 'Signature: 8a477f597d28d172789f06886806bc55' > "$dir/target/CACHEDIR.TAG"
     local i
     for i in 1 2 3; do
@@ -351,6 +358,9 @@ _assert_kept_for_state() {
 }
 
 @test "a target that is a symlink is untouched and its destination is intact" {
+    # Note: the symlink guard on target/ is an equivalent mutant (a symlink's
+    # physical path can never equal <canon work_dir>/target); the guard is
+    # defence in depth, so this test pins the outcome, not a unique guard.
     _fake_worktree linked
     local dest="$MOTHER_ROOT/elsewhere/real-target"
     mkdir -p "$MOTHER_ROOT/elsewhere"
@@ -640,11 +650,19 @@ _placed_job() {
         ".work_dir = \"$(_wt "$name")\" | .repo_path = \"$(_wt "$main")\" | .branch = \"$branch\" | .repo = \"$repo\" | $extra"
 }
 
+# A real git repo at $MOTHER_ROOT/wt/<name> (idempotent). The runner derives an unplaced
+# job's worktree from the real repo, so unplaced-job fixtures must point at one.
+_real_repo() {
+    local d; d=$(_wt "$1")
+    [ -d "$d/.git" ] || git init -q "$d"
+}
+
 # A job that has NOT been given a work_dir yet (queued, or dispatched but the
 # worker has not recorded one). Its eventual worktree is <main>-<branch>.
 # Usage: _unplaced_job <id> <state> <main-name> <branch> [repo] [extra jq]
 _unplaced_job() {
     local id="$1" state="$2" main="$3" branch="$4" repo="${5:-testrepo}" extra="${6:-.}"
+    _real_repo "$main"
     make_job "$id" "$state" \
         "del(.work_dir) | .repo_path = \"$(_wt "$main")\" | .branch = \"$branch\" | .repo = \"$repo\" | $extra"
 }
@@ -1207,4 +1225,211 @@ _purge_case() {
     _assert_sources_intact "idle tree"
     _assert_target_kept "busy tree"
     _assert_output_has "wt/idle tree/target"
+}
+
+# ===========================================================================
+# Unplaced jobs: the derived worktree must be the one the runner would create
+# ===========================================================================
+
+# Give a real repo one commit so `git worktree add` works.
+_commit_in() {
+    git -C "$1" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m init
+}
+
+# The path bin/mother-run-job would give <repo_path>/<branch>, computed the same way.
+_runner_path() {
+    ( source "$MOTHER_LIB_DIR/worktree.sh" && worktree_path_for_repo "$1" "$2" )
+}
+
+# An unplaced job whose repo_path is given verbatim (no fixture repo is created).
+# Usage: _unplaced_at <id> <state> <repo_path> <branch> [repo]
+_unplaced_at() {
+    make_job "$1" "$2" "del(.work_dir) | .repo_path = \"$3\" | .branch = \"$4\" | .repo = \"${5:-testrepo}\""
+}
+
+@test "a queued job whose repo_path is a symlink to the repo keeps the worktree it will land on" {
+    _real_repo real
+    ln -s "$(_wt real)" "$(_wt link)"
+    _fake_worktree real-feat-x
+    _wt_job "ct-sym-done" succeeded real-feat-x
+    _unplaced_at "ct-sym-next" queued "$(_wt link)" feat/x
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept real-feat-x
+    _assert_sources_intact real-feat-x
+    _assert_output_lacks "removed "
+}
+
+@test "a queued job whose repo_path is a subdirectory of the repo keeps the worktree it will land on" {
+    _real_repo real
+    mkdir -p "$(_wt real)/sub"
+    _fake_worktree real-feat-x
+    _wt_job "ct-sub-done" succeeded real-feat-x
+    _unplaced_at "ct-sub-next" queued "$(_wt real)/sub" feat/x
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept real-feat-x
+    _assert_output_lacks "removed "
+}
+
+@test "a queued job whose repo_path is a linked worktree of the repo keeps the worktree it will land on" {
+    _real_repo real
+    _commit_in "$(_wt real)"
+    git -C "$(_wt real)" worktree add -q -b side "$(_wt real-side)"
+    _fake_worktree real-feat-x
+    _wt_job "ct-lw-done" succeeded real-feat-x
+    _unplaced_at "ct-lw-next" queued "$(_wt real-side)" feat/x
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept real-feat-x
+    _assert_output_lacks "removed "
+}
+
+@test "an unplaced job on a different branch of a real git repo does not block an idle worktree" {
+    _real_repo real
+    _fake_worktree real-fix
+    _wt_job "ct-diff-done" succeeded real-fix
+    _unplaced_at "ct-diff-next" queued "$(_wt real)" other-branch
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_removed real-fix
+    _assert_sources_intact real-fix
+}
+
+@test "an unplaced job whose repo_path does not exist keeps every worktree of the same repo" {
+    _fake_worktree same-a
+    _wt_job "ct-nx-done" succeeded same-a
+    _unplaced_at "ct-nx-next" queued "$MOTHER_ROOT/wt/does-not-exist" fix
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept same-a
+    _assert_output_lacks "removed "
+}
+
+@test "an unplaced job whose repo_path is not a git repo keeps every worktree of the same repo" {
+    mkdir -p "$(_wt plain-dir)"
+    _fake_worktree same-a
+    _wt_job "ct-ng-done" succeeded same-a
+    _unplaced_at "ct-ng-next" queued "$(_wt plain-dir)" fix
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept same-a
+}
+
+@test "an underivable unplaced job's block does not extend to a worktree of a different repo" {
+    _fake_worktree same-a
+    _fake_worktree elsewhere
+    _wt_job "ct-nxr-a" succeeded same-a
+    _wt_job "ct-nxr-x" succeeded elsewhere '.repo = "otherrepo"'
+    _unplaced_at "ct-nxr-next" queued "$MOTHER_ROOT/wt/does-not-exist" fix testrepo
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    _assert_target_kept same-a
+    _assert_target_removed elsewhere
+}
+
+@test "gc and the runner agree on which worktree an unplaced job will land on (plain, symlinked, linked-worktree repo_path)" {
+    _real_repo real
+    _commit_in "$(_wt real)"
+    ln -s "$(_wt real)" "$(_wt link)"
+    git -C "$(_wt real)" worktree add -q -b side "$(_wt real-side)"
+
+    local rp out name
+    for rp in "$(_wt real)" "$(_wt link)" "$(_wt real-side)"; do
+        out=$(_runner_path "$rp" feat/x)
+        [ -n "$out" ]
+        name=$(basename "$out")
+        rm -rf "$JOBS_DIR"/*.json "$(_wt "$name")"
+        _fake_worktree "$name"
+        _fake_worktree decoy
+        _wt_job "ct-drift-done" succeeded "$name"
+        _wt_job "ct-drift-decoy" succeeded decoy
+        _unplaced_at "ct-drift-next" queued "$rp" feat/x
+
+        run mother gc
+        [ "$status" -eq 0 ]
+        # The worktree the runner would create must never be reclaimed from under it.
+        _assert_target_kept "$name" || { echo "repo_path=$rp runner path=$out" >&2; return 1; }
+        # For the plain repo the derivation is exact: an unrelated worktree is not blocked.
+        if [ "$rp" = "$(_wt real)" ]; then _assert_target_removed decoy; fi
+        rm -rf "$(_wt decoy)"
+    done
+}
+
+@test "mother-run-job derives a job's worktree path with the shared worktree_path_for_repo helper" {
+    grep -q 'worktree_path_for_repo "\$repo_path" "\$branch"' "$BATS_TEST_DIRNAME/../bin/mother-run-job"
+}
+
+# ===========================================================================
+# <work_dir>/.git must be a genuine linked-worktree pointer
+# ===========================================================================
+
+# Replace an idle worktree's .git file content, then gc.
+# Usage: _git_shape <name> <content>
+_git_shape() {
+    _fake_worktree "$1"
+    printf '%s' "$2" > "$(_wt "$1")/.git"
+    _wt_job "ct-gs-$1" succeeded "$1"
+}
+
+@test "a worktree whose .git file is empty keeps its target/" {
+    _git_shape gs-empty ""
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_kept gs-empty
+}
+
+@test "a worktree whose .git file is garbage keeps its target/" {
+    _git_shape gs-garbage "this is not a gitdir pointer"
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_kept gs-garbage
+}
+
+@test "a submodule-style .git pointer (existing .git/modules dir) keeps its target/" {
+    mkdir -p "$MOTHER_ROOT/wt/.git/modules/x"
+    _git_shape gs-sub "gitdir: ../.git/modules/x"
+    run mother gc
+    [ "$status" -eq 0 ]
+    [ -d "$MOTHER_ROOT/wt/.git/modules/x" ]
+    _assert_target_kept gs-sub
+}
+
+@test "a worktree .git pointer to a missing directory keeps its target/" {
+    _git_shape gs-missing "gitdir: $MOTHER_ROOT/fake-main/.git/worktrees/never-created"
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_kept gs-missing
+}
+
+@test "a genuine absolute linked-worktree pointer is reclaimed" {
+    mkdir -p "$MOTHER_ROOT/fake-main/.git/worktrees/gs-real"
+    _git_shape gs-real "gitdir: $MOTHER_ROOT/fake-main/.git/worktrees/gs-real"
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_removed gs-real
+    _assert_sources_intact gs-real
+}
+
+@test "a relative linked-worktree pointer to an existing worktrees/<name> dir is reclaimed" {
+    mkdir -p "$MOTHER_ROOT/wt/gs-rel-meta/worktrees/gs-rel"
+    _git_shape gs-rel "gitdir: ../gs-rel-meta/worktrees/gs-rel"
+    run mother gc
+    [ "$status" -eq 0 ]
+    _assert_target_removed gs-rel
+    _assert_sources_intact gs-rel
 }

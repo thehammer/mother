@@ -220,17 +220,44 @@ _gc_job_may_use_cache() {
 }
 
 # _gc_derived_worktree <repo_path> <branch> — the path mother-run-job will give
-# this job's worktree (worktree_get_path), or nothing when it can't be derived.
+# this job's worktree, or nothing when it can't be derived (the caller then
+# treats every worktree of that repo name as in use: fail closed).
+# Derived by the very function the runner uses (worktree_path_for_repo, from
+# inside repo_path), never re-implemented, so the two cannot drift. Also
+# nothing unless repo_path is itself the top level of its git repo: a symlink,
+# subdirectory or other non-root repo_path is not something we dare predict.
 _gc_derived_worktree() {
-    local rp="$1" br="$2" out parent
+    local rp="$1" br="$2" out rpc top parent
     [ -n "$rp" ] && [ -n "$br" ] || return 0
+    rpc=$(_gc_canon "$rp") || rpc=""
+    [ -n "$rpc" ] || return 0
+    top=$(cd "$rp" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || top=""
+    [ -n "$top" ] || return 0
+    top=$(_gc_canon "$top") || top=""
+    [ "$top" = "$rpc" ] || return 0
     # shellcheck disable=SC1091
-    out=$( ( type worktree_get_path >/dev/null 2>&1 || source "${MOTHER_LIB_DIR:-}/worktree.sh" >/dev/null 2>&1
-             worktree_get_path "$br" "$rp" ) 2>/dev/null ) || out=""
+    out=$( ( type worktree_path_for_repo >/dev/null 2>&1 || source "${MOTHER_LIB_DIR:-}/worktree.sh" >/dev/null 2>&1
+             worktree_path_for_repo "$rp" "$br" ) 2>/dev/null ) || out=""
     [ -n "$out" ] || return 0
     # Physical form of the parent so a symlinked checkout location compares equal.
     parent=$(_gc_canon "${out%/*}") || parent=""
     if [ -n "$parent" ]; then printf '%s/%s' "$parent" "${out##*/}"; else printf '%s' "$out"; fi
+}
+
+# _gc_is_linked_worktree <work_dir> — 0 only when <work_dir>/.git is a regular
+# file (not a symlink) whose first line is `gitdir: <path>`, where <path> (made
+# absolute against work_dir when relative) is an existing directory named
+# <something>/worktrees/<name>. An empty or garbage file, a submodule-style
+# pointer (.git/modules/x) or a pointer to a missing directory all fail.
+_gc_is_linked_worktree() {
+    local g="$1/.git" line p
+    [ -f "$g" ] && [ ! -L "$g" ] || return 1
+    line=$(head -n 1 "$g" 2>/dev/null) || return 1
+    case "$line" in "gitdir: "?*) p="${line#gitdir: }" ;; *) return 1 ;; esac
+    case "$p" in /*) ;; *) p="$1/$p" ;; esac
+    while [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+    [ -d "$p" ] || return 1
+    [ "$(basename "$(dirname "$p")")" = "worktrees" ]
 }
 
 # _gc_load_jobs — (re)read every job record into the cache.
@@ -383,7 +410,8 @@ _gc_keep_reason() {
 # read by `mother status` and the low-disk message). Only ever removes
 # <worktree>/target, and only when every guard below holds:
 #   * Cargo.toml beside it; the worktree is a LINKED worktree (its .git is a
-#     file, never a directory: a main checkout is never touched); target is a
+#     `gitdir: <dir>/worktrees/<name>` file naming an existing directory, never
+#     a directory: a main checkout is never touched); target is a
 #     real directory (not a symlink) holding cargo's CACHEDIR.TAG; its physical
 #     path is <physical worktree>/target
 #   * repo not in MOTHER_CARGO_TARGET_PURGE_EXCLUDE; purge not disabled
@@ -419,7 +447,7 @@ _gc_cargo_job_targets() {
         t="$work_dir/target"
 
         [ -f "$work_dir/Cargo.toml" ] || continue
-        [ -f "$work_dir/.git" ] && [ ! -L "$work_dir/.git" ] || continue
+        _gc_is_linked_worktree "$work_dir" || continue
         [ -d "$t" ] && [ ! -L "$t" ] && [ -f "$t/CACHEDIR.TAG" ] || continue
         [ "$(_gc_canon "$t")" = "$canon/target" ] || continue
 

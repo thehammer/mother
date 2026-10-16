@@ -1293,7 +1293,7 @@ _workspace_lock_held=0
 if [ "$isolation" = "worktree" ]; then
     (cd "$repo_path" && git fetch --quiet origin "${base_ref#origin/}" 2>/dev/null || true)
     # Create the branch + worktree from base_ref.
-    wt_path=$(cd "$repo_path" && source "$MOTHER_LIB_DIR/worktree.sh" && worktree_get_path "$branch")
+    wt_path=$(source "$MOTHER_LIB_DIR/worktree.sh" && worktree_path_for_repo "$repo_path" "$branch")
     if [ ! -d "$wt_path" ]; then
         # If the branch already exists (e.g. adherence rework re-run), add the
         # worktree pointing at it rather than trying to create a new branch with

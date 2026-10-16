@@ -57,6 +57,19 @@ worktree_get_path() {
     echo "${parent_dir}/${repo_name}-${safe_branch}"
 }
 
+# Worktree path a job on <repo_path> / <branch> gets: resolved from inside
+# repo_path exactly as bin/mother-run-job does (so a symlinked, subdirectory or
+# linked-worktree repo_path resolves to the main repo). This is the single
+# definition shared by mother-run-job and `mother gc`; do not inline it.
+# Args: $1 = repo path, $2 = branch name
+# Returns: full path for the worktree directory; non-zero and nothing on stdout
+#          when repo_path can't be entered
+worktree_path_for_repo() {
+    local repo_path="$1" branch="$2"
+    [[ -n "$repo_path" ]] || return 1
+    (cd "$repo_path" 2>/dev/null && worktree_get_path "$branch")
+}
+
 # Check if a worktree exists for a branch
 # Args: $1 = branch name
 # Returns: 0 if exists, 1 if not
