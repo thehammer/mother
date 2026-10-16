@@ -387,11 +387,22 @@ _disk_check() {
         announce=1
     fi
     [ -n "$since" ] || since=$(_iso_now)
+    # Rust build-dir figures from the last `mother gc` pass (no du here).
+    local cargo_json="{}" cargo_note="" cache="$RUNNER_DIR/cargo-targets.json"
+    if [ -f "$cache" ]; then
+        cargo_json=$(jq -c 'select(type == "object" and (.total_kb | type) == "number")
+            | {cargo_targets_kb: .total_kb, cargo_in_use_kb: (.in_use_kb // 0), cargo_checked_at: (.checked_at // "")}' \
+            "$cache" 2>/dev/null) || cargo_json=""
+        [ -n "$cargo_json" ] || cargo_json="{}"
+        cargo_note=$(printf '%s' "$cargo_json" | jq -r 'select(.cargo_targets_kb != null)
+            | def gb: (. / 1048576 * 10 | round) as $t | "\(($t / 10 | floor)).\($t % 10)";
+              "; Rust build dirs \(.cargo_targets_kb | gb) GB (\(.cargo_in_use_kb | gb) GB in running jobs)"' 2>/dev/null) || cargo_note=""
+    fi
     _atomic_write "$state" "$(jq -nc --argjson free "$free_gb" --argjson thr "$min_gb" \
-        --arg path "$repo_path" --arg since "$since" --arg now "$(_iso_now)" \
-        '{free_gb: $free, threshold_gb: $thr, path: $path, repo_path: $path, since: $since, checked_at: $now}')"
+        --arg path "$repo_path" --arg since "$since" --arg now "$(_iso_now)" --argjson cargo "$cargo_json" \
+        '{free_gb: $free, threshold_gb: $thr, path: $path, repo_path: $path, since: $since, checked_at: $now} + $cargo')"
     if [ "$announce" -eq 1 ]; then
-        _log "low disk: ${free_gb} GB free (< ${min_gb} GB) — dispatch paused; running jobs untouched"
+        _log "low disk: ${free_gb} GB free (< ${min_gb} GB) — dispatch paused; running jobs untouched${cargo_note}"
         type mother_attention_write >/dev/null 2>&1 && mother_attention_write 2>/dev/null
     fi
     _lowdisk_gc

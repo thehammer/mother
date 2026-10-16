@@ -404,6 +404,9 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_MIN_FREE_GB` | `20` | Pause dispatch (never running jobs) while the volume holding the next job's repo has less than this many GB free; shows as a `low_disk` needs-attention item and triggers one `mother gc` sweep (at most every `MOTHER_LOWDISK_GC_INTERVAL`, default 600s). `0` disables. Resumes automatically |
 | `MOTHER_GOCACHE_MAX_GB` | `10` | `mother gc` runs `go clean -cache` when the Go build cache is larger than this and no job is running |
 | `MOTHER_GC_ENABLED` | `1` | Run `mother gc` in the hourly sweep and on low disk (`0` to disable) |
+| `MOTHER_CARGO_TARGET_PURGE` | `1` | `mother gc` deletes the `target/` of a Cargo job worktree once every job on it is `succeeded`/`failed`/`cancelled` (none adherence-pending or in pipeline review). `0` only reports |
+| `MOTHER_CARGO_TARGET_IDLE_MINUTES` | `10` | A worktree `target/` with anything modified within this many minutes is kept |
+| `MOTHER_CARGO_TARGET_PURGE_EXCLUDE` | (empty) | Job `repo` names (space or comma separated) whose worktree `target/` dirs are never purged |
 | `MOTHER_RECONCILE_ENABLED` | `1` | Let the daemon try `mother reconcile --auto` on a failed job before escalating it |
 | `MOTHER_RATE_LIMIT_CACHE` | `$MOTHER_ROOT/rate-limits.json` | Where the statusline writes 5h/7d quota state |
 | `MOTHER_QUOTA_CAP_5H_PCT` | `90` | Refuse new dispatches when the 5h window is at or over this percentage |
@@ -469,8 +472,12 @@ Xcode DerivedData folders whose `WorkspacePath` no longer exists, runs
 `go clean -cache` when the Go cache exceeds `MOTHER_GOCACHE_MAX_GB` and no job
 is running (it skips, with a logged reason, when `go` is unavailable — e.g. an
 asdf shim with no version set), removes `$MOTHER_ROOT/tmp/<job-id>` for jobs
-that no longer have a live record, and reports (never touches) main-checkout
-Cargo `target/` dirs over 10 GB. Every worker runs with a job-scoped
+that no longer have a live record, deletes the `target/` of a Cargo job worktree
+once no live job uses it (every job on it finished, none adherence-pending or in
+pipeline review, nothing in it touched for `MOTHER_CARGO_TARGET_IDLE_MINUTES`; a
+resumed or reworked job whose `target/` was reclaimed rebuilds cold), and reports
+(never touches) main-checkout Cargo `target/` dirs over 10 GB. `mother status`
+and the low-disk message show how much disk Rust build dirs hold. Every worker runs with a job-scoped
 `TMPDIR=$MOTHER_ROOT/tmp/<job-id>`, removed at teardown. `/private/tmp` is
 never swept.
 

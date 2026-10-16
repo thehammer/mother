@@ -346,6 +346,32 @@ EOF
     [[ "$output" != *"proj/target"* ]]
 }
 
+@test "gc Rust targets: a job worktree's target/ under the code dir is not mislabelled 'main checkout'" {
+    # A real main checkout beside it proves the report scan did run.
+    mkdir -p "$MOTHER_GC_CODE_DIR/proj/target/debug"
+    echo "[package]" > "$MOTHER_GC_CODE_DIR/proj/Cargo.toml"
+    echo "binary" > "$MOTHER_GC_CODE_DIR/proj/target/debug/app"
+    # A Mother job worktree that happens to live under the same code dir. The
+    # job is running, so the idle-target purge leaves it alone and only the
+    # report scan decides whether it gets mentioned.
+    local wt="$MOTHER_GC_CODE_DIR/proj-wt"
+    mkdir -p "$wt/target/debug"
+    echo "[package]" > "$wt/Cargo.toml"
+    echo "Signature: 8a477f597d28d172789f06886806bc55" > "$wt/target/CACHEDIR.TAG"
+    echo "binary" > "$wt/target/debug/app"
+    make_job "gc-wt-job" "running" ".work_dir = \"$wt\""
+    export MOTHER_GC_TARGET_REPORT_GB=0
+
+    run mother gc
+    [ "$status" -eq 0 ]
+
+    printf '%s\n' "$output" | grep -F "proj/target" | grep -Fq "main checkout"
+    run bash -c "printf '%s\n' \"\$1\" | grep -F 'proj-wt/target' | grep -F 'main checkout'" _ "$output"
+    [ "$status" -ne 0 ]
+    [ -f "$wt/target/debug/app" ]
+    [ -f "$MOTHER_GC_CODE_DIR/proj/target/debug/app" ]
+}
+
 # ===========================================================================
 # 4. Job-scoped temp directories
 # ===========================================================================

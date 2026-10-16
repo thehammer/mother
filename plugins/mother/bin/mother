@@ -836,6 +836,27 @@ _effective_concurrency() {
     )
 }
 
+# "Rust build dirs: ..." status line from the cargo-targets.json cache (only
+# when it lists any dirs).
+_status_rust_dirs_line() {
+    local cache="$1" n total in_use idle at hhmm=""
+    n=$(printf '%s' "$cache" | jq -r '.dirs // 0' 2>/dev/null) || n=0
+    case "$n" in ''|*[!0-9]*|0) return 0 ;; esac
+    total=$(_gc_human_kb "$(printf '%s' "$cache" | jq -r '.total_kb // 0')")
+    in_use=$(_gc_human_kb "$(printf '%s' "$cache" | jq -r '.in_use_kb // 0')")
+    idle=$(_gc_human_kb "$(printf '%s' "$cache" | jq -r '.idle_kb // 0')")
+    at=$(printf '%s' "$cache" | jq -r '.checked_at // ""')
+    if [ -n "$at" ]; then
+        # checked_at is UTC; BSD date (macOS) first, GNU date as a fallback.
+        local epoch
+        epoch=$(TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%SZ' "$at" +%s 2>/dev/null) \
+            || epoch=$(date -d "$at" +%s 2>/dev/null) || epoch=""
+        [ -n "$epoch" ] && { hhmm=$(date -r "$epoch" '+%-I:%M %p' 2>/dev/null) \
+            || hhmm=$(date -d "@$epoch" '+%-I:%M %p' 2>/dev/null) || hhmm=""; }
+    fi
+    echo "Rust build dirs: $n worktree target/ dirs, $total ($in_use in use, $idle idle; reclaimed by mother gc)${hhmm:+ — as of $hhmm}"
+}
+
 # `mother status` with no id: queue overview + the needs-attention list.
 # Recomputes live (no gh — see lib/attention.sh) and refreshes attention.json
 # as a side effect so the statusline / `mother list` footer stay in step.
@@ -863,14 +884,19 @@ _status_overview() {
                auto_resumes: ((.paused_reason // "") | startswith("quota_"))})')
 
     local conc; conc=$(_effective_concurrency)
+    # Rust build-dir inventory written by `mother gc` (lib/gc.sh); null when absent.
+    local rust_dirs
+    rust_dirs=$(jq -c 'select(type == "object")' "$RUNNER_DIR/cargo-targets.json" 2>/dev/null) || rust_dirs=""
+    [ -n "$rust_dirs" ] || rust_dirs="null"
     if [ "$format" = "json" ]; then
         jq -nc --argjson counts "$counts" --argjson awaiting "$awaiting" --argjson na "$items" \
-            --argjson conc "$conc" \
-            '{counts: $counts, awaiting: $awaiting, needs_attention: $na, concurrency: $conc}'
+            --argjson conc "$conc" --argjson rust "$rust_dirs" \
+            '{counts: $counts, awaiting: $awaiting, needs_attention: $na, concurrency: $conc, rust_build_dirs: $rust}'
         return 0
     fi
 
     echo "Concurrency: $(printf '%s' "$conc" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
+    _status_rust_dirs_line "$rust_dirs"
     echo "Queue: $(printf '%s' "$counts" | jq -r 'to_entries | if length == 0 then "(no jobs)" else map("\(.key)=\(.value)") | join("  ") end')"
     echo ""
     echo "=== awaiting operator ==="
@@ -3526,7 +3552,8 @@ cmd_prune_temps() {
 
 # `mother gc [--dry-run]` — the disk hygiene sweep (lib/gc.sh): orphaned Xcode
 # DerivedData, an oversized Go build cache, job-scoped temp dirs of archived
-# jobs. Also run by the daemon's hourly ride-along and, rate-limited, whenever
+# jobs, and the target/ of Cargo job worktrees no live job uses (the cache that
+# `mother status` and the low-disk message summarise). Also run by the daemon's hourly ride-along and, rate-limited, whenever
 # dispatch is paused for low disk.
 cmd_gc() {
     local dry_run=0
@@ -3827,7 +3854,8 @@ Usage:
                                               be an integer)
   mother prune-temps [--dry-run]              (remove orphaned *.tmp.*/*.bak.* state files)
   mother gc [--dry-run]                       (disk hygiene: orphaned Xcode DerivedData, oversized Go
-                                              build cache, archived jobs' temp dirs; reports big Cargo targets)
+                                              build cache, archived jobs' temp dirs, idle job-worktree Rust target/ dirs;
+                                              reports big main-checkout Cargo targets)
   mother teardowns [--drain] [--dry-run]      (list/retry pending worktree+docker teardowns)
   mother retro --since 60d|2w|36h|YYYY-MM-DD [--format table|json] [--backfill]
                                               (cost/outcome/failure retrospective report)
@@ -3912,6 +3940,10 @@ Daemon env vars:
   MOTHER_GOCACHE_MAX_GB        (default: 10)   `mother gc` runs `go clean -cache` when the Go
                                                  build cache is larger and no job is running
   MOTHER_GC_ENABLED            (default: 1)    run `mother gc` in the hourly sweep (0 to disable)
+  MOTHER_CARGO_TARGET_PURGE    (default: 1)    `mother gc` deletes the target/ of a Cargo job worktree once no
+                                                 job uses it (0: report only)
+  MOTHER_CARGO_TARGET_IDLE_MINUTES (default: 10) skip a target/ modified within this many minutes
+  MOTHER_CARGO_TARGET_PURGE_EXCLUDE (default: empty) job repo names (space/comma separated) never purged
 
 Hook / events env vars:
   MOTHER_EVENTS_MAX_AGE_HOURS  (default: 6)    age floor for

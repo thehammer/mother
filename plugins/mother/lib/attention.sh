@@ -93,12 +93,18 @@ _attention_residue_items() {
 _attention_low_disk_items() {
     local f="$RUNNER_DIR/low-disk.json"
     [ -f "$f" ] || return 0
-    jq -c '{kind: "low_disk", job_id: "", repo: "", branch: "",
-            reason: ("Low disk: " + (.free_gb | tostring) + " GB free, dispatch paused"),
-            since: (.since // ""),
-            detail: {free_gb: .free_gb, threshold_gb: .threshold_gb, path: (.path // ""), repo_path: (.repo_path // "")},
-            hint: ("free space (mother gc, empty caches); dispatch resumes automatically above "
-                   + (.threshold_gb | tostring) + " GB — running jobs are not affected")}' "$f" 2>/dev/null
+    jq -c '
+        def gb: (. / 1048576 * 10 | round) as $t | "\(($t / 10 | floor)).\($t % 10)";
+        (.cargo_targets_kb | type == "number") as $cargo
+        | {kind: "low_disk", job_id: "", repo: "", branch: "",
+           reason: ("Low disk: " + (.free_gb | tostring) + " GB free, dispatch paused"
+                    + (if $cargo then "; Rust build dirs " + (.cargo_targets_kb | gb)
+                                      + " GB (" + ((.cargo_in_use_kb // 0) | gb) + " GB in use)" else "" end)),
+           since: (.since // ""),
+           detail: {free_gb: .free_gb, threshold_gb: .threshold_gb, path: (.path // ""), repo_path: (.repo_path // "")},
+           hint: ("free space (mother gc, empty caches); dispatch resumes automatically above "
+                  + (.threshold_gb | tostring) + " GB — running jobs are not affected"
+                  + (if $cargo then "; `mother gc` reclaims idle worktree target/ dirs automatically" else "" end))}' "$f" 2>/dev/null
 }
 
 _attention_job_items() {

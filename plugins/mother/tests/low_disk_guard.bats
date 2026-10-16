@@ -198,6 +198,65 @@ _attention_item() {
 }
 
 # ---------------------------------------------------------------------------
+# Rust build dir inventory (written by `mother gc`) enriches the message
+# ---------------------------------------------------------------------------
+
+# The inventory `mother gc` leaves in $RUNNER_DIR/cargo-targets.json.
+_seed_cargo_cache() {
+    jq -n '{checked_at: "2026-10-16T15:00:00Z", dirs: 3,
+            total_kb: 23907533, in_use_kb: 10276045, idle_kb: 13631488, reclaimed_kb: 0,
+            entries: []}' > "$RUNNER_DIR/cargo-targets.json"
+}
+
+@test "low disk: a cargo-targets cache adds its totals to low-disk.json and to the needs-attention reason" {
+    _df_free_gb 5
+    _ready_job "ld-cargo"
+    _seed_cargo_cache
+
+    _dispatch_tick
+
+    local f="$RUNNER_DIR/low-disk.json"
+    [ "$(jq -r '.cargo_targets_kb' "$f")" = "23907533" ]
+    [ "$(jq -r '.cargo_in_use_kb' "$f")" = "10276045" ]
+    [ "$(jq -r '.cargo_checked_at' "$f")" = "2026-10-16T15:00:00Z" ]
+    # Dispatch is still paused: the cache is information only.
+    [ "$(_state_of ld-cargo)" = "ready" ]
+
+    local item reason
+    item=$(_attention_item low_disk)
+    [ -n "$item" ]
+    reason=$(printf '%s' "$item" | jq -r '.reason')
+    [[ "$reason" == "Low disk: 5 GB free, dispatch paused; Rust build dirs "* ]]
+    [[ "$reason" =~ Rust\ build\ dirs\ [0-9.]+\ GB\ \([0-9.]+\ GB\ in\ use\)$ ]]
+    # The hint tells the operator that gc reclaims idle worktree target/ dirs.
+    printf '%s' "$item" | jq -r '.hint' | grep -F 'mother gc' | grep -Fq 'target/'
+}
+
+@test "low disk: without a cargo-targets cache the reason is exactly the plain message and low-disk.json has no cargo fields" {
+    _df_free_gb 5
+    _ready_job "ld-nocargo"
+
+    _dispatch_tick
+
+    local f="$RUNNER_DIR/low-disk.json"
+    [ -f "$f" ]
+    [ "$(jq 'has("cargo_targets_kb")' "$f")" = "false" ]
+    [ "$(_attention_item low_disk | jq -r '.reason')" = "Low disk: 5 GB free, dispatch paused" ]
+}
+
+@test "low disk: an unreadable cargo-targets cache is ignored and the message stays plain" {
+    _df_free_gb 5
+    _ready_job "ld-badcargo"
+    echo '{ not json' > "$RUNNER_DIR/cargo-targets.json"
+
+    _dispatch_tick
+
+    [ "$(_state_of ld-badcargo)" = "ready" ]
+    [ "$(jq 'has("cargo_targets_kb")' "$RUNNER_DIR/low-disk.json")" = "false" ]
+    [ "$(_attention_item low_disk | jq -r '.reason')" = "Low disk: 5 GB free, dispatch paused" ]
+}
+
+# ---------------------------------------------------------------------------
 # Hygiene sweep trigger
 # ---------------------------------------------------------------------------
 
