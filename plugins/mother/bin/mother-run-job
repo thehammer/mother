@@ -1156,6 +1156,612 @@ type _failure_reason_literal >/dev/null 2>&1 || _failure_reason_literal() {
     printf '%s' "$1" | jq -c '(.reason // "") | tostring | if . == "" then "unspecified" else . end' 2>/dev/null || echo '"unspecified"'
 }
 
+# _terminate_worker: SIGTERM the wrapper + its direct children, wait up to
+# 10s for them to exit, then SIGKILL stragglers. We hit the children
+# explicitly because the cancel/reap path has historically just SIGTERM'd
+# the wrapper, which would leave a hung claude orphaned (the failure mode
+# this bug fix is closing). With the wrapper's signal trap in place, the
+# direct kill is mostly belt-and-suspenders, but it's also what saves us
+# if the wrapper itself has somehow died.
+_terminate_worker() {
+    local kids
+    kids=$(pgrep -P "$worker_pid" 2>/dev/null || true)
+    [ -n "$kids" ] && kill -TERM $kids 2>/dev/null || true
+    kill -TERM "$worker_pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$worker_pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$worker_pid" 2>/dev/null; then
+        kids=$(pgrep -P "$worker_pid" 2>/dev/null || true)
+        [ -n "$kids" ] && kill -KILL $kids 2>/dev/null || true
+        kill -KILL "$worker_pid" 2>/dev/null || true
+    fi
+}
+
+# _log_mtime: epoch seconds of the log file's last write, or 0 if missing.
+# Wrapped because macOS uses `stat -f %m` and Linux uses `stat -c %Y`.
+_log_mtime() {
+    [ -f "$log_path" ] || { echo 0; return; }
+    stat -f %m "$log_path" 2>/dev/null \
+        || stat -c %Y "$log_path" 2>/dev/null \
+        || echo 0
+}
+
+# _spawn_and_wait <mode> [prompt_file] — spawn one claude worker for this job
+# and block until it exits (or is cancelled / paused / reaped). Everything it
+# sets (worker_pid, log_offset_at_spawn, marker_file, exit_code, session_id,
+# cancel_requested, reaped_reason, ...) is a script global: the post-exit path
+# reads them. Defined before the SOURCE_ONLY guard so bats can drive it.
+#
+#   fresh   the normal path: new session (`--session-id`), plan/preamble prompt
+#           built and any pending operator answer consumed.
+#   resume  re-enter the job's existing `.session_id` (`--resume`) with the given
+#           prompt file on stdin; used for quality-gate fix turns. Skips the
+#           prompt build and pending_answer consumption.
+#
+# Each call has its own marker/wrapper files and its own log_offset_at_spawn,
+# so a caller can record the finished run (`_record_run_usage_for_last_spawn`)
+# before spawning the next one.
+_spawn_and_wait() {
+    local mode="${1:-}" resume_prompt="${2:-}"
+    local session_flag stdin_prompt spawn_sfx
+    case "$mode" in
+        fresh) ;;
+        resume)
+            if [ ! -r "$resume_prompt" ]; then
+                echo "_spawn_and_wait: resume needs a readable prompt file (got: '$resume_prompt')" >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "_spawn_and_wait: unknown mode '$mode' (expected fresh|resume)" >&2
+            return 2
+            ;;
+    esac
+
+    if [ "$mode" = "resume" ]; then
+        # Resume: re-enter the job's existing claude session (same session id,
+        # prompt cache intact). No plan/preamble build and no pending_answer
+        # consumption: the caller supplies the whole prompt in $resume_prompt.
+        session_id=$(jq -r '.session_id // empty' "$job_file" 2>/dev/null)
+        stdin_prompt="$resume_prompt"
+        session_flag="--resume"
+        if [ -z "$session_id" ]; then
+            echo "_spawn_and_wait: cannot resume - job $id has no .session_id" >&2
+            return 1
+        fi
+    else
+        session_flag="--session-id"
+        # Generate a deterministic session ID and pass it to claude via --session-id
+        # so the transcript filename is predictable. Without this, main-dir jobs
+        # sharing a work_dir all land in the same ~/.claude/projects/<slug>/ and
+        # `mother peek` can't tell them apart — it falls back to newest-mtime,
+        # which conflates sibling workers and any user's foreground Claude session
+        # in the same directory.
+        session_id=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')
+        if [ -z "$session_id" ] && [ -r /proc/sys/kernel/random/uuid ]; then
+            session_id=$(cat /proc/sys/kernel/random/uuid)
+        fi
+        if [ -n "$session_id" ]; then
+            _job_update ".session_id = \"$session_id\""
+        fi
+
+        # Compose the spawn-time prompt. The on-disk plan file stays the user's
+        # authored content; everything Mother adds (the await/resume capability
+        # preamble, plus any resume context from a previous pause cycle) is
+        # layered in at spawn time and written to a single $RUNNER_DIR/$id.prompt.md
+        # that becomes the prompt claude actually receives.
+        #
+        #   [preamble]              ← from $MOTHER_PREAMBLE_PATH or the shipped
+        #                             template; tells the agent how to call
+        #                             `mother await`. Empty / disabled by pointing
+        #                             MOTHER_PREAMBLE_PATH at /dev/null or a
+        #                             missing file.
+        #   [resume context]        ← only on resume cycles: previous question,
+        #                             operator's answer, worktree-state heads-up.
+        #   [user's plan]           ← exact contents of $plan_path, untouched.
+        #
+        # Continuation, operator resume and adherence rework still start a fresh
+        # session: the augmented prompt + the worktree itself (which still carries
+        # the in-progress changes from before the pause) preserve continuity. Resume
+        # mode (`_spawn_and_wait resume <prompt_file>`, i.e. `claude -p --resume
+        # <session-id>`) re-enters the SAME session and is used for quality-gate
+        # fix turns, which supply their own prompt file.
+
+        spawn_prompt="$RUNNER_DIR/$id.prompt.md"
+        preamble_path="${MOTHER_PREAMBLE_PATH:-$MOTHER_LIB_DIR/../templates/preamble.md}"
+        pending_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null || echo "")
+        prev_question=$(jq -r '.question // empty'       "$job_file" 2>/dev/null || echo "")
+
+        {
+            if [ -r "$preamble_path" ] && [ -s "$preamble_path" ]; then
+                cat "$preamble_path"
+                printf '\n---\n\n'
+            fi
+
+            # Routing context stanza: insert after preamble, before plan (or resume context).
+            # Tells the worker agent which model/effort it's running at and how to configure sub-agents.
+            printf '%s\n\n' "$routing_context"
+
+            if [ "$kind" = "pipeline" ] && [ -n "$phase_agent" ]; then
+                # ---- Pipeline phase prompt: request-type-driven ----
+                # Renders a header identifying the request type and one titled section
+                # per input key declared by rt_inputs, in declaration order (D1/D2).
+                # The resume/continuation path is legacy-only in W2 — pipeline jobs do
+                # not use mother await for phases yet (that is W4's concern).
+                _contract=$(rt_contract "$phase_agent" "$phase_request_type" 2>/dev/null \
+                    || echo "(no contract description)")
+                printf '# Request type: %s:%s\n\n' "$phase_agent" "$phase_request_type"
+                printf '%s\n\n' "$_contract"
+                printf '---\n\n'
+                # Collect the declared input keys. Using a variable + <<< (here-string)
+                # keeps the while-loop body in the current shell scope (bash 3.2-safe),
+                # unlike a pipe or heredoc which may fork a subshell and lose variable
+                # assignments in the loop body.
+                _inputs_list=$(rt_inputs "$phase_agent" "$phase_request_type" 2>/dev/null || echo "")
+                # Pre-check whether 'plan' is declared; always include it as the spine
+                # even if a future request type somehow omits it from rt_inputs.
+                _declared_plan=$(printf '%s\n' "$_inputs_list" | grep -c '^plan$' 2>/dev/null || echo 0)
+                while IFS= read -r _input_key; do
+                    [ -z "$_input_key" ] && continue
+                    phase_render_input "$_input_key" "$work_dir" "$plan_path" \
+                        "${prd_path:-}" "${base_ref:-}" "$job_file" "$phase_agent"
+                done <<< "$_inputs_list"
+                if [ "${_declared_plan:-0}" -eq 0 ]; then
+                    phase_render_input "plan" "$work_dir" "$plan_path" \
+                        "${prd_path:-}" "${base_ref:-}" "$job_file" "$phase_agent"
+                fi
+            else
+                # ---- Legacy (non-pipeline) prompt: preamble + routing + plan ----
+                # This path is byte-for-byte the pre-W2 behavior. No pipeline header.
+                if [ -n "$pending_answer" ]; then
+                    printf '# Resumed plan — operator answered your question\n\n'
+                    printf 'A previous worker on this job paused itself with `mother await`.\n'
+                    printf 'The operator has answered. Pick up from where the prior worker left off.\n\n'
+                    printf '## The question you (or your predecessor) asked\n\n'
+                    if [ -n "$prev_question" ]; then
+                        printf '%s\n\n' "$prev_question"
+                    else
+                        printf '_(no question recorded — this should not happen; proceed with the answer below as guidance)_\n\n'
+                    fi
+                    printf "## The operator's answer\n\n"
+                    printf '%s\n\n' "$pending_answer"
+                    printf '## Worktree state at pause time\n\n'
+                    printf 'Your work directory at `%s` retains all changes and commits from the\n' "$work_dir"
+                    printf 'previous run — your branch is `%s`. Run `git status` and `git log --oneline`\n' "$branch"
+                    printf 'before resuming so you orient yourself in the in-progress work.\n\n'
+                    printf '## Original plan (for reference)\n\n'
+                fi
+
+                cat "$plan_path"
+            fi
+        } > "$spawn_prompt"
+        resolved_plan_path="$spawn_prompt"
+
+        if [ -n "$pending_answer" ]; then
+            # Consume the answer + question so the next spawn (if any) starts clean.
+            # Keep resumed_at / resume_count for the audit trail.
+            merged=$(jq '.pending_answer = null | .question = null' "$job_file") \
+                && _atomic_write "$job_file" "$merged"
+            _append_event "resumed_from_input" \
+                "$(jq -nc --arg q "$prev_question" --arg a "$pending_answer" --arg p "$spawn_prompt" \
+                    '{question: $q, answer: $a, resume_prompt: $p}')"
+        fi
+
+        stdin_prompt="$resolved_plan_path"
+    fi
+
+    # Each call gets its own marker/wrapper files (the first keeps the historical
+    # names; later calls get a `.<n>` suffix) so a second call never sees the
+    # previous call's exit marker. The previous call's leftovers are removed here.
+    if [ "${spawn_seq:-0}" -gt 0 ]; then
+        rm -f "${marker_file:-}" "${wrapper:-}"
+    fi
+    spawn_seq=$(( ${spawn_seq:-0} + 1 ))
+    spawn_sfx=""
+    [ "$spawn_seq" -gt 1 ] && spawn_sfx=".$spawn_seq"
+
+    marker_file="$RUNNER_DIR/$id.exit$spawn_sfx"
+    wrapper="$RUNNER_DIR/$id.wrap$spawn_sfx"
+    # Job-scoped Docker Compose project name (see mother_compose_project in
+    # state.sh). Computed here, not inside the heredoc, so it interpolates at
+    # generation time like $branch/$worker_agent below.
+    compose_project=$(mother_compose_project "$id")
+    # Job-scoped TMPDIR for the worker: temp files (build scratch, test
+    # fixtures, tool sockets) land under $MOTHER_ROOT/tmp/<id> instead of the
+    # shared system temp dir, so teardown / `mother gc` can remove exactly this
+    # job's leftovers and nothing else. Empty (no TMPDIR export) if it can't be made.
+    job_tmp="$MOTHER_ROOT/tmp/$id"
+    mkdir -p "$job_tmp" 2>/dev/null || job_tmp=""
+    job_tmp_export=""
+    [ -n "$job_tmp" ] && job_tmp_export="export TMPDIR=$(printf '%q' "$job_tmp")"
+
+    # --effort + MCP-scope args (lib/usage.sh). Rendered at generation time
+    # (the wrapper is a plain generated script, not a live shell) with printf
+    # '%q' so quoting stays sane regardless of what the args contain.
+    mother_claude_extra_args "$worker_effort" worker
+    extra_claude_args_quoted=""
+    if [ "${#MOTHER_CLAUDE_ARGS[@]}" -gt 0 ]; then
+        for _extra_arg in "${MOTHER_CLAUDE_ARGS[@]}"; do
+            extra_claude_args_quoted="$extra_claude_args_quoted $(printf '%q' "$_extra_arg")"
+        done
+    fi
+
+    # --max-cost enforcement (F3): only when the job has a cap. Writes a
+    # job-scoped Claude settings file wiring the PreToolUse cost-gate hook, and
+    # clears any stale cost-cap flag left over from a previous poll cycle.
+    max_cost_usd=$(jq -r '.max_cost_usd // empty' "$job_file" 2>/dev/null)
+    cost_cap_flag="$RUNNER_DIR/$id.cost-cap"
+    rm -f "$cost_cap_flag"
+    settings_args_quoted=""
+    if [ -n "$max_cost_usd" ]; then
+        settings_file="$RUNNER_DIR/$id.settings.json"
+        cost_gate_hook="$MOTHER_LIB_DIR/../hooks/mother-cost-gate.sh"
+        jq -n --arg cmd "$cost_gate_hook" \
+            '{hooks: {PreToolUse: [{matcher: "*", hooks: [{type: "command", command: $cmd}]}]}}' \
+            > "$settings_file" 2>/dev/null
+        settings_args_quoted=" $(printf '%q' --settings) $(printf '%q' "$settings_file")"
+    fi
+
+    cat > "$wrapper" <<WRAP
+#!/usr/bin/env bash
+cd "$work_dir"
+exec > >(tee -a "$log_path") 2>&1
+# Export the job id so an in-worker agent can call \`mother await --question
+# "..."\` without bookkeeping. Without this, the agent has no clean way to
+# discover which job it belongs to.
+export MOTHER_JOB_ID="$id"
+export MOTHER_ROOT="$MOTHER_ROOT"
+# Docker Compose reads COMPOSE_PROJECT_NAME automatically, so any
+# `docker compose up` the worker runs lands in a job-scoped project with
+# zero convention-following required by the plan or the agent. Mother tears
+# this project down once the job's PR is merged/closed (see lib/teardown.sh).
+export COMPOSE_PROJECT_NAME="$compose_project"
+# Job-scoped scratch dir (created above; removed at teardown / by \`mother gc\`).
+$job_tmp_export
+# Export effort for agents that honor MOTHER_EFFORT (e.g. to set thinking budgets).
+export MOTHER_EFFORT="$worker_effort"
+echo "=== mother job $id starting at \$(date) ==="
+echo "=== working dir: \$PWD ==="
+echo "=== branch:      $branch ==="
+echo "=== agent:       $worker_agent ==="
+echo "=== model:       $worker_model ==="
+echo "=== effort:      $worker_effort ==="
+echo "=== tier:        $current_tier ==="
+echo "=== session-id:  $session_id ==="
+echo "=== compose:     $compose_project ==="
+echo "=== plan:        $stdin_prompt ==="
+echo
+# stream-json + verbose gives us a live per-event log (one JSON object per
+# line). \`mother logs --follow\` pretty-prints these via mother-stream-pretty;
+# the raw file stays authoritative and greppable.
+#
+# Run claude in the background so we can forward signals to it. Without this,
+# a SIGTERM to the wrapper would kill bash and orphan claude — which is the
+# failure mode mother's reaper needs to escape when claude refuses to exit
+# after emitting its final 'result' event. With the trap in place, a SIGTERM
+# to the wrapper unblocks claude (gracefully on a healthy session, after
+# SIGKILL escalation from mother-run-job on a wedged one), 'wait' returns
+# its real exit code, and the marker file is written normally.
+# The prompt is fed on stdin from the plan file (never argv: argv is visible
+# to \`ps\` and EDR command-line scanners). The explicit redirect matters:
+# bash would otherwise give a backgrounded job /dev/null as stdin.
+claude_pid=""
+_forward_signal() {
+    [ -n "\$claude_pid" ] && kill -TERM "\$claude_pid" 2>/dev/null || true
+}
+trap _forward_signal TERM INT
+claude --dangerously-skip-permissions --agent "$worker_agent" --model "$worker_model"$extra_claude_args_quoted$settings_args_quoted $session_flag "$session_id" -p --output-format stream-json --verbose < "$stdin_prompt" &
+claude_pid=\$!
+# wait may be interrupted by the trap (signal raises EINTR and bash returns
+# 128+sig); loop until claude is actually gone before recording its real
+# exit code.
+rc=0
+while :; do
+    wait "\$claude_pid" 2>/dev/null
+    rc=\$?
+    kill -0 "\$claude_pid" 2>/dev/null || break
+done
+echo "\$rc" > "$marker_file"
+WRAP
+
+    chmod +x "$wrapper"
+
+    # Capture the log file's size BEFORE spawning (moved ahead of the nohup
+    # below so `.current_run.log_offset` — used by orphan recovery to record a
+    # usage row for a dead run — always reflects this run's true starting
+    # offset, never a byte written by the process we're about to start). The
+    # wrapper tees to $log_path with `-a`, so on resume cycles the file already
+    # contains content from previous runs (one per pause/resume). The
+    # result-event detector in the poll loop below uses this offset to ignore
+    # content older than this run — without it, the resumed worker's poll loop
+    # would see the previous run's `result` event (the one emitted around the
+    # `mother await` call) and immediately start the post-result-grace timer,
+    # reaping the worker 5 min later regardless of what it's actually doing.
+    log_offset_at_spawn=0
+    _pr_rejected_urls=""   # rejected-scrape memory is per spawn (see _reject_scraped_pr_url)
+    _pr_transient_failures=""
+    if [ -f "$log_path" ]; then
+        log_offset_at_spawn=$(stat -f %z "$log_path" 2>/dev/null \
+            || stat -c %s "$log_path" 2>/dev/null \
+            || echo 0)
+    fi
+
+    nohup bash "$wrapper" >/dev/null 2>&1 &
+    worker_pid=$!
+    disown 2>/dev/null || true
+    _job_update ".worker_pid = $worker_pid"
+    _job_update ".current_run = $(jq -nc \
+        --argjson lo "$log_offset_at_spawn" --arg at "$(iso_now)" --arg sid "$session_id" --arg md "$mode" \
+        --arg hs "${run_head_sha_at_start:-}" --arg rr "${run_remote_ref:-}" \
+        --arg rs "${run_remote_sha_at_start:-}" --arg pu "${run_pr_url_at_start:-}" \
+        --argjson ha "${run_had_artifact_at_start:-false}" \
+        '{log_offset: $lo, spawned_at: $at, session_id: $sid,
+          head_sha_at_start: $hs, remote_ref: $rr, remote_sha_at_start: $rs,
+          pr_url_at_start: $pu, had_artifact_at_start: $ha, mode: $md}')"
+    _append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" --arg md "$mode" '{pid: $pid, session_id: $sid, mode: $md}')"
+
+    # Live usage checks (F1/F2/F3): baseline spend/tokens read once at spawn.
+    usage_state_file="$RUNNER_DIR/$id.usage-state.json"
+    rm -f "$usage_state_file"
+    prior_spend=$(jq -r '.actual_cost_usd // 0' "$job_file" 2>/dev/null); : "${prior_spend:=0}"
+    prior_tokens=$(jq -r '.actual_tokens // 0' "$job_file" 2>/dev/null); : "${prior_tokens:=0}"
+    case "$prior_tokens" in ''|*[!0-9]*) prior_tokens=0 ;; esac
+    last_usage_check_epoch=0
+    cost_cap_breached=0
+    usage_main_actor="${phase_agent:-cody}-main"
+
+    # Reaper tunables. RESULT_GRACE_SECONDS is how long we let the worker linger
+    # after we observe a top-level "result" event in the stream-json log before
+    # forcing it down (Layer 1 in the bug report). IDLE_REAP_SECONDS is the
+    # log-mtime watchdog (Layer 2): if the worker hasn't written a single byte
+    # in that long, we treat it as wedged regardless of whether we ever saw a
+    # result. Both knobs default conservatively — five minutes is plenty for
+    # any sane post-result cleanup, and 30 minutes of total log silence is
+    # already unusual even for long-running tool calls (claude emits periodic
+    # system events while waiting on tools).
+    RESULT_GRACE_SECONDS="${MOTHER_RESULT_GRACE_SECONDS:-300}"
+    IDLE_REAP_SECONDS="${MOTHER_IDLE_REAP_SECONDS:-1800}"
+
+    # Poll for the marker file.
+    cancel_requested=0
+    final_result_epoch=0
+    reaped_reason=""
+    while [ ! -f "$marker_file" ]; do
+        sleep 2
+
+        # Honor cancellation: TERM, grace period, then KILL (handled in the helper).
+        if [ "$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
+            cancel_requested=1
+            _terminate_worker
+            break
+        fi
+
+        # Honor a system-initiated pause (daemon's quota gate). Same kill path
+        # as cancel, but the state transitions to `awaiting` (not cancelled) so
+        # the daemon's auto-resume can pick the job back up when the offending
+        # window resets. We transition state BEFORE killing the worker so the
+        # post-loop short-circuit at line ~470 (the `awaiting` exit path) finds
+        # the right state and skips the terminal-transition logic.
+        if [ "$(jq -r '.pause_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
+            _pause_reason=$(jq -r '.paused_reason // "system"' "$job_file" 2>/dev/null)
+            _pause_resume_at=$(jq -r '.auto_resume_at // 0'    "$job_file" 2>/dev/null)
+            _job_update '.state = "awaiting"
+                | .question = "Mother paused this job because the quota cap was reached. Auto-resumes when the blocking window resets."
+                | .pause_requested = null'
+            _append_event "paused_for_quota" \
+                "$(jq -nc --arg r "$_pause_reason" --argjson ts "${_pause_resume_at:-0}" \
+                    '{paused_reason: $r, auto_resume_at: $ts}')"
+            _terminate_worker
+            break
+        fi
+
+        # Live observability. Two things we want to know about *as they happen*,
+        # not just after claude exits:
+        #   1. The PR URL (so `mother status` reflects the artifact even while
+        #      the wrapper is still running). Without this, the bug's
+        #      "PR exists but mother shows pr_url: null" symptom persists for
+        #      the entire post-result-hang window.
+        #   2. The top-level `result` event in the stream-json output. Once we
+        #      see it, the agent has emitted its canonical "I'm done" signal —
+        #      from here on, mother is the timekeeper for how long the wrapper
+        #      gets to gracefully wind down.
+        if [ -f "$log_path" ]; then
+            if [ -z "$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)" ]; then
+                # Only scan log content written by THIS worker (past log_offset_at_spawn)
+                # to avoid picking up PR URLs left by previous runs on the same log file
+                # (e.g. escalation retries on the same job ID).
+                _live_capture_pr_url
+            fi
+
+            if [ "$final_result_epoch" -eq 0 ]; then
+                # stream-json emits one complete JSON event per line. The result
+                # event has top-level "type":"result". The whitespace tolerance
+                # is paranoia — claude's SDK currently emits compact JSON, but
+                # stream formatters change. Crucially we only look at log content
+                # newer than this worker's spawn (`log_offset_at_spawn`), not the
+                # whole file: on resume cycles the file already contains a
+                # previous run's `result` event, and scanning the whole thing
+                # would set final_result_epoch instantly and trip the post-
+                # result-grace reaper before this worker has done any new work.
+                if tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
+                    | grep -Eq '"type"[[:space:]]*:[[:space:]]*"result"' 2>/dev/null; then
+                    final_result_epoch=$(date +%s)
+                    _job_update ".final_result_at = \"$(iso_now)\""
+                    _append_event "final_result_observed" "{}"
+                fi
+            fi
+        fi
+
+        # Live usage checks (F1-F3): token alert + --max-cost enforcement.
+        # Runs at most once every MOTHER_USAGE_CHECK_INTERVAL seconds (default
+        # 120), and only once the log file exists.
+        _usage_check_interval="${MOTHER_USAGE_CHECK_INTERVAL:-120}"
+        _now_epoch=$(date +%s)
+        if [ -f "$log_path" ] && [ $((_now_epoch - last_usage_check_epoch)) -ge "$_usage_check_interval" ]; then
+            last_usage_check_epoch=$_now_epoch
+            read -r job_spend job_tokens _run_cost _run_tokens <<USAGE_EOF
+$(mother_usage_check_live "$id" "$log_path" "$log_offset_at_spawn" "$usage_state_file" "$prior_spend" "$prior_tokens" "$usage_main_actor")
+USAGE_EOF
+            : "${job_spend:=$prior_spend}" "${job_tokens:=$prior_tokens}"
+            _job_update ".live_cost_usd = ${job_spend:-0} | .live_tokens = ${job_tokens:-0}"
+
+            _token_alert_threshold="${MOTHER_TOKEN_ALERT_THRESHOLD:-100000000}"
+            if [ "${job_tokens:-0}" -gt "$_token_alert_threshold" ] \
+                && [ -z "$(jq -r '.token_alert_at // empty' "$job_file" 2>/dev/null)" ]; then
+                _job_update ".token_alert_at = \"$(iso_now)\""
+                _append_event "token_alert" "$(jq -nc --argjson tokens "${job_tokens:-0}" --arg cost "${job_spend:-0}" --argjson threshold "$_token_alert_threshold" '{tokens: $tokens, cost_usd: ($cost | tonumber), threshold: $threshold}')"
+                echo "job $id: TOKEN ALERT — ${job_tokens} tokens (threshold ${_token_alert_threshold}), cost \$${job_spend}"
+            fi
+
+            if [ -n "$max_cost_usd" ] && [ "$cost_cap_breached" -eq 0 ]; then
+                _over_cap=$(awk -v s="${job_spend:-0}" -v m="$max_cost_usd" 'BEGIN { print (s+0 >= m+0) ? 1 : 0 }' 2>/dev/null)
+                [ -n "$_over_cap" ] || _over_cap=0
+                if [ "$_over_cap" = "1" ]; then
+                    cost_cap_breached=1
+                    cost_cap_breach_epoch=$_now_epoch
+                    _cap_by_actor='{}'
+                    _cap_by_model='{}'
+                    if mother_usage_available; then
+                        _cap_parsed=$(python3 "$MOTHER_USAGE_BIN" parse --log "$log_path" --offset "$log_offset_at_spawn" \
+                            --state "$usage_state_file" --main-actor "$usage_main_actor" 2>/dev/null)
+                        _cap_by_actor=$(printf '%s' "$_cap_parsed" | jq -c '.by_actor // {}' 2>/dev/null)
+                        _cap_by_model=$(printf '%s' "$_cap_parsed" | jq -c '.by_model // {}' 2>/dev/null)
+                        [ -n "$_cap_by_actor" ] || _cap_by_actor='{}'
+                        [ -n "$_cap_by_model" ] || _cap_by_model='{}'
+                    fi
+                    _cap_summary="Mother cost cap reached on job $id: spent \$${job_spend} of the \$${max_cost_usd} cap across all runs. Per-actor breakdown: ${_cap_by_actor}. Per-model breakdown: ${_cap_by_model}. Total tokens: ${job_tokens}. To continue: mother resume $id --max-cost <usd> \"<instructions>\". To stop: mother cancel $id."
+                    printf '%s\n' "$_cap_summary" > "$cost_cap_flag"
+                    _job_update ".cost_cap_breached_at = \"$(iso_now)\""
+                    _append_event "cost_cap_breached" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" --argjson by_actor "$_cap_by_actor" --argjson by_model "$_cap_by_model" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber), by_actor: $by_actor, by_model: $by_model}')"
+                fi
+            fi
+
+            # Fallback: if the hook somehow didn't stop the worker, force a
+            # pause MOTHER_COST_CAP_GRACE_SECONDS after the breach.
+            if [ "$cost_cap_breached" -eq 1 ] && [ "$(jq -r '.state' "$job_file" 2>/dev/null)" = "running" ]; then
+                _grace="${MOTHER_COST_CAP_GRACE_SECONDS:-300}"
+                if [ $((_now_epoch - cost_cap_breach_epoch)) -ge "$_grace" ]; then
+                    _cap_summary=$(cat "$cost_cap_flag" 2>/dev/null || echo "Mother cost cap reached on job $id.")
+                    _cc_merged=$(jq --arg q "$_cap_summary" --arg ts "$(iso_now)" \
+                        '.state = "awaiting" | .question = $q | .paused_at = $ts | .paused_reason = "cost_cap"' \
+                        "$job_file") && _atomic_write "$job_file" "$_cc_merged"
+                    _append_event "cost_cap_forced_pause" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber)}')"
+                    _append_event "awaiting_input" "$(jq -nc --arg q "$_cap_summary" '{question: $q, paused_reason: "cost_cap"}')"
+                    _terminate_worker
+                    break
+                fi
+            fi
+        fi
+
+        # Layer 1 — result observed + grace window expired. The worker has
+        # signalled completion and then sat idle past the patience threshold;
+        # force it down and treat the job as succeeded (with metadata noting
+        # we had to reap).
+        if [ "$final_result_epoch" -gt 0 ]; then
+            _now_epoch=$(date +%s)
+            if [ $((_now_epoch - final_result_epoch)) -ge "$RESULT_GRACE_SECONDS" ]; then
+                # Stale-supervisor guard: a resume cycle may have spawned a new
+                # mother-run-job for this job, updating worker_pid in the job
+                # file. If our worker_pid no longer matches, we are the old
+                # (stale) supervisor — break cleanly rather than killing the
+                # wrong wrapper and writing a spurious exit code to the shared
+                # marker file, which would cause the active run to fail.
+                _live_wpid=$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)
+                if [ "$_live_wpid" != "$worker_pid" ]; then
+                    break
+                fi
+                reaped_reason="result_grace_expired"
+                _append_event "reaping_after_result_grace" "$(jq -nc --argjson grace "$RESULT_GRACE_SECONDS" '{grace_seconds: $grace}')"
+                _terminate_worker
+                break
+            fi
+        fi
+
+        # Layer 2 — log has been silent past the idle threshold. Catches the
+        # "claude hung BEFORE emitting result" case that Layer 1 can't see.
+        # Without a result event we don't know whether the work artifact
+        # exists, so the final transition will mark this `failed`.
+        _mtime=$(_log_mtime)
+        if [ "$_mtime" -gt 0 ]; then
+            _now_epoch=$(date +%s)
+            if [ $((_now_epoch - _mtime)) -ge "$IDLE_REAP_SECONDS" ]; then
+                # Same stale-supervisor guard as Layer 1.
+                _live_wpid=$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)
+                if [ "$_live_wpid" != "$worker_pid" ]; then
+                    break
+                fi
+                reaped_reason="idle_timeout"
+                _append_event "reaping_after_idle_timeout" "$(jq -nc --argjson seconds "$IDLE_REAP_SECONDS" --argjson last_activity "$_mtime" '{idle_seconds: $seconds, last_activity_epoch: $last_activity}')"
+                _terminate_worker
+                break
+            fi
+        fi
+    done
+
+    exit_code=0
+    [ -f "$marker_file" ] && exit_code=$(cat "$marker_file")
+    return 0
+}
+
+# _record_run_usage_for_last_spawn <outcome> <run_kind> [extra-detail-json] —
+# append one runs.jsonl row for the most recent _spawn_and_wait call, scoped to
+# its log range (log_offset_at_spawn..end). Call it before the next spawn.
+# _append_metrics is the original worker-run spelling of this.
+_record_run_usage_for_last_spawn() {
+    local outcome="$1" run_kind="${2:-worker}" extra_detail="${3:-}"
+    [ -z "$extra_detail" ] && extra_detail='{}'
+    local now_epoch; now_epoch=$(date +%s)
+    local started_epoch=0
+    local started_at_raw; started_at_raw=$(jq -r '.started_at // empty' "$job_file" 2>/dev/null)
+    if [ -n "$started_at_raw" ]; then
+        local started_sec="${started_at_raw%%.*}"
+        case "$started_sec" in *Z) ;; *) started_sec="${started_sec}Z" ;; esac
+        started_epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$started_sec" +%s 2>/dev/null \
+            || date -u -d "$started_sec" +%s 2>/dev/null || echo 0)
+    fi
+    local wall_time=0
+    [ "$started_epoch" -gt 0 ] && wall_time=$(( now_epoch - started_epoch ))
+    local log_size=0
+    [ -f "$log_path" ] && log_size=$(stat -f %z "$log_path" 2>/dev/null \
+        || stat -c %s "$log_path" 2>/dev/null || echo 0)
+    local retry_count; retry_count=$(jq -r '.retry_count // 0' "$job_file" 2>/dev/null)
+    local esc_count_val; esc_count_val=$(jq -r '.escalation_count // 0' "$job_file" 2>/dev/null)
+
+    local extra
+    extra=$(jq -nc \
+        --arg model "$worker_model" \
+        --arg effort "$worker_effort" \
+        --arg tier "$current_tier" \
+        --argjson retry_count "${retry_count:-0}" \
+        --argjson escalation_count "${esc_count_val:-0}" \
+        --argjson wall_time_seconds "$wall_time" \
+        --argjson log_size_bytes "${log_size:-0}" \
+        --arg pr_url "${pr_url:-}" \
+        --arg posture_at_spawn "${posture_at_spawn:-normal}" \
+        --arg posture_bias_applied "${posture_bias_applied:-none}" \
+        --argjson extra_detail "$extra_detail" \
+        '{
+            model: $model, effort: $effort, tier: $tier,
+            retry_count: $retry_count,
+            escalation_count: $escalation_count,
+            wall_time_seconds: $wall_time_seconds,
+            log_size_bytes: $log_size_bytes,
+            pr_url: $pr_url,
+            posture_at_spawn: $posture_at_spawn,
+            posture_bias_applied: $posture_bias_applied
+        } + $extra_detail')
+
+    mother_record_run_usage "$id" "$outcome" "$log_path" "$log_offset_at_spawn" "" \
+        "${phase_agent:-cody}" "$usage_main_actor" "$run_kind" "$extra"
+}
+
+_append_metrics() {
+    _record_run_usage_for_last_spawn "$1" worker "${2:-}"
+}
+
 # Allow sourcing helpers without running job logic (used by bats tests).
 [ "${SOURCE_ONLY:-}" = "1" ] && return 0
 
@@ -1592,492 +2198,7 @@ detection work and operator confusion.
 
 ---"
 
-# Generate a deterministic session ID and pass it to claude via --session-id
-# so the transcript filename is predictable. Without this, main-dir jobs
-# sharing a work_dir all land in the same ~/.claude/projects/<slug>/ and
-# `mother peek` can't tell them apart — it falls back to newest-mtime,
-# which conflates sibling workers and any user's foreground Claude session
-# in the same directory.
-session_id=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')
-if [ -z "$session_id" ] && [ -r /proc/sys/kernel/random/uuid ]; then
-    session_id=$(cat /proc/sys/kernel/random/uuid)
-fi
-if [ -n "$session_id" ]; then
-    _job_update ".session_id = \"$session_id\""
-fi
-
-# Compose the spawn-time prompt. The on-disk plan file stays the user's
-# authored content; everything Mother adds (the await/resume capability
-# preamble, plus any resume context from a previous pause cycle) is
-# layered in at spawn time and written to a single $RUNNER_DIR/$id.prompt.md
-# that becomes the prompt claude actually receives.
-#
-#   [preamble]              ← from $MOTHER_PREAMBLE_PATH or the shipped
-#                             template; tells the agent how to call
-#                             `mother await`. Empty / disabled by pointing
-#                             MOTHER_PREAMBLE_PATH at /dev/null or a
-#                             missing file.
-#   [resume context]        ← only on resume cycles: previous question,
-#                             operator's answer, worktree-state heads-up.
-#   [user's plan]           ← exact contents of $plan_path, untouched.
-#
-# We don't try to resume the previous claude session (no --resume in -p
-# mode); the augmented prompt + the worktree itself (which still carries
-# the in-progress changes from before the pause) are how continuity is
-# preserved.
-
-spawn_prompt="$RUNNER_DIR/$id.prompt.md"
-preamble_path="${MOTHER_PREAMBLE_PATH:-$MOTHER_LIB_DIR/../templates/preamble.md}"
-pending_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null || echo "")
-prev_question=$(jq -r '.question // empty'       "$job_file" 2>/dev/null || echo "")
-
-{
-    if [ -r "$preamble_path" ] && [ -s "$preamble_path" ]; then
-        cat "$preamble_path"
-        printf '\n---\n\n'
-    fi
-
-    # Routing context stanza: insert after preamble, before plan (or resume context).
-    # Tells the worker agent which model/effort it's running at and how to configure sub-agents.
-    printf '%s\n\n' "$routing_context"
-
-    if [ "$kind" = "pipeline" ] && [ -n "$phase_agent" ]; then
-        # ---- Pipeline phase prompt: request-type-driven ----
-        # Renders a header identifying the request type and one titled section
-        # per input key declared by rt_inputs, in declaration order (D1/D2).
-        # The resume/continuation path is legacy-only in W2 — pipeline jobs do
-        # not use mother await for phases yet (that is W4's concern).
-        _contract=$(rt_contract "$phase_agent" "$phase_request_type" 2>/dev/null \
-            || echo "(no contract description)")
-        printf '# Request type: %s:%s\n\n' "$phase_agent" "$phase_request_type"
-        printf '%s\n\n' "$_contract"
-        printf '---\n\n'
-        # Collect the declared input keys. Using a variable + <<< (here-string)
-        # keeps the while-loop body in the current shell scope (bash 3.2-safe),
-        # unlike a pipe or heredoc which may fork a subshell and lose variable
-        # assignments in the loop body.
-        _inputs_list=$(rt_inputs "$phase_agent" "$phase_request_type" 2>/dev/null || echo "")
-        # Pre-check whether 'plan' is declared; always include it as the spine
-        # even if a future request type somehow omits it from rt_inputs.
-        _declared_plan=$(printf '%s\n' "$_inputs_list" | grep -c '^plan$' 2>/dev/null || echo 0)
-        while IFS= read -r _input_key; do
-            [ -z "$_input_key" ] && continue
-            phase_render_input "$_input_key" "$work_dir" "$plan_path" \
-                "${prd_path:-}" "${base_ref:-}" "$job_file" "$phase_agent"
-        done <<< "$_inputs_list"
-        if [ "${_declared_plan:-0}" -eq 0 ]; then
-            phase_render_input "plan" "$work_dir" "$plan_path" \
-                "${prd_path:-}" "${base_ref:-}" "$job_file" "$phase_agent"
-        fi
-    else
-        # ---- Legacy (non-pipeline) prompt: preamble + routing + plan ----
-        # This path is byte-for-byte the pre-W2 behavior. No pipeline header.
-        if [ -n "$pending_answer" ]; then
-            printf '# Resumed plan — operator answered your question\n\n'
-            printf 'A previous worker on this job paused itself with `mother await`.\n'
-            printf 'The operator has answered. Pick up from where the prior worker left off.\n\n'
-            printf '## The question you (or your predecessor) asked\n\n'
-            if [ -n "$prev_question" ]; then
-                printf '%s\n\n' "$prev_question"
-            else
-                printf '_(no question recorded — this should not happen; proceed with the answer below as guidance)_\n\n'
-            fi
-            printf "## The operator's answer\n\n"
-            printf '%s\n\n' "$pending_answer"
-            printf '## Worktree state at pause time\n\n'
-            printf 'Your work directory at `%s` retains all changes and commits from the\n' "$work_dir"
-            printf 'previous run — your branch is `%s`. Run `git status` and `git log --oneline`\n' "$branch"
-            printf 'before resuming so you orient yourself in the in-progress work.\n\n'
-            printf '## Original plan (for reference)\n\n'
-        fi
-
-        cat "$plan_path"
-    fi
-} > "$spawn_prompt"
-resolved_plan_path="$spawn_prompt"
-
-if [ -n "$pending_answer" ]; then
-    # Consume the answer + question so the next spawn (if any) starts clean.
-    # Keep resumed_at / resume_count for the audit trail.
-    merged=$(jq '.pending_answer = null | .question = null' "$job_file") \
-        && _atomic_write "$job_file" "$merged"
-    _append_event "resumed_from_input" \
-        "$(jq -nc --arg q "$prev_question" --arg a "$pending_answer" --arg p "$spawn_prompt" \
-            '{question: $q, answer: $a, resume_prompt: $p}')"
-fi
-
-marker_file="$RUNNER_DIR/$id.exit"
-wrapper="$RUNNER_DIR/$id.wrap"
-# Job-scoped Docker Compose project name (see mother_compose_project in
-# state.sh). Computed here, not inside the heredoc, so it interpolates at
-# generation time like $branch/$worker_agent below.
-compose_project=$(mother_compose_project "$id")
-# Job-scoped TMPDIR for the worker: temp files (build scratch, test
-# fixtures, tool sockets) land under $MOTHER_ROOT/tmp/<id> instead of the
-# shared system temp dir, so teardown / `mother gc` can remove exactly this
-# job's leftovers and nothing else. Empty (no TMPDIR export) if it can't be made.
-job_tmp="$MOTHER_ROOT/tmp/$id"
-mkdir -p "$job_tmp" 2>/dev/null || job_tmp=""
-job_tmp_export=""
-[ -n "$job_tmp" ] && job_tmp_export="export TMPDIR=$(printf '%q' "$job_tmp")"
-
-# --effort + MCP-scope args (lib/usage.sh). Rendered at generation time
-# (the wrapper is a plain generated script, not a live shell) with printf
-# '%q' so quoting stays sane regardless of what the args contain.
-mother_claude_extra_args "$worker_effort" worker
-extra_claude_args_quoted=""
-if [ "${#MOTHER_CLAUDE_ARGS[@]}" -gt 0 ]; then
-    for _extra_arg in "${MOTHER_CLAUDE_ARGS[@]}"; do
-        extra_claude_args_quoted="$extra_claude_args_quoted $(printf '%q' "$_extra_arg")"
-    done
-fi
-
-# --max-cost enforcement (F3): only when the job has a cap. Writes a
-# job-scoped Claude settings file wiring the PreToolUse cost-gate hook, and
-# clears any stale cost-cap flag left over from a previous poll cycle.
-max_cost_usd=$(jq -r '.max_cost_usd // empty' "$job_file" 2>/dev/null)
-cost_cap_flag="$RUNNER_DIR/$id.cost-cap"
-rm -f "$cost_cap_flag"
-settings_args_quoted=""
-if [ -n "$max_cost_usd" ]; then
-    settings_file="$RUNNER_DIR/$id.settings.json"
-    cost_gate_hook="$MOTHER_LIB_DIR/../hooks/mother-cost-gate.sh"
-    jq -n --arg cmd "$cost_gate_hook" \
-        '{hooks: {PreToolUse: [{matcher: "*", hooks: [{type: "command", command: $cmd}]}]}}' \
-        > "$settings_file" 2>/dev/null
-    settings_args_quoted=" $(printf '%q' --settings) $(printf '%q' "$settings_file")"
-fi
-
-cat > "$wrapper" <<WRAP
-#!/usr/bin/env bash
-cd "$work_dir"
-exec > >(tee -a "$log_path") 2>&1
-# Export the job id so an in-worker agent can call \`mother await --question
-# "..."\` without bookkeeping. Without this, the agent has no clean way to
-# discover which job it belongs to.
-export MOTHER_JOB_ID="$id"
-export MOTHER_ROOT="$MOTHER_ROOT"
-# Docker Compose reads COMPOSE_PROJECT_NAME automatically, so any
-# `docker compose up` the worker runs lands in a job-scoped project with
-# zero convention-following required by the plan or the agent. Mother tears
-# this project down once the job's PR is merged/closed (see lib/teardown.sh).
-export COMPOSE_PROJECT_NAME="$compose_project"
-# Job-scoped scratch dir (created above; removed at teardown / by \`mother gc\`).
-$job_tmp_export
-# Export effort for agents that honor MOTHER_EFFORT (e.g. to set thinking budgets).
-export MOTHER_EFFORT="$worker_effort"
-echo "=== mother job $id starting at \$(date) ==="
-echo "=== working dir: \$PWD ==="
-echo "=== branch:      $branch ==="
-echo "=== agent:       $worker_agent ==="
-echo "=== model:       $worker_model ==="
-echo "=== effort:      $worker_effort ==="
-echo "=== tier:        $current_tier ==="
-echo "=== session-id:  $session_id ==="
-echo "=== compose:     $compose_project ==="
-echo "=== plan:        $resolved_plan_path ==="
-echo
-# stream-json + verbose gives us a live per-event log (one JSON object per
-# line). \`mother logs --follow\` pretty-prints these via mother-stream-pretty;
-# the raw file stays authoritative and greppable.
-#
-# Run claude in the background so we can forward signals to it. Without this,
-# a SIGTERM to the wrapper would kill bash and orphan claude — which is the
-# failure mode mother's reaper needs to escape when claude refuses to exit
-# after emitting its final 'result' event. With the trap in place, a SIGTERM
-# to the wrapper unblocks claude (gracefully on a healthy session, after
-# SIGKILL escalation from mother-run-job on a wedged one), 'wait' returns
-# its real exit code, and the marker file is written normally.
-# The prompt is fed on stdin from the plan file (never argv: argv is visible
-# to \`ps\` and EDR command-line scanners). The explicit redirect matters:
-# bash would otherwise give a backgrounded job /dev/null as stdin.
-claude_pid=""
-_forward_signal() {
-    [ -n "\$claude_pid" ] && kill -TERM "\$claude_pid" 2>/dev/null || true
-}
-trap _forward_signal TERM INT
-claude --dangerously-skip-permissions --agent "$worker_agent" --model "$worker_model"$extra_claude_args_quoted$settings_args_quoted --session-id "$session_id" -p --output-format stream-json --verbose < "$resolved_plan_path" &
-claude_pid=\$!
-# wait may be interrupted by the trap (signal raises EINTR and bash returns
-# 128+sig); loop until claude is actually gone before recording its real
-# exit code.
-rc=0
-while :; do
-    wait "\$claude_pid" 2>/dev/null
-    rc=\$?
-    kill -0 "\$claude_pid" 2>/dev/null || break
-done
-echo "\$rc" > "$marker_file"
-WRAP
-chmod +x "$wrapper"
-
-# Capture the log file's size BEFORE spawning (moved ahead of the nohup
-# below so `.current_run.log_offset` — used by orphan recovery to record a
-# usage row for a dead run — always reflects this run's true starting
-# offset, never a byte written by the process we're about to start). The
-# wrapper tees to $log_path with `-a`, so on resume cycles the file already
-# contains content from previous runs (one per pause/resume). The
-# result-event detector in the poll loop below uses this offset to ignore
-# content older than this run — without it, the resumed worker's poll loop
-# would see the previous run's `result` event (the one emitted around the
-# `mother await` call) and immediately start the post-result-grace timer,
-# reaping the worker 5 min later regardless of what it's actually doing.
-log_offset_at_spawn=0
-_pr_rejected_urls=""   # rejected-scrape memory is per spawn (see _reject_scraped_pr_url)
-_pr_transient_failures=""
-if [ -f "$log_path" ]; then
-    log_offset_at_spawn=$(stat -f %z "$log_path" 2>/dev/null \
-        || stat -c %s "$log_path" 2>/dev/null \
-        || echo 0)
-fi
-
-nohup bash "$wrapper" >/dev/null 2>&1 &
-worker_pid=$!
-disown 2>/dev/null || true
-_job_update ".worker_pid = $worker_pid"
-_job_update ".current_run = $(jq -nc \
-    --argjson lo "$log_offset_at_spawn" --arg at "$(iso_now)" --arg sid "$session_id" \
-    --arg hs "${run_head_sha_at_start:-}" --arg rr "${run_remote_ref:-}" \
-    --arg rs "${run_remote_sha_at_start:-}" --arg pu "${run_pr_url_at_start:-}" \
-    --argjson ha "${run_had_artifact_at_start:-false}" \
-    '{log_offset: $lo, spawned_at: $at, session_id: $sid,
-      head_sha_at_start: $hs, remote_ref: $rr, remote_sha_at_start: $rs,
-      pr_url_at_start: $pu, had_artifact_at_start: $ha}')"
-_append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" '{pid: $pid, session_id: $sid}')"
-
-# Live usage checks (F1/F2/F3): baseline spend/tokens read once at spawn.
-usage_state_file="$RUNNER_DIR/$id.usage-state.json"
-rm -f "$usage_state_file"
-prior_spend=$(jq -r '.actual_cost_usd // 0' "$job_file" 2>/dev/null); : "${prior_spend:=0}"
-prior_tokens=$(jq -r '.actual_tokens // 0' "$job_file" 2>/dev/null); : "${prior_tokens:=0}"
-case "$prior_tokens" in ''|*[!0-9]*) prior_tokens=0 ;; esac
-last_usage_check_epoch=0
-cost_cap_breached=0
-usage_main_actor="${phase_agent:-cody}-main"
-
-# Reaper tunables. RESULT_GRACE_SECONDS is how long we let the worker linger
-# after we observe a top-level "result" event in the stream-json log before
-# forcing it down (Layer 1 in the bug report). IDLE_REAP_SECONDS is the
-# log-mtime watchdog (Layer 2): if the worker hasn't written a single byte
-# in that long, we treat it as wedged regardless of whether we ever saw a
-# result. Both knobs default conservatively — five minutes is plenty for
-# any sane post-result cleanup, and 30 minutes of total log silence is
-# already unusual even for long-running tool calls (claude emits periodic
-# system events while waiting on tools).
-RESULT_GRACE_SECONDS="${MOTHER_RESULT_GRACE_SECONDS:-300}"
-IDLE_REAP_SECONDS="${MOTHER_IDLE_REAP_SECONDS:-1800}"
-
-# _terminate_worker: SIGTERM the wrapper + its direct children, wait up to
-# 10s for them to exit, then SIGKILL stragglers. We hit the children
-# explicitly because the cancel/reap path has historically just SIGTERM'd
-# the wrapper, which would leave a hung claude orphaned (the failure mode
-# this bug fix is closing). With the wrapper's signal trap in place, the
-# direct kill is mostly belt-and-suspenders, but it's also what saves us
-# if the wrapper itself has somehow died.
-_terminate_worker() {
-    local kids
-    kids=$(pgrep -P "$worker_pid" 2>/dev/null || true)
-    [ -n "$kids" ] && kill -TERM $kids 2>/dev/null || true
-    kill -TERM "$worker_pid" 2>/dev/null || true
-    local waited=0
-    while kill -0 "$worker_pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
-        sleep 1
-        waited=$((waited + 1))
-    done
-    if kill -0 "$worker_pid" 2>/dev/null; then
-        kids=$(pgrep -P "$worker_pid" 2>/dev/null || true)
-        [ -n "$kids" ] && kill -KILL $kids 2>/dev/null || true
-        kill -KILL "$worker_pid" 2>/dev/null || true
-    fi
-}
-
-# _log_mtime: epoch seconds of the log file's last write, or 0 if missing.
-# Wrapped because macOS uses `stat -f %m` and Linux uses `stat -c %Y`.
-_log_mtime() {
-    [ -f "$log_path" ] || { echo 0; return; }
-    stat -f %m "$log_path" 2>/dev/null \
-        || stat -c %Y "$log_path" 2>/dev/null \
-        || echo 0
-}
-
-# Poll for the marker file.
-cancel_requested=0
-final_result_epoch=0
-reaped_reason=""
-while [ ! -f "$marker_file" ]; do
-    sleep 2
-
-    # Honor cancellation: TERM, grace period, then KILL (handled in the helper).
-    if [ "$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
-        cancel_requested=1
-        _terminate_worker
-        break
-    fi
-
-    # Honor a system-initiated pause (daemon's quota gate). Same kill path
-    # as cancel, but the state transitions to `awaiting` (not cancelled) so
-    # the daemon's auto-resume can pick the job back up when the offending
-    # window resets. We transition state BEFORE killing the worker so the
-    # post-loop short-circuit at line ~470 (the `awaiting` exit path) finds
-    # the right state and skips the terminal-transition logic.
-    if [ "$(jq -r '.pause_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
-        _pause_reason=$(jq -r '.paused_reason // "system"' "$job_file" 2>/dev/null)
-        _pause_resume_at=$(jq -r '.auto_resume_at // 0'    "$job_file" 2>/dev/null)
-        _job_update '.state = "awaiting"
-            | .question = "Mother paused this job because the quota cap was reached. Auto-resumes when the blocking window resets."
-            | .pause_requested = null'
-        _append_event "paused_for_quota" \
-            "$(jq -nc --arg r "$_pause_reason" --argjson ts "${_pause_resume_at:-0}" \
-                '{paused_reason: $r, auto_resume_at: $ts}')"
-        _terminate_worker
-        break
-    fi
-
-    # Live observability. Two things we want to know about *as they happen*,
-    # not just after claude exits:
-    #   1. The PR URL (so `mother status` reflects the artifact even while
-    #      the wrapper is still running). Without this, the bug's
-    #      "PR exists but mother shows pr_url: null" symptom persists for
-    #      the entire post-result-hang window.
-    #   2. The top-level `result` event in the stream-json output. Once we
-    #      see it, the agent has emitted its canonical "I'm done" signal —
-    #      from here on, mother is the timekeeper for how long the wrapper
-    #      gets to gracefully wind down.
-    if [ -f "$log_path" ]; then
-        if [ -z "$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)" ]; then
-            # Only scan log content written by THIS worker (past log_offset_at_spawn)
-            # to avoid picking up PR URLs left by previous runs on the same log file
-            # (e.g. escalation retries on the same job ID).
-            _live_capture_pr_url
-        fi
-
-        if [ "$final_result_epoch" -eq 0 ]; then
-            # stream-json emits one complete JSON event per line. The result
-            # event has top-level "type":"result". The whitespace tolerance
-            # is paranoia — claude's SDK currently emits compact JSON, but
-            # stream formatters change. Crucially we only look at log content
-            # newer than this worker's spawn (`log_offset_at_spawn`), not the
-            # whole file: on resume cycles the file already contains a
-            # previous run's `result` event, and scanning the whole thing
-            # would set final_result_epoch instantly and trip the post-
-            # result-grace reaper before this worker has done any new work.
-            if tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
-                | grep -Eq '"type"[[:space:]]*:[[:space:]]*"result"' 2>/dev/null; then
-                final_result_epoch=$(date +%s)
-                _job_update ".final_result_at = \"$(iso_now)\""
-                _append_event "final_result_observed" "{}"
-            fi
-        fi
-    fi
-
-    # Live usage checks (F1-F3): token alert + --max-cost enforcement.
-    # Runs at most once every MOTHER_USAGE_CHECK_INTERVAL seconds (default
-    # 120), and only once the log file exists.
-    _usage_check_interval="${MOTHER_USAGE_CHECK_INTERVAL:-120}"
-    _now_epoch=$(date +%s)
-    if [ -f "$log_path" ] && [ $((_now_epoch - last_usage_check_epoch)) -ge "$_usage_check_interval" ]; then
-        last_usage_check_epoch=$_now_epoch
-        read -r job_spend job_tokens _run_cost _run_tokens <<USAGE_EOF
-$(mother_usage_check_live "$id" "$log_path" "$log_offset_at_spawn" "$usage_state_file" "$prior_spend" "$prior_tokens" "$usage_main_actor")
-USAGE_EOF
-        : "${job_spend:=$prior_spend}" "${job_tokens:=$prior_tokens}"
-        _job_update ".live_cost_usd = ${job_spend:-0} | .live_tokens = ${job_tokens:-0}"
-
-        _token_alert_threshold="${MOTHER_TOKEN_ALERT_THRESHOLD:-100000000}"
-        if [ "${job_tokens:-0}" -gt "$_token_alert_threshold" ] \
-            && [ -z "$(jq -r '.token_alert_at // empty' "$job_file" 2>/dev/null)" ]; then
-            _job_update ".token_alert_at = \"$(iso_now)\""
-            _append_event "token_alert" "$(jq -nc --argjson tokens "${job_tokens:-0}" --arg cost "${job_spend:-0}" --argjson threshold "$_token_alert_threshold" '{tokens: $tokens, cost_usd: ($cost | tonumber), threshold: $threshold}')"
-            echo "job $id: TOKEN ALERT — ${job_tokens} tokens (threshold ${_token_alert_threshold}), cost \$${job_spend}"
-        fi
-
-        if [ -n "$max_cost_usd" ] && [ "$cost_cap_breached" -eq 0 ]; then
-            _over_cap=$(awk -v s="${job_spend:-0}" -v m="$max_cost_usd" 'BEGIN { print (s+0 >= m+0) ? 1 : 0 }' 2>/dev/null)
-            [ -n "$_over_cap" ] || _over_cap=0
-            if [ "$_over_cap" = "1" ]; then
-                cost_cap_breached=1
-                cost_cap_breach_epoch=$_now_epoch
-                _cap_by_actor='{}'
-                _cap_by_model='{}'
-                if mother_usage_available; then
-                    _cap_parsed=$(python3 "$MOTHER_USAGE_BIN" parse --log "$log_path" --offset "$log_offset_at_spawn" \
-                        --state "$usage_state_file" --main-actor "$usage_main_actor" 2>/dev/null)
-                    _cap_by_actor=$(printf '%s' "$_cap_parsed" | jq -c '.by_actor // {}' 2>/dev/null)
-                    _cap_by_model=$(printf '%s' "$_cap_parsed" | jq -c '.by_model // {}' 2>/dev/null)
-                    [ -n "$_cap_by_actor" ] || _cap_by_actor='{}'
-                    [ -n "$_cap_by_model" ] || _cap_by_model='{}'
-                fi
-                _cap_summary="Mother cost cap reached on job $id: spent \$${job_spend} of the \$${max_cost_usd} cap across all runs. Per-actor breakdown: ${_cap_by_actor}. Per-model breakdown: ${_cap_by_model}. Total tokens: ${job_tokens}. To continue: mother resume $id --max-cost <usd> \"<instructions>\". To stop: mother cancel $id."
-                printf '%s\n' "$_cap_summary" > "$cost_cap_flag"
-                _job_update ".cost_cap_breached_at = \"$(iso_now)\""
-                _append_event "cost_cap_breached" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" --argjson by_actor "$_cap_by_actor" --argjson by_model "$_cap_by_model" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber), by_actor: $by_actor, by_model: $by_model}')"
-            fi
-        fi
-
-        # Fallback: if the hook somehow didn't stop the worker, force a
-        # pause MOTHER_COST_CAP_GRACE_SECONDS after the breach.
-        if [ "$cost_cap_breached" -eq 1 ] && [ "$(jq -r '.state' "$job_file" 2>/dev/null)" = "running" ]; then
-            _grace="${MOTHER_COST_CAP_GRACE_SECONDS:-300}"
-            if [ $((_now_epoch - cost_cap_breach_epoch)) -ge "$_grace" ]; then
-                _cap_summary=$(cat "$cost_cap_flag" 2>/dev/null || echo "Mother cost cap reached on job $id.")
-                _cc_merged=$(jq --arg q "$_cap_summary" --arg ts "$(iso_now)" \
-                    '.state = "awaiting" | .question = $q | .paused_at = $ts | .paused_reason = "cost_cap"' \
-                    "$job_file") && _atomic_write "$job_file" "$_cc_merged"
-                _append_event "cost_cap_forced_pause" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber)}')"
-                _append_event "awaiting_input" "$(jq -nc --arg q "$_cap_summary" '{question: $q, paused_reason: "cost_cap"}')"
-                _terminate_worker
-                break
-            fi
-        fi
-    fi
-
-    # Layer 1 — result observed + grace window expired. The worker has
-    # signalled completion and then sat idle past the patience threshold;
-    # force it down and treat the job as succeeded (with metadata noting
-    # we had to reap).
-    if [ "$final_result_epoch" -gt 0 ]; then
-        _now_epoch=$(date +%s)
-        if [ $((_now_epoch - final_result_epoch)) -ge "$RESULT_GRACE_SECONDS" ]; then
-            # Stale-supervisor guard: a resume cycle may have spawned a new
-            # mother-run-job for this job, updating worker_pid in the job
-            # file. If our worker_pid no longer matches, we are the old
-            # (stale) supervisor — break cleanly rather than killing the
-            # wrong wrapper and writing a spurious exit code to the shared
-            # marker file, which would cause the active run to fail.
-            _live_wpid=$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)
-            if [ "$_live_wpid" != "$worker_pid" ]; then
-                break
-            fi
-            reaped_reason="result_grace_expired"
-            _append_event "reaping_after_result_grace" "$(jq -nc --argjson grace "$RESULT_GRACE_SECONDS" '{grace_seconds: $grace}')"
-            _terminate_worker
-            break
-        fi
-    fi
-
-    # Layer 2 — log has been silent past the idle threshold. Catches the
-    # "claude hung BEFORE emitting result" case that Layer 1 can't see.
-    # Without a result event we don't know whether the work artifact
-    # exists, so the final transition will mark this `failed`.
-    _mtime=$(_log_mtime)
-    if [ "$_mtime" -gt 0 ]; then
-        _now_epoch=$(date +%s)
-        if [ $((_now_epoch - _mtime)) -ge "$IDLE_REAP_SECONDS" ]; then
-            # Same stale-supervisor guard as Layer 1.
-            _live_wpid=$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)
-            if [ "$_live_wpid" != "$worker_pid" ]; then
-                break
-            fi
-            reaped_reason="idle_timeout"
-            _append_event "reaping_after_idle_timeout" "$(jq -nc --argjson seconds "$IDLE_REAP_SECONDS" --argjson last_activity "$_mtime" '{idle_seconds: $seconds, last_activity_epoch: $last_activity}')"
-            _terminate_worker
-            break
-        fi
-    fi
-done
-
-exit_code=0
-[ -f "$marker_file" ] && exit_code=$(cat "$marker_file")
+_spawn_and_wait fresh
 
 # _split_pr_hit, _maybe_emit_pr_opened, and _finalize_pr_url are defined up
 # near _verify_artifact_or_fail (before the SOURCE_ONLY guard) so bats can
@@ -2233,53 +2354,6 @@ _attempt_continuation() {
 METRICS_DIR="$MOTHER_ROOT/metrics"
 mkdir -p "$METRICS_DIR"
 
-_append_metrics() {
-    local outcome="$1" extra_detail="${2:-}"
-    [ -z "$extra_detail" ] && extra_detail='{}'
-    local now_epoch; now_epoch=$(date +%s)
-    local started_epoch=0
-    local started_at_raw; started_at_raw=$(jq -r '.started_at // empty' "$job_file" 2>/dev/null)
-    if [ -n "$started_at_raw" ]; then
-        local started_sec="${started_at_raw%%.*}"
-        case "$started_sec" in *Z) ;; *) started_sec="${started_sec}Z" ;; esac
-        started_epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$started_sec" +%s 2>/dev/null \
-            || date -u -d "$started_sec" +%s 2>/dev/null || echo 0)
-    fi
-    local wall_time=0
-    [ "$started_epoch" -gt 0 ] && wall_time=$(( now_epoch - started_epoch ))
-    local log_size=0
-    [ -f "$log_path" ] && log_size=$(stat -f %z "$log_path" 2>/dev/null \
-        || stat -c %s "$log_path" 2>/dev/null || echo 0)
-    local retry_count; retry_count=$(jq -r '.retry_count // 0' "$job_file" 2>/dev/null)
-    local esc_count_val; esc_count_val=$(jq -r '.escalation_count // 0' "$job_file" 2>/dev/null)
-
-    local extra
-    extra=$(jq -nc \
-        --arg model "$worker_model" \
-        --arg effort "$worker_effort" \
-        --arg tier "$current_tier" \
-        --argjson retry_count "${retry_count:-0}" \
-        --argjson escalation_count "${esc_count_val:-0}" \
-        --argjson wall_time_seconds "$wall_time" \
-        --argjson log_size_bytes "${log_size:-0}" \
-        --arg pr_url "${pr_url:-}" \
-        --arg posture_at_spawn "${posture_at_spawn:-normal}" \
-        --arg posture_bias_applied "${posture_bias_applied:-none}" \
-        --argjson extra_detail "$extra_detail" \
-        '{
-            model: $model, effort: $effort, tier: $tier,
-            retry_count: $retry_count,
-            escalation_count: $escalation_count,
-            wall_time_seconds: $wall_time_seconds,
-            log_size_bytes: $log_size_bytes,
-            pr_url: $pr_url,
-            posture_at_spawn: $posture_at_spawn,
-            posture_bias_applied: $posture_bias_applied
-        } + $extra_detail')
-
-    mother_record_run_usage "$id" "$outcome" "$log_path" "$log_offset_at_spawn" "" \
-        "${phase_agent:-cody}" "$usage_main_actor" "worker" "$extra"
-}
 
 # Stale-supervisor guard: if a resume cycle updated worker_pid in the job
 # file to a different wrapper, we are no longer the active supervisor. Exit

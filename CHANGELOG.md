@@ -10,6 +10,20 @@ All notable changes to Mother are documented here. Format based on
 
 - **Headless-crew client contract.** `docs/design.md` gains "Headless crew contract (Phase 1)": the additive-only rules, new `activity` values, job keys, `.progress` overlay, attention reasons, event kinds, `progress` broker category, `ack` command and `answer.option` capability. Provisional NDJSON fixtures live in `plugins/mother/tests/fixtures/contract/` and `plugins/mother/scripts/contract-check.sh` validates broker streams against the contract. Docs, fixtures and checker only; no runtime change.
 
+### Changed
+
+- `mother-run-job`: the worker spawn-and-poll block is now `_spawn_and_wait <fresh|resume> [prompt_file]`
+  (defined before the `SOURCE_ONLY` guard), so a supervisor run can spawn a worker more than once. The
+  main path makes one `_spawn_and_wait fresh` call and behaves as before: same `claude` argv, prompt,
+  events and job writes. `current_run` and the `worker_spawned` event gain an additive `mode` key.
+- `_spawn_and_wait resume <prompt_file>` re-enters the job's `.session_id` with `claude -p --resume`
+  (prompt file on stdin; no plan/preamble build, no `pending_answer` consumption) and runs the same poll
+  loop. It is groundwork for quality-gate fix turns: nothing calls it yet, and continuation, operator
+  resume and adherence rework still start fresh sessions.
+- Each call uses its own marker/wrapper files (the first keeps `<id>.exit` / `<id>.wrap`, later calls get a
+  `.<n>` suffix) and its own `log_offset_at_spawn`. New `_record_run_usage_for_last_spawn <outcome> <run_kind>`
+  writes a separate `runs.jsonl` row for the last spawn; `_append_metrics` is now a wrapper for it.
+
 ## [0.3.8] - 2026-10-16
 
 ### Added
