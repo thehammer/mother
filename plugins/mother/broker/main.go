@@ -99,8 +99,11 @@ func main() {
 		cliPath:   cfg.cli,
 		eventsDir: eventsDir,
 		extraEnv:  []string{"MOTHER_ROOT=" + cfg.root},
+		acksDir:   filepath.Join(cfg.root, "acks"),
 	}
 	h := newHub(store, runner, cfg.pingSeconds, cfg.clientBuf)
+	h.registryPath = filepath.Join(cfg.root, "runner", "broker-clients.json")
+	_ = os.MkdirAll(filepath.Dir(h.registryPath), 0o755)
 	h.replayBytes = cfg.replayBytes
 	h.outputMaxGap = cfg.outputMaxGap
 

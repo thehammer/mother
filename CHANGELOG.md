@@ -8,6 +8,7 @@ All notable changes to Mother are documented here. Format based on
 
 ### Added
 
+- **Typed attention reasons, `mother ack`, and no duplicate pushes while Nostromo is connected.** New needs-attention kind `job_attention` for the closed reasons `progress_stalled`, `burn_ahead`, `gates_incomplete`, `decision_awaiting` (union of job `.attention[]` and progress `.flags[]`), exposed as `attention_reasons` on `mother list/status --format json` and broker snapshot/`query.list`/`query.get`. `mother ack <id> <reason>` and broker `ack {job, reason}` (in `hello`) acknowledge a reason; acks live in `$MOTHER_ROOT/acks/<id>.json`, lapse when the condition's `since` changes, and acked items don't count toward `⚑N`. The broker publishes `runner/broker-clients.json`; `_notify_awaiting` skips the macOS push (recorded as `transport: "suppressed_client"`) while a fresh registry shows a live `await` subscriber. `MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT=0` restores always-push. Plumbing only: no producers yet.
 - **Headless-crew client contract.** `docs/design.md` gains "Headless crew contract (Phase 1)": the additive-only rules, new `activity` values, job keys, `.progress` overlay, attention reasons, event kinds, `progress` broker category, `ack` command and `answer.option` capability. Provisional NDJSON fixtures live in `plugins/mother/tests/fixtures/contract/` and `plugins/mother/scripts/contract-check.sh` validates broker streams against the contract. Docs, fixtures and checker only; no runtime change.
 
 ## [0.3.8] - 2026-10-16

@@ -626,3 +626,137 @@ _tn_argv() { cat "$MOTHER_ROOT/terminal-notifier-argv"; }
     if grep -qF "touch $MOTHER_ROOT/pwned" "$MOTHER_ROOT/terminal-notifier-argv"; then false; fi
     [ ! -e "$MOTHER_ROOT/pwned" ]
 }
+
+# ---------------------------------------------------------------------------
+# Suppression while a broker client is subscribed to `await`
+
+_iso_ms_ago() {
+    /usr/bin/perl -MPOSIX=strftime -e \
+        'print strftime("%Y-%m-%dT%H:%M:%S", gmtime(time - $ARGV[0])) . ".123Z"' "$1"
+}
+
+# Write $RUNNER_DIR/broker-clients.json.
+# Usage: _registry [pid] [age_seconds] [await_subscribers]
+_registry() {
+    local pid="${1:-$$}" age="${2:-0}" subs="${3:-1}"
+    mkdir -p "$RUNNER_DIR"
+    jq -n --argjson pid "$pid" --arg at "$(_iso_ms_ago "$age")" --argjson s "$subs" \
+        '{pid: $pid, updated_at: $at, clients: 1, await_subscribers: $s}' > "$RUNNER_DIR/broker-clients.json"
+}
+
+_dead_pid() {
+    local p=99999
+    while kill -0 "$p" 2>/dev/null; do p=$((p + 1)); done
+    echo "$p"
+}
+
+_assert_sent_as_usual() {
+    [ "$(_call_count)" -eq 1 ]
+    [ "$(_events_of job-a awaiting_notified | jq -r '.detail.transport')" = "command" ]
+}
+
+@test "a subscribed broker client suppresses the push but the bookkeeping still advances" {
+    _make_awaiting "job-a"
+    _registry
+
+    _tick
+
+    [ "$(_call_count)" -eq 0 ]
+    [ "$(_event_count job-a awaiting_notified)" -eq 1 ]
+    [ "$(_events_of job-a awaiting_notified | jq -r '.detail.transport')" = "suppressed_client" ]
+    [ "$(_events_of job-a awaiting_notified | jq -r '.detail.ok')" = "true" ]
+    assert_job_field "job-a" '.awaiting_notify.count' "1"
+    assert_job_field_truthy "job-a" '.awaiting_notify.last_notified_at'
+}
+
+@test "a suppressed push is not repeated on the next scan and the 24h reminder cadence continues" {
+    _make_awaiting "job-a"
+    _registry
+    _tick
+    _tick
+    [ "$(_event_count job-a awaiting_notified)" -eq 1 ]
+
+    _age_last_notified "job-a" 25
+    _registry
+    _tick
+    [ "$(_call_count)" -eq 0 ]
+    [ "$(_event_count job-a awaiting_notified)" -eq 2 ]
+    assert_job_field "job-a" '.awaiting_notify.count' "2"
+}
+
+@test "suppression does not alter the job's state or question" {
+    _make_awaiting "job-a" "Which database?"
+    _registry
+    _tick
+    assert_job_field "job-a" '.state' "awaiting"
+    assert_job_field "job-a" '.question' "Which database?"
+}
+
+@test "a push is sent as usual when no broker client registry exists" {
+    _make_awaiting "job-a"
+    [ ! -e "$RUNNER_DIR/broker-clients.json" ]
+    _tick
+    _assert_sent_as_usual
+}
+
+@test "a push is sent as usual when the registry is older than three ping intervals" {
+    _make_awaiting "job-a"
+    _registry "$$" 60
+    _tick
+    _assert_sent_as_usual
+}
+
+@test "a registry just inside three ping intervals still suppresses" {
+    _make_awaiting "job-a"
+    _registry "$$" 30
+    _tick
+    [ "$(_call_count)" -eq 0 ]
+}
+
+@test "MOTHER_BROKER_PING_SEC moves the staleness window" {
+    _make_awaiting "job-a"
+    _registry "$$" 20
+    MOTHER_BROKER_PING_SEC=5 _tick
+    _assert_sent_as_usual
+}
+
+@test "a push is sent as usual when the broker pid in the registry is dead" {
+    _make_awaiting "job-a"
+    _registry "$(_dead_pid)" 0
+    _tick
+    _assert_sent_as_usual
+}
+
+@test "a push is sent as usual when no connected client is subscribed to await" {
+    _make_awaiting "job-a"
+    _registry "$$" 0 0
+    _tick
+    _assert_sent_as_usual
+}
+
+@test "a push is sent as usual when the registry is unparseable" {
+    _make_awaiting "job-a"
+    mkdir -p "$RUNNER_DIR"
+    echo "not json" > "$RUNNER_DIR/broker-clients.json"
+    _tick
+    _assert_sent_as_usual
+}
+
+@test "MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT=0 disables suppression" {
+    _make_awaiting "job-a"
+    _registry
+    MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT=0 _tick
+    _assert_sent_as_usual
+}
+
+@test "a connected client suppresses the coalesced summary push too, recording every job" {
+    local i
+    for i in 1 2 3 4; do _make_awaiting "job-$i"; done
+    _registry
+    _tick
+    [ "$(_call_count)" -eq 0 ]
+    for i in 1 2 3 4; do
+        [ "$(_events_of "job-$i" awaiting_notified | jq -r '.detail.transport')" = "suppressed_client" ]
+        assert_job_field "job-$i" '.awaiting_notify.count' "1"
+    done
+}
