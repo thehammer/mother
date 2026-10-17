@@ -10,6 +10,8 @@ job because a pip package is missing). Subcommands:
   mother-usage classify-exit --log PATH --offset N --exit-code C
   mother-usage publish-rates [--dest PATH]
   mother-usage retro --root PATH --since WINDOW [--format table|json] [--backfill]
+  mother-usage calibrate --root PATH          (progress indicator calibration)
+  mother-usage progress-tick --root PATH [--now ISO]   (progress indicator tick)
 
 All commands are best-effort: parse/classify-exit never exit non-zero on bad
 input (they print {"error": ...} and exit 0 instead) — callers treat that as
@@ -1491,6 +1493,643 @@ def cmd_retro(args):
 
 
 # ---------------------------------------------------------------------------
+# progress indicator (HC-09) — observer only, never writes job JSON
+# ---------------------------------------------------------------------------
+#
+# `calibrate` fits per-stage shares/durations and remaining/elapsed ratios from
+# finished jobs; `progress-tick` turns each live job's events + job JSON into
+# $MOTHER_ROOT/progress/<id>.json (and rate-bounded progress_* events).
+# The pct formula lives in `progress_fraction`; the ETA band in `eta_band`.
+# Both are single functions so the retro calibration work (HC-11) can tune them.
+
+PROGRESS_STAGES = ["build", "rework", "gates", "review", "present"]  # canonical pct order
+PROGRESS_DEFAULT_SHARES = {"build": 0.72, "rework": 0.17, "gates": 0.03, "review": 0.06, "present": 0.02}
+PROGRESS_DEFAULT_MEDIANS = {"build": 1200, "rework": 600, "gates": 120, "review": 300, "present": 60}
+PROGRESS_MIN_N = 20                 # per-repo / fleet threshold for calibration to be used
+PROGRESS_START_MIN_N = 5            # samples needed to trust a per-stage-start ratio
+PROGRESS_STAGE_CAP = 0.9            # never count a stage as more than 90% done by time alone
+PROGRESS_NONFINAL_MAX = 95
+PROGRESS_BUCKET = 5
+PROGRESS_HALF_PCT = 50
+PROGRESS_EVENT_MIN_GAP_S = 60
+PROGRESS_TERMINAL = ("succeeded", "failed", "cancelled")
+_ESTIMATE_RE = re.compile(r"expected\s+spend\s*[≈~]\s*\$?([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+
+
+def _progress_enabled():
+    return os.environ.get("MOTHER_PROGRESS_ENABLED", "1") != "0"
+
+
+def _iso_ms(epoch_s):
+    dt = datetime.fromtimestamp(epoch_s, timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % int(dt.microsecond / 1000)
+
+
+def _event_epoch(ev):
+    d = _parse_iso(ev.get("ts"))
+    return d.timestamp() if d else None
+
+
+# --- segmenting events into active intervals --------------------------------
+
+class _Segments(object):
+    """Result of segment_events: active intervals plus the facts the estimator
+    needs about where the job currently is."""
+
+    def __init__(self):
+        self.intervals = []          # [(stage, start_s, end_s)] active time only
+        self.stage = "build"         # stage the job is in (last stage worked on)
+        self.active = False
+        self.elapsed = 0.0           # total active seconds
+        self.stage_totals = {}       # stage -> active seconds
+        self.starts = {}             # stage -> total elapsed when the stage first started
+        self.paused = None           # {"reason", "since"} while awaiting
+        self.trigger = None          # last rework trigger event kind
+        self.planned_gates = None    # len(gates) from the latest gates_started
+        self.terminal_ts = None
+
+
+def segment_events(events, now_s=None):
+    """Split a job's events into active intervals per stage.
+
+    The active clock runs only while a worker, gate run or review runs; queue
+    waits and awaiting pauses are excluded. An interval still open at the end
+    is credited up to `now_s` (when given)."""
+    seg = _Segments()
+    state = {"since": None, "pending_rework": False, "reviewers": 0}
+
+    def close(t):
+        if seg.active and state["since"] is not None:
+            dur = max(0.0, t - state["since"])
+            seg.intervals.append((seg.stage, state["since"], t))
+            seg.stage_totals[seg.stage] = seg.stage_totals.get(seg.stage, 0.0) + dur
+            seg.elapsed += dur
+        state["since"] = t
+
+    def activate(t, stage):
+        close(t)
+        seg.stage = stage
+        seg.active = True
+        state["since"] = t
+        seg.starts.setdefault(stage, seg.elapsed)
+
+    def deactivate(t):
+        close(t)
+        seg.active = False
+
+    timed = [(t, ev) for ev in events if (t := _event_epoch(ev)) is not None]
+    timed.sort(key=lambda p: p[0])
+    last_t = None
+    for t, ev in timed:
+        kind = ev.get("kind")
+        detail = ev.get("detail") or {}
+        last_t = t
+        if kind == "worker_spawned":
+            activate(t, "rework" if state["pending_rework"] else "build")
+        elif kind == "final_result_observed":
+            deactivate(t)
+        elif kind in ("awaiting_input", "paused_for_quota"):
+            deactivate(t)
+            reason = detail.get("paused_reason") or ("quota" if kind == "paused_for_quota" else "awaiting_input")
+            seg.paused = {"reason": reason, "since": t}
+        elif kind in ("resumed", "resumed_from_input", "auto_resumed"):
+            seg.paused = None
+        elif kind in PROGRESS_TERMINAL:
+            deactivate(t)
+            seg.terminal_ts = t
+        elif kind == "adherence_review_spawned":
+            state["pending_rework"] = False
+            activate(t, "review")
+        elif kind == "adherence_reviewed":
+            deactivate(t)
+        elif kind in ("adherence_rework_kicked", "pipeline_cycle_continued"):
+            deactivate(t)
+            state["pending_rework"] = True
+            seg.trigger = kind
+            seg.stage = "rework"
+        elif kind == "review_spawned":
+            state["pending_rework"] = False
+            state["reviewers"] += 1
+            activate(t, "review")
+        elif kind == "reviewed":
+            state["reviewers"] = max(0, state["reviewers"] - 1)
+            if state["reviewers"] == 0:
+                deactivate(t)
+        elif kind == "review_cycle_started":
+            state["pending_rework"] = False
+            activate(t, "review")
+        elif kind in ("review_cycle_completed", "review_wave_completed"):
+            state["reviewers"] = 0
+            deactivate(t)
+        elif kind == "gates_started":
+            state["pending_rework"] = False
+            gates = detail.get("gates")
+            if isinstance(gates, list):
+                seg.planned_gates = len(gates)
+            activate(t, "gates")
+        elif kind == "gates_completed":
+            deactivate(t)
+        elif kind == "gate_fix_started":
+            state["pending_rework"] = True
+            seg.trigger = kind
+            activate(t, "rework")
+        elif kind == "pr_marked_ready":
+            activate(t, "present")
+    if seg.active:
+        end = now_s if now_s is not None else last_t
+        if end is not None:
+            close(end)
+    return seg
+
+
+# --- the estimator ------------------------------------------------------------
+
+def _scope_stats(scope):
+    """(shares, medians) for a calibration scope; defaults when there is none."""
+    if not scope:
+        return dict(PROGRESS_DEFAULT_SHARES), dict(PROGRESS_DEFAULT_MEDIANS)
+    stages = scope.get("stages") or {}
+    shares = {s: float((stages.get(s) or {}).get("share") or 0.0) for s in PROGRESS_STAGES}
+    medians = {s: float((stages.get(s) or {}).get("median_s") or PROGRESS_DEFAULT_MEDIANS[s])
+               for s in PROGRESS_STAGES}
+    return shares, medians
+
+
+def progress_fraction(stage, stage_elapsed_s, shares, medians, stage_frac=None):
+    """THE progress formula. Returns (fraction 0..1, stage_frac).
+
+    Σ shares of the stages before `stage` + share(stage) × stage_frac, where
+    stage_frac is stage time over the stage's median, capped at 0.9 (or the
+    caller's own within-stage signal, e.g. gates passed/total)."""
+    if stage_frac is None:
+        median = medians.get(stage) or PROGRESS_DEFAULT_MEDIANS.get(stage) or 1
+        stage_frac = min(stage_elapsed_s / float(median), PROGRESS_STAGE_CAP)
+    idx = PROGRESS_STAGES.index(stage)
+    done = sum(shares.get(s, 0.0) for s in PROGRESS_STAGES[:idx])
+    return done + shares.get(stage, 0.0) * stage_frac, stage_frac
+
+
+def _shown_pct(fraction, final=False):
+    if final:
+        return 100
+    pct = int(PROGRESS_BUCKET * round(fraction * 100.0 / PROGRESS_BUCKET))
+    return max(0, min(PROGRESS_NONFINAL_MAX, pct))
+
+
+def eta_band(elapsed_s, stage, scope):
+    """(lo_s, hi_s) remaining-time band, or None when the data can't support one."""
+    if not scope or elapsed_s <= 0:
+        return None
+    ratios = scope.get("remaining_ratio") or {}
+    r = (ratios.get("start") or {}).get(stage)
+    if not r or (r.get("n") or 0) < PROGRESS_START_MIN_N:
+        r = ratios.get("half")
+    if not r or r.get("p10") is None or r.get("p90") is None:
+        return None
+    lo, hi = elapsed_s * float(r["p10"]), elapsed_s * float(r["p90"])
+    return int(round(min(lo, hi))), int(round(max(lo, hi)))
+
+
+def _fmt_hours(h):
+    return ("%g" % h)
+
+
+def eta_label(lo_s, hi_s):
+    """Round a band to what the data supports: minutes under 15, 5-minute steps
+    to an hour, half-hours beyond. Never a single-minute value for a long ETA."""
+    lo_s, hi_s = max(0, lo_s), max(0, hi_s)
+    if hi_s <= 900:
+        a = max(1, int(round(lo_s / 60.0)))
+        b = max(1, int(round(hi_s / 60.0)))
+        return "~%dm" % b if a >= b else "~%d–%dm" % (a, b)
+    if hi_s <= 3600:
+        a = max(5, int(round(lo_s / 300.0)) * 5)
+        b = max(5, int(round(hi_s / 300.0)) * 5)
+        return "~%dm" % b if a >= b else "~%d–%dm" % (a, b)
+    a = max(0.5, round(lo_s / 1800.0) * 0.5)
+    b = max(0.5, round(hi_s / 1800.0) * 0.5)
+    return "~%sh" % _fmt_hours(b) if a >= b else "~%s–%sh" % (_fmt_hours(a), _fmt_hours(b))
+
+
+def _pick_scope(calib, repo):
+    """(basis, scope, n): per-repo when the repo has >= PROGRESS_MIN_N finished
+    jobs, else the fleet when it does; otherwise no usable calibration."""
+    if not calib:
+        return "none", None, None
+    min_n = calib.get("min_repo_n") or PROGRESS_MIN_N
+    r = (calib.get("repos") or {}).get(repo)
+    if r and (r.get("n") or 0) >= min_n:
+        return "repo", r, r.get("n")
+    f = calib.get("fleet")
+    if f and (f.get("n") or 0) >= PROGRESS_MIN_N:
+        return "fleet", f, f.get("n")
+    return "none", None, None
+
+
+def _gates_signal(job, seg):
+    g = job.get("gates")
+    if not isinstance(g, dict) and seg.planned_gates is None:
+        return None
+    g = g if isinstance(g, dict) else {}
+    results = [r for r in (g.get("results") or []) if isinstance(r, dict)]
+    passed = sum(1 for r in results if r.get("result") in ("passed", "skipped"))
+    failed = sum(1 for r in results if r.get("result") == "failed" and r.get("blocking") is not False)
+    total = seg.planned_gates if seg.planned_gates is not None else len(results) + len(g.get("not_run") or [])
+    total = max(total, passed + failed)
+    if total == 0 and not g:
+        return None
+    return {"passed": passed, "failed": failed, "total": total,
+            "attempt": g.get("attempt"), "max_attempts": g.get("max_attempts"),
+            "_status": g.get("status")}
+
+
+def _cost_signal(job):
+    spent = max(job.get("actual_cost_usd") or 0, job.get("live_cost_usd") or 0)
+    spent = round(float(spent), 4)
+    cap, basis = job.get("max_cost_usd"), "cap"
+    if not cap:
+        m = _ESTIMATE_RE.search(job.get("plan_summary") or "")
+        cap, basis = (float(m.group(1)), "estimate") if m else (None, "none")
+    if not cap:
+        return {"usd": spent, "of_usd": None, "basis": "none", "fraction": None}
+    return {"usd": spent, "of_usd": cap, "basis": basis, "fraction": round(spent / float(cap), 3)}
+
+
+def _nonfinal(job):
+    """A `succeeded` job that is still going through adherence/pipeline review."""
+    return job.get("state") == "succeeded" and (
+        job.get("adherence_pending") is True or job.get("activity") == "pipeline_review")
+
+
+def _current_stage(seg, nonfinal, gates, gates_failed):
+    """The stage to report. A job awaiting adherence/pipeline review is in
+    review even though its last worked stage was earlier; a gates stage whose
+    gates failed is really the gate-fix rework."""
+    stage = seg.stage
+    if nonfinal and stage in ("build", "rework", "gates"):
+        stage = "review"
+    if stage == "gates" and gates_failed:
+        stage = "rework"
+    return stage
+
+
+def _gates_fraction(stage, gates):
+    """Within-stage signal for gates: passed/total (None outside the gates stage)."""
+    if stage == "gates" and gates and gates["total"] > 0:
+        return min(gates["passed"] / float(gates["total"]), PROGRESS_STAGE_CAP)
+    return None
+
+
+def _eta_object(final, band, basis, scope_n):
+    if final:
+        return {"lo_s": 0, "hi_s": 0, "label": "", "basis": "none", "n": None}
+    if band is None:
+        return {"lo_s": None, "hi_s": None, "label": "?", "basis": "none", "n": None}
+    return {"lo_s": band[0], "hi_s": band[1], "label": eta_label(*band), "basis": basis, "n": scope_n}
+
+
+def _freeze_while_paused(job, prev, pct, eta, elapsed):
+    """While awaiting, nothing advances: keep the last pct/elapsed/ETA band and
+    label the pause. Returns (pct, eta, elapsed)."""
+    if prev:
+        if prev.get("pct") is not None:
+            pct = prev["pct"]
+        pe = prev.get("eta") or {}
+        eta = {"lo_s": pe.get("lo_s"), "hi_s": pe.get("hi_s"), "label": "?",
+               "basis": pe.get("basis", "none"), "n": pe.get("n")}
+        elapsed = (prev.get("signals") or {}).get("elapsed_active_s", elapsed)
+    reason = job.get("paused_reason") or job.get("activity") or "awaiting"
+    eta["label"] = "paused · %s" % reason
+    return pct, eta, elapsed
+
+
+def _moved_back(prev, pct, paused, gates_failed, trigger, now_s):
+    """Why the bar went backwards (None if it didn't). A recorded move-back is
+    carried forward until pct climbs back past where it started."""
+    prev_pct = prev.get("pct") if prev else None
+    if prev_pct is not None and pct < prev_pct and not paused:
+        if gates_failed or trigger == "gate_fix_started":
+            why = "gate_failed"
+        elif trigger == "adherence_rework_kicked":
+            why = "adherence_rework"
+        else:
+            why = "review_rework"
+        return {"reason": why, "at": _iso_ms(now_s), "from_pct": prev_pct}
+    pm = prev.get("moved_back") if prev else None
+    if pm and pct < (pm.get("from_pct") or 0):
+        return pm
+    return None
+
+
+def _progress_label(pct, gates_out, eta_label_text, final, paused):
+    parts = ["≈%d%%" % pct]
+    if gates_out:
+        if gates_out["failed"] > 0:
+            parts.append("gates ✗ attempt %s/%s" % (gates_out.get("attempt") or "?", gates_out.get("max_attempts") or "?"))
+        else:
+            parts.append("gates %d/%d" % (gates_out["passed"], gates_out["total"]))
+    if not final:
+        parts.append(eta_label_text if paused else "ETA %s" % eta_label_text)
+    return " · ".join(parts)
+
+
+def compute_progress(job, events, now_s, calib, prev):
+    """Build the progress object for one job (no I/O)."""
+    state = job.get("state")
+    nonfinal = _nonfinal(job)
+    final = state in PROGRESS_TERMINAL and not nonfinal
+    paused = state == "awaiting" and not nonfinal
+    seg = segment_events(events, None if final else now_s)
+    basis, scope, scope_n = _pick_scope(calib, job.get("repo"))
+    shares, medians = _scope_stats(scope)
+
+    gates = _gates_signal(job, seg)
+    gates_failed = bool(gates) and (gates["failed"] > 0 or gates.get("_status") in ("failed", "exhausted"))
+    gates_out = {k: v for k, v in gates.items() if not k.startswith("_")} if gates else None
+    stage = _current_stage(seg, nonfinal, gates, gates_failed)
+
+    fraction, stage_frac = progress_fraction(
+        stage, seg.stage_totals.get(stage, 0.0), shares, medians, _gates_fraction(stage, gates))
+    pct = _shown_pct(fraction, final)
+    elapsed = int(round(seg.elapsed))
+    band = None if final else eta_band(elapsed, stage, scope)
+    eta = _eta_object(final, band, basis, scope_n)
+    if paused:
+        pct, eta, elapsed = _freeze_while_paused(job, prev, pct, eta, elapsed)
+
+    moved_back = None if final else _moved_back(prev, pct, paused, gates_failed, seg.trigger, now_s)
+
+    obj = {
+        "v": 1, "pct": pct, "label": _progress_label(pct, gates_out, eta["label"], final, paused),
+        "stage": "done" if final else stage,
+        "signals": {
+            "stage": "done" if final else stage,
+            "stage_share": round(shares.get(stage, 0.0), 3),
+            "stage_frac": round(stage_frac, 3),
+            "elapsed_active_s": elapsed,
+            "gates": gates_out,
+            "checklist": {"status": "unavailable"},
+            "cost": _cost_signal(job),
+        },
+        "eta": eta, "paused": paused, "flags": [],
+    }
+    if moved_back:
+        obj["moved_back"] = moved_back
+    return obj
+
+
+def _visible_tuple(obj):
+    g = obj["signals"].get("gates")
+    gt = [g.get(k) for k in ("passed", "failed", "total", "attempt")] if g else None
+    return [obj["pct"], obj["stage"], gt, obj["eta"]["label"], obj["paused"],
+            "moved_back" in obj, obj.get("flags", [])]
+
+
+# --- files and events ---------------------------------------------------------
+
+def _progress_dir(root):
+    return os.path.join(root, "progress")
+
+
+def _read_json(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _write_json_atomic(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False, separators=(",", ":"))
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _append_event_locked(root, jid, kind, detail, now_s):
+    """Append one {ts,kind,detail} line under the same mkdir lock as
+    lib/state.sh's mother_event_append (`mkdir <file>.lockdir`)."""
+    path = os.path.join(root, "events", jid + ".jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lockdir = path + ".lockdir"
+    for _ in range(200):
+        try:
+            os.mkdir(lockdir)
+            break
+        except OSError:
+            time.sleep(0.05)
+    else:
+        return False
+    try:
+        line = json.dumps({"ts": _iso_ms(now_s), "kind": kind, "detail": detail},
+                          ensure_ascii=False, separators=(",", ":"))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    finally:
+        try:
+            os.rmdir(lockdir)
+        except OSError:
+            pass
+    return True
+
+
+def _calibration_path(root):
+    return os.path.join(root, "runner", "progress-calibration.json")
+
+
+def _resolve_now(args):
+    spec = getattr(args, "now", None) or os.environ.get("MOTHER_PROGRESS_NOW")
+    if spec:
+        d = _parse_iso(spec)
+        if d:
+            return d.timestamp()
+    return time.time()
+
+
+def _live_jobs(root):
+    jobs_dir = os.path.join(root, "jobs")
+    if not os.path.isdir(jobs_dir):
+        return
+    for name in sorted(os.listdir(jobs_dir)):
+        if not name.endswith(".json"):
+            continue
+        job = _read_json(os.path.join(jobs_dir, name))
+        if isinstance(job, dict) and job.get("id"):
+            yield job
+
+
+def _tick_job(root, job, now_s, calib):
+    jid = job["id"]
+    pdir = _progress_dir(root)
+    ppath = os.path.join(pdir, jid + ".json")
+    prev = _read_json(ppath)
+    state = job.get("state")
+    nonfinal = _nonfinal(job)
+    live = state in ("running", "awaiting") or nonfinal
+    final_write = state in PROGRESS_TERMINAL and not nonfinal and prev and prev.get("pct") != 100
+    if not (live or final_write):
+        return False
+    events = _load_events(os.path.join(root, "events", jid + ".jsonl"))
+    obj = compute_progress(job, events, now_s, calib, prev)
+
+    # updated_at only moves when something else changed, so idle ticks are no-ops.
+    stable = lambda o: {k: v for k, v in (o or {}).items() if k != "updated_at"}
+    if prev and stable(prev) == stable(obj):
+        obj["updated_at"] = prev.get("updated_at") or _iso_ms(now_s)
+    else:
+        obj["updated_at"] = _iso_ms(now_s)
+        _write_json_atomic(ppath, obj)
+
+    _emit_progress_events(root, jid, obj, now_s, os.path.join(pdir, "meta", jid + ".json"))
+    return True
+
+
+def _emit_progress_events(root, jid, obj, now_s, mpath):
+    """Rate-bounded progress_updated, plus progress_half once. `meta` remembers
+    what was last announced so clients aren't spammed by unchanged ticks."""
+    meta = _read_json(mpath) or {}
+    dirty = False
+    tup = _visible_tuple(obj)
+    last_at = meta.get("last_event_epoch")
+    final = obj["pct"] == 100  # the terminal write must reach clients; it happens once
+    if tup != meta.get("last_tuple") and (final or last_at is None or now_s - last_at >= PROGRESS_EVENT_MIN_GAP_S):
+        if _append_event_locked(root, jid, "progress_updated", obj, now_s):
+            meta["last_tuple"], meta["last_event_epoch"] = tup, now_s
+            dirty = True
+    if not meta.get("half_done") and PROGRESS_HALF_PCT <= obj["pct"] < 100 and not obj["paused"]:
+        eta = obj["eta"]
+        if eta.get("lo_s") is not None:
+            _append_event_locked(root, jid, "progress_half", {
+                "eta_lo_s": eta["lo_s"], "eta_hi_s": eta["hi_s"],
+                "elapsed_active_s": obj["signals"]["elapsed_active_s"]}, now_s)
+        meta["half_done"] = True
+        dirty = True
+    if dirty:
+        _write_json_atomic(mpath, meta)
+
+
+def cmd_progress_tick(args):
+    if not _progress_enabled():
+        return 0
+    root = args.root
+    now_s = _resolve_now(args)
+    calib = _read_json(_calibration_path(root))
+    seen, n = set(), 0
+    for job in _live_jobs(root):
+        seen.add(job["id"])
+        try:
+            if _tick_job(root, job, now_s, calib):
+                n += 1
+        except Exception as e:  # observer: one bad job must not stop the rest
+            print("progress-tick: %s: %s" % (job.get("id"), e), file=sys.stderr)
+    pdir = _progress_dir(root)
+    for sub in (pdir, os.path.join(pdir, "meta")):
+        if not os.path.isdir(sub):
+            continue
+        for name in os.listdir(sub):
+            if name.endswith(".json") and name[:-5] not in seen:
+                try:
+                    os.remove(os.path.join(sub, name))
+                except OSError:
+                    pass
+    print("progress-tick: %d job(s)" % n)
+    return 0
+
+
+# --- calibration ----------------------------------------------------------------
+
+def _finished_rows(root):
+    """One row per finished job: repo, total active time, per-stage totals,
+    stage start offsets and the active intervals."""
+    rows = []
+    for job, _path, archived in _iter_job_files(root):
+        if job.get("state") not in ("succeeded", "failed"):
+            continue
+        events = _load_events(_events_path_for(root, job, archived))
+        seg = segment_events(events)
+        if seg.elapsed <= 0:
+            continue
+        rows.append({"repo": job.get("repo") or "unknown", "total": seg.elapsed,
+                     "stage_totals": seg.stage_totals, "starts": seg.starts,
+                     "intervals": seg.intervals})
+    return rows
+
+
+def _quantiles(values):
+    return {"n": len(values), "p10": round(_percentile(values, 10), 4),
+            "p50": round(_percentile(values, 50), 4), "p90": round(_percentile(values, 90), 4)}
+
+
+def _half_point(row, shares, medians):
+    """Active seconds into the job when the indicator would first show >= 50%."""
+    target = (PROGRESS_HALF_PCT - PROGRESS_BUCKET / 2.0) / 100.0
+    cum, before = {}, 0.0
+    for stage, start, end in row["intervals"]:
+        dur = end - start
+        have = cum.get(stage, 0.0)
+        f = lambda x: progress_fraction(stage, have + x, shares, medians)[0]
+        if f(0.0) >= target:
+            return before
+        if f(dur) >= target:
+            lo, hi = 0.0, dur
+            for _ in range(30):
+                mid = (lo + hi) / 2.0
+                lo, hi = (lo, mid) if f(mid) >= target else (mid, hi)
+            return before + hi
+        cum[stage] = have + dur
+        before += dur
+    return None
+
+
+def _fit_scope(rows):
+    scope = {"n": len(rows), "stages": {}, "remaining_ratio": {"start": {}, "half": None}}
+    grand = sum(r["total"] for r in rows)
+    if not rows or grand <= 0:
+        return scope
+    for stage in PROGRESS_STAGES:
+        per_job = [r["stage_totals"][stage] for r in rows if r["stage_totals"].get(stage, 0) > 0]
+        if not per_job:
+            continue
+        scope["stages"][stage] = {
+            "n": len(per_job), "median_s": round(statistics.median(per_job), 1),
+            "p90_s": round(_percentile(per_job, 90), 1),
+            "share": round(sum(per_job) / grand, 4)}
+    shares, medians = _scope_stats(scope)
+    for stage in PROGRESS_STAGES:
+        vals = [(r["total"] - r["starts"][stage]) / r["starts"][stage]
+                for r in rows if r["starts"].get(stage, 0) > 0]
+        if vals:
+            scope["remaining_ratio"]["start"][stage] = _quantiles(vals)
+    halves = []
+    for r in rows:
+        t50 = _half_point(r, shares, medians)
+        if t50 and t50 > 0:
+            halves.append((r["total"] - t50) / t50)
+    if halves:
+        scope["remaining_ratio"]["half"] = _quantiles(halves)
+    return scope
+
+
+def cmd_calibrate(args):
+    if not _progress_enabled():
+        return 0
+    root = args.root
+    rows = _finished_rows(root)
+    by_repo = {}
+    for r in rows:
+        by_repo.setdefault(r["repo"], []).append(r)
+    out = {"fitted_at": _iso_ms(time.time()), "min_repo_n": PROGRESS_MIN_N,
+           "fleet": _fit_scope(rows),
+           "repos": {name: _fit_scope(rs) for name, rs in sorted(by_repo.items())
+                     if len(rs) >= PROGRESS_MIN_N}}
+    _write_json_atomic(_calibration_path(root), out)
+    print("calibrate: %d job(s), %d repo(s) with per-repo data" % (len(rows), len(out["repos"])))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1521,6 +2160,13 @@ def build_arg_parser():
     rt.add_argument("--format", default="table", choices=["table", "json"])
     rt.add_argument("--backfill", action="store_true")
 
+    cal = sub.add_parser("calibrate")
+    cal.add_argument("--root", required=True)
+
+    pt = sub.add_parser("progress-tick")
+    pt.add_argument("--root", required=True)
+    pt.add_argument("--now", default=None)  # ISO-8601; test hook, also MOTHER_PROGRESS_NOW
+
     return p
 
 
@@ -1545,6 +2191,10 @@ def main(argv=None):
         return cmd_publish_rates(args)
     elif args.cmd == "retro":
         return cmd_retro(args)
+    elif args.cmd == "calibrate":
+        return cmd_calibrate(args)
+    elif args.cmd == "progress-tick":
+        return cmd_progress_tick(args)
     else:
         parser.print_help()
         return 1

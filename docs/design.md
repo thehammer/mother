@@ -755,6 +755,16 @@ off). `mother list/status --format json` merge `$MOTHER_ROOT/progress/<id>.json`
 and the broker overlays the latest `progress_updated` detail as `.progress`:
 `{v, pct, label, stage, signals{stage, checklist, gates, elapsed_active_s, cost}, eta{lo_s, hi_s, label, basis: repo|fleet|none}, paused, moved_back{reason, at}, flags[], updated_at}`.
 
+As produced by HC-09 (additive detail on the shape above): `stage` is one of `build|rework|gates|review|present|done`;
+`signals` also carries `stage_share` and `stage_frac`, `gates` is `null` or `{passed, failed, total, attempt, max_attempts}`,
+`checklist` is `{status: "unavailable"}` until HC-10, and `cost` is `{usd, of_usd, basis: cap|estimate|none, fraction}`;
+`eta` also carries `n` (jobs behind the calibration) and its `label` is `~25m`, `~1–2h`, `?` (no usable calibration) or
+`paused · <reason>`; `moved_back` also carries `from_pct` (`reason`: `gate_failed|adherence_rework|review_rework`).
+`pct` is a multiple of 5, at most 95 until the job is terminal. `progress_updated` is emitted only on a visible change
+and at most once per job per 60s; the broker keeps the latest one per job (snapshot, `query.list`, `query.get`).
+The provisional fixtures under `tests/fixtures/contract/` use older illustrative stage names and scalar `cost`; they
+are replaced when re-recorded from real runs.
+
 ### Attention reasons
 
 Closed and documented; new reasons are additive. Acknowledgements live in

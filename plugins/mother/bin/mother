@@ -753,6 +753,67 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
 
 # ---------- list ----------
 
+# ---------- progress indicator (HC-09) ----------
+# Read-only views of $MOTHER_ROOT/progress/<id>.json, written by the runner's
+# progress tick (`mother-usage progress-tick`). Never written into job JSON.
+# MOTHER_PROGRESS_ENABLED=0 hides all of it (displays look as they did before).
+
+_progress_enabled() { [ "${MOTHER_PROGRESS_ENABLED:-1}" != "0" ]; }
+
+# JSON map {<job id>: <progress object>} for every progress file; {} when the
+# indicator is off or there are none.
+_progress_map() {
+    _progress_enabled || { echo '{}'; return 0; }
+    set -- "$MOTHER_ROOT"/progress/*.json
+    [ -e "$1" ] || { echo '{}'; return 0; }
+    jq -cn 'reduce inputs as $p ({}; .[(input_filename | split("/") | last | sub("\\.json$"; ""))] = $p)' "$@" 2>/dev/null || echo '{}'
+}
+
+# One job's progress object (compact JSON), empty when off/absent/unreadable.
+_progress_file_json() {
+    _progress_enabled || return 0
+    local f="$MOTHER_ROOT/progress/$1.json"
+    [ -f "$f" ] || return 0
+    jq -c 'select(type == "object")' "$f" 2>/dev/null
+}
+
+# stdin: `mother status --format json` output; merges .job.progress when present.
+_status_json_with_progress() {
+    local p; p=$(_progress_file_json "$1")
+    if [ -z "$p" ]; then cat; else jq --argjson p "$p" '.job.progress = $p'; fi
+}
+
+_status_progress_section() {
+    local p; p=$(_progress_file_json "$1")
+    [ -n "$p" ] || return 0
+    echo "=== progress ==="
+    printf '%s' "$p" | jq -r '
+        def pctof: (. * 100 | round | tostring) + "%";
+        def mins: ((. / 60 | floor) | tostring) + "m";
+        def money: "$" + (. * 100 | round / 100 | tostring);
+        .signals as $s
+        | "  Figure: \(.label)",
+          "  Stage: \(.stage)"
+            + (if .stage == "done" then "" else " (share of job time \($s.stage_share | pctof), \($s.stage_frac | pctof) through the stage)" end),
+          "  Gates: " + (if $s.gates then
+                "\($s.gates.passed)/\($s.gates.total) passed"
+                + (if $s.gates.failed > 0 then ", \($s.gates.failed) failed" else "" end)
+                + (if $s.gates.attempt != null then " (attempt \($s.gates.attempt)/\($s.gates.max_attempts // "?"))" else "" end)
+              else "none" end),
+          "  Elapsed: \($s.elapsed_active_s | mins) active (queue waits and pauses excluded)",
+          "  Cost: " + ($s.cost | if .basis == "none" then "\(.usd | money) (no cap or plan estimate)"
+              else "\(.usd | money) of \(.of_usd | money) \(.basis) (\(.fraction | pctof))" end),
+          "  Checklist: \($s.checklist.status // "unavailable")",
+          (if .stage == "done" then empty
+           elif .paused then "  ETA: \(.eta.label)"
+           else "  ETA: " + (if .eta.basis == "none" then "unknown (calibration: none, or no active time yet)"
+                  else "\(.eta.label)  (calibration: " + (if .eta.basis == "repo" then "per-repo" else "fleet" end)
+                       + (if .eta.n != null then " (n=\(.eta.n))" else "" end) + ")" end) end),
+          (if .moved_back then "  Moved back: \(.moved_back.reason) at \(.moved_back.at) (was \(.moved_back.from_pct)%)" else empty end),
+          (if .paused then "  Paused: yes (figure and ETA frozen; paused time not counted)" else empty end),
+          ""'
+}
+
 cmd_list() {
     local state_filter="" repo_filter="" format="table" proj_filter="" label_filter=""
     while [ $# -gt 0 ]; do
@@ -779,6 +840,8 @@ cmd_list() {
         | sort_by(.created_at)
     ')
 
+    local pmap; pmap=$(_progress_map)
+
     if [ "$format" = "json" ]; then
         # For pipeline jobs, attach the derived `cycles` array; standard jobs
         # pass through byte-identical so clients that don't expect `cycles` are
@@ -798,7 +861,8 @@ cmd_list() {
             else
                 printf '%s\n' "$job_json"
             fi
-        done | jq -cs '.'
+        done | jq -cs --argjson pm "$pmap" \
+            'if ($pm | length) == 0 then . else map(if $pm[.id] then . + {progress: $pm[.id]} else . end) end'
     else
         local count
         count=$(echo "$rows" | jq 'length')
@@ -814,7 +878,7 @@ cmd_list() {
         # [tier_0]", REPO showing the isolation, and so on). A non-whitespace
         # IFS byte makes every delimiter significant, so empty fields survive.
         local _us; _us=$(printf '\037')
-        echo "$rows" | jq -r --arg us "$_us" '.[] |
+        echo "$rows" | jq -r --arg us "$_us" --argjson pm "$pmap" '.[] |
             [
                 .id,
                 .state,
@@ -828,9 +892,10 @@ cmd_list() {
                 (.max_cost_usd // ""),
                 .title,
                 (.kind // ""),
-                (.adherence_status // "")
+                (.adherence_status // ""),
+                (if (.state == "running" or .state == "awaiting") then ($pm[.id].label // "") else "" end)
             ] | map((. // "") | tostring | gsub("[\n\r\t]"; " ")) | join($us)' | \
-            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence; do
+            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel; do
                 cost_display="-"
                 if [ -n "$max_cost" ]; then
                     if [ "$st" = "running" ] && [ -n "$live_cost" ]; then
@@ -867,6 +932,7 @@ cmd_list() {
                     tier_2) state_display="$state_display tier:2" ;;
                     tier_3) state_display="$state_display tier:3" ;;
                 esac
+                [ -n "${plabel:-}" ] && state_display="$state_display $plabel"
                 printf "%-28s  %-16s  %-18s  %-12s  %-16s  %8s  %s\n" "$id" "$state_display" "$repo" "$iso" "$origin" "$cost_display" "$title"
             done
         # Attention footer: reads the cached list only (never recomputes, never gh).
@@ -1000,6 +1066,7 @@ cmd_status() {
     _job_exists "$id" || _die "no such job: $id"
 
     if [ "$format" = "json" ]; then
+      {
         # For pipeline jobs, attach the derived cycles array to the job object.
         local job_file; job_file=$(_job_path "$id")
         local kind; kind=$(jq -r '.kind // ""' "$job_file" 2>/dev/null) || kind=""
@@ -1021,6 +1088,7 @@ cmd_status() {
                 "$job_file" \
                 <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
         fi
+      } | _status_json_with_progress "$id"
     else
         local job_file; job_file=$(_job_path "$id")
         local activity; activity=$(jq -r '.activity // empty' "$job_file")
@@ -1099,6 +1167,8 @@ cmd_status() {
             echo "Summary: $plan_summary"
             echo ""
         fi
+
+        _status_progress_section "$id"
 
         # Pipeline section — only for pipeline jobs.
         if [ "${kind:-}" = "pipeline" ]; then
@@ -4423,6 +4493,12 @@ Quota gate env vars (require statusline integration — see segment.sh
                            Lower these to leave more headroom for
                            interactive use; e.g. cap=70 reserves the
                            top 30% for non-Mother work.
+
+Progress indicator env vars:
+  MOTHER_PROGRESS_ENABLED         (default: 1)    0 disables the indicator entirely
+                                                   (no files, no events, no display)
+  MOTHER_PROGRESS_INTERVAL        (default: 30)   seconds between progress ticks
+  MOTHER_PROGRESS_CALIBRATE_INTERVAL (default: 3600) seconds between calibrations
 
 Cost visibility / --max-cost env vars:
   MOTHER_USAGE_CHECK_INTERVAL     (default: 120)  seconds between live usage/

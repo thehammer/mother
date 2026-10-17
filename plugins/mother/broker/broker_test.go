@@ -1902,3 +1902,353 @@ func TestHandshake_helloCapabilitiesAdvertiseAnswerOption(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// HC-09 — progress category, overlay, and capability
+// =============================================================================
+//
+// Contract: `progress_updated` and `progress_half` events classify into the new
+// category "progress"; the hub keeps the latest progress_updated detail per job
+// and overlays it as `progress` on snapshot jobs and on query.list / query.get
+// payloads; a client subscribed only to other categories never sees progress
+// events; hello advertises "progress". The job JSON files are never touched.
+//
+// The category name is spelled as a literal here (not CatProgress) so this file
+// compiles before the constant exists and the tests fail on behaviour.
+
+const testCatProgress = "progress"
+
+// progressDetail builds a realistic progress_updated detail (the .progress
+// object, per docs/design.md "Headless crew contract").
+func progressDetail(pct int, label string) map[string]any {
+	return map[string]any{
+		"v":     1,
+		"pct":   pct,
+		"label": label,
+		"stage": "build",
+		"signals": map[string]any{
+			"stage": "build", "stage_share": 0.72, "stage_frac": 0.5,
+			"elapsed_active_s": 600, "gates": nil,
+			"checklist": map[string]any{"status": "unavailable"},
+			"cost":      map[string]any{"usd": 1.5, "of_usd": nil, "basis": "none", "fraction": nil},
+		},
+		"eta":        map[string]any{"lo_s": 300, "hi_s": 900, "label": "~5–15m", "basis": "fleet", "n": 40},
+		"paused":     false,
+		"flags":      []any{},
+		"updated_at": "2026-10-17T12:00:00.000Z",
+	}
+}
+
+// drainEvents feeds everything currently in the job's events file through the
+// real event source (classification included) into the hub.
+func (th *testHub) drainEvents(es *eventSource, id string) {
+	es.drain(filepath.Join(th.eventsDir, id+".jsonl"))
+}
+
+func TestClassify_progressEventsMapToProgressCategory(t *testing.T) {
+	for _, kind := range []string{"progress_updated", "progress_half"} {
+		if got := classify(kind); got != testCatProgress {
+			t.Errorf("classify(%q) = %q, want %q", kind, got, testCatProgress)
+		}
+	}
+}
+
+func TestClassify_nonProgressKindsAreUnaffectedByProgressCategory(t *testing.T) {
+	// Guard against an over-broad prefix match: other kinds starting with
+	// "progress" are not ours, and ordinary activity stays activity.
+	if got := classify("running"); got != CatState {
+		t.Errorf("classify(running) = %q, want %q", got, CatState)
+	}
+	if got := classify("gates_started"); got != CatActivity {
+		t.Errorf("classify(gates_started) = %q, want %q", got, CatActivity)
+	}
+}
+
+func TestHandshake_helloCapabilitiesIncludesProgress(t *testing.T) {
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+
+	hello, _ := readNext(t, conn)
+	data := mustDecodeData(t, hello)
+	capSet := map[string]bool{}
+	for _, c := range data["capabilities"].([]any) {
+		capSet[c.(string)] = true
+	}
+	if !capSet[testCatProgress] {
+		t.Errorf("hello capabilities missing %q; got %v", testCatProgress, data["capabilities"])
+	}
+	// Additive only: everything that was advertised before still is.
+	for _, c := range append(append([]string{}, w1Categories...), w1Commands...) {
+		if c == testCatProgress {
+			continue
+		}
+		if !capSet[c] {
+			t.Errorf("hello capabilities lost pre-existing entry %q", c)
+		}
+	}
+}
+
+func TestSubscribeValidation_progressCategoryIsAccepted(t *testing.T) {
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+
+	sendCmd(t, conn, CmdSubscribe, "prog1", map[string]any{
+		"sub":        "mysub",
+		"jobs":       []string{"all"},
+		"categories": []string{testCatProgress},
+	})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	data := mustDecodeData(t, ack)
+	if data["ok"] != true {
+		t.Errorf("progress subscribe ack ok=%v, want true; data=%v", data["ok"], data)
+	}
+}
+
+func TestProgress_subscriberToStateAndActivityOnlyReceivesNoProgressEvents(t *testing.T) {
+	th := newTestHub(t, 1024)
+	id := "job-prog-quiet"
+	th.injectJob(t, id, map[string]any{"state": "running"})
+	es := newEventSource(th.eventsDir, th.hub.ingest)
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	subscribeSimple(t, conn, "quiet", []string{"all"}, []string{CatState, CatActivity})
+
+	th.injectEvent(t, id, "progress_updated", progressDetail(40, "≈40% · ETA ?"))
+	th.injectEvent(t, id, "progress_half", map[string]any{"eta_lo_s": 60, "eta_hi_s": 300, "elapsed_active_s": 900})
+	th.injectEvent(t, id, "gates_started", map[string]any{"attempt": 1}) // activity sentinel
+	th.drainEvents(es, id)
+
+	m, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading first event: %v", err)
+	}
+	if m.T == "progress_updated" || m.T == "progress_half" {
+		t.Fatalf("[state,activity] subscriber received %q; progress events must be progress-category only", m.T)
+	}
+	if m.T != "gates_started" {
+		t.Errorf("first event = %q, want the activity sentinel gates_started", m.T)
+	}
+}
+
+func TestProgress_progressSubscriberReceivesEventsWithJobAndCategory(t *testing.T) {
+	th := newTestHub(t, 1024)
+	id := "job-prog-live"
+	th.injectJob(t, id, map[string]any{"state": "running"})
+	es := newEventSource(th.eventsDir, th.hub.ingest)
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	subscribeSimple(t, conn, "prog", []string{"all"}, []string{testCatProgress})
+
+	th.injectEvent(t, id, "progress_updated", progressDetail(55, "≈55% · ETA ~5–15m"))
+	th.injectEvent(t, id, "progress_half", map[string]any{"eta_lo_s": 60, "eta_hi_s": 300, "elapsed_active_s": 900})
+	th.drainEvents(es, id)
+
+	m, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("progress_updated: %v", err)
+	}
+	if m.T != "progress_updated" {
+		t.Fatalf("event t = %q, want progress_updated", m.T)
+	}
+	d := mustDecodeData(t, m)
+	if d["category"] != testCatProgress {
+		t.Errorf("category = %v, want %q", d["category"], testCatProgress)
+	}
+	if d["job"] != id {
+		t.Errorf("job = %v, want %q", d["job"], id)
+	}
+	if d["pct"] != float64(55) || d["label"] != "≈55% · ETA ~5–15m" || d["stage"] != "build" {
+		t.Errorf("event data should be the progress detail verbatim, got %v", d)
+	}
+	if eta, _ := d["eta"].(map[string]any); eta["basis"] != "fleet" {
+		t.Errorf("nested eta not carried through: %v", d["eta"])
+	}
+
+	half, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("progress_half: %v", err)
+	}
+	if half.T != "progress_half" {
+		t.Fatalf("second event t = %q, want progress_half", half.T)
+	}
+	hd := mustDecodeData(t, half)
+	if hd["category"] != testCatProgress || hd["job"] != id || hd["elapsed_active_s"] != float64(900) {
+		t.Errorf("progress_half data unexpected: %v", hd)
+	}
+}
+
+func TestProgress_progressSubscriberDoesNotReceiveOtherActivity(t *testing.T) {
+	th := newTestHub(t, 1024)
+	id := "job-prog-only"
+	th.injectJob(t, id, map[string]any{"state": "running"})
+	es := newEventSource(th.eventsDir, th.hub.ingest)
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	subscribeSimple(t, conn, "prog", []string{"all"}, []string{testCatProgress})
+
+	th.injectEvent(t, id, "gates_started", map[string]any{"attempt": 1})
+	th.injectEvent(t, id, "progress_updated", progressDetail(30, "≈30% · ETA ?"))
+	th.drainEvents(es, id)
+
+	m, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading event: %v", err)
+	}
+	if m.T != "progress_updated" {
+		t.Errorf("first event = %q, want progress_updated (activity must not leak into a progress-only subscription)", m.T)
+	}
+}
+
+func TestProgress_snapshotJobCarriesProgressWrittenBeforeBrokerStarted(t *testing.T) {
+	th := newTestHub(t, 1024)
+	id := "job-prog-snap"
+	th.injectJob(t, id, map[string]any{"state": "running"})
+	// Two lines: the latest one must win.
+	th.injectEvent(t, id, "progress_updated", progressDetail(25, "≈25% · ETA ?"))
+	th.injectEvent(t, id, "progress_updated", progressDetail(60, "≈60% · ETA ~5–15m"))
+	newEventSource(th.eventsDir, th.hub.ingest).prime()
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	snap := subscribeSimple(t, conn, "s", []string{"all"}, []string{testCatProgress})
+	jobs := mustDecodeData(t, snap)["jobs"].([]any)
+	if len(jobs) != 1 {
+		t.Fatalf("snapshot jobs = %d, want 1", len(jobs))
+	}
+	p, ok := jobs[0].(map[string]any)["progress"].(map[string]any)
+	if !ok {
+		t.Fatalf("snapshot job has no progress object: %v", jobs[0])
+	}
+	if p["pct"] != float64(60) || p["label"] != "≈60% · ETA ~5–15m" {
+		t.Errorf("snapshot progress = %v, want the latest progress_updated detail (pct 60)", p)
+	}
+	if _, leaked := p["job"]; leaked {
+		t.Errorf("snapshot progress must be the detail itself, not the wire-merged event data: %v", p)
+	}
+}
+
+func TestProgress_snapshotJobCarriesProgressAppendedLive(t *testing.T) {
+	th := newTestHub(t, 1024)
+	id := "job-prog-late"
+	th.injectJob(t, id, map[string]any{"state": "running"})
+	es := newEventSource(th.eventsDir, th.hub.ingest)
+	es.prime()
+
+	th.injectEvent(t, id, "progress_updated", progressDetail(45, "≈45% · ETA ?"))
+	th.drainEvents(es, id)
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	snap := subscribeSimple(t, conn, "s", []string{"all"}, []string{testCatProgress})
+	jobs := mustDecodeData(t, snap)["jobs"].([]any)
+	p, ok := jobs[0].(map[string]any)["progress"].(map[string]any)
+	if !ok || p["pct"] != float64(45) {
+		t.Errorf("snapshot progress = %v, want pct 45", jobs[0])
+	}
+}
+
+func TestProgress_jobWithoutProgressEventsHasNoProgressKeyAnywhere(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.injectJob(t, "job-noprog", map[string]any{"state": "running"})
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	snap := subscribeSimple(t, conn, "s", []string{"all"}, []string{CatState})
+	job := mustDecodeData(t, snap)["jobs"].([]any)[0].(map[string]any)
+	if _, has := job["progress"]; has {
+		t.Errorf("snapshot job without progress events carries a progress key: %v", job["progress"])
+	}
+
+	sendCmd(t, conn, CmdQueryList, "ql", map[string]any{})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("query.list: %v", err)
+	}
+	lj := mustDecodeData(t, ack)["jobs"].([]any)[0].(map[string]any)
+	if _, has := lj["progress"]; has {
+		t.Errorf("query.list job without progress carries a progress key: %v", lj["progress"])
+	}
+
+	sendCmd(t, conn, CmdQueryGet, "qg", map[string]any{"job": "job-noprog"})
+	ack, err = readNext(t, conn)
+	if err != nil {
+		t.Fatalf("query.get: %v", err)
+	}
+	gj := mustDecodeData(t, ack)["job"].(map[string]any)
+	if _, has := gj["progress"]; has {
+		t.Errorf("query.get job without progress carries a progress key: %v", gj["progress"])
+	}
+}
+
+func TestProgress_queryListAndQueryGetCarryLatestProgress(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.injectJob(t, "job-q-1", map[string]any{"state": "running"})
+	th.injectJob(t, "job-q-2", map[string]any{"state": "running"}) // no progress
+	th.injectEvent(t, "job-q-1", "progress_updated", progressDetail(20, "≈20% · ETA ?"))
+	th.injectEvent(t, "job-q-1", "progress_updated", progressDetail(65, "≈65% · ETA ~5–15m"))
+	newEventSource(th.eventsDir, th.hub.ingest).prime()
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+
+	sendCmd(t, conn, CmdQueryList, "ql", map[string]any{})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("query.list: %v", err)
+	}
+	byID := map[string]map[string]any{}
+	for _, j := range mustDecodeData(t, ack)["jobs"].([]any) {
+		jm := j.(map[string]any)
+		byID[jm["id"].(string)] = jm
+	}
+	p, ok := byID["job-q-1"]["progress"].(map[string]any)
+	if !ok || p["pct"] != float64(65) {
+		t.Errorf("query.list job-q-1 progress = %v, want latest (pct 65)", byID["job-q-1"]["progress"])
+	}
+	if _, has := byID["job-q-2"]["progress"]; has {
+		t.Errorf("query.list job-q-2 should have no progress key")
+	}
+
+	sendCmd(t, conn, CmdQueryGet, "qg", map[string]any{"job": "job-q-1"})
+	ack, err = readNext(t, conn)
+	if err != nil {
+		t.Fatalf("query.get: %v", err)
+	}
+	gd := mustDecodeData(t, ack)
+	gp, ok := gd["job"].(map[string]any)["progress"].(map[string]any)
+	if !ok || gp["pct"] != float64(65) || gp["label"] != "≈65% · ETA ~5–15m" {
+		t.Errorf("query.get job.progress = %v, want latest progress_updated detail", gd["job"])
+	}
+}
+
+func TestProgress_overlayNeverRewritesTheJobFile(t *testing.T) {
+	th := newTestHub(t, 1024)
+	id := "job-prog-ro"
+	th.injectJob(t, id, map[string]any{"state": "running"})
+	path := filepath.Join(th.jobsDir, id+".json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	th.injectEvent(t, id, "progress_updated", progressDetail(50, "≈50% · ETA ?"))
+	newEventSource(th.eventsDir, th.hub.ingest).prime()
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+	subscribeSimple(t, conn, "s", []string{"all"}, []string{testCatProgress})
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("job file changed on disk; progress is an overlay only\nbefore: %s\nafter:  %s", before, after)
+	}
+}

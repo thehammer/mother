@@ -34,10 +34,14 @@ type jobStore struct {
 
 	mu   sync.RWMutex
 	jobs map[string]*jobRecord
+
+	// progress is the latest progress_updated detail per job (HC-09), folded
+	// in from the event stream by the hub. Not job JSON: merged on read.
+	progress map[string]json.RawMessage
 }
 
 func newJobStore(jobsDir string) *jobStore {
-	return &jobStore{dir: jobsDir, jobs: map[string]*jobRecord{}}
+	return &jobStore{dir: jobsDir, jobs: map[string]*jobRecord{}, progress: map[string]json.RawMessage{}}
 }
 
 // load reads every jobs/*.json into memory. Called once at startup.
@@ -61,6 +65,7 @@ func (s *jobStore) refresh(path string) {
 	if err != nil {
 		s.mu.Lock()
 		delete(s.jobs, id)
+		delete(s.progress, id)
 		s.mu.Unlock()
 		return
 	}
@@ -126,7 +131,36 @@ func (s *jobStore) get(id string) (json.RawMessage, bool) {
 	if !ok {
 		return nil, false
 	}
-	return rec.raw, true
+	return s.withProgressLocked(id, rec.raw), true
+}
+
+// setProgress records a job's latest progress object (a progress_updated detail).
+func (s *jobStore) setProgress(id string, detail json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.progress == nil {
+		s.progress = map[string]json.RawMessage{}
+	}
+	s.progress[id] = append(json.RawMessage(nil), detail...)
+}
+
+// withProgressLocked adds the job's `progress` key to its raw JSON. Jobs with
+// no progress are returned untouched (byte-identical).
+func (s *jobStore) withProgressLocked(id string, raw json.RawMessage) json.RawMessage {
+	p, ok := s.progress[id]
+	if !ok || len(p) == 0 {
+		return raw
+	}
+	m := map[string]json.RawMessage{}
+	if json.Unmarshal(raw, &m) != nil {
+		return raw
+	}
+	m["progress"] = p
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // allIDs returns every known job id, sorted, for snapshotting an all-jobs
@@ -193,7 +227,7 @@ func (s *jobStore) list(f listFilter) []json.RawMessage {
 		if f.repo != "" && rec.repo != f.repo {
 			continue
 		}
-		out = append(out, rec.raw)
+		out = append(out, s.withProgressLocked(id, rec.raw))
 	}
 	return out
 }

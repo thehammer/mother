@@ -75,6 +75,9 @@ MOTHER_BACKUP_ENABLED="${MOTHER_BACKUP_ENABLED:-1}"           # back up the stat
 MOTHER_BACKUP_INTERVAL="${MOTHER_BACKUP_INTERVAL:-900}"       # seconds between state-tree backups
 MOTHER_BACKUP_TIMEOUT="${MOTHER_BACKUP_TIMEOUT:-300}"         # seconds before a stuck backup is killed
 MOTHER_ATTENTION_INTERVAL="${MOTHER_ATTENTION_INTERVAL:-60}" # seconds between attention.json refreshes
+MOTHER_PROGRESS_INTERVAL="${MOTHER_PROGRESS_INTERVAL:-30}"   # seconds between progress ticks
+MOTHER_PROGRESS_CALIBRATE_INTERVAL="${MOTHER_PROGRESS_CALIBRATE_INTERVAL:-$MOTHER_ARCHIVE_INTERVAL}" # seconds between progress calibrations
+MOTHER_PROGRESS_TIMEOUT="${MOTHER_PROGRESS_TIMEOUT:-60}"     # seconds before a stuck progress tick/calibration is killed
 MOTHER_MIN_FREE_GB="${MOTHER_MIN_FREE_GB:-20}"               # pause dispatch below this much free disk (0 disables)
 MOTHER_LOWDISK_GC_INTERVAL="${MOTHER_LOWDISK_GC_INTERVAL:-600}" # min seconds between low-disk-triggered `mother gc` sweeps
 MOTHER_GC_ENABLED="${MOTHER_GC_ENABLED:-1}"                   # run `mother gc` hourly and on low disk (0 to disable)
@@ -848,6 +851,63 @@ _maybe_refresh_attention() {
         echo "$now" > "$marker"
         mother_attention_write 2>/dev/null || _log "attention: refresh failed"
     fi
+}
+
+# Progress indicator (HC-09). Observer only: `mother-usage progress-tick` writes
+# $MOTHER_ROOT/progress/<id>.json (+ rate-bounded progress_* events) and never
+# touches job JSON. Every MOTHER_PROGRESS_INTERVAL seconds; `calibrate` refits
+# the stage statistics when the calibration file is missing or older than
+# MOTHER_PROGRESS_CALIBRATE_INTERVAL. Both run under a watchdog (same pattern as
+# _maybe_archive): `_loop` is single-threaded, so a wedged python must not stall
+# dispatch. MOTHER_PROGRESS_ENABLED=0 skips everything.
+_run_progress_bounded() {
+    local what="$1"; shift
+    local flag="$RUNNER_DIR/progress-timed-out.flag"
+    rm -f "$flag"
+    (
+        "$MOTHER_BIN_DIR/mother-usage" "$what" --root "$MOTHER_ROOT" 2>&1 | while read -r line; do _log "progress: $line"; done
+    ) &
+    local run_pid=$!
+    (
+        sleep "$MOTHER_PROGRESS_TIMEOUT"
+        kill -9 "$run_pid" 2>/dev/null && : > "$flag"
+    ) &
+    local watchdog_pid=$!
+    wait "$run_pid" 2>/dev/null
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    if [ -f "$flag" ]; then
+        _log "progress: $what exceeded ${MOTHER_PROGRESS_TIMEOUT}s, killed pid $run_pid"
+        rm -f "$flag"
+    fi
+}
+
+# _read_epoch_marker <file> — print the epoch stored in a marker file, 0 when
+# the file is missing or holds anything non-numeric.
+_read_epoch_marker() {
+    local v=0
+    [ -f "$1" ] && v=$(cat "$1" 2>/dev/null || echo 0)
+    case "$v" in ''|*[!0-9]*) v=0 ;; esac
+    echo "$v"
+}
+
+_maybe_progress_tick() {
+    [ "${MOTHER_PROGRESS_ENABLED:-1}" = "0" ] && return 0
+    local now last
+    now=$(date +%s)
+    local marker="$RUNNER_DIR/last-progress.ts"
+    last=$(_read_epoch_marker "$marker")
+    [ $((now - last)) -ge "$MOTHER_PROGRESS_INTERVAL" ] || return 0
+    echo "$now" > "$marker"
+
+    local cal_marker="$RUNNER_DIR/last-progress-calibrate.ts" cal_last
+    cal_last=$(_read_epoch_marker "$cal_marker")
+    if [ ! -f "$RUNNER_DIR/progress-calibration.json" ] \
+        || [ $((now - cal_last)) -ge "$MOTHER_PROGRESS_CALIBRATE_INTERVAL" ]; then
+        echo "$now" > "$cal_marker"
+        _run_progress_bounded calibrate
+    fi
+    _run_progress_bounded progress-tick
 }
 
 # ---------- awaiting notifications ----------
@@ -1766,6 +1826,7 @@ _loop() {
         _maybe_backup
         _maybe_archive
         _maybe_refresh_attention
+        _maybe_progress_tick
         _notify_awaiting
         # Sleep in short slices so signal handling is responsive.
         local slept=0
@@ -1891,6 +1952,15 @@ case "${1:-}" in
         # the last-attention.ts marker. Used by attention.bats.
         # Usage: mother-runner --attention-tick
         _maybe_refresh_attention
+        exit 0
+        ;;
+    --progress-tick)
+        # Test entry point: run one _maybe_progress_tick pass and exit without
+        # starting the daemon loop. Callers control whether the interval gate
+        # fires via MOTHER_PROGRESS_INTERVAL (0 = always) / the
+        # last-progress.ts marker. Used by progress.bats.
+        # Usage: mother-runner --progress-tick
+        _maybe_progress_tick
         exit 0
         ;;
     --notify-tick)

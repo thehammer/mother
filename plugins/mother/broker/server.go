@@ -102,6 +102,15 @@ func (h *hub) ingest(ev rawEvent) {
 }
 
 func (h *hub) applyOverlayLocked(ev rawEvent) {
+	// HC-09: the latest progress_updated detail is the job's `progress` key.
+	// It lives in the job store (not derivedState) so query.list/query.get,
+	// which serve store records directly, carry it as well as the snapshot.
+	// TODO(HC-11): merge the progress `flags` into the attention reasons once
+	// HC-03's attention_reasons function exists.
+	if ev.kind == "progress_updated" {
+		h.store.setProgress(ev.jobID, ev.detail)
+	}
+
 	ds := h.jobState[ev.jobID]
 	if ds == nil {
 		ds = &derivedState{}

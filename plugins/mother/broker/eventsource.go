@@ -36,6 +36,8 @@ type rawEvent struct {
 //   - the seven state names           → state
 //   - awaiting_input                  → await
 //   - pause_requested / auto_resumed / paused_for_quota → quota
+//   - progress_updated / progress_half → progress (HC-09; opt-in, so clients
+//     that don't subscribe see no added volume)
 //   - everything else                 → activity
 //
 // The "everything else" bucket includes (non-exhaustive):
@@ -63,6 +65,8 @@ func classify(kind string) string {
 		return CatAwait
 	case "pause_requested", "auto_resumed", "paused_for_quota":
 		return CatQuota
+	case "progress_updated", "progress_half":
+		return CatProgress
 	default:
 		return CatActivity
 	}

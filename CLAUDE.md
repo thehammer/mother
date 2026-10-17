@@ -201,6 +201,7 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_NOTIFY_COMMAND=PATH` — program run as `PATH TITLE BODY JOB_ID` when the transport is `command` (the swap point for off-box delivery).
 - `MOTHER_NOTIFY_SCAN_INTERVAL=N` — seconds between the daemon's awaiting scans (default: 60).
 - `MOTHER_AWAITING_REMIND_HOURS=N` — reminder cadence for a job left `awaiting` (default: 24; open-ended).
+- `MOTHER_PROGRESS_ENABLED=0` — disable the progress indicator entirely (default: `1`): `mother-usage progress-tick`/`calibrate` do nothing, and `mother list`/`status` ignore progress files, so displays look as before. See "Progress indicator" below. `MOTHER_PROGRESS_INTERVAL=N` (default 30) is the tick cadence; `MOTHER_PROGRESS_CALIBRATE_INTERVAL=N` (default: `MOTHER_ARCHIVE_INTERVAL`, 3600) the calibration cadence; `MOTHER_PROGRESS_TIMEOUT=N` (default 60) the watchdog on each.
 - `MOTHER_SHARED_RATES_PATH=PATH` — destination `mother-usage publish-rates` writes the rate table to (default: `~/.claude/model-rates.json`), for Bishop or other tools to read the same per-model pricing Mother uses.
 
 ### Durable daemon config (`config.env`)
@@ -458,6 +459,25 @@ true), where: any|sandbox (default any), timeout_s 1..3600 (default 900), hint <
 - **Settings:** `MOTHER_GATES_ENABLED=0` makes `gates run` a no-op (`{"status":"disabled"}`) and
   skips the add-time snapshot. `MOTHER_PHI_REPOS` (default `admin-portal referral-monitor`, also
   settable in `config.env`) forces `phi_sensitive: true` for those repo names.
+
+## Progress indicator
+
+An observer-only estimate (`≈NN% · gates n/N · ETA ~band`) for running jobs. **It never writes job JSON** — job
+writes are unlocked read-modify-write, so a second writer would race the supervisor. State lives in:
+
+- `$MOTHER_ROOT/progress/<id>.json` — the `.progress` object (`docs/design.md`, "Headless crew contract"),
+  written atomically only by `mother-usage progress-tick` (run by the runner's `_maybe_progress_tick`).
+  `progress/meta/<id>.json` is rate-limit bookkeeping (last emitted tuple/time, `progress_half` done). Files
+  for jobs no longer in `jobs/` are removed by the tick.
+- `$RUNNER_DIR/progress-calibration.json` — `{fitted_at, min_repo_n, fleet, repos}` from `mother-usage calibrate`
+  (stage shares/medians/p90 and remaining/elapsed ratios; per-repo entries only at n ≥ 20).
+
+Stages in pct order: `build`, `rework`, `gates`, `review`, `present`. The active clock counts worker, gate and
+review process time only (no queue waits, no `awaiting`). `progress_fraction` (pct) and `eta_band` (ETA) in
+`bin/mother-usage` are the single tunable functions (HC-11). pct is a multiple of 5, ≤ 95 until terminal.
+`progress_updated` events (broker category `progress`) are emitted only when the visible tuple changes and at
+most once per job per 60s (the terminal 100% write bypasses the gap); `progress_half` once at the first ≥ 50%.
+`mother list`/`status` and the broker merge the file/latest event in as `.progress` — job files stay identical.
 
 ## Internals reference (lazy-loaded)
 

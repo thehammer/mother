@@ -75,14 +75,15 @@ const (
 	CatAwait           = "await"
 	CatCurrentActivity = "current_activity"
 	CatQuota           = "quota"
-	CatOutput          = "output" // W2 — advertised as absent in W1's hello
+	CatOutput          = "output"   // W2 — advertised as absent in W1's hello
+	CatProgress        = "progress" // HC-09 — progress_updated / progress_half
 )
 
 // w1Categories is the full set of categories this broker knows about,
 // including CatOutput (added in W2). The runtime-active set may be a subset
 // when MOTHER_BROKER_OUTPUT_ENABLED=0; see liveCategories.
 var w1Categories = []string{
-	CatState, CatActivity, CatAwait, CatCurrentActivity, CatQuota, CatOutput,
+	CatState, CatActivity, CatAwait, CatCurrentActivity, CatQuota, CatOutput, CatProgress,
 }
 
 // liveCategories is the runtime-active subset of w1Categories. Populated by
