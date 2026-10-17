@@ -12,8 +12,11 @@ _LIB_DIR="$_PLUGIN_DIR/lib"
 
 setup_mother_env() {
     # Isolated MOTHER_ROOT per test — each test gets a fresh state tree.
+    # Never inherit a real state tree (workers export MOTHER_ROOT=~/.mother).
+    unset MOTHER_ROOT _MOTHER_TEST_ROOT
     export MOTHER_ROOT
     MOTHER_ROOT="$(mktemp -d)"
+    export _MOTHER_TEST_ROOT="$MOTHER_ROOT"
     export JOBS_DIR="$MOTHER_ROOT/jobs"
     export EVENTS_DIR="$MOTHER_ROOT/events"
     export LOGS_DIR="$MOTHER_ROOT/logs"
@@ -45,7 +48,12 @@ setup_mother_env() {
 }
 
 teardown_mother_env() {
-    rm -rf "${MOTHER_ROOT:-}"
+    # Only ever delete the temp tree this test's setup created. A test killed
+    # before setup finished must not delete an inherited MOTHER_ROOT.
+    if [ -n "${_MOTHER_TEST_ROOT:-}" ] && [ "${MOTHER_ROOT:-}" = "$_MOTHER_TEST_ROOT" ] \
+        && [ "$MOTHER_ROOT" != "$HOME/.mother" ] && [ "$MOTHER_ROOT" != "/" ]; then
+        rm -rf "$MOTHER_ROOT"
+    fi
 }
 
 # Create a minimal plan file with a valid suggested_config block.
