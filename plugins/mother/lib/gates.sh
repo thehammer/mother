@@ -96,12 +96,13 @@ _gates_precheck_pushed() {
 }
 
 # _gates_prepare_env <work_dir> <base_ref> <crew_file>
+# Uses --no-renames so both sides of a rename are matched against path scopes.
 # Sets _GATES_BASE / _GATES_CHANGED (the gate env) and _GATES_APPLICABLE (JSON
 # array of applicable check names). Call it directly, not via $(...). If the diff can't be computed it fails closed: every
 # check applies (a path-scoped gate must not silently drop out).
 _gates_prepare_env() {
     local work_dir="$1" base_ref="$2" crew_file="$3" changed applicable=""
-    if changed=$(git -C "$work_dir" diff --name-only "$base_ref...HEAD" 2>/dev/null); then
+    if changed=$(git -C "$work_dir" diff --name-only --no-renames "$base_ref...HEAD" 2>/dev/null); then
         applicable=$(printf '%s\n' "$changed" | python3 "$MOTHER_CREW_CONFIG_PY" applicable "$crew_file" - 2>/dev/null) || applicable=""
     fi
     _GATES_BASE=$(git -C "$work_dir" merge-base "$base_ref" HEAD 2>/dev/null) \
