@@ -636,3 +636,139 @@ The broker is a single static binary built by `scripts/build-broker.sh` into
 `plugins/mother/broker/bin/mother-broker` (gitignored). `scripts/run-tests.sh` builds
 it and runs `go test ./broker/...` alongside the bats suite. `mother broker status|path`
 are read-only diagnostics.
+
+## Headless crew contract (Phase 1)
+
+The headless-crew work adds quality gates, a parallel reviewer "lens wave", decisions, attention
+flags and a progress indicator. This section is the **client contract** for all of it, published
+before any producer lands so that Nostromo can build against fixtures
+(`plugins/mother/tests/fixtures/contract/*.ndjson`, provisional until re-recorded from real runs)
+while Mother builds the producers. Every later PR emits exactly these names.
+`plugins/mother/scripts/contract-check.sh` validates NDJSON streams against this section; its
+table at the top of the script must match the tables below exactly.
+
+### Compatibility rules
+
+- **Additive only (C4).** New keys, new `activity` values, new event kinds, new capabilities, new
+  command names and new broker categories only. Nothing here renames or re-types an existing field,
+  state, activity, event, command or error code, and no existing key changes its format.
+- **Why the rule is strict.** Clients get raw job JSON (`broker/commands.go` `query.list`/`query.get`
+  and the snapshot) with an overlay of `state`/`question`/`paused_reason`/`current_activity`
+  (`broker/server.go`). Nostromo's Rust daemon decodes the snapshot as a single `Vec<MotherJob>`, so
+  one type change on an existing key breaks every job. **New keys only; never change an existing
+  key's type or format.** Timestamps stay ISO-8601 millisecond `Z`.
+- **Unknown event kinds** are classified `activity` by the broker (`broker/eventsource.go`), so
+  clients that do not know a kind still see it as generic activity.
+- **Wire payloads carry no free text (C11).** Wire payloads (events, snapshots, `query.*` results)
+  carry ids, enums, counts, durations, costs and the Mother-templated `question` only. Gate output,
+  finding text, claim quotes and checklist text never go on the wire, for any repo. They live in side
+  files under `$MOTHER_ROOT/crew/<id>/` that only local `mother status` reads. PHI-sensitive repos
+  never get an excerpt in `question`. The checker rejects the keys `excerpt`, `output`,
+  `detail_text`, `summary`, `quote`, `text` (allowed only on the client `answer` cmd) and
+  `criterion_text` anywhere in new-kind event details and new job keys.
+- Existing event details are not changed by this PR. `resumed` today carries `answer` (the operator's
+  text); this contract only adds `option` and `source` to it, and HC-02 owns what happens to
+  `answer`.
+
+### New `activity` values
+
+Each maps onto an existing `state` (C4); `paused_reason` is an existing key.
+
+| `activity` | `state` | `paused_reason` | Meaning |
+|---|---|---|---|
+| `gating` | `running` | — | Mother is running gates on the head commit |
+| `gate_fix` | `running` | — | worker (resumed session) fixing red gates |
+| `review_wave` | `running` | — | adherence and lenses running on the gated commit |
+| `review_rework` | `running` | — | worker (resumed session) addressing blocking wave findings |
+| `gate_hold` | `awaiting` | `gate_hold` | gate attempts exhausted, a decision is open |
+| `review_hold` | `awaiting` | `review_hold` | human-blocking finding or wave cycle cap, a decision is open |
+
+### New job keys
+
+All optional; absent until the producing feature runs. Existing keys keep their types.
+
+| Key | Fields |
+|---|---|
+| `crew` | resolved crew snapshot (opaque to clients; presence means the repo opted in) |
+| `gates` | `{mode, posture, status, attempt, max_attempts, head_sha, started_at, finished_at, results[{name, result: passed\|failed\|skipped\|unavailable, blocking, duration_s, exit_code, unavailable_reason}], not_run[], override}` |
+| `review_wave` | `{mode, cycle, cycle_cap, status, budget_usd, spent_usd, lenses[{reviewer, lens, state: pending\|running\|done\|skipped\|error, skip_reason, findings{blocking, advisory}, cost_usd, examined_files}], adherence{state, verdict}, coverage_gaps, claims{verified, refuted, unverified}}` |
+| `decision` | `{id, kind, options[{id, label, consequence, takes_text}], opened_at, resolved_at, resolution}` |
+| `attention` | `[{reason, since}]` |
+| `last_answer` | `{source, session, agent, option, at}` |
+| `criteria_source` | `checklist` or `ledger` (the checklist/ledger seam) |
+
+**`.progress` overlay.** Not stored in job JSON (job files are identical with the indicator on or
+off). `mother list/status --format json` merge `$MOTHER_ROOT/progress/<id>.json` in as `.progress`,
+and the broker overlays the latest `progress_updated` detail as `.progress`:
+`{v, pct, label, stage, signals{stage, checklist, gates, elapsed_active_s, cost}, eta{lo_s, hi_s, label, basis: repo|fleet|none}, paused, moved_back{reason, at}, flags[], updated_at}`.
+
+### Attention reasons
+
+Closed and documented; new reasons are additive. Acknowledgements live in
+`$MOTHER_ROOT/acks/<id>.json`, never in job JSON.
+
+| `reason` | Meaning |
+|---|---|
+| `progress_stalled` | no visible progress movement for too long |
+| `burn_ahead` | spend is running ahead of progress |
+| `gates_incomplete` | gates could not all run (`unavailable`/`not_run`) at presentation |
+| `decision_awaiting` | a decision is open and unanswered |
+
+### Events
+
+Category `activity` unless noted. Every detail value is an id, enum, count, duration or cost.
+On the wire an event is `{v, dir:"event", t:<kind>, id, ts, data}` with `data` = the detail plus
+`job` and `category`.
+
+| Kind | Detail keys |
+|---|---|
+| `gates_started` | `attempt, max_attempts, head_sha, mode, posture, gates[]` |
+| `gate_result` | `attempt, name, result, blocking, duration_s, exit_code` |
+| `gates_completed` | `attempt, status, passed, failed, unavailable, not_run[]` |
+| `gate_fix_started` | `attempt, session_id, red[]` |
+| `gates_exhausted` | `attempts, red[]` |
+| `gates_overridden` | `red[], source` |
+| `pr_marked_draft` | `reason` |
+| `pr_marked_ready` | `reason` |
+| `pr_draft_unverified` | *(none)* |
+| `criterion_checked` | `id, status, has_evidence` |
+| `review_cycle_started` *(existing)* | `cycle, reviewers[]`, plus `pending_reviewers[], wave: true` for a wave (see note) |
+| `lens_skipped` | `reviewer, lens, reason: path_scope\|posture\|budget\|removed_by_plan` |
+| `reviewed` *(existing)* | `reviewer, finding_count, decision` |
+| `claims_verified` | `verified, refuted, unverified` |
+| `review_cycle_completed` *(existing)* | `cycle, decision, findings_count`, plus `coverage_gaps` for a wave |
+| `review_wave_completed` | `cycles, status` |
+| `decision_opened` | `decision_id, kind, options[]` (option ids) |
+| `decision_resolved` | `decision_id, option, source` |
+| `resumed` *(existing)* | gains `option` and `source` |
+| `attention_raised` | `reason` |
+| `attention_cleared` | `reason` |
+| `attention_acked` | `reason, source` |
+| `progress_updated` *(category `progress`)* | the `.progress` object above |
+| `progress_half` *(category `progress`)* | `eta_lo_s, eta_hi_s, elapsed_active_s` |
+
+Notes:
+- `review_cycle_started` currently carries `reviewers` (not `pending_reviewers`), and `findings_routed`
+  is never emitted (`bin/mother-runner`). This table records the real names; `pending_reviewers` is
+  added additively by HC-14.
+- `gate_result.result` is `passed|failed|skipped|unavailable`. `unavailable` is never reported as `passed`.
+- Reviewer names are `archie:adherence` and `perri:<lens>` (`perri:correctness`, `perri:phi-security`,
+  `perri:tests`, `perri:ops-infra`).
+- New `runs.jsonl` run kinds are `gate_fix` and `review_rework`; lens stages are `review-perri:<lens>`.
+- The job key `criteria_source` is `checklist` or `ledger`; `criterion_checked` events come from HC-10.
+
+### Broker additions
+
+Hello capabilities are additive strings.
+
+| Addition | Detail |
+|---|---|
+| category `progress` | carries `progress_updated` and `progress_half`; clients that do not subscribe see nothing new |
+| command `ack {job, reason}` | maps to `mother ack <id> <reason>`; `reason` is an attention reason |
+| `answer` fields `option`, `source` | `answer {job, text?, option?, source?}`; plain text with no option means `resume_with_guidance` |
+| capability `answer.option` | advertised in `hello.capabilities` when the `answer` command accepts `option` and `source` |
+| error `unauthorized` | existing code, now also returned when the peer is a Mother worker (it was reserved for the network-auth path) |
+
+**Decision option ids:** `resume_with_guidance` (`takes_text: true`), `escalate`, `override_open`, `cancel`.
+
+**Answer sources:** `nostromo_app`, `cli`, `broker_client`.

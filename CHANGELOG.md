@@ -4,6 +4,12 @@ All notable changes to Mother are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Headless-crew client contract.** `docs/design.md` gains "Headless crew contract (Phase 1)": the additive-only rules, new `activity` values, job keys, `.progress` overlay, attention reasons, event kinds, `progress` broker category, `ack` command and `answer.option` capability. Provisional NDJSON fixtures live in `plugins/mother/tests/fixtures/contract/` and `plugins/mother/scripts/contract-check.sh` validates broker streams against the contract. Docs, fixtures and checker only; no runtime change.
+
 ## [0.3.8] - 2026-10-16
 
 ### Added
