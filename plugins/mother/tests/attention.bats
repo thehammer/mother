@@ -25,6 +25,8 @@ setup() {
     export HOME="$MOTHER_ROOT/home"
     mkdir -p "$HOME"
     export MOTHER_NOTIFY_TRANSPORT=none
+    # `mother ack` refuses workers; the harness may export a job id.
+    unset MOTHER_JOB_ID
 
     # gh tripwire: any invocation records a marker and fails.
     GH_MARKER="$MOTHER_ROOT/gh-was-called"
@@ -770,6 +772,242 @@ _seg() {
          | .open_pr = {url: \"https://github.com/x/y/pull/1\", created_at: \"$(_iso_ago $(( $(_days 20) )))\", first_seen_open_at: null}"
 
     run mother-runner --attention-tick
+    [ "$status" -eq 0 ]
+    _gh_not_called
+}
+
+# ---------------------------------------------------------------------------
+# Typed attention reasons (job_attention) and `mother ack`
+# ---------------------------------------------------------------------------
+
+T1="2026-10-01T10:00:00Z"
+T2="2026-10-02T11:00:00Z"
+
+# Raise a typed reason on a job. Usage: _raise <id> <reason> <since> [state]
+_raise() {
+    make_job "$1" "${4:-running}" \
+        ".attention = [{reason: \"$2\", since: \"$3\"}]"
+}
+
+_events_of() {
+    [ -f "$EVENTS_DIR/$1.jsonl" ] || return 0
+    jq -c --arg k "$2" 'select(.kind == $k)' "$EVENTS_DIR/$1.jsonl"
+}
+_event_count() { _events_of "$1" "$2" | grep -c . || true; }
+
+_needs() { mother status --format json | jq -c '.needs_attention'; }
+
+# Unacked count as shown by the `mother status` heading.
+_status_count() {
+    mother status | sed -n 's/.*=== needs attention (\([0-9]*\)) ===.*/\1/p'
+}
+
+@test "typed attention: a job's attention[] entry is listed as a job_attention item with detail and hint" {
+    _raise j gates_incomplete "$T1"
+
+    run mother status --format json
+    [ "$status" -eq 0 ]
+    local item
+    item=$(printf '%s' "$output" | jq -c '[.needs_attention[] | select(.kind == "job_attention")] | .[0]')
+    [ "$(echo "$item" | jq -r .job_id)" = "j" ]
+    [ "$(echo "$item" | jq -r .reason)" = "gates_incomplete" ]
+    [ "$(echo "$item" | jq -r .since)" = "$T1" ]
+    [ "$(echo "$item" | jq -c .detail)" = "{\"acked\":false,\"since\":\"$T1\"}" ]
+    [ "$(echo "$item" | jq -r .hint)" = "mother status j" ]
+}
+
+@test "typed attention: list and status <id> JSON expose attention_reasons, [] when none" {
+    _raise j gates_incomplete "$T1"
+    make_job "calm" "running"
+
+    run mother list --format json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -c '.[] | select(.id=="j") | .attention_reasons')" = "[{\"reason\":\"gates_incomplete\",\"since\":\"$T1\",\"acked\":false}]" ]
+    [ "$(echo "$output" | jq -c '.[] | select(.id=="calm") | .attention_reasons')" = "[]" ]
+
+    run mother status j --format json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -c '.job.attention_reasons')" = "[{\"reason\":\"gates_incomplete\",\"since\":\"$T1\",\"acked\":false}]" ]
+
+    run mother status calm --format json
+    [ "$(echo "$output" | jq -c '.job.attention_reasons')" = "[]" ]
+}
+
+@test "typed attention: progress file flags are unioned with the job's own attention" {
+    _raise j gates_incomplete "$T1"
+    mkdir -p "$MOTHER_ROOT/progress"
+    echo "{\"flags\":[{\"reason\":\"burn_ahead\",\"since\":\"$T2\"}]}" > "$MOTHER_ROOT/progress/j.json"
+
+    run mother status j --format json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -c '[.job.attention_reasons[].reason] | sort')" = '["burn_ahead","gates_incomplete"]' ]
+    [ "$(_items | jq '[.[] | select(.kind=="job_attention")] | length')" = "2" ]
+}
+
+@test "typed attention: a missing progress file is fine and a progress-only flag still counts" {
+    make_job "j" "running"
+    run mother status j --format json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -c '.job.attention_reasons')" = "[]" ]
+
+    mkdir -p "$MOTHER_ROOT/progress"
+    echo "{\"flags\":[{\"reason\":\"progress_stalled\",\"since\":\"$T1\"}]}" > "$MOTHER_ROOT/progress/j.json"
+    [ "$(_kind_count job_attention j)" = "1" ]
+}
+
+@test "typed attention: reasons outside the closed list are ignored" {
+    make_job "j" "running" ".attention = [{reason: \"made_up\", since: \"$T1\"}]"
+    mkdir -p "$MOTHER_ROOT/progress"
+    echo "{\"flags\":[{\"reason\":\"also_made_up\",\"since\":\"$T1\"}]}" > "$MOTHER_ROOT/progress/j.json"
+
+    [ "$(_kind_count job_attention)" = "0" ]
+    run mother status j --format json
+    [ "$(echo "$output" | jq -c '.job.attention_reasons')" = "[]" ]
+}
+
+@test "typed attention: each of the four closed reasons is accepted" {
+    local r n=0
+    for r in progress_stalled burn_ahead gates_incomplete decision_awaiting; do
+        n=$((n + 1))
+        _raise "j$n" "$r" "$T1"
+    done
+    [ "$(_kind_count job_attention)" = "4" ]
+}
+
+@test "ack: acknowledges a raised reason and records the ack outside the job JSON" {
+    _raise j gates_incomplete "$T1"
+    local before; before=$(cat "$JOBS_DIR/j.json")
+
+    run mother ack j gates_incomplete
+    [ "$status" -eq 0 ]
+
+    [ "$(jq -c '.gates_incomplete | {since, src: .source, hasat: (.at | type)}' "$MOTHER_ROOT/acks/j.json")" = "{\"since\":\"$T1\",\"src\":\"cli\",\"hasat\":\"string\"}" ]
+    [ "$(cat "$JOBS_DIR/j.json")" = "$before" ]
+    [ "$(_items | jq -r '.[] | select(.kind=="job_attention") | .detail.acked')" = "true" ]
+    run mother status j --format json
+    [ "$(echo "$output" | jq -r '.job.attention_reasons[0].acked')" = "true" ]
+}
+
+@test "ack: emits an attention_acked event with the reason and source" {
+    _raise j gates_incomplete "$T1"
+    run mother ack j gates_incomplete
+    [ "$status" -eq 0 ]
+    [ "$(_event_count j attention_acked)" -eq 1 ]
+    [ "$(_events_of j attention_acked | jq -c '.detail | {reason, source}')" = '{"reason":"gates_incomplete","source":"cli"}' ]
+}
+
+@test "ack: --source is recorded in the acks file and event" {
+    _raise j burn_ahead "$T1"
+    run mother ack j burn_ahead --source nostromo_app
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.burn_ahead.source' "$MOTHER_ROOT/acks/j.json")" = "nostromo_app" ]
+    [ "$(_events_of j attention_acked | jq -r '.detail.source')" = "nostromo_app" ]
+}
+
+@test "ack: an unknown --source is refused" {
+    _raise j burn_ahead "$T1"
+    run mother ack j burn_ahead --source carrier_pigeon
+    [ "$status" -ne 0 ]
+    [ ! -e "$MOTHER_ROOT/acks/j.json" ]
+}
+
+@test "ack: acking one reason leaves other reasons on the job unacked and keeps earlier acks" {
+    make_job "j" "running" ".attention = [{reason:\"gates_incomplete\",since:\"$T1\"},{reason:\"burn_ahead\",since:\"$T1\"}]"
+    run mother ack j gates_incomplete
+    [ "$status" -eq 0 ]
+    run mother ack j burn_ahead
+    [ "$status" -eq 0 ]
+    [ "$(jq -c 'keys' "$MOTHER_ROOT/acks/j.json")" = '["burn_ahead","gates_incomplete"]' ]
+}
+
+@test "ack: lowers the unacked count in status, list footer and statusline, and renders (acked)" {
+    SL_CACHE="$MOTHER_ROOT/sl-cache"
+    _raise j gates_incomplete "$T1"
+    _raise k burn_ahead "$T1"
+    mother status >/dev/null     # refreshes attention.json
+    [ "$(_status_count)" = "2" ]
+
+    run mother ack j gates_incomplete
+    [ "$status" -eq 0 ]
+
+    [ "$(_status_count)" = "1" ]
+    run mother status
+    [[ "$output" == *"(acked)"* ]]
+    local section; section=$(_section "=== needs attention")
+    [ "$(echo "$section" | grep -c '(acked)')" = "1" ]
+    [[ "$(echo "$section" | grep '(acked)')" == *"j"* ]]
+
+    run mother list
+    [[ "$output" == *"⚑ 1 item(s) need attention"* ]]
+
+    _seg "mother_statusline_refresh '$SL_CACHE'"
+    [ "$(tr -d '\n' < "$SL_CACHE" | awk -F: '{print $6}')" = "1" ]
+}
+
+@test "ack: acknowledging every item removes the footer and the nothing-to-see count reads 0" {
+    _raise j gates_incomplete "$T1"
+    mother status >/dev/null
+    run mother ack j gates_incomplete
+    [ "$status" -eq 0 ]
+    [ "$(_status_count)" = "0" ]
+    run mother list
+    [[ "$output" != *"need attention"* ]]
+}
+
+@test "ack lapses when the condition returns with a new since" {
+    _raise j gates_incomplete "$T1"
+    run mother ack j gates_incomplete
+    [ "$status" -eq 0 ]
+    [ "$(_items | jq -r '.[] | select(.kind=="job_attention") | .detail.acked')" = "true" ]
+
+    _edit_attention() { jq ".attention[0].since = \"$T2\"" "$JOBS_DIR/j.json" > "$JOBS_DIR/j.json.e" && mv "$JOBS_DIR/j.json.e" "$JOBS_DIR/j.json"; }
+    _edit_attention
+
+    [ "$(_items | jq -r '.[] | select(.kind=="job_attention") | .detail.acked')" = "false" ]
+    run mother status j --format json
+    [ "$(echo "$output" | jq -c '.job.attention_reasons')" = "[{\"reason\":\"gates_incomplete\",\"since\":\"$T2\",\"acked\":false}]" ]
+}
+
+@test "ack: refuses a reason that is not currently raised, naming the job state, and writes nothing" {
+    make_job "j" "running"
+    run mother ack j gates_incomplete
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"is in state"* ]]
+    [ ! -e "$MOTHER_ROOT/acks/j.json" ]
+}
+
+@test "ack: a not-raised reason leaves an existing acks file untouched" {
+    _raise j gates_incomplete "$T1"
+    run mother ack j gates_incomplete
+    local before; before=$(cat "$MOTHER_ROOT/acks/j.json")
+    run mother ack j burn_ahead
+    [ "$status" -eq 1 ]
+    [ "$(cat "$MOTHER_ROOT/acks/j.json")" = "$before" ]
+}
+
+@test "ack: an unknown reason is refused" {
+    _raise j gates_incomplete "$T1"
+    run mother ack j not_a_reason
+    [ "$status" -eq 1 ]
+    [ ! -e "$MOTHER_ROOT/acks/j.json" ]
+}
+
+@test "ack: an unknown job is refused" {
+    run mother ack nope gates_incomplete
+    [ "$status" -ne 0 ]
+}
+
+@test "ack: a worker (MOTHER_JOB_ID set) may not acknowledge" {
+    _raise j gates_incomplete "$T1"
+    MOTHER_JOB_ID=x run mother ack j gates_incomplete
+    [ "$status" -ne 0 ]
+    [ ! -e "$MOTHER_ROOT/acks/j.json" ]
+    [ "$(_event_count j attention_acked)" -eq 0 ]
+}
+
+@test "ack: never calls gh" {
+    _raise j gates_incomplete "$T1"
+    run mother ack j gates_incomplete
     [ "$status" -eq 0 ]
     _gh_not_called
 }

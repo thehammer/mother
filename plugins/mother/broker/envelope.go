@@ -54,6 +54,7 @@ const (
 	CmdCancel      = "cancel"
 	CmdRetry       = "retry"
 	CmdForceStart  = "force-start"
+	CmdAck         = "ack" // acknowledge a raised attention reason (HC-03)
 )
 
 // Output event sub-types (data.subtype on TypeOutput events). These mirror
@@ -94,7 +95,7 @@ var liveCategories = w1Categories
 // w1Commands is the set of commands this W1 broker accepts.
 var w1Commands = []string{
 	CmdSubscribe, CmdUnsubscribe, CmdQueryList, CmdQueryGet,
-	CmdAnswer, CmdCancel, CmdRetry, CmdForceStart,
+	CmdAnswer, CmdCancel, CmdRetry, CmdForceStart, CmdAck,
 }
 
 // Message is the single envelope used in both directions.
