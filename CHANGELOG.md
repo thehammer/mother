@@ -9,6 +9,26 @@ All notable changes to Mother are documented here. Format based on
 ### Added
 
 - **Quality gates: `.mother/crew.yml` and `mother gates run`.** A repo declares shell checks (name, `run`, path scope or always, blocking/advisory, `where: any|sandbox`, `timeout_s`, optional `hint`) in `.mother/crew.yml`, read from the job's base ref (`git show <base_ref>:.mother/crew.yml`), never the worktree. `lib/crew_config.py` validates and resolves it; `lib/gates.sh` (`mother_gates_run`) runs the checks and prints one JSON object (status `passed|failed|incomplete`, per-gate results, `not_run`) with no output text, writing full logs and ≤ 4 KB excerpts to side files. Built-in `clean_tree` and `pushed` pre-checks; sandbox gates run `rwx sandbox reset` → `exec -- bash -c` → `stop` and report `unavailable` (never `passed`) when rwx is missing, disabled, errors, times out or HEAD isn't pushed. New: `mother gates run [--job] [--repo] [--base] [--format text|json]`, `mother gates check [--repo] [--ref]`, and a real `mother doctor` subcommand (runs `scripts/doctor.sh`, then a `crew config:` section). `mother add` rejects an invalid `crew.yml` and snapshots a valid one into the job's `.crew` (plan `gates: {max_attempts: N}` overrides); nothing reads `.crew` yet (HC-06 wires it in). Kill switch `MOTHER_GATES_ENABLED=0`; `MOTHER_PHI_REPOS` forces `phi_sensitive`. `mother_watchdog_run` in `lib/proc.sh` is now the single watchdog shared by `mother_rwx_sandbox` and the gate runner; `_rwx_run_action` gains `exec`. Workers are told to run `mother gates run` before claiming done.
+
+- **State safety: three layers so no single mistake destroys the live tree (`~/.mother`).**
+  - **Live marker + delete guard.** The runner and every `mother` command ensure `$MOTHER_ROOT/.mother-live`
+    exists (never in tests: `MOTHER_TEST_ROOT=1`). New `lib/safe-rm.sh` `safe_rm_tree <path>` refuses `""`, `/`,
+    `$HOME` (and its ancestors) and any directory that is or contains a marker. All recursive deletes in
+    `bin/` and `lib/` (gc, teardown residue and job-tmp removal, the runner's stale-lock cleanup) and
+    `teardown_mother_env` go through it.
+  - **Workers no longer carry the real path as `MOTHER_ROOT`.** The worker wrapper exports `MOTHER_LIVE_ROOT`
+    instead; every entry point (CLI, runner, run-job, broker, hooks, statusline, libs) resolves
+    `${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}`, so in-worker `mother await` still finds the tree.
+    `setup_mother_env` unsets `MOTHER_LIVE_ROOT`, so test code can never resolve the live tree.
+  - **Rotating backups + restore.** The runner takes a `mother-state-<UTC>.tar.gz` at most every
+    `MOTHER_BACKUP_INTERVAL` (900s) into `MOTHER_BACKUP_DIR` (outside the tree), atomically and under a
+    watchdog. Contents: `jobs events archive drafts cursors metrics attention.json rate-limits.json config.env`
+    (`logs/` only with `MOTHER_BACKUP_LOGS=1`). Retention: everything from the last 24h, then one per UTC day for
+    30 days. New `mother backup now|list|restore <file> [--yes]`; restore refuses while the runner is running and
+    moves the current state to `$MOTHER_ROOT/.pre-restore-<ts>/` instead of deleting it.
+  - Docs: `docs/design.md` "State safety"; worker preamble and `CLAUDE.md` now forbid `pkill`/`killall` by
+    pattern and tests that touch the real `~/.mother`.
+
 - **Headless-crew client contract.** `docs/design.md` gains "Headless crew contract (Phase 1)": the additive-only rules, new `activity` values, job keys, `.progress` overlay, attention reasons, event kinds, `progress` broker category, `ack` command and `answer.option` capability. Provisional NDJSON fixtures live in `plugins/mother/tests/fixtures/contract/` and `plugins/mother/scripts/contract-check.sh` validates broker streams against the contract. Docs, fixtures and checker only; no runtime change.
 - **Structured operator decisions (HC-02).** A held job can carry a `decision` (`{id, kind, options[{id,label,consequence,takes_text}], opened_at, resolved_at, resolution}`; helpers in `lib/decision.sh`). `mother resume <id> --option <id>` and broker `answer {job, option, source}` answer by option id; plain text still means `resume_with_guidance`, so old clients keep working. New flags `--option`, `--source`, `--session`, `--agent`; every answer records `last_answer` and `decision.resolution`, emits `decision_resolved`, and `resumed` gains `option`/`source`. An unoffered option, a resolved decision, or `--option` on a decision-less job fails with `invalid_state` and changes nothing. `escalate`/`override_open` are refused (`not supported for this hold`) until a hold kind registers a handler. Mother never picks an option itself. Broker `hello` advertises `answer.option`.
 - **Workers cannot answer holds.** `mother resume` refuses (exit 1, `refused`) when `MOTHER_JOB_ID` is set, and broker `answer` returns `unauthorized` when the peer process (darwin `LOCAL_PEERPID`) has a `mother-run-job` ancestor; unreadable peer = fail-open, since the CLI guard still applies. Interactive agent sessions (Claudia, terminal agents, Nostromo) are unaffected. `cancel`, `retry` and `force-start` are not guarded.

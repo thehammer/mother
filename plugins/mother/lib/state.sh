@@ -9,7 +9,7 @@
 
 # ---------- state paths ----------
 
-: "${MOTHER_ROOT:=${MOTHER_ROOT:-$HOME/.mother}}"
+: "${MOTHER_ROOT:=${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
 : "${JOBS_DIR:=$MOTHER_ROOT/jobs}"
 : "${EVENTS_DIR:=$MOTHER_ROOT/events}"
 : "${LOGS_DIR:=$MOTHER_ROOT/logs}"
@@ -21,6 +21,14 @@
 : "${RESIDUE_DIR:=$MOTHER_ROOT/teardown-residue}"   # unremovable worktree leftovers (see lib/teardown.sh)
 
 mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" "$CURSORS_DIR" "$RUNNER_DIR" "$ARCHIVE_DIR" "$TEARDOWN_DIR"
+
+# Live-tree marker + the guard in front of every recursive delete (lib/safe-rm.sh).
+# Sourcing state.sh is how every `mother` command and the runner resolve the tree,
+# so this is where the marker is ensured.
+# shellcheck source=/dev/null
+[ -r "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/safe-rm.sh" ] \
+    && source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/safe-rm.sh"
+type mother_ensure_live_marker >/dev/null 2>&1 && mother_ensure_live_marker
 
 # ---------- primitives ----------
 

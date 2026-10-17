@@ -45,7 +45,7 @@ _preview_cfg() {
     printf '%s' "${val:-$default}"
 }
 
-_preview_root()       { printf '%s' "${MOTHER_ROOT:-$HOME/.mother}"; }
+_preview_root()       { printf '%s' "${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}"; }
 _preview_jobs_dir()   { printf '%s' "${JOBS_DIR:-$(_preview_root)/jobs}"; }
 _preview_events_dir() { printf '%s' "${EVENTS_DIR:-$(_preview_root)/events}"; }
 _preview_runner_dir() { printf '%s' "${RUNNER_DIR:-$(_preview_root)/runner}"; }

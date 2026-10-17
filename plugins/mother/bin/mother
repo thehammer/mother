@@ -35,7 +35,7 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 #   mother run [--once]
 #   mother help
 #
-# State lives under ${MOTHER_ROOT:-$HOME/.mother}/ (plain JSON files, gitignored).
+# State lives under ${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/ (plain JSON files, gitignored).
 # See docs/design.md for the design.
 
 set -u
@@ -71,6 +71,7 @@ source "$MOTHER_LIB_DIR/state.sh"
 source "$MOTHER_LIB_DIR/config.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/gates.sh" ]         && source "$MOTHER_LIB_DIR/gates.sh"
+[ -r "$MOTHER_LIB_DIR/backup.sh" ]        && source "$MOTHER_LIB_DIR/backup.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/preview.sh" ]       && source "$MOTHER_LIB_DIR/preview.sh"
 type mother_preview_main >/dev/null 2>&1 || mother_preview_main() { echo "mother preview: lib/preview.sh is missing" >&2; return 1; }
@@ -3678,6 +3679,20 @@ cmd_prune_temps() {
     _prune_orphan_temps "$dry_run"
 }
 
+# `mother backup now|list|restore <file> [--yes]` — rotating backups of the state
+# tree and restore (lib/backup.sh). The daemon runs `backup now` on a timer.
+cmd_backup() {
+    type mother_backup_now >/dev/null 2>&1 || _die "lib/backup.sh is missing"
+    local sub="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        now)     mother_backup_now "$@" || exit 1 ;;
+        list)    mother_backup_list "$@" ;;
+        restore) mother_backup_restore "$@" || exit $? ;;
+        *)       _die "usage: mother backup now | list | restore <file> [--yes]" ;;
+    esac
+}
+
 # `mother gc [--dry-run]` — the disk hygiene sweep (lib/gc.sh): orphaned Xcode
 # DerivedData, an oversized Go build cache, job-scoped temp dirs of archived
 # jobs, and the target/ of Cargo job worktrees no live job uses (the cache that
@@ -4088,7 +4103,7 @@ _gates_run_with_config() {
         return 0
     fi
 
-    local out_dir="${MOTHER_ROOT:-$HOME/.mother}/gates/$out_name"
+    local out_dir="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/gates/$out_name"
     mkdir -p "$out_dir" && rm -f "${out_dir:?}"/*.log "${out_dir:?}"/*.excerpt
     type mother_gates_run >/dev/null 2>&1 || _die "gates run: lib/gates.sh is missing"
 
@@ -4204,6 +4219,11 @@ Usage:
                                               including jobs enqueued by other sessions; DAYS must
                                               be an integer)
   mother prune-temps [--dry-run]              (remove orphaned *.tmp.*/*.bak.* state files)
+  mother backup now                           (back up the state tree now, to MOTHER_BACKUP_DIR, then prune)
+  mother backup list                          (backups, newest first, with size and job count)
+  mother backup restore <file> [--yes]        (restore a backup; refuses while the runner is running;
+                                              the current state is moved to $MOTHER_ROOT/.pre-restore-<ts>/,
+                                              never deleted)
   mother gc [--dry-run]                       (disk hygiene: orphaned Xcode DerivedData, oversized Go
                                               build cache, archived jobs' temp dirs, idle job-worktree Rust target/ dirs;
                                               reports big main-checkout Cargo targets)
@@ -4291,6 +4311,14 @@ Daemon env vars:
   MOTHER_GOCACHE_MAX_GB        (default: 10)   `mother gc` runs `go clean -cache` when the Go
                                                  build cache is larger and no job is running
   MOTHER_GC_ENABLED            (default: 1)    run `mother gc` in the hourly sweep (0 to disable)
+  MOTHER_BACKUP_ENABLED        (default: 1)    runner backs up the state tree on a timer (0 to disable)
+  MOTHER_BACKUP_INTERVAL       (default: 900)  seconds between backups
+  MOTHER_BACKUP_DIR            (default: ~/Library/Application Support/Mother/backups on macOS,
+                                                 ${XDG_STATE_HOME:-~/.local/state}/mother/backups elsewhere;
+                                                 must be outside MOTHER_ROOT)
+  MOTHER_BACKUP_KEEP_HOURS     (default: 24)   keep every backup newer than this
+  MOTHER_BACKUP_KEEP_DAYS      (default: 30)   then keep one backup per UTC day for this many days
+  MOTHER_BACKUP_LOGS           (default: 0)    1 = include logs/ in backups
   MOTHER_CARGO_TARGET_PURGE    (default: 1)    `mother gc` deletes the target/ of a Cargo job worktree once no
                                                  job uses it (0/false/no/off: report only;
                                                  an unrecognised value also disables it)
@@ -4489,6 +4517,7 @@ main() {
         archive)           cmd_archive "$@" ;;
         prune-temps)       cmd_prune_temps "$@" ;;
         gc)                cmd_gc "$@" ;;
+        backup)            cmd_backup "$@" ;;
         teardowns)         cmd_teardowns "$@" ;;
         retro)             cmd_retro "$@" ;;
         run)               cmd_run "$@" ;;

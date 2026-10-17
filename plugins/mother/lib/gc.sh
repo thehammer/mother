@@ -30,6 +30,11 @@
 #   MOTHER_CARGO_TARGET_IDLE_MINUTES  default 10; a target/ touched more recently is kept
 #   MOTHER_CARGO_TARGET_PURGE_EXCLUDE job `repo` names (space/comma separated) never purged
 
+# Every recursive delete here goes through safe_rm_tree (lib/safe-rm.sh), which
+# refuses a directory that is or contains the live-tree marker.
+# shellcheck source=/dev/null
+type safe_rm_tree >/dev/null 2>&1 || source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/safe-rm.sh"
+
 # _gc_dir_kb <dir> — size in KB (0 when it can't be measured).
 _gc_dir_kb() {
     local kb
@@ -88,7 +93,7 @@ _gc_derived_data() {
         kb=$(_gc_dir_kb "$dir")
         if [ "$dry_run" -eq 1 ]; then
             echo "[dry-run] would remove DerivedData/$name ($(_gc_human_kb "$kb")) — workspace gone: $ws"
-        elif rm -rf "$dir" 2>/dev/null; then
+        elif safe_rm_tree "$dir"; then
             echo "removed DerivedData/$name ($(_gc_human_kb "$kb")) — workspace gone: $ws"
         else
             echo "DerivedData/$name: could not remove (left in place)"
@@ -476,7 +481,7 @@ _gc_cargo_job_targets() {
         elif [ "$dry_run" -eq 1 ]; then
             echo "[dry-run] would remove $repo worktree target $t ($(_gc_human_kb "$kb"))"
             would=$((would + 1))
-        elif rm -rf -- "$t" 2>/dev/null && [ ! -e "$t" ]; then
+        elif safe_rm_tree "$t" && [ ! -e "$t" ]; then
             echo "removed $repo worktree target $t ($(_gc_human_kb "$kb")) — job(s) $ids finished"
             reclaimed=$((reclaimed + 1)); reclaimed_kb=$((reclaimed_kb + kb))
             continue
@@ -557,7 +562,7 @@ _gc_job_tmp() {
         kb=$(_gc_dir_kb "$d")
         if [ "$dry_run" -eq 1 ]; then
             echo "[dry-run] would remove job temp dir tmp/$id ($(_gc_human_kb "$kb"))"
-        elif rm -rf "$d" 2>/dev/null; then
+        elif safe_rm_tree "$d"; then
             echo "removed job temp dir tmp/$id ($(_gc_human_kb "$kb"))"
         else
             echo "tmp/$id: could not remove (left in place)"

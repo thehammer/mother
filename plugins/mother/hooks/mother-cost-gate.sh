@@ -30,7 +30,7 @@ payload=$(cat 2>/dev/null) || _fail_open
 job_id="${MOTHER_JOB_ID:-}"
 [ -n "$job_id" ] || _fail_open
 
-mother_root="${MOTHER_ROOT:-$HOME/.mother}"
+mother_root="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
 flag_file="$mother_root/runner/$job_id.cost-cap"
 
 [ -f "$flag_file" ] || _fail_open

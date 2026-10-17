@@ -33,7 +33,7 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 
 set -u
 
-MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_ROOT:-$HOME/.mother}}"
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
 JOBS_DIR="$MOTHER_ROOT/jobs"
 EVENTS_DIR="$MOTHER_ROOT/events"
 LOGS_DIR="$MOTHER_ROOT/logs"
@@ -1413,7 +1413,15 @@ exec > >(tee -a "$log_path") 2>&1
 # "..."\` without bookkeeping. Without this, the agent has no clean way to
 # discover which job it belongs to.
 export MOTHER_JOB_ID="$id"
-export MOTHER_ROOT="$MOTHER_ROOT"
+# Workers get the live state path as MOTHER_LIVE_ROOT, never MOTHER_ROOT: a test
+# or script run by the worker that inherited MOTHER_ROOT would treat the real
+# tree as its own scratch space (2026-10-17: a killed bats run deleted it).
+# Every Mother entry point falls back to MOTHER_LIVE_ROOT when MOTHER_ROOT is
+# unset, so in-worker mother await / mother status still find the real tree.
+# (This is an unquoted heredoc: no backticks or dollar signs in comments.)
+export MOTHER_LIVE_ROOT="$MOTHER_ROOT"
+# Drop any MOTHER_ROOT inherited from the daemon environment, too.
+unset MOTHER_ROOT
 # Docker Compose reads COMPOSE_PROJECT_NAME automatically, so any
 # `docker compose up` the worker runs lands in a job-scoped project with
 # zero convention-following required by the plan or the agent. Mother tears

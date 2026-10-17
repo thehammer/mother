@@ -71,7 +71,7 @@ mother_rwx_sandbox() {
             ;;
     esac
 
-    local dir="${MOTHER_ROOT:-$HOME/.mother}/runner" tmp
+    local dir="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/runner" tmp
     mkdir -p "$dir" 2>/dev/null
     tmp=$(mktemp "$dir/rwx-out.tmp.XXXXXX" 2>/dev/null) || tmp="/tmp/rwx-out.tmp.$$"
 

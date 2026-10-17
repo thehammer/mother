@@ -95,6 +95,17 @@ pause that preserves your worktree and resumes you with the operator's
 answer in your next prompt. Yielding without finishing is an accidental
 "I'm done" signal that has no resume mechanism.
 
+## Processes and state you must never touch
+
+- **Never `pkill`, `killall` or `kill` by pattern** (`pkill -f bats`, `killall node`, ...). Other Mother
+  workers run the same tools on this machine at the same moment; a pattern match kills their work and
+  can interrupt a test mid-teardown. Kill only a process **you** started, by its exact pid or the
+  background task id you were given.
+- **Tests must never use the real `~/.mother`.** Mother's live state tree is exported to you as
+  `MOTHER_LIVE_ROOT` (never `MOTHER_ROOT`), and it carries a `.mother-live` marker that its delete
+  guard refuses to remove. Tests must build their own temp tree (`mktemp -d`, bats `setup_mother_env`)
+  and delete only that. Never `rm -rf` a path derived from `MOTHER_LIVE_ROOT` or `$HOME/.mother`.
+
 ## Containers and test infrastructure
 
 `COMPOSE_PROJECT_NAME` is already exported into your environment, scoped to

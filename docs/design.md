@@ -391,6 +391,57 @@ auto-stops `job` stacks after an hour asleep, a backstop behind Mother's own lay
 
 ---
 
+## State safety
+
+On 2026-10-17 the whole state tree (`~/.mother`: ~1,500 job records, events, archive) was deleted when a
+test run killed mid-flight executed `rm -rf "$MOTHER_ROOT"` with the real path inherited from its worker.
+No backup existed. Three independent layers now make a single mistake survivable.
+
+### 1. Live marker and the delete guard
+
+- `$MOTHER_ROOT/.mother-live` (explanation + creation time) is ensured by `lib/state.sh` whenever it is sourced
+  (every `mother` command and the runner) and again at runner startup. Test setup exports `MOTHER_TEST_ROOT=1`,
+  which suppresses it, so temp trees never carry one.
+- `lib/safe-rm.sh` `safe_rm_tree <path>` is the only way `bin/` and `lib/` delete a directory tree. It returns
+  non-zero with a `safe_rm_tree: refusing ...` message (deleting nothing) for: an empty path, `/`, `$HOME` or any
+  ancestor of it, and any directory that is or contains (within 4 levels, or as an ancestor of
+  `$MOTHER_ROOT` / `$MOTHER_LIVE_ROOT` / `~/.mother`) a `.mother-live` marker. Call sites: `lib/gc.sh`,
+  `lib/teardown.sh` (residue and job tmp), `bin/mother-runner` (stale lockdirs), `lib/backup.sh` (restore rollback)
+  and `teardown_mother_env`. `git worktree remove` is not a state-tree delete and is left alone; file-level
+  `rm -f` is out of scope.
+
+### 2. `MOTHER_LIVE_ROOT`
+
+The worker wrapper exports the live root as `MOTHER_LIVE_ROOT`, never `MOTHER_ROOT`. Every entry point resolves
+`${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}`, so in-worker `mother await` / `mother status` still reach
+the real tree, an explicit `MOTHER_ROOT` (tests) wins, and anything a worker spawns that "cleans up
+`$MOTHER_ROOT`" sees nothing. `setup_mother_env` unsets both variables, so test code cannot resolve the live tree.
+
+### 3. Backups and restore
+
+- The runner calls `mother backup now` at most every `MOTHER_BACKUP_INTERVAL` seconds (default 900), gated by
+  `$RUNNER_DIR/last-backup.ts` (written before the run, like `_maybe_archive`) and bounded by a
+  `MOTHER_BACKUP_TIMEOUT` watchdog (default 300s) so a slow `tar` cannot block dispatch.
+- Location: `MOTHER_BACKUP_DIR`, default `~/Library/Application Support/Mother/backups` (macOS) or
+  `${XDG_STATE_HOME:-~/.local/state}/mother/backups`. A dir inside `$MOTHER_ROOT` is refused.
+- Contents: `jobs events archive drafts cursors metrics attention.json rate-limits.json config.env`; `logs/` only
+  with `MOTHER_BACKUP_LOGS=1`. (`metrics/runs.jsonl` is the retro / ETA-calibration history and `config.env`
+  the durable operator settings; both are small and unrecoverable, so they ride along.)
+- Format: `mother-state-<YYYYmmddTHHMMSSZ>.tar.gz`, written to a hidden temp name and `mv`'d into place, so a
+  crash never leaves a half-written file that looks valid.
+- Retention (after each successful backup): keep everything newer than `MOTHER_BACKUP_KEEP_HOURS` (24); of the
+  older ones keep the newest per UTC day for `MOTHER_BACKUP_KEEP_DAYS` (30); prune the rest. Age comes from the
+  timestamp in the file name, never mtime; files that don't match the name pattern are never touched.
+  `MOTHER_BACKUP_ENABLED=0` disables the timer.
+- CLI: `mother backup now`, `mother backup list` (newest first, size, `jobs=N`), and
+  `mother backup restore <file> [--yes]`. Restore refuses while `$RUNNER_DIR/runner.pid` names a live process
+  (`mother daemon stop` first), validates the archive (relative paths, known top-level entries only) before
+  touching anything, moves the current restorable entries to `$MOTHER_ROOT/.pre-restore-<ts>/` (never deleted),
+  extracts, and prints what it restored. Without `--yes` it asks on a tty and refuses otherwise.
+
+**Recovering from a lost tree:** `mother daemon stop`; `mother backup list`; `mother backup restore <newest> --yes`;
+`mother daemon start`. Jobs that were `running` are picked up by the runner's orphan recovery.
+
 ## Broker / IPC protocol (W1 + W2)
 
 The **broker** is a long-lived Go sidecar that gives clients a single bidirectional

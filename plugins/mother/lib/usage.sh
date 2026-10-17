@@ -75,7 +75,7 @@ _usage_append_line() { printf '%s\n' "$2" >> "$1"; }
 _usage_append_event() {
     local job_id="$1" kind="$2" detail="${3:-}"
     [ -z "$detail" ] && detail='{}'
-    local events_dir="${MOTHER_ROOT:-$HOME/.mother}/events"
+    local events_dir="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/events"
     mkdir -p "$events_dir" 2>/dev/null
     local events_file="$events_dir/${job_id}.jsonl"
     local ev
@@ -133,10 +133,10 @@ mother_claude_extra_args() {
 # isn't fully parsed on every call.
 mother_recompute_job_cost() {
     local job_id="$1"
-    local job_file="${JOBS_DIR:-${MOTHER_ROOT:-$HOME/.mother}/jobs}/${job_id}.json"
+    local job_file="${JOBS_DIR:-${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/jobs}/${job_id}.json"
     [ -f "$job_file" ] || return 0
 
-    local metrics_file="${MOTHER_ROOT:-$HOME/.mother}/metrics/runs.jsonl"
+    local metrics_file="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/metrics/runs.jsonl"
     local cost="0" tokens="0" complete="true"
     if [ -f "$metrics_file" ]; then
         local agg
@@ -183,7 +183,7 @@ _usage_job_update_argjson() {
 # actual_tokens crosses MOTHER_TOKEN_ALERT_THRESHOLD (default 100,000,000).
 mother_maybe_token_alert() {
     local job_id="$1"
-    local job_file="${JOBS_DIR:-${MOTHER_ROOT:-$HOME/.mother}/jobs}/${job_id}.json"
+    local job_file="${JOBS_DIR:-${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/jobs}/${job_id}.json"
     [ -f "$job_file" ] || return 0
 
     local already; already=$(jq -r '.token_alert_at // empty' "$job_file" 2>/dev/null)
@@ -217,7 +217,7 @@ mother_record_run_usage() {
           stage="$6" actor_main="${7:-cody-main}" run_kind="${8:-worker}" extra_json="${9:-}"
     [ -z "$extra_json" ] && extra_json='{}'
 
-    local metrics_dir="${MOTHER_ROOT:-$HOME/.mother}/metrics"
+    local metrics_dir="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/metrics"
     mkdir -p "$metrics_dir" 2>/dev/null
     local metrics_file="$metrics_dir/runs.jsonl"
 

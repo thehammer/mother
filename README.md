@@ -386,7 +386,12 @@ Defaults preserve current behavior — every variable is optional.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MOTHER_ROOT` | `$HOME/.mother` | State dir (jobs, events, logs, locks) |
+| `MOTHER_ROOT` | `$MOTHER_LIVE_ROOT`, else `$HOME/.mother` | State dir (jobs, events, logs, locks). Workers are given the live path as `MOTHER_LIVE_ROOT`, not `MOTHER_ROOT` (see [State safety](#state-safety-and-backups)) |
+| `MOTHER_BACKUP_ENABLED` | `1` | Runner backs up the state tree on a timer (`0` to disable) |
+| `MOTHER_BACKUP_INTERVAL` | `900` | Seconds between backups |
+| `MOTHER_BACKUP_DIR` | macOS: `~/Library/Application Support/Mother/backups`; else `${XDG_STATE_HOME:-~/.local/state}/mother/backups` | Where backups go. Must be outside `$MOTHER_ROOT` |
+| `MOTHER_BACKUP_KEEP_HOURS` / `MOTHER_BACKUP_KEEP_DAYS` | `24` / `30` | Keep every backup from the last N hours, then one per UTC day for N days |
+| `MOTHER_BACKUP_LOGS` | `0` | `1` includes `logs/` in backups (large) |
 | `MOTHER_WORKER_AGENT` | (auto) | Force a specific worker agent name |
 | `MOTHER_PREAMBLE_PATH` | `<plugin>/templates/preamble.md` | Capabilities preamble prepended to every worker's prompt; point at `/dev/null` to disable |
 | `MOTHER_CONCURRENCY` | `2` | Max parallel jobs. Any `MOTHER_*` variable can also be set in `$MOTHER_ROOT/config.env` (`KEY=VALUE` lines; the environment wins) — unlike a hand-edited launchd plist, that survives `mother daemon install`. `mother status` shows the effective value and its source |
@@ -411,6 +416,25 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_RATE_LIMIT_CACHE` | `$MOTHER_ROOT/rate-limits.json` | Where the statusline writes 5h/7d quota state |
 | `MOTHER_QUOTA_CAP_5H_PCT` | `90` | Refuse new dispatches when the 5h window is at or over this percentage |
 | `MOTHER_QUOTA_CAP_7D_PCT` | `90` | Same for the 7d window |
+
+### State safety and backups
+
+Mother's state tree is plain files and irreplaceable, so three independent layers protect it:
+
+1. **Live marker + delete guard.** `$MOTHER_ROOT/.mother-live` marks the real tree. Every recursive delete in
+   Mother goes through `safe_rm_tree`, which refuses `/`, `$HOME` and any directory that is or contains the marker.
+2. **Workers never get the real path as `MOTHER_ROOT`.** They get `MOTHER_LIVE_ROOT`; Mother's own commands
+   resolve `${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}`, tests set a temp `MOTHER_ROOT`.
+3. **Rotating backups outside the tree**, taken by the runner every 15 minutes:
+
+```
+mother backup now                    # take a backup immediately, then prune
+mother backup list                   # newest first, with size and job count
+mother backup restore <file> [--yes] # refuses while the runner is running (mother daemon stop first)
+```
+
+Restore moves the current `jobs/ events/ archive/ ...` to `$MOTHER_ROOT/.pre-restore-<ts>/` before extracting;
+nothing is deleted. Details in `docs/design.md` ("State safety").
 
 ### Archiving
 

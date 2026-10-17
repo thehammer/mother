@@ -16,7 +16,7 @@
 MOTHER_CONFIG_FROM_FILE=" "
 
 mother_config_file() {
-    echo "${MOTHER_ROOT:-$HOME/.mother}/config.env"
+    echo "${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/config.env"
 }
 
 # _config_unquote <val> — strip one pair of surrounding single or double quotes.

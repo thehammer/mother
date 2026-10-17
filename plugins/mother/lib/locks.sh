@@ -6,7 +6,7 @@
 # (default: ~/.mother/locks). Each lock is a JSON file with holder info
 # for debugging and stale detection.
 
-: "${MOTHER_ROOT:=$HOME/.mother}"
+: "${MOTHER_ROOT:=${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
 MOTHER_LOCKS_DIR="$MOTHER_ROOT/locks"
 # Back-compat alias: older callers may reference IDE_LOCKS_DIR.
 IDE_LOCKS_DIR="$MOTHER_LOCKS_DIR"

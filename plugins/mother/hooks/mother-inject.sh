@@ -45,7 +45,7 @@ if [ -n "${MOTHER_CLI:-}" ] && [ -x "${MOTHER_CLI}" ]; then
     mother_cli="$MOTHER_CLI"
 fi
 if [ -z "$mother_cli" ]; then
-    cli_path_file="${MOTHER_ROOT:-$HOME/.mother}/runner/cli-path"
+    cli_path_file="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/runner/cli-path"
     if [ -f "$cli_path_file" ]; then
         published=$(cat "$cli_path_file" 2>/dev/null | tr -d '\r\n')
         [ -n "$published" ] && [ -x "$published" ] && mother_cli="$published"

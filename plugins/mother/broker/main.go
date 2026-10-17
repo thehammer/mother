@@ -53,7 +53,7 @@ func envInt(key string, def int) int {
 
 func loadConfig() config {
 	home, _ := os.UserHomeDir()
-	root := envOr("MOTHER_ROOT", filepath.Join(home, ".mother"))
+	root := envOr("MOTHER_ROOT", envOr("MOTHER_LIVE_ROOT", filepath.Join(home, ".mother")))
 	return config{
 		root:          root,
 		sock:          envOr("MOTHER_BROKER_SOCK", filepath.Join(root, "broker.sock")),

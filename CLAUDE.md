@@ -21,6 +21,24 @@ for product-level detail.
   (in `lib/state.sh`) to mutate job JSON — both go through an atomic
   write. Don't hand-edit the json files.
 
+## State safety (never destroy the live tree)
+
+Mother's state tree (`~/.mother`: jobs, events, archive) is irreplaceable; on 2026-10-17 a stray
+`rm -rf "$MOTHER_ROOT"` in a test teardown deleted all of it. Rules for anyone touching this repo:
+
+- **Never `pkill`/`killall`/`kill` by pattern.** Other workers run bats concurrently on this machine.
+  Kill only a process you started, by exact pid or background task id.
+- **Tests must never use the real `~/.mother`.** Every bats file uses `setup_mother_env` /
+  `teardown_mother_env` (temp `MOTHER_ROOT`, `MOTHER_TEST_ROOT=1`, `MOTHER_LIVE_ROOT` unset). Never
+  point a test at `$HOME/.mother` or an inherited root.
+- **Every recursive directory delete goes through `safe_rm_tree`** (`lib/safe-rm.sh`). It refuses
+  `""`, `/`, `$HOME` and anything that is or contains a `.mother-live` marker. Don't add a bare
+  `rm -rf <dir>` in `bin/` or `lib/`; file-level `rm -f` is fine.
+- **Workers get `MOTHER_LIVE_ROOT`, not `MOTHER_ROOT`.** Resolve the root as
+  `${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}` in any new entry point.
+- **Backups:** the runner writes `mother-state-<UTC>.tar.gz` every `MOTHER_BACKUP_INTERVAL` (900s) outside
+  the tree; `mother backup now|list|restore`. See `docs/design.md` "State safety".
+
 ## Bug report workflow
 
 Bug reports are filed as markdown under `.claude/bug-reports/` (this
@@ -161,6 +179,7 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_EVENTS_MAX_AGE_HOURS=N` — age floor (default: 6) for `mother events --since-cursor`, the query the `UserPromptSubmit` hook (`hooks/mother-inject.sh`) uses to inject a queue-update banner into interactive sessions. No event older than this is ever surfaced on the `--since-cursor` path, no matter how stale a syntactically valid cursor is. `0` disables the floor. Plain `mother events` and `mother events --since <ts>` are never floored. This is defense in depth on top of a hard contract in `cmd_events`: an unreadable or non-ISO session cursor (missing file, zero-byte, non-JSON, missing/`null` `.last_seen`, or a `.last_seen` that isn't an ISO-8601 instant) is always treated as a brand-new session — bootstrap the cursor to now, emit nothing — and must never degrade into a full-history replay of `$EVENTS_DIR` (which retains orphaned `.jsonl` files for long-archived jobs; see the resolved 2026-07-14 bug report).
 - `MOTHER_RETENTION_SWEEP_ENABLED=0` — disable the orphaned atomic-write temp file sweep (reserved as the shared gate for future retention steps — see "Orphaned temp file sweep" below).
 - `MOTHER_TEMP_ORPHAN_MINUTES=N` — age threshold in minutes before an orphaned `*.tmp.*` / `*.bak.*` state file is removed (default: 60). This gate is what prevents deleting an in-flight write's temp file out from under its own writer.
+- `MOTHER_BACKUP_ENABLED=0` — disable the runner's periodic state-tree backup (default: `1`). `MOTHER_BACKUP_INTERVAL=N` (default 900), `MOTHER_BACKUP_TIMEOUT=N` (watchdog, default 300), `MOTHER_BACKUP_DIR=PATH` (default `~/Library/Application Support/Mother/backups` on macOS, `${XDG_STATE_HOME:-~/.local/state}/mother/backups` elsewhere; refused when inside `$MOTHER_ROOT`), `MOTHER_BACKUP_KEEP_HOURS=N` (24) / `MOTHER_BACKUP_KEEP_DAYS=N` (30) retention, `MOTHER_BACKUP_LOGS=1` to include `logs/`.
 - `MOTHER_RWX_SANDBOX_ENABLED=0` — disable the RWX sandbox lifecycle (default: `1`). When a job's work_dir has `.rwx/sandbox.yml` and `rwx` is on PATH, `mother-run-job` runs `rwx sandbox reset` before the first spawn of each fresh attempt and `rwx sandbox stop` after every worker exit (`lib/rwx.sh`). Best-effort: failures, hangs and a missing CLI are events only (`rwx_sandbox_reset` / `rwx_sandbox_stop`) and never change the job's state or `failure_reason`. Repos without `.rwx/sandbox.yml` see no calls and no events.
 - **RWX SIGKILL gap:** `_rwx_post_exit` covers normal exit, the EXIT trap, SIGTERM and SIGINT, but not a SIGKILLed `mother-run-job` (OOM, `kill -9`, host crash). `mother-runner`'s orphan reaper then calls the same best-effort stop for worktree-isolated jobs whose worktree still has `.rwx/sandbox.yml` (event `rwx_sandbox_stop`, `reason: "orphan"`). If the host itself dies, the sandbox bills until its own `--inactivity-timeout` (10m in admin-portal's `sandbox.yml`).
 - `MOTHER_RWX_RESET_TIMEOUT=N` / `MOTHER_RWX_STOP_TIMEOUT=N` — watchdog seconds for the reset (default: 90) and stop (default: 60); on expiry the call is killed, the event says `outcome: "timeout"`, and the job proceeds.

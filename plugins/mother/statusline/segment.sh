@@ -19,7 +19,7 @@
 
 : "${MOTHER_STATUSLINE_CACHE:=/tmp/.mother-statusline}"
 : "${MOTHER_STATUSLINE_TTL:=10}"  # seconds
-: "${MOTHER_ROOT:=$HOME/.mother}"
+: "${MOTHER_ROOT:=${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
 : "${MOTHER_RATE_LIMIT_CACHE:=$MOTHER_ROOT/rate-limits.json}"
 : "${MOTHER_QUOTA_CAP_5H_PCT:=90}"
 : "${MOTHER_QUOTA_CAP_7D_PCT:=90}"

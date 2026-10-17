@@ -37,6 +37,11 @@
 # caller can produce two recorded outcomes (or two gh/docker calls) for one
 # attempt.
 
+# Every recursive delete here goes through safe_rm_tree (lib/safe-rm.sh), which
+# refuses a directory that is or contains the live-tree marker.
+# shellcheck source=/dev/null
+type safe_rm_tree >/dev/null 2>&1 || source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/safe-rm.sh"
+
 : "${MOTHER_TEARDOWN_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_DOCKER_ENABLED:=1}"
 : "${MOTHER_TEARDOWN_MAX_DEFERRALS:=30}"
@@ -443,7 +448,7 @@ _teardown_remove_residue() {
     [ -L "$dir" ] && refuse=1
     # A refused path is never removed, but it is not claimed as removed either:
     # it is reported as residue so the operator sees it.
-    [ "$refuse" -eq 1 ] || rm -rf "$dir" >/dev/null 2>&1
+    [ "$refuse" -eq 1 ] || safe_rm_tree "$dir" >/dev/null 2>&1
     if [ -d "$dir" ]; then
         TEARDOWN_RESIDUE_PATH="$dir"
         TEARDOWN_RESIDUE_SUB=$(ls -A "$dir" 2>/dev/null | head -1)
@@ -493,7 +498,7 @@ _teardown_remove_job_tmp() {
     if [ "$dry_run" -eq 1 ]; then
         echo "[dry-run] would remove job temp dir $dir"
     else
-        rm -rf "$dir" 2>/dev/null || true
+        safe_rm_tree "$dir" || true
     fi
     return 0
 }

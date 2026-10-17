@@ -10,10 +10,23 @@ _PLUGIN_DIR="$(cd "$_HELPER_DIR/.." && pwd -P)"
 _BIN_DIR="$_PLUGIN_DIR/bin"
 _LIB_DIR="$_PLUGIN_DIR/lib"
 
+# The one guard in front of every recursive delete (refuses a live state tree).
+# shellcheck source=/dev/null
+source "$_LIB_DIR/safe-rm.sh"
+
+# Many tests point HOME at a directory inside their temp MOTHER_ROOT. Remember
+# the real one (captured at load time, before any test changes it) so teardown
+# can hand safe_rm_tree the true $HOME to guard rather than the fixture's.
+_MOTHER_TEST_REAL_HOME="${_MOTHER_TEST_REAL_HOME:-${HOME:-}}"
+
 setup_mother_env() {
     # Isolated MOTHER_ROOT per test — each test gets a fresh state tree.
-    # Never inherit a real state tree (workers export MOTHER_ROOT=~/.mother).
-    unset MOTHER_ROOT _MOTHER_TEST_ROOT
+    # Never inherit a real state tree: workers export it as MOTHER_LIVE_ROOT (and
+    # older workers as MOTHER_ROOT=~/.mother). Unsetting both means test code can
+    # never resolve the live tree.
+    unset MOTHER_ROOT MOTHER_LIVE_ROOT _MOTHER_TEST_ROOT
+    # Test trees never get a .mother-live marker (see lib/safe-rm.sh).
+    export MOTHER_TEST_ROOT=1
     export MOTHER_ROOT
     MOTHER_ROOT="$(mktemp -d)"
     export _MOTHER_TEST_ROOT="$MOTHER_ROOT"
@@ -56,7 +69,10 @@ teardown_mother_env() {
     # before setup finished must not delete an inherited MOTHER_ROOT.
     if [ -n "${_MOTHER_TEST_ROOT:-}" ] && [ "${MOTHER_ROOT:-}" = "$_MOTHER_TEST_ROOT" ] \
         && [ "$MOTHER_ROOT" != "$HOME/.mother" ] && [ "$MOTHER_ROOT" != "/" ]; then
-        rm -rf "$MOTHER_ROOT"
+        [ -n "$_MOTHER_TEST_REAL_HOME" ] && export HOME="$_MOTHER_TEST_REAL_HOME"
+        # safe_rm_tree refuses a tree carrying a .mother-live marker, so even a
+        # mixed-up MOTHER_ROOT can't take the live state tree with it.
+        safe_rm_tree "$MOTHER_ROOT" || true
     fi
 }
 
