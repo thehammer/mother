@@ -138,6 +138,8 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `awaiting_notify` | object | `{episode, first_seen_at, count, last_notified_at}` — the push-notification bookkeeping for an `awaiting` job (see "Operator attention and notifications"). Cleared when the job leaves `awaiting`. |
 | `needs_attention` | object | Producer-agnostic flag `{reason, note, since}`. Anything that holds a job for the operator sets it; Mother renders it as a `job_flagged` needs-attention item. This repo adds no producer. |
 | `origin` | object | Provenance captured at `mother add` time: `{project, cwd, session, enqueued_by, label}`. `project` = basename of the enqueuing cwd's git toplevel, or the `--origin-project` override; `session` = `--origin-session` → `$MOTHER_ORIGIN_SESSION` → `$CLAUDE_SESSION_ID` → `""`. Surfaced as `mother list`'s ORIGIN column, filtered by `mother list --project`/`--label`, and rendered by `mother status`'s `=== origin ===` block. |
+| `decision` | object | Structured hold: `{id, kind, options[{id,label,consequence,takes_text}], opened_at, resolved_at, resolution{option,source,session,agent}}` (`lib/decision.sh`; option ids `resume_with_guidance`, `escalate`, `override_open`, `cancel`). Opened by a hold producer via `mother_decision_open`; resolved only by an explicit answer — Mother never selects an option (no timeout, no default). A resolved decision blocks answers only while `paused_reason == decision.kind`. |
+| `last_answer` | object | `{source, session, agent, option, at}` of the most recent `mother resume` / broker `answer`. `source` is `nostromo_app`, `cli` or `broker_client`; `option` is null for a plain-text answer to a decision-less job. |
 
 ### Kill switches
 

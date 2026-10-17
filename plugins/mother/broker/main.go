@@ -29,6 +29,7 @@ type config struct {
 
 	// W2: output category knobs.
 	outputEnabled bool  // MOTHER_BROKER_OUTPUT_ENABLED (default 1)
+	answerGuard   bool  // MOTHER_BROKER_ANSWER_GUARD (default 1)
 	outputSecs    int   // MOTHER_BROKER_OUTPUT_SEC (default 1)
 	replayBytes   int64 // MOTHER_BROKER_OUTPUT_REPLAY_BYTES (default 65536)
 	outputMaxGap  int   // MOTHER_BROKER_OUTPUT_MAX_GAP (default 10000)
@@ -62,6 +63,7 @@ func loadConfig() config {
 		clientBuf:     envInt("MOTHER_BROKER_CLIENT_BUF", 1024),
 		activitySecs:  envInt("MOTHER_BROKER_ACTIVITY_SEC", 1),
 		outputEnabled: os.Getenv("MOTHER_BROKER_OUTPUT_ENABLED") != "0",
+		answerGuard:   os.Getenv("MOTHER_BROKER_ANSWER_GUARD") != "0",
 		outputSecs:    envInt("MOTHER_BROKER_OUTPUT_SEC", 1),
 		replayBytes:   int64(envInt("MOTHER_BROKER_OUTPUT_REPLAY_BYTES", 65536)),
 		outputMaxGap:  envInt("MOTHER_BROKER_OUTPUT_MAX_GAP", 10000),
@@ -102,6 +104,12 @@ func main() {
 	}
 	h := newHub(store, runner, cfg.pingSeconds, cfg.clientBuf)
 	h.replayBytes = cfg.replayBytes
+	if !cfg.answerGuard {
+		// Kill switch for harnesses that run the broker under a Mother worker
+		// (the peer guard would otherwise refuse their answers).
+		h.guard = nil
+		fmt.Fprintln(os.Stderr, "mother-broker: answer peer guard disabled (MOTHER_BROKER_ANSWER_GUARD=0)")
+	}
 	h.outputMaxGap = cfg.outputMaxGap
 
 	es := newEventSource(eventsDir, h.ingest)

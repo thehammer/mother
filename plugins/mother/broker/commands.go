@@ -61,6 +61,10 @@ func mapCLIError(stderr string) string {
 	switch {
 	case strings.Contains(s, "no such job"):
 		return ErrNoSuchJob
+	case strings.Contains(s, "refused"):
+		return ErrUnauthorized
+	case strings.Contains(s, "invalid_state:"):
+		return ErrInvalidState
 	case strings.Contains(s, "expected awaiting"),
 		strings.Contains(s, "expected running"),
 		strings.Contains(s, "cannot cancel job in state"),
@@ -73,15 +77,28 @@ func mapCLIError(stderr string) string {
 	}
 }
 
-// answer routes to `mother resume <job> -` with the text on stdin.
-func (c *commandRunner) answer(job, text string) cmdResult {
+// answer routes to `mother resume <job> [--option <o>] --source <s> -` with
+// the text (possibly empty when an option is chosen) on stdin. The source is
+// forwarded only when it is "nostromo_app"; every other client is recorded as
+// "broker_client". Old clients that send text only keep working: no option
+// means resume_with_guidance on a decision, and plain resume otherwise.
+func (c *commandRunner) answer(job, text, option, source string) cmdResult {
 	if job == "" {
 		return fail(ErrMalformed, "answer: job required")
 	}
-	if text == "" {
-		return fail(ErrMalformed, "answer: text required")
+	if text == "" && option == "" {
+		return fail(ErrMalformed, "answer: text or option required")
 	}
-	_, stderr, code := c.runCLI(text, "resume", job, "-")
+	src := "broker_client"
+	if source == "nostromo_app" {
+		src = source
+	}
+	args := []string{"resume", job}
+	if option != "" {
+		args = append(args, "--option", option)
+	}
+	args = append(args, "--source", src, "-")
+	_, stderr, code := c.runCLI(text, args...)
 	if code != "" {
 		return fail(code, strings.TrimSpace(stderr))
 	}

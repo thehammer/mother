@@ -11,12 +11,15 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"go/parser"
 	"go/token"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -446,9 +449,9 @@ func TestSnapshot_pipelineAdvisoriesSurviveRoundTrip(t *testing.T) {
 		"kind":  "pipeline",
 		"state": "succeeded",
 		"pipeline": map[string]any{
-			"phase":       "done",
+			"phase":        "done",
 			"review_cycle": 0,
-			"advisories":  advisories,
+			"advisories":   advisories,
 		},
 		"pipeline_reviewed": true,
 	})
@@ -1572,6 +1575,330 @@ func TestMapCLIError_forceStartMustBeReadyOrQueuedMapsToInvalidState(t *testing.
 	for _, stderr := range cases {
 		if got := mapCLIError(stderr); got != ErrInvalidState {
 			t.Errorf("mapCLIError(%q) = %q, want %q", stderr, got, ErrInvalidState)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HC-02: answer {job, text, option, source}, worker guard, error mapping
+// ---------------------------------------------------------------------------
+
+// fakeGuard is an injectable workerGuard for handleAnswer tests.
+type fakeGuard struct{ worker bool }
+
+func (g fakeGuard) fromWorker(conn *clientConn) bool { return g.worker }
+
+// newHubWithRecordingCLI installs a fake `mother` that records argv (one per
+// line) to <dir>/args and stdin to <dir>/stdin, then prints stderrMsg to
+// stderr and exits with exitCode. Returns the hub and the record dir.
+func newHubWithRecordingCLI(t *testing.T, stderrMsg string, exitCode int) (*testHub, string) {
+	t.Helper()
+	th := newTestHub(t, 1024)
+	rec := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"for a in \"$@\"; do printf '%s\\n' \"$a\" >> '" + rec + "/args'; done\n" +
+		"cat > '" + rec + "/stdin'\n" +
+		"if [ -n '" + strings.ReplaceAll(stderrMsg, "'", "'\\''") + "' ]; then printf '%s\\n' '" +
+		strings.ReplaceAll(stderrMsg, "'", "'\\''") + "' >&2; fi\n" +
+		"exit " + strconv.Itoa(exitCode) + "\n"
+	cli := filepath.Join(t.TempDir(), "fake-mother")
+	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake CLI: %v", err)
+	}
+	if err := os.Chmod(cli, 0o755); err != nil {
+		t.Fatalf("chmod fake CLI: %v", err)
+	}
+	th.runner.cliPath = cli
+	return th, rec
+}
+
+func recordedArgs(t *testing.T, rec string) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(rec, "args"))
+	if err != nil {
+		return nil
+	}
+	return strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+}
+
+func recordedStdin(t *testing.T, rec string) string {
+	t.Helper()
+	b, _ := os.ReadFile(filepath.Join(rec, "stdin"))
+	return string(b)
+}
+
+// answerAck sends an answer command and returns the decoded ack data.
+func answerAck(t *testing.T, th *testHub, data map[string]any) map[string]any {
+	t.Helper()
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	sendCmd(t, conn, CmdAnswer, "a1", data)
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading ack: %v", err)
+	}
+	if ack.Dir != DirAck || ack.T != CmdAnswer {
+		t.Fatalf("unexpected ack envelope: dir=%s t=%s", ack.Dir, ack.T)
+	}
+	return mustDecodeData(t, ack)
+}
+
+func ackErrCode(t *testing.T, data map[string]any) string {
+	t.Helper()
+	if data["ok"] != false {
+		t.Fatalf("expected ok:false, got %v", data)
+	}
+	eo, ok := data["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object, got %v", data)
+	}
+	s, _ := eo["code"].(string)
+	return s
+}
+
+func TestAnswer_optionOnlyForwardsResumeWithOptionAndBrokerClientSource(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	res := th.runner.answer("j", "", "cancel", "")
+	if res.code != "" {
+		t.Fatalf("answer failed: %s %s", res.code, res.msg)
+	}
+	want := []string{"resume", "j", "--option", "cancel", "--source", "broker_client", "-"}
+	if got := recordedArgs(t, rec); !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %q, want %q", got, want)
+	}
+}
+
+func TestAnswer_nostromoAppSourceIsForwarded(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	res := th.runner.answer("j", "", "cancel", "nostromo_app")
+	if res.code != "" {
+		t.Fatalf("answer failed: %s %s", res.code, res.msg)
+	}
+	want := []string{"resume", "j", "--option", "cancel", "--source", "nostromo_app", "-"}
+	if got := recordedArgs(t, rec); !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %q, want %q", got, want)
+	}
+}
+
+func TestAnswer_unrecognizedSourceBecomesBrokerClient(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	res := th.runner.answer("j", "", "cancel", "weird")
+	if res.code != "" {
+		t.Fatalf("answer failed: %s %s", res.code, res.msg)
+	}
+	got := recordedArgs(t, rec)
+	want := []string{"resume", "j", "--option", "cancel", "--source", "broker_client", "-"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %q, want %q", got, want)
+	}
+}
+
+func TestAnswer_textOnlyOldClientOmitsOptionAndSendsTextOnStdin(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	res := th.runner.answer("j", "use approach B", "", "")
+	if res.code != "" {
+		t.Fatalf("answer failed: %s %s", res.code, res.msg)
+	}
+	want := []string{"resume", "j", "--source", "broker_client", "-"}
+	if got := recordedArgs(t, rec); !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %q, want %q", got, want)
+	}
+	if got := recordedStdin(t, rec); got != "use approach B" {
+		t.Errorf("stdin = %q, want %q", got, "use approach B")
+	}
+}
+
+func TestAnswer_optionWithTextSendsBoth(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	res := th.runner.answer("j", "guidance", "resume_with_guidance", "nostromo_app")
+	if res.code != "" {
+		t.Fatalf("answer failed: %s %s", res.code, res.msg)
+	}
+	want := []string{"resume", "j", "--option", "resume_with_guidance", "--source", "nostromo_app", "-"}
+	if got := recordedArgs(t, rec); !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %q, want %q", got, want)
+	}
+	if got := recordedStdin(t, rec); got != "guidance" {
+		t.Errorf("stdin = %q, want %q", got, "guidance")
+	}
+}
+
+func TestAnswer_bothTextAndOptionEmptyIsMalformedAndCLINotInvoked(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	data := answerAck(t, th, map[string]any{"job": "j"})
+	if code := ackErrCode(t, data); code != ErrMalformed {
+		t.Errorf("error.code = %q, want %q", code, ErrMalformed)
+	}
+	if _, err := os.Stat(filepath.Join(rec, "stdin")); err == nil {
+		t.Error("CLI was invoked despite malformed answer")
+	}
+}
+
+func TestAnswer_emptyJobIsMalformed(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	res := th.runner.answer("", "text", "", "")
+	if res.code != ErrMalformed {
+		t.Errorf("code = %q, want %q", res.code, ErrMalformed)
+	}
+	if _, err := os.Stat(filepath.Join(rec, "stdin")); err == nil {
+		t.Error("CLI was invoked despite empty job")
+	}
+}
+
+func TestAnswer_cliInvalidStateStderrMapsToInvalidStateAck(t *testing.T) {
+	th, _ := newHubWithRecordingCLI(t, "mother: resume: invalid_state: option 'x' not offered", 1)
+	data := answerAck(t, th, map[string]any{"job": "j", "option": "x"})
+	if code := ackErrCode(t, data); code != ErrInvalidState {
+		t.Errorf("error.code = %q, want %q", code, ErrInvalidState)
+	}
+}
+
+func TestAnswer_cliRefusedStderrMapsToUnauthorizedAck(t *testing.T) {
+	th, _ := newHubWithRecordingCLI(t, "mother: resume: refused — called from inside Mother job", 1)
+	data := answerAck(t, th, map[string]any{"job": "j", "text": "hi"})
+	if code := ackErrCode(t, data); code != ErrUnauthorized {
+		t.Errorf("error.code = %q, want %q", code, ErrUnauthorized)
+	}
+}
+
+func TestMapCLIError_invalidStateAndRefused(t *testing.T) {
+	if got := mapCLIError("mother: resume: invalid_state: not supported for this hold"); got != ErrInvalidState {
+		t.Errorf("invalid_state -> %q, want %q", got, ErrInvalidState)
+	}
+	if got := mapCLIError("mother: resume: refused — called from inside Mother job"); got != ErrUnauthorized {
+		t.Errorf("refused -> %q, want %q", got, ErrUnauthorized)
+	}
+}
+
+func TestAnswer_fromWorkerConnectionIsUnauthorizedAndCLINotCalled(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	th.hub.guard = fakeGuard{worker: true}
+	data := answerAck(t, th, map[string]any{"job": "j", "text": "hi"})
+	if code := ackErrCode(t, data); code != ErrUnauthorized {
+		t.Errorf("error.code = %q, want %q", code, ErrUnauthorized)
+	}
+	msg, _ := data["error"].(map[string]any)["message"].(string)
+	if msg != "answering from inside a Mother job is not allowed" {
+		t.Errorf("message = %q", msg)
+	}
+	if _, err := os.Stat(filepath.Join(rec, "stdin")); err == nil {
+		t.Error("CLI was invoked for a worker-originated answer")
+	}
+}
+
+func TestAnswer_nonWorkerConnectionPassesGuard(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	th.hub.guard = fakeGuard{worker: false}
+	data := answerAck(t, th, map[string]any{"job": "j", "option": "cancel"})
+	if data["ok"] != true {
+		t.Fatalf("expected ok:true, got %v", data)
+	}
+	if got := recordedArgs(t, rec); len(got) == 0 {
+		t.Error("CLI was not invoked")
+	}
+}
+
+func TestGuard_doesNotApplyToCancel(t *testing.T) {
+	th, rec := newHubWithRecordingCLI(t, "", 0)
+	th.hub.guard = fakeGuard{worker: true}
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	sendCmd(t, conn, CmdCancel, "c1", map[string]any{"job": "j"})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatalf("reading ack: %v", err)
+	}
+	if mustDecodeData(t, ack)["ok"] != true {
+		t.Errorf("cancel should not be guarded: %v", mustDecodeData(t, ack))
+	}
+	if got := recordedArgs(t, rec); len(got) == 0 || got[0] != "cancel" {
+		t.Errorf("CLI args = %q, want cancel invocation", got)
+	}
+}
+
+func TestAncestryHasWorker(t *testing.T) {
+	chain := func(m map[int][2]any) func(int) (int, string, error) {
+		return func(pid int) (int, string, error) {
+			e, ok := m[pid]
+			if !ok {
+				return 0, "", fmt.Errorf("no such pid %d", pid)
+			}
+			return e[0].(int), e[1].(string), nil
+		}
+	}
+
+	t.Run("worker ancestor is found", func(t *testing.T) {
+		l := chain(map[int][2]any{
+			100: {90, "mother-broker"}, 90: {80, "claude"}, 80: {70, "mother-run-job"}, 70: {1, "launchd"},
+		})
+		if !ancestryHasWorker(100, l) {
+			t.Error("expected true")
+		}
+	})
+	t.Run("no worker in chain", func(t *testing.T) {
+		l := chain(map[int][2]any{100: {90, "nostromo"}, 90: {80, "zsh"}, 80: {1, "launchd"}})
+		if ancestryHasWorker(100, l) {
+			t.Error("expected false")
+		}
+	})
+	t.Run("lookup error yields false", func(t *testing.T) {
+		l := func(pid int) (int, string, error) { return 0, "", fmt.Errorf("boom") }
+		if ancestryHasWorker(100, l) {
+			t.Error("expected false")
+		}
+	})
+	t.Run("cycle terminates with false", func(t *testing.T) {
+		l := chain(map[int][2]any{100: {90, "a"}, 90: {100, "b"}})
+		done := make(chan bool, 1)
+		go func() { done <- ancestryHasWorker(100, l) }()
+		select {
+		case got := <-done:
+			if got {
+				t.Error("expected false")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("ancestryHasWorker did not terminate on a cyclic chain")
+		}
+	})
+	t.Run("basename of full path matches", func(t *testing.T) {
+		l := chain(map[int][2]any{100: {90, "sh"}, 90: {1, "/usr/local/bin/mother-run-job"}})
+		if !ancestryHasWorker(100, l) {
+			t.Error("expected true")
+		}
+	})
+	t.Run("pid <= 1 is false", func(t *testing.T) {
+		l := chain(map[int][2]any{1: {0, "mother-run-job"}})
+		if ancestryHasWorker(1, l) || ancestryHasWorker(0, l) {
+			t.Error("expected false")
+		}
+	})
+	t.Run("worker beyond 32 levels is not reached", func(t *testing.T) {
+		m := map[int][2]any{}
+		for i := 100; i < 150; i++ {
+			m[i] = [2]any{i + 1, "sh"}
+		}
+		m[150] = [2]any{1, "mother-run-job"}
+		if ancestryHasWorker(100, chain(m)) {
+			t.Error("expected false: depth limit is 32")
+		}
+	})
+}
+
+func TestHandshake_helloCapabilitiesAdvertiseAnswerOption(t *testing.T) {
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+	hello, _ := readNext(t, conn)
+	caps := mustDecodeData(t, hello)["capabilities"].([]any)
+	capSet := map[string]bool{}
+	for _, c := range caps {
+		capSet[c.(string)] = true
+	}
+	if !capSet["answer.option"] {
+		t.Errorf("capabilities missing %q: %v", "answer.option", caps)
+	}
+	for _, cmd := range w1Commands {
+		if !capSet[cmd] {
+			t.Errorf("capabilities lost existing command %q", cmd)
 		}
 	}
 }

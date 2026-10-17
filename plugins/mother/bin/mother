@@ -27,7 +27,7 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 #   mother retry <id>
 #   mother await [<id>] --question "..."
 #   mother preview up|wait|info|verify|call|fake|down
-#   mother resume <id> "<answer>" | --from-file <path> | -
+#   mother resume <id> "<answer>" | --from-file <path> | -  [--option <id>] [--source <s>] [--session <id>] [--agent <name>]
 #   mother events [--since-cursor <session-id>] [--since <iso-ts>]
 #   mother drafts list|show <id>|rm <id>
 #   mother run [--once]
@@ -63,6 +63,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/attention.sh" ]     && source "$MOTHER_LIB_DIR/attention.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/failure-route.sh" ]  && source "$MOTHER_LIB_DIR/failure-route.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/decision.sh" ]      && source "$MOTHER_LIB_DIR/decision.sh"
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/config.sh"
 # shellcheck source=/dev/null
@@ -2875,9 +2877,23 @@ EOF
 # choose whichever is convenient for the answer's length / shape.
 
 cmd_resume() {
+    # Only the operator (or an agent session acting for them) answers a hold.
+    # A worker inside a Mother job must never answer — its own or anyone's.
+    [ -z "${MOTHER_JOB_ID:-}" ] \
+        || _die "resume: refused — called from inside Mother job $MOTHER_JOB_ID; only the operator (or an agent session acting for them) can answer"
+
     local id="" answer="" from_file="" from_stdin=0 max_cost_arg="" max_cost_given=0
+    local option="" source="cli" session="${CLAUDE_SESSION_ID:-${MOTHER_ORIGIN_SESSION:-}}" agent="${CLAUDE_AGENT_NAME:-}"
     while [ $# -gt 0 ]; do
         case "$1" in
+            --option)      option="$2"; shift 2 ;;
+            --option=*)    option="${1#*=}"; shift ;;
+            --source)      source="$2"; shift 2 ;;
+            --source=*)    source="${1#*=}"; shift ;;
+            --session)     session="$2"; shift 2 ;;
+            --session=*)   session="${1#*=}"; shift ;;
+            --agent)       agent="$2"; shift 2 ;;
+            --agent=*)     agent="${1#*=}"; shift ;;
             --from-file)   from_file="$2"; shift 2 ;;
             --from-file=*) from_file="${1#*=}"; shift ;;
             --max-cost)    max_cost_arg="$2"; max_cost_given=1; shift 2 ;;
@@ -2894,6 +2910,49 @@ cmd_resume() {
     done
     [ -n "$id" ] || _die "resume: <id> required"
     _job_exists "$id" || _die "no such job: $id"
+    case "$source" in
+        nostromo_app|cli|broker_client) ;;
+        *) _die "resume: --source must be nostromo_app, cli or broker_client (got: $source)" ;;
+    esac
+
+    # Structured decision (see lib/decision.sh). Validate before anything is
+    # written so a refused answer leaves the job file and event log untouched.
+    # A resolved decision only blocks an answer while the job is still in that
+    # decision's hold (.paused_reason == .decision.kind); a later, unrelated
+    # `awaiting` (e.g. a worker's own question) must stay answerable with text.
+    local decision_state
+    decision_state=$(jq -r '
+        if .decision == null then "none"
+        elif .decision.resolved_at == null then "open"
+        elif (.paused_reason // "") == .decision.kind then "resolved"
+        else "spent" end' "$(_job_path "$id")")
+    if [ -n "$option" ]; then
+        case "$decision_state" in
+            open) mother_decision_option "$id" "$option" >/dev/null \
+                      || _die "resume: invalid_state: option '$option' not offered" ;;
+            none) _die "resume: invalid_state: option '$option' not offered (job has no decision)" ;;
+            *)    _die "resume: invalid_state: decision already resolved" ;;
+        esac
+    else
+        case "$decision_state" in
+            open)     option="resume_with_guidance" ;;
+            resolved) _die "resume: invalid_state: decision already resolved" ;;
+        esac
+    fi
+
+    # Options that are not "resume with text" act directly on a held job.
+    case "$option" in
+        cancel|escalate|override_open)
+            local ostate; ostate=$(jq -r .state "$(_job_path "$id")")
+            [ "$ostate" = "awaiting" ] || _die "resume: job is in state $ostate, expected awaiting"
+            if [ "$option" = "cancel" ]; then
+                cmd_cancel "$id" || exit 1
+            else
+                "_decision_apply_$option" "$id" || exit 1
+            fi
+            mother_decision_resolve "$id" "$option" "$source" "$session" "$agent"
+            return 0 ;;
+    esac
 
     if [ -n "$from_file" ]; then
         [ -f "$from_file" ] || _die "resume: --from-file not found: $from_file"
@@ -2961,7 +3020,8 @@ cmd_resume() {
     # grant on the next failure shouldn't be foreclosed by a budget spent
     # before the operator stepped in.
     local merged
-    merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" '
+    local resume_jq
+    resume_jq='
         .pending_answer = $a
         | .resumed_at = $ts
         | .resume_count = ((.resume_count // 0) + 1)
@@ -2972,10 +3032,17 @@ cmd_resume() {
         | .operator_hold = null
         | .auto_retry_count = 0
         | .state = "ready"
-    ' "$job_file") || _die "resume: jq update failed"
+        | '"$MOTHER_DECISION_RESOLVE_JQ"
+    merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" \
+        --arg opt "$option" --arg src "$source" --arg sess "$session" --arg agent "$agent" \
+        "$resume_jq" "$job_file") || _die "resume: jq update failed"
     _atomic_write "$job_file" "$merged"
+    if [ -n "$option" ]; then
+        _append_event "$id" "decision_resolved" "$(jq -nc --arg d "$(jq -r '.decision.id' "$job_file")" --arg o "$option" --arg s "$source" '{decision_id: $d, option: $o, source: $s}')"
+    fi
     _append_event "$id" "resumed" \
-        "$(jq -nc --arg a "$answer" '{answer: $a}')"
+        "$(jq -nc --arg a "$answer" --arg o "$option" --arg s "$source" \
+            '{answer: $a, option: (if $o == "" then null else $o end), source: $s}')"
     echo "$id: awaiting -> ready (worker will spawn on next daemon tick)"
 }
 

@@ -470,7 +470,9 @@ firehose):
 - `query.list {jobs?, state?, repo?}` → one-shot `ack` with job records (the
   `mother list --format json` equivalent, served from broker memory).
 - `query.get {job}` → one-shot `ack` with one job record + its event history.
-- `answer {job, text}` → routes to `mother resume <job> -` (text on stdin).
+- `answer {job, text}` → routes to `mother resume <job> -` (text on stdin). Since HC-02 it also takes
+  optional `option` and `source` (see "Headless crew contract" → Broker additions); it is the one command
+  refused (`unauthorized`) when the peer's process ancestry contains `mother-run-job`.
 - `cancel {job}` → routes to `mother cancel <job>`.
 - `retry {job}` → routes to `mother retry <job>`.
 
@@ -768,6 +770,14 @@ Hello capabilities are additive strings.
 | `answer` fields `option`, `source` | `answer {job, text?, option?, source?}`; plain text with no option means `resume_with_guidance` |
 | capability `answer.option` | advertised in `hello.capabilities` when the `answer` command accepts `option` and `source` |
 | error `unauthorized` | existing code, now also returned when the peer is a Mother worker (it was reserved for the network-auth path) |
+
+**Answer authorization.** Only the operator, or an agent session acting for them, may answer a hold.
+`mother resume` exits 1 (`refused`) when `MOTHER_JOB_ID` is set (a worker inside a Mother job). The
+broker applies the same rule to `answer` by reading the peer pid of the Unix socket (darwin
+`LOCAL_PEERPID`) and walking its parent chain (32 levels) for a `mother-run-job` process; if the pid
+cannot be read it allows the answer (logged) because the CLI guard still applies. `cancel`, `retry` and
+`force-start` are not guarded. Option validation errors use `invalid_state:` so the broker maps them to
+`invalid_state`. A resolved decision only blocks answers while the job is still in that decision's hold.
 
 **Decision option ids:** `resume_with_guidance` (`takes_text: true`), `escalate`, `override_open`, `cancel`.
 

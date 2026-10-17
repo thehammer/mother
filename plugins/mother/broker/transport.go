@@ -14,10 +14,12 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"sync"
+	"syscall"
 )
 
 // listen binds a listener. For Unix sockets it first removes any stale
@@ -89,4 +91,23 @@ func (c *clientConn) writeMessage(m Message) error {
 
 func (c *clientConn) close() error {
 	return c.rwc.Close()
+}
+
+// peerPID returns the pid of the process on the other end of the connection.
+// It errors for transports with no peer credentials (net.Pipe, TCP) and on
+// platforms where socketPeerPID is not implemented.
+func (c *clientConn) peerPID() (int, error) {
+	sc, ok := c.rwc.(syscall.Conn)
+	if !ok {
+		return 0, errors.New("transport has no peer credentials")
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	pid, opErr := 0, error(nil)
+	if err := raw.Control(func(fd uintptr) { pid, opErr = socketPeerPID(fd) }); err != nil {
+		return 0, err
+	}
+	return pid, opErr
 }

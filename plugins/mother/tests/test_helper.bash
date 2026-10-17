@@ -41,6 +41,10 @@ setup_mother_env() {
     export MOTHER_LIB_DIR="$_LIB_DIR"
     export MOTHER_PLUGIN_DIR="$_PLUGIN_DIR"
 
+    # Workers (mother-run-job) export MOTHER_JOB_ID; `mother resume` refuses to
+    # run when it is set (HC-02 worker guard). Tests are never "inside a job".
+    unset MOTHER_JOB_ID
+
     # Default: mock_claude exits 0
     export MOCK_CLAUDE_EXIT=0
     # Default: mock_claude records args to this file

@@ -38,6 +38,9 @@ type hub struct {
 	pingSeconds int
 	clientBuf   int
 
+	// guard vetoes `answer` from workers inside Mother jobs. nil allows all.
+	guard workerGuard
+
 	// W2: output category support. outputSrc is nil when output is disabled.
 	outputSrc    *outputSource
 	replayBytes  int64 // MOTHER_BROKER_OUTPUT_REPLAY_BYTES
@@ -54,6 +57,7 @@ func newHub(store *jobStore, runner *commandRunner, pingSeconds, clientBuf int) 
 		runner:      runner,
 		pingSeconds: pingSeconds,
 		clientBuf:   clientBuf,
+		guard:       newProcessGuard(),
 		clients:     map[*client]bool{},
 		jobState:    map[string]*derivedState{},
 	}
@@ -400,9 +404,10 @@ func (cl *client) sendHello() {
 	// capabilities and validCategories() validation always agree. When
 	// MOTHER_BROKER_OUTPUT_ENABLED=0, liveCategories excludes CatOutput
 	// and this hello will not advertise it.
-	caps := make([]string, 0, len(liveCategories)+len(w1Commands))
+	caps := make([]string, 0, len(liveCategories)+len(w1Commands)+len(w1Features))
 	caps = append(caps, liveCategories...)
 	caps = append(caps, w1Commands...)
+	caps = append(caps, w1Features...)
 	data, _ := json.Marshal(map[string]any{
 		"protocol_version": ProtocolVersion,
 		"capabilities":     caps,
@@ -587,11 +592,17 @@ func (cl *client) handleQueryGet(m Message) {
 
 func (cl *client) handleAnswer(m Message) {
 	var a struct {
-		Job  string `json:"job"`
-		Text string `json:"text"`
+		Job    string `json:"job"`
+		Text   string `json:"text"`
+		Option string `json:"option"`
+		Source string `json:"source"`
 	}
 	_ = json.Unmarshal(m.Data, &a)
-	cl.respond(m, cl.hub.runner.answer(a.Job, a.Text))
+	if g := cl.hub.guard; g != nil && g.fromWorker(cl.conn) {
+		cl.ack(errAck(m.T, m.ID, ErrUnauthorized, "answering from inside a Mother job is not allowed"))
+		return
+	}
+	cl.respond(m, cl.hub.runner.answer(a.Job, a.Text, a.Option, a.Source))
 }
 
 func (cl *client) handleCancel(m Message) {

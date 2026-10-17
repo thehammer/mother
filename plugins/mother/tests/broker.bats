@@ -32,6 +32,11 @@ setup() {
     # Each test gets its own socket path to avoid cross-test interference.
     export MOTHER_BROKER_SOCK="$MOTHER_ROOT/broker.sock"
 
+    # These tests may themselves run under a Mother worker, whose process
+    # ancestry would trip the broker's answer peer guard. The guard has its
+    # own Go tests; disable it for the integration client.
+    export MOTHER_BROKER_ANSWER_GUARD=0
+
     # Point broker at mock mother CLI (it's already on PATH from setup_mother_env).
     export MOTHER_CLI="$_BIN_DIR/mother"
     export MOTHER_BIN_DIR="$_BIN_DIR"
@@ -295,6 +300,48 @@ s.close()
     rm -f /tmp/broker-live-$$.log
     echo "$result"
     [ "$result" = "ok" ]
+}
+
+# =============================================================================
+# HC-02: answer {job, option} resolves a held job's decision through the real
+# `mother resume --option`, attributed to source "broker_client".
+# =============================================================================
+@test "answer with option cancel resolves the decision and records source broker_client" {
+    make_job job-dec-1 awaiting '. + {decision: {id:"d-1", kind:"operator_hold", options:[
+      {id:"resume_with_guidance",label:"Resume",consequence:"Resumes.",takes_text:true},
+      {id:"cancel",label:"Cancel",consequence:"Cancels.",takes_text:false}],
+      opened_at:"2026-01-01T00:00:00.000Z", resolved_at:null, resolution:null}}'
+
+    # Broker must shell out to the real mother CLI.
+    export MOTHER_CLI="$_BIN_DIR/mother"
+    unset MOTHER_JOB_ID
+    kill "$_BROKER_PID" 2>/dev/null || true
+    sleep 0.2
+    "$_BROKER_BIN" >/tmp/broker-test-dec-$$.log 2>&1 &
+    export _BROKER_PID=$!
+    local i=0
+    while [ $i -lt 30 ]; do
+        [ -S "$MOTHER_BROKER_SOCK" ] && break
+        sleep 0.1
+        i=$((i+1))
+    done
+
+    result=$(run_broker_client "
+s = connect()
+recv_next(s)   # hello
+send(s, cmd('answer', 'dec1', {'job': 'job-dec-1', 'option': 'cancel'}))
+ack = recv_next(s)
+assert ack['dir'] == 'ack', f'expected ack, got {ack}'
+assert ack['data']['ok'] == True, f'answer failed: {ack}'
+print('ok')
+s.close()
+")
+    rm -f /tmp/broker-test-dec-$$.log
+    echo "$result"
+    [ "$result" = "ok" ]
+    assert_job_field job-dec-1 .state cancelled
+    assert_job_field job-dec-1 .decision.resolution.option cancel
+    assert_job_field job-dec-1 .decision.resolution.source broker_client
 }
 
 # =============================================================================

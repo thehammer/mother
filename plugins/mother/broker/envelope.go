@@ -32,7 +32,7 @@ const (
 	ErrMalformed       = "malformed"        // envelope/command failed to parse or validate
 	ErrUnavailable     = "unavailable"      // broker transiently unable to serve; back off + retry
 	ErrVersionMismatch = "version_mismatch" // client/broker protocol version incompatible
-	ErrUnauthorized    = "unauthorized"     // reserved for the future network-auth path (W4); never returned by W1's local transport
+	ErrUnauthorized    = "unauthorized"     // answer from a Mother worker (peer guard); reserved for the network-auth path (W4)
 	ErrInternal        = "internal"         // broker-side failure (e.g. CLI shell-out errored)
 )
 
@@ -96,6 +96,10 @@ var w1Commands = []string{
 	CmdSubscribe, CmdUnsubscribe, CmdQueryList, CmdQueryGet,
 	CmdAnswer, CmdCancel, CmdRetry, CmdForceStart,
 }
+
+// w1Features are capability strings that are not commands or categories.
+// `answer.option`: the answer command accepts `option` and `source`.
+var w1Features = []string{"answer.option"}
 
 // Message is the single envelope used in both directions.
 type Message struct {
