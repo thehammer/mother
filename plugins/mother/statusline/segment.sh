@@ -101,7 +101,7 @@ mother_statusline_refresh() {
     # Attention count: length of the cached needs-attention list (0 when the
     # file is missing/unreadable). Read-only — the daemon owns the refresh.
     local attention_count
-    attention_count=$(jq 'length' "$MOTHER_ROOT/attention.json" 2>/dev/null)
+    attention_count=$(jq '[.[] | select(.detail.acked != true)] | length' "$MOTHER_ROOT/attention.json" 2>/dev/null)
     case "${attention_count:-}" in ''|*[!0-9]*) attention_count=0 ;; esac
 
     printf '%s:%s:%s\n' "$counts" "$alert_count" "$attention_count" > "$tmp" && mv "$tmp" "$cache"

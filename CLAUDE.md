@@ -205,6 +205,8 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_NOTIFY_SCAN_INTERVAL=N` — seconds between the daemon's awaiting scans (default: 60).
 - `MOTHER_AWAITING_REMIND_HOURS=N` — reminder cadence for a job left `awaiting` (default: 24; open-ended).
 - `MOTHER_PROGRESS_ENABLED=0` — disable the progress indicator entirely (default: `1`): `mother-usage progress-tick`/`calibrate` do nothing, and `mother list`/`status` ignore progress files, so displays look as before. See "Progress indicator" below. `MOTHER_PROGRESS_INTERVAL=N` (default 30) is the tick cadence; `MOTHER_PROGRESS_CALIBRATE_INTERVAL=N` (default: `MOTHER_ARCHIVE_INTERVAL`, 3600) the calibration cadence; `MOTHER_PROGRESS_TIMEOUT=N` (default 60) the watchdog on each.
+
+- `MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT=0` — send awaiting pushes even while a broker client subscribed to `await` (Nostromo) is connected (default: `1`, suppress; see "Operator attention and notifications").
 - `MOTHER_SHARED_RATES_PATH=PATH` — destination `mother-usage publish-rates` writes the rate table to (default: `~/.claude/model-rates.json`), for Bishop or other tools to read the same per-model pricing Mother uses.
 
 ### Durable daemon config (`config.env`)
@@ -415,6 +417,40 @@ only as argv. **Permanent boundary:** `_notify_awaiting` may only write
 auto-cancel, auto-resume, auto-answer or auto-rework an unanswered `awaiting`
 job. Push is reserved for `awaiting`; everything else is attention-list and
 statusline only.
+
+**Typed attention reasons and acks.** Kind `job_attention` — one item per raised
+reason from a closed list: `progress_stalled`, `burn_ahead`, `gates_incomplete`,
+`decision_awaiting`. A job's raised reasons are the union of its `.attention[]`
+(`{reason, since}`, job-owned) and `$MOTHER_ROOT/progress/<id>.json` `.flags[]`
+(progress-owned; file may be absent), computed in one place:
+`mother_attention_reasons_json <id>` → `[{reason, since, acked}]`. The item is
+`{reason: <enum>, detail: {acked, since}, hint: "mother status <id>"}`. The same
+array is the derived `attention_reasons` key on every job object in
+`mother list/status --format json` and on broker snapshot / `query.list` /
+`query.get` records (computed in Go by `attentionReasons`, a pure read; no CLI
+shell-out). `mother ack <id> <reason> [--source cli|nostromo_app|broker_client]`
+(broker command `ack {job, reason}`, advertised in `hello`) acknowledges a raised
+reason: stored in `$MOTHER_ROOT/acks/<id>.json` = `{"<reason>": {since, at,
+source}}` under `_with_lock` — **never in job JSON**, whose writes are unlocked.
+An ack applies only while its `since` equals the condition's current `since`, so
+a condition that clears and returns lapses it. Acking a reason not raised fails
+with `is in state` wording (broker: `invalid_state`); an unknown reason fails;
+a worker (`MOTHER_JOB_ID` set) is refused. Event `attention_acked {reason,
+source}`. Acked items stay listed as `(acked)` but do not count toward `⚑N`
+(statusline, `mother list` footer, `mother status`). Mother produces none of the
+reasons yet (HC-08/HC-11/HC-14).
+
+**No duplicate pushes while Nostromo is connected.** The broker writes
+`$RUNNER_DIR/broker-clients.json` = `{pid, updated_at, clients,
+await_subscribers}` on subscribe/unsubscribe/connect/drop and every ping tick.
+`_notify_awaiting` skips the transport when `MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT`
+(default `1`) is on and the file is fresh (`updated_at` within 3 x
+`MOTHER_BROKER_PING_SEC`, default 15), its `pid` is alive and
+`await_subscribers > 0`. A suppressed push is bookkept exactly like a delivered
+one (so the 24h cadence continues) and recorded as `awaiting_notified` with
+`transport: "suppressed_client"`, `ok: true`. Any missing/stale/unparseable file
+or dead pid fails closed to "push as usual". The operator-only boundary is
+unchanged: only `.awaiting_notify` and `awaiting_notified` events are written.
 
 **The hook reads from the daemon's CLI.** `hooks/mother-inject.sh` resolves
 the CLI as `$MOTHER_CLI`, then the path `mother-runner` publishes to

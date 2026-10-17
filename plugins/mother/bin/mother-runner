@@ -921,6 +921,30 @@ _notify_event() {
             --argjson ok "$ok" '{kind: $k, count: $c, transport: $t, ok: $ok}')"
 }
 
+# _notify_client_connected — true when a Nostromo-style broker client is
+# subscribed to the `await` category right now, so a macOS push would only
+# duplicate what that client already shows. Reads $RUNNER_DIR/broker-clients.json
+# (written by the broker, refreshed every ping tick). Fails closed: a missing,
+# unparseable or stale file (older than 3 x MOTHER_BROKER_PING_SEC), a dead
+# broker pid, or zero await subscribers all mean "no client" -> push as usual,
+# so a crashed broker can never silence notifications.
+_notify_client_connected() {
+    [ "${MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT:-1}" = "1" ] || return 1
+    local f="$RUNNER_DIR/broker-clients.json" pid updated subs
+    [ -f "$f" ] || return 1
+    read -r pid updated subs < <(jq -r '[(.pid // 0), (.updated_at // ""), (.await_subscribers // 0)]
+        | map(tostring) | join(" ")' "$f" 2>/dev/null) || return 1
+    case "$pid" in ''|*[!0-9]*|0) return 1 ;; esac
+    case "$subs" in ''|*[!0-9]*|0) return 1 ;; esac
+    local up_epoch now max
+    up_epoch=$(_iso_to_epoch "$updated")
+    [ "${up_epoch:-0}" -gt 0 ] || return 1
+    now=$(date +%s)
+    max=$((3 * ${MOTHER_BROKER_PING_SEC:-15}))
+    [ $((now - up_epoch)) -le "$max" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
 # _notify_awaiting — one scan over $JOBS_DIR that pushes a notification to the
 # operator when a job is waiting on them.
 #
@@ -1009,8 +1033,15 @@ _notify_awaiting() {
     [ "$due_n" -gt 0 ] || return 0
 
     # Pass 2: send. More than 3 due -> one summary push covering all of them.
-    local summary_ok="" line
-    if [ "$due_n" -gt 3 ]; then
+    # With a subscribed broker client connected the transport is skipped, but
+    # the bookkeeping below runs exactly as for a delivered push (so the 24h
+    # reminder cadence continues); it is recorded as transport suppressed_client.
+    local summary_ok="" line suppress=0
+    _notify_client_connected && suppress=1
+    if [ "$suppress" -eq 1 ]; then
+        MOTHER_NOTIFY_LAST_TRANSPORT="suppressed_client"
+        [ "$due_n" -gt 3 ] && summary_ok=true
+    elif [ "$due_n" -gt 3 ]; then
         if mother_notify "Mother: $due_n jobs waiting for you" \
             "$due_n Mother jobs are waiting for you — mother status" ""; then
             summary_ok=true
@@ -1024,6 +1055,8 @@ _notify_awaiting() {
         [ -n "$id" ] || continue
         if [ -n "$summary_ok" ]; then
             ok="$summary_ok"
+        elif [ "$suppress" -eq 1 ]; then
+            ok=true
         else
             if [ "$kind" = "initial" ]; then
                 ptitle="Mother: job needs your answer"

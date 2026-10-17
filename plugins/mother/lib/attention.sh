@@ -15,6 +15,18 @@
 #
 # Item shape: {kind, job_id, repo, branch, reason, since, detail, hint}.
 #
+# Typed attention reasons (kind `job_attention`). A closed list — clients count
+# and badge them without parsing text: progress_stalled, burn_ahead,
+# gates_incomplete, decision_awaiting. A condition is the union of the job's
+# own `.attention[]` ({reason, since}, job-owned) and
+# $MOTHER_ROOT/progress/<id>.json `.flags[]` (progress-owned; file may be
+# absent). Acknowledgement lives OUTSIDE job JSON, in
+# $MOTHER_ROOT/acks/<id>.json = {"<reason>": {since, at, source}}, because job
+# JSON writes are unlocked read-modify-write. An ack applies only while its
+# `since` equals the condition's current `since`; a condition that clears and
+# returns gets a new `since`, so the ack lapses on its own. Acked items stay
+# listed (detail.acked == true) but do not count toward the ⚑N totals.
+#
 # `needs_attention` job-field contract (producer-agnostic): any job JSON in
 # $JOBS_DIR carrying `needs_attention: {reason, note, since}` is rendered as a
 # `job_flagged` item. Whoever holds a job for the operator (a failure
@@ -23,6 +35,8 @@
 : "${MOTHER_TEARDOWN_MAX_DEFERRALS:=30}"
 : "${MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS:=2}"
 : "${MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS:=7}"
+
+MOTHER_ATTENTION_REASONS="progress_stalled burn_ahead gates_incomplete decision_awaiting"
 
 _ATTENTION_PLUGIN_UPDATE_CMD='claude plugin update mother@thehammer-mother'
 
@@ -125,6 +139,51 @@ _attention_job_items() {
     done
 }
 
+# --- typed attention reasons ---
+
+# _attention_read_json <file> <default> — compact JSON of <file>, or <default>
+# when it is missing or unparseable.
+_attention_read_json() {
+    jq -c '.' "$1" 2>/dev/null || printf '%s' "$2"
+}
+
+# mother_attention_reasons_json <id> — print [{reason, since, acked}] for the
+# job: the closed-list union of job `.attention[]` and progress `.flags[]`,
+# one entry per reason (job-owned wins), with `acked` resolved from the acks
+# file. The one place that union is computed (list, status, attention list).
+mother_attention_reasons_json() {
+    local id="$1" job prog acks
+    job=$(_attention_read_json "$(_job_path "$id")" '{}')
+    prog=$(_attention_read_json "$MOTHER_ROOT/progress/$id.json" '{}')
+    acks=$(_attention_read_json "$MOTHER_ROOT/acks/$id.json" '{}')
+    jq -nc --argjson job "$job" --argjson prog "$prog" --argjson acks "$acks" \
+        --arg allowed "$MOTHER_ATTENTION_REASONS" '
+        ($allowed | split(" ")) as $ok
+        | ([($job.attention // [])[]?, ($prog.flags // [])[]?]
+           | map(select(type == "object" and (.reason | type) == "string" and (.reason as $r | $ok | index($r)))))
+        | reduce .[] as $c ([]; if any(.[]; .reason == $c.reason) then . else . + [$c] end)
+        | map(.reason as $r | (.since // "") as $s
+              | {reason: $r, since: $s,
+                 acked: ((($acks | objects | .[$r]?) // null) as $a
+                         | ($a | type) == "object" and ($a.since // null) == $s)})' 2>/dev/null \
+        || echo '[]'
+}
+
+_attention_reason_items() {
+    local f id
+    for f in "$JOBS_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        id=$(basename "$f" .json)
+        mother_attention_reasons_json "$id" | jq -c --arg id "$id" \
+            --arg repo "$(jq -r '.repo // ""' "$f" 2>/dev/null)" \
+            --arg branch "$(jq -r '.branch // ""' "$f" 2>/dev/null)" '
+            .[] | {kind: "job_attention", job_id: $id, repo: $repo, branch: $branch,
+                   reason: .reason, since: .since,
+                   detail: {acked: .acked, since: .since},
+                   hint: ("mother status " + $id)}' 2>/dev/null
+    done
+}
+
 # A job whose adherence review has been spawned more than
 # MOTHER_ADHERENCE_LOOP_THRESHOLD (default 5) times in the last hour is almost
 # certainly looping (see the 1532-review incident) — whatever the cause. Reads
@@ -218,6 +277,7 @@ mother_attention_items() {
       _attention_residue_items
       _attention_low_disk_items
       _attention_job_items
+      _attention_reason_items
       _attention_adherence_loop_items
       _attention_stash_items
       _attention_plugin_cache_items
@@ -236,14 +296,15 @@ mother_attention_write() {
 # mother_attention_render_text <items_json> — human rendering used by `mother status`.
 mother_attention_render_text() {
     local items="$1" n
-    n=$(printf '%s' "$items" | jq 'length')
+    n=$(printf '%s' "$items" | jq '[.[] | select(.detail.acked != true)] | length')
     echo "=== needs attention ($n) ==="
-    if [ "$n" = "0" ]; then
+    if [ "$(printf '%s' "$items" | jq 'length')" = "0" ]; then
         echo "  (nothing needs attention)"
         return 0
     fi
     printf '%s' "$items" | jq -r '.[] |
         "  [" + .kind + "] " + (if .job_id != "" then .job_id else "-" end)
         + (if .reason != "" then " — " + .reason else "" end)
+        + (if .detail.acked == true then " (acked)" else "" end)
         + "\n      " + .hint'
 }

@@ -944,24 +944,21 @@ cmd_list() {
     local pmap; pmap=$(_progress_map)
 
     if [ "$format" = "json" ]; then
-        # For pipeline jobs, attach the derived `cycles` array; standard jobs
-        # pass through byte-identical so clients that don't expect `cycles` are
-        # unaffected (back-compat AC).
+        # Attach derived keys: `attention_reasons` on every job (typed
+        # attention, see lib/attention.sh) and, for pipeline jobs, `cycles`.
         echo "$rows" | jq -c '.[]' | while IFS= read -r job_json; do
-            local kind job_id
+            local kind job_id reasons cycles
             kind=$(printf '%s' "$job_json" | jq -r '.kind // ""' 2>/dev/null) || kind=""
+            job_id=$(printf '%s' "$job_json" | jq -r '.id' 2>/dev/null) || job_id=""
+            reasons=$(mother_attention_reasons_json "${job_id:-}")
+            job_json=$(printf '%s' "$job_json" | jq -c --argjson r "${reasons:-[]}" '. + {attention_reasons: $r}')
             if [ "${kind:-}" = "pipeline" ]; then
-                job_id=$(printf '%s' "$job_json" | jq -r '.id' 2>/dev/null) || job_id=""
-                local cycles
                 cycles=$(_pipeline_cycles_json "$(_job_path "${job_id:-}")" 2>/dev/null) || cycles=""
                 if [ -n "${cycles:-}" ]; then
-                    printf '%s' "$job_json" | jq -c --argjson cycles "$cycles" '. + {cycles: $cycles}'
-                else
-                    printf '%s\n' "$job_json"
+                    job_json=$(printf '%s' "$job_json" | jq -c --argjson cycles "$cycles" '. + {cycles: $cycles}')
                 fi
-            else
-                printf '%s\n' "$job_json"
             fi
+            printf '%s\n' "$job_json"
         done | jq -cs --argjson pm "$pmap" \
             'if ($pm | length) == 0 then . else map(if $pm[.id] then . + {progress: $pm[.id]} else . end) end'
     else
@@ -1038,7 +1035,7 @@ cmd_list() {
             done
         # Attention footer: reads the cached list only (never recomputes, never gh).
         local _att_n
-        _att_n=$(jq 'length' "$MOTHER_ROOT/attention.json" 2>/dev/null) || _att_n=0
+        _att_n=$(jq '[.[] | select(.detail.acked != true)] | length' "$MOTHER_ROOT/attention.json" 2>/dev/null) || _att_n=0
         case "${_att_n:-0}" in ''|*[!0-9]*) _att_n=0 ;; esac
         if [ "$_att_n" -gt 0 ]; then
             echo "⚑ $_att_n item(s) need attention — run: mother status"
@@ -1206,27 +1203,19 @@ cmd_status() {
 
     if [ "$format" = "json" ]; then
       {
-        # For pipeline jobs, attach the derived cycles array to the job object.
+        # Attach derived keys to the job object: `attention_reasons` always,
+        # `cycles` for pipeline jobs.
         local job_file; job_file=$(_job_path "$id")
         local kind; kind=$(jq -r '.kind // ""' "$job_file" 2>/dev/null) || kind=""
+        local derived; derived=$(jq -nc --argjson r "$(mother_attention_reasons_json "$id")" '{attention_reasons: $r}')
         if [ "${kind:-}" = "pipeline" ]; then
             local cycles
             cycles=$(_pipeline_cycles_json "$job_file" 2>/dev/null) || cycles=""
-            if [ -n "${cycles:-}" ]; then
-                jq -s --argjson cycles "$cycles" \
-                    '{job: (.[0] + {cycles: $cycles}), events: .[1]}' \
-                    "$job_file" \
-                    <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
-            else
-                jq -s '{job: .[0], events: .[1]}' \
-                    "$job_file" \
-                    <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
-            fi
-        else
-            jq -s '{job: .[0], events: .[1]}' \
-                "$job_file" \
-                <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
+            [ -n "${cycles:-}" ] && derived=$(printf '%s' "$derived" | jq -c --argjson c "$cycles" '. + {cycles: $c}')
         fi
+        jq -s --argjson d "$derived" '{job: (.[0] + $d), events: .[1]}' \
+            "$job_file" \
+            <(jq -cs '.' "$(_events_path "$id")" 2>/dev/null || echo '[]')
       } | _status_json_with_progress "$id"
     else
         local job_file; job_file=$(_job_path "$id")
@@ -4653,6 +4642,10 @@ Usage:
   mother attach ID
   mother plan ID
   mother cancel ID
+  mother ack ID REASON [--source cli|nostromo_app|broker_client]
+                                              (acknowledge a raised attention reason: progress_stalled,
+                                              burn_ahead, gates_incomplete, decision_awaiting. Stays
+                                              acked until the condition clears and returns. Operator-only)
   mother force-start ID [--yes] [--ignore-deps]  (override quota cap; --ignore-deps also skips dependency gates)
   mother retry ID [--yes]
   mother escalate ID [--yes]                 (bump failed job to next model tier)
@@ -4957,6 +4950,57 @@ See docs/design.md for the full design.
 EOF
 }
 
+# ---------- attention acknowledgement ----------
+
+# Merge one ack into $MOTHER_ROOT/acks/<id>.json. Runs under _with_lock.
+_ack_write() {
+    local acks_file="$1" reason="$2" since="$3" source="$4" cur
+    cur=$(_attention_read_json "$acks_file" '{}')
+    printf '%s' "$cur" | jq -e 'type == "object"' >/dev/null 2>&1 || cur='{}'
+    _atomic_write "$acks_file" "$(printf '%s' "$cur" | jq -c --arg r "$reason" --arg s "$since" \
+        --arg at "$(_iso_now)" --arg src "$source" '.[$r] = {since: $s, at: $at, source: $src}')"
+}
+
+# mother ack <id> <reason> [--source cli|nostromo_app|broker_client]
+# Acknowledge a raised typed attention reason. The ack is keyed to the
+# condition's current `since`, so it lapses when the condition clears and
+# returns. Stored in acks/<id>.json, never in job JSON. Operator-only: a worker
+# (MOTHER_JOB_ID set) may not acknowledge its own flags.
+cmd_ack() {
+    local id="" reason="" source="cli"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --source) [ $# -ge 2 ] || _die "ack: --source needs a value"; source="$2"; shift 2 ;;
+            -*) _die "unknown flag for ack: $1" ;;
+            *) if [ -z "$id" ]; then id="$1"; elif [ -z "$reason" ]; then reason="$1"; else _die "ack: unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+    [ -z "${MOTHER_JOB_ID:-}" ] || _die "ack: refused — attention is acknowledged by the operator, not by a worker (MOTHER_JOB_ID is set)"
+    [ -n "$id" ] && [ -n "$reason" ] || _die "usage: mother ack <id> <reason> [--source cli|nostromo_app|broker_client]"
+    case "$source" in cli|nostromo_app|broker_client) ;; *) _die "ack: unknown source: $source" ;; esac
+    case " $MOTHER_ATTENTION_REASONS " in
+        *" $reason "*) ;;
+        *) _die "ack: unknown reason: $reason (expected one of: $MOTHER_ATTENTION_REASONS)" ;;
+    esac
+    _job_exists "$id" || _die "no such job: $id"
+
+    local entry since state
+    entry=$(mother_attention_reasons_json "$id" | jq -c --arg r "$reason" 'map(select(.reason == $r)) | .[0] // empty')
+    if [ -z "$entry" ]; then
+        state=$(jq -r '.state // "unknown"' "$(_job_path "$id")")
+        _die "ack: $reason is not raised for $id (job is in state $state)"
+    fi
+    since=$(printf '%s' "$entry" | jq -r '.since')
+
+    mkdir -p "$MOTHER_ROOT/acks"
+    local acks_file="$MOTHER_ROOT/acks/$id.json"
+    _with_lock "$acks_file" _ack_write "$acks_file" "$reason" "$since" "$source" \
+        || _die "ack: could not write $acks_file"
+    _append_event "$id" "attention_acked" "$(jq -nc --arg r "$reason" --arg s "$source" '{reason: $r, source: $s}')"
+    mother_attention_write 2>/dev/null || true
+    echo "$id: acknowledged $reason"
+}
+
 # ---------- dispatch ----------
 
 main() {
@@ -4971,6 +5015,7 @@ main() {
         attach)            cmd_attach "$@" ;;
         plan)              cmd_plan "$@" ;;
         cancel)            cmd_cancel "$@" ;;
+        ack)               cmd_ack "$@" ;;
         force-start)       cmd_force_start "$@" ;;
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;

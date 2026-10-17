@@ -15,6 +15,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -45,6 +46,12 @@ type hub struct {
 	outputSrc    *outputSource
 	replayBytes  int64 // MOTHER_BROKER_OUTPUT_REPLAY_BYTES
 	outputMaxGap int   // MOTHER_BROKER_OUTPUT_MAX_GAP
+
+	// registryPath, when set, is where the client registry
+	// (runner/broker-clients.json) is written. regMu serializes writes so a
+	// stale count can never overwrite a newer one.
+	registryPath string
+	regMu        sync.Mutex
 
 	mu       sync.Mutex
 	clients  map[*client]bool
@@ -333,6 +340,13 @@ func (h *hub) overlayJobLocked(id string, raw json.RawMessage) json.RawMessage {
 	if json.Unmarshal(raw, &m) != nil {
 		return raw
 	}
+	acksDir := ""
+	if h.runner != nil {
+		acksDir = h.runner.acksDir
+	}
+	if b, err := json.Marshal(attentionReasons(raw, acksDir)); err == nil {
+		m["attention_reasons"] = b
+	}
 	ds := h.jobState[id]
 	if ds != nil {
 		if ds.state != "" {
@@ -360,8 +374,64 @@ func jstr(s string) json.RawMessage {
 	return b
 }
 
-func (h *hub) register(cl *client)   { h.mu.Lock(); h.clients[cl] = true; h.mu.Unlock() }
-func (h *hub) unregister(cl *client) { h.mu.Lock(); delete(h.clients, cl); h.mu.Unlock() }
+func (h *hub) register(cl *client) {
+	h.mu.Lock()
+	h.clients[cl] = true
+	h.mu.Unlock()
+	h.writeRegistry()
+}
+
+func (h *hub) unregister(cl *client) {
+	h.mu.Lock()
+	delete(h.clients, cl)
+	h.mu.Unlock()
+	h.writeRegistry()
+}
+
+// writeRegistry publishes {pid, updated_at, clients, await_subscribers} to
+// registryPath (temp + rename). await_subscribers counts live clients holding
+// any subscription that includes the `await` category — what mother-runner
+// reads to suppress duplicate macOS notifications. Refreshed on every ping
+// tick so a dead broker's file goes stale. Best-effort: errors are ignored
+// (a missing/stale file simply means "no client", the safe direction).
+func (h *hub) writeRegistry() {
+	if h.registryPath == "" {
+		return
+	}
+	h.regMu.Lock()
+	defer h.regMu.Unlock()
+
+	h.mu.Lock()
+	clients, awaitSubs := 0, 0
+	for cl := range h.clients {
+		if atomic.LoadInt32(&cl.dead) == 1 {
+			continue
+		}
+		clients++
+		for _, s := range cl.subs {
+			if s.categories[CatAwait] {
+				awaitSubs++
+				break
+			}
+		}
+	}
+	h.mu.Unlock()
+
+	b, err := json.Marshal(map[string]any{
+		"pid":               os.Getpid(),
+		"updated_at":        isoNow(),
+		"clients":           clients,
+		"await_subscribers": awaitSubs,
+	})
+	if err != nil {
+		return
+	}
+	tmp := h.registryPath + ".tmp"
+	if os.WriteFile(tmp, b, 0o644) != nil {
+		return
+	}
+	_ = os.Rename(tmp, h.registryPath)
+}
 
 func (h *hub) clientCount() int {
 	h.mu.Lock()
@@ -487,6 +557,7 @@ func (cl *client) pingLoop() {
 				go cl.drop("slow client: outbound buffer overflow")
 				return
 			}
+			cl.hub.writeRegistry()
 		}
 	}
 }
@@ -540,6 +611,8 @@ func (cl *client) handleLine(line []byte) {
 		cl.handleRetry(m)
 	case CmdForceStart:
 		cl.handleForceStart(m)
+	case CmdAck:
+		cl.handleAck(m)
 	default:
 		cl.ack(errAck(m.T, m.ID, ErrMalformed, "unknown command: "+m.T))
 	}
@@ -568,6 +641,7 @@ func (cl *client) handleSubscribe(m Message) {
 	}
 	cl.ack(okAck(m.T, m.ID, map[string]any{"sub": a.Sub}))
 	cl.hub.subscribe(cl, newSubscription(a))
+	cl.hub.writeRegistry()
 }
 
 func (cl *client) handleUnsubscribe(m Message) {
@@ -577,6 +651,7 @@ func (cl *client) handleUnsubscribe(m Message) {
 		return
 	}
 	cl.hub.unsubscribe(cl, a.Sub)
+	cl.hub.writeRegistry()
 	cl.ack(okAck(m.T, m.ID, map[string]any{"sub": a.Sub}))
 }
 
@@ -636,6 +711,16 @@ func (cl *client) handleForceStart(m Message) {
 	}
 	_ = json.Unmarshal(m.Data, &a)
 	cl.respond(m, cl.hub.runner.forceStart(a.Job))
+}
+
+func (cl *client) handleAck(m Message) {
+	var a struct {
+		Job    string `json:"job"`
+		Reason string `json:"reason"`
+		Source string `json:"source"`
+	}
+	_ = json.Unmarshal(m.Data, &a)
+	cl.respond(m, cl.hub.runner.ack(a.Job, a.Reason, a.Source))
 }
 
 // respond turns a cmdResult into the correlated ack.

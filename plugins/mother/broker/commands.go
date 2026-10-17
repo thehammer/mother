@@ -21,6 +21,7 @@ type commandRunner struct {
 	cliPath   string // path to the `mother` executable
 	eventsDir string
 	extraEnv  []string // env to pass to the CLI (MOTHER_ROOT etc.)
+	acksDir   string   // $MOTHER_ROOT/acks — read-only, for attention_reasons
 }
 
 // cmdResult is what a handler returns: on success payload is the ack data
@@ -65,6 +66,8 @@ func mapCLIError(stderr string) string {
 		return ErrUnauthorized
 	case strings.Contains(s, "invalid_state:"):
 		return ErrInvalidState
+	case strings.Contains(s, "unknown reason"):
+		return ErrMalformed
 	case strings.Contains(s, "expected awaiting"),
 		strings.Contains(s, "expected running"),
 		strings.Contains(s, "cannot cancel job in state"),
@@ -141,11 +144,32 @@ func (c *commandRunner) retry(job string) cmdResult {
 	return ok(map[string]any{"job": job})
 }
 
+// ack routes to `mother ack <job> <reason> --source <s>`. An empty source is
+// recorded as broker_client; the CLI validates the closed source list.
+func (c *commandRunner) ack(job, reason, source string) cmdResult {
+	if job == "" {
+		return fail(ErrMalformed, "ack: job required")
+	}
+	if reason == "" {
+		return fail(ErrMalformed, "ack: reason required")
+	}
+	if source == "" {
+		source = "broker_client"
+	}
+	_, stderr, code := c.runCLI("", "ack", job, reason, "--source", source)
+	if code != "" {
+		return fail(code, strings.TrimSpace(stderr))
+	}
+	return ok(map[string]any{"job": job, "reason": reason})
+}
+
 // queryList serves the `mother list --format json` equivalent from memory.
 func (c *commandRunner) queryList(f listFilter) cmdResult {
 	records := c.store.list(f)
 	jobs := make([]json.RawMessage, len(records))
-	copy(jobs, records)
+	for i, r := range records {
+		jobs[i] = withAttentionReasons(r, c.acksDir)
+	}
 	return ok(map[string]any{"jobs": jobs})
 }
 
@@ -161,7 +185,7 @@ func (c *commandRunner) queryGet(job string) cmdResult {
 	}
 	events := c.readEvents(job)
 	return ok(map[string]any{
-		"job":    json.RawMessage(raw),
+		"job":    withAttentionReasons(raw, c.acksDir),
 		"events": events,
 	})
 }

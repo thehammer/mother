@@ -2252,3 +2252,384 @@ func TestProgress_overlayNeverRewritesTheJobFile(t *testing.T) {
 		t.Errorf("job file changed on disk; progress is an overlay only\nbefore: %s\nafter:  %s", before, after)
 	}
 }
+
+// =============================================================================
+// HC-03 — client registry, ack command, attention_reasons
+// =============================================================================
+
+type registryFile struct {
+	Pid              int    `json:"pid"`
+	UpdatedAt        string `json:"updated_at"`
+	Clients          int    `json:"clients"`
+	AwaitSubscribers int    `json:"await_subscribers"`
+}
+
+func readRegistry(path string) (registryFile, bool) {
+	var r registryFile
+	b, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(b, &r) != nil {
+		return r, false
+	}
+	return r, true
+}
+
+// registryPathFor returns a registry path outside the test's TempDir: the hub
+// may legitimately rewrite the registry while a client is being torn down, so
+// a TempDir cleanup could otherwise race that write.
+func registryPathFor(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "registry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "broker-clients.json")
+}
+
+func registryWith(path string, fn func(registryFile) bool) func() bool {
+	return func() bool {
+		r, ok := readRegistry(path)
+		return ok && fn(r)
+	}
+}
+
+func TestRegistry_awaitSubscriptionIsCountedAndCarriesPidAndClients(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.hub.registryPath = registryPathFor(t)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+
+	subscribeSimple(t, conn, "s", nil, []string{CatAwait})
+
+	if !pollCondition(registryWith(th.hub.registryPath, func(r registryFile) bool { return r.AwaitSubscribers == 1 }), 2*time.Second) {
+		r, _ := readRegistry(th.hub.registryPath)
+		t.Fatalf("registry never showed await_subscribers=1: %+v", r)
+	}
+	r, _ := readRegistry(th.hub.registryPath)
+	if r.Pid != os.Getpid() {
+		t.Errorf("pid = %d, want %d", r.Pid, os.Getpid())
+	}
+	if r.Clients != 1 {
+		t.Errorf("clients = %d, want 1", r.Clients)
+	}
+	if !iso8601ms.MatchString(r.UpdatedAt) {
+		t.Errorf("updated_at = %q, want ISO-8601 with milliseconds", r.UpdatedAt)
+	}
+}
+
+var iso8601ms = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`)
+
+func TestRegistry_subscriptionWithoutAwaitDoesNotCount(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.hub.registryPath = registryPathFor(t)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+
+	subscribeSimple(t, conn, "s", nil, []string{CatState})
+
+	if !pollCondition(registryWith(th.hub.registryPath, func(r registryFile) bool { return r.Clients == 1 }), 2*time.Second) {
+		t.Fatal("registry never showed the connected client")
+	}
+	r, _ := readRegistry(th.hub.registryPath)
+	if r.AwaitSubscribers != 0 {
+		t.Errorf("await_subscribers = %d, want 0 for a state-only subscription", r.AwaitSubscribers)
+	}
+}
+
+func TestRegistry_unsubscribingFromAwaitReturnsCountToZero(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.hub.registryPath = registryPathFor(t)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+	subscribeSimple(t, conn, "s", nil, []string{CatAwait})
+	if !pollCondition(registryWith(th.hub.registryPath, func(r registryFile) bool { return r.AwaitSubscribers == 1 }), 2*time.Second) {
+		t.Fatal("await subscriber never registered")
+	}
+
+	sendCmd(t, conn, CmdUnsubscribe, "u1", map[string]any{"sub": "s"})
+	if _, err := readNext(t, conn); err != nil {
+		t.Fatalf("unsubscribe ack: %v", err)
+	}
+	if !pollCondition(registryWith(th.hub.registryPath, func(r registryFile) bool { return r.AwaitSubscribers == 0 }), 2*time.Second) {
+		t.Error("await_subscribers did not return to 0 after unsubscribe")
+	}
+}
+
+func TestRegistry_droppingTheClientRewritesCountsToZero(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.hub.registryPath = registryPathFor(t)
+	srv, cli := net.Pipe()
+	th.hub.serve(newClientConn(srv))
+	conn := newClientConn(cli)
+	_, _ = readNext(t, conn)
+	subscribeSimple(t, conn, "s", nil, []string{CatAwait})
+	if !pollCondition(registryWith(th.hub.registryPath, func(r registryFile) bool { return r.AwaitSubscribers == 1 }), 2*time.Second) {
+		t.Fatal("await subscriber never registered")
+	}
+
+	cli.Close()
+
+	if !pollCondition(registryWith(th.hub.registryPath, func(r registryFile) bool { return r.AwaitSubscribers == 0 && r.Clients == 0 }), 3*time.Second) {
+		r, _ := readRegistry(th.hub.registryPath)
+		t.Errorf("registry not rewritten to zero after client drop: %+v", r)
+	}
+}
+
+func TestRegistry_noPathConfiguredWritesNothingAndDoesNotFail(t *testing.T) {
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+	subscribeSimple(t, conn, "s", nil, []string{CatAwait})
+	entries, _ := os.ReadDir(th.tmpRoot)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "broker-clients") {
+			t.Errorf("unexpected registry file %s", e.Name())
+		}
+	}
+}
+
+// newTestHubWithRecordingCLI fakes `mother`, appending each invocation's argv
+// (one line, space-joined) to <tmp>/argv.log and exiting 0 — except that
+// `ack <job> unknown_reason ...` fails like the real CLI.
+func newTestHubWithRecordingCLI(t *testing.T) (*testHub, string) {
+	t.Helper()
+	th := newTestHub(t, 1024)
+	logPath := filepath.Join(th.tmpRoot, "argv.log")
+	script := "#!/bin/sh\necho \"$*\" >> '" + logPath + "'\n" +
+		"if [ \"$3\" = \"unknown_reason\" ]; then echo 'mother: ack: unknown reason: unknown_reason' >&2; exit 1; fi\n" +
+		"if [ \"$2\" = \"nope\" ]; then echo 'mother: no such job: nope' >&2; exit 1; fi\n" +
+		"exit 0\n"
+	fake := filepath.Join(th.tmpRoot, "fake-mother-rec")
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	th.runner.cliPath = fake
+	return th, logPath
+}
+
+func errCode(d map[string]any) any {
+	e, _ := d["error"].(map[string]any)
+	return e["code"]
+}
+
+func TestAck_routesToCLIWithJobReasonAndSource(t *testing.T) {
+	th, logPath := newTestHubWithRecordingCLI(t)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+
+	sendCmd(t, conn, CmdAck, "a1", map[string]any{"job": "j1", "reason": "gates_incomplete", "source": "nostromo_app"})
+	ack, err := readNext(t, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Dir != DirAck || ack.T != CmdAck {
+		t.Fatalf("got dir=%s t=%s, want ack/ack", ack.Dir, ack.T)
+	}
+	if d := mustDecodeData(t, ack); d["ok"] != true {
+		t.Errorf("ok = %v, want true (%v)", d["ok"], d)
+	}
+	b, _ := os.ReadFile(logPath)
+	if got := strings.TrimSpace(string(b)); got != "ack j1 gates_incomplete --source nostromo_app" {
+		t.Errorf("CLI argv = %q", got)
+	}
+}
+
+func TestAck_sourceDefaultsToBrokerClient(t *testing.T) {
+	th, logPath := newTestHubWithRecordingCLI(t)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+
+	sendCmd(t, conn, CmdAck, "a1", map[string]any{"job": "j1", "reason": "burn_ahead"})
+	if _, err := readNext(t, conn); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(logPath)
+	if got := strings.TrimSpace(string(b)); got != "ack j1 burn_ahead --source broker_client" {
+		t.Errorf("CLI argv = %q", got)
+	}
+}
+
+func TestAck_missingJobOrReasonIsMalformedAndCLIIsNotInvoked(t *testing.T) {
+	th, logPath := newTestHubWithRecordingCLI(t)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+
+	for i, data := range []map[string]any{{"reason": "burn_ahead"}, {"job": "j1"}} {
+		sendCmd(t, conn, CmdAck, "m"+string(rune('0'+i)), data)
+		ack, err := readNext(t, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := mustDecodeData(t, ack)
+		if d["ok"] != false || errCode(d) != ErrMalformed {
+			t.Errorf("data %v: ack = %v, want ok:false code:%s", data, d, ErrMalformed)
+		}
+	}
+	if _, err := os.Stat(logPath); err == nil {
+		t.Error("CLI was invoked for a malformed ack")
+	}
+}
+
+func TestAck_cliRefusalsSurfaceAsErrorAcks(t *testing.T) {
+	th, _ := newTestHubWithRecordingCLI(t)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+
+	sendCmd(t, conn, CmdAck, "a1", map[string]any{"job": "j1", "reason": "unknown_reason"})
+	ack, _ := readNext(t, conn)
+	if d := mustDecodeData(t, ack); d["ok"] != false || errCode(d) != ErrMalformed {
+		t.Errorf("unknown reason: %v, want ok:false code:%s", d, ErrMalformed)
+	}
+
+	sendCmd(t, conn, CmdAck, "a2", map[string]any{"job": "nope", "reason": "burn_ahead"})
+	ack, _ = readNext(t, conn)
+	if d := mustDecodeData(t, ack); d["ok"] != false || errCode(d) != ErrNoSuchJob {
+		t.Errorf("no such job: %v, want ok:false code:%s", d, ErrNoSuchJob)
+	}
+}
+
+func TestAck_advertisedInHelloCapabilities(t *testing.T) {
+	th := newTestHub(t, 1024)
+	conn := th.connect(t)
+	hello, _ := readNext(t, conn)
+	found := false
+	for _, c := range mustDecodeData(t, hello)["capabilities"].([]any) {
+		if c == "ack" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("hello capabilities missing \"ack\"")
+	}
+}
+
+// writeAcks writes <acksDir>/<job>.json with one ack per reason->since.
+func writeAcks(t *testing.T, acksDir, job string, acks map[string]string) {
+	t.Helper()
+	if err := os.MkdirAll(acksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]any{}
+	for r, since := range acks {
+		m[r] = map[string]any{"since": since, "at": isoNow(), "source": "cli"}
+	}
+	b, _ := json.Marshal(m)
+	if err := os.WriteFile(filepath.Join(acksDir, job+".json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type reasonView struct {
+	Reason string `json:"reason"`
+	Since  string `json:"since"`
+	Acked  bool   `json:"acked"`
+}
+
+func reasonsOf(t *testing.T, job any) []reasonView {
+	t.Helper()
+	m, ok := job.(map[string]any)
+	if !ok {
+		t.Fatalf("job is %T, want object", job)
+	}
+	raw, present := m["attention_reasons"]
+	if !present {
+		t.Fatalf("job has no attention_reasons: %v", m)
+	}
+	b, _ := json.Marshal(raw)
+	out := []reasonView{}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("attention_reasons: %v (%s)", err, b)
+	}
+	return out
+}
+
+const (
+	hcT1 = "2026-10-01T10:00:00.000Z"
+	hcT2 = "2026-10-02T11:00:00.000Z"
+)
+
+func injectAttentionJobs(t *testing.T, th *testHub) {
+	th.runner.acksDir = filepath.Join(th.tmpRoot, "acks")
+	th.injectJob(t, "j-acked", map[string]any{"attention": []map[string]any{{"reason": "gates_incomplete", "since": hcT1}}})
+	th.injectJob(t, "j-stale", map[string]any{"attention": []map[string]any{{"reason": "burn_ahead", "since": hcT2}}})
+	th.injectJob(t, "j-plain", nil)
+	th.injectJob(t, "j-bogus", map[string]any{"attention": []map[string]any{{"reason": "made_up", "since": hcT1}}})
+	writeAcks(t, th.runner.acksDir, "j-acked", map[string]string{"gates_incomplete": hcT1})
+	writeAcks(t, th.runner.acksDir, "j-stale", map[string]string{"burn_ahead": hcT1}) // since mismatch
+}
+
+func checkAttentionViews(t *testing.T, where string, byID map[string]any) {
+	t.Helper()
+	if r := reasonsOf(t, byID["j-acked"]); len(r) != 1 || r[0] != (reasonView{"gates_incomplete", hcT1, true}) {
+		t.Errorf("%s j-acked: %+v, want one acked gates_incomplete", where, r)
+	}
+	if r := reasonsOf(t, byID["j-stale"]); len(r) != 1 || r[0] != (reasonView{"burn_ahead", hcT2, false}) {
+		t.Errorf("%s j-stale: %+v, want unacked burn_ahead (ack since mismatched)", where, r)
+	}
+	if r := reasonsOf(t, byID["j-plain"]); len(r) != 0 {
+		t.Errorf("%s j-plain: %+v, want empty", where, r)
+	}
+	if r := reasonsOf(t, byID["j-bogus"]); len(r) != 0 {
+		t.Errorf("%s j-bogus: %+v, want empty (reason outside closed list)", where, r)
+	}
+}
+
+func TestAttentionReasons_snapshotJobsCarryResolvedAckState(t *testing.T) {
+	th := newTestHub(t, 1024)
+	injectAttentionJobs(t, th)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+
+	snap := subscribeSimple(t, conn, "s", nil, []string{CatState})
+	jobs, ok := mustDecodeData(t, snap)["jobs"].([]any)
+	if !ok {
+		t.Fatalf("snapshot has no jobs array: %s", snap.Data)
+	}
+	byID := map[string]any{}
+	for _, j := range jobs {
+		byID[j.(map[string]any)["id"].(string)] = j
+	}
+	checkAttentionViews(t, "snapshot", byID)
+}
+
+func TestAttentionReasons_queryListAndQueryGetCarryResolvedAckState(t *testing.T) {
+	th := newTestHub(t, 1024)
+	injectAttentionJobs(t, th)
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+
+	sendCmd(t, conn, CmdQueryList, "q1", map[string]any{})
+	resp, err := readNext(t, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]any{}
+	for _, j := range mustDecodeData(t, resp)["jobs"].([]any) {
+		byID[j.(map[string]any)["id"].(string)] = j
+	}
+	checkAttentionViews(t, "query.list", byID)
+
+	got := map[string]any{}
+	for _, id := range []string{"j-acked", "j-stale", "j-plain", "j-bogus"} {
+		sendCmd(t, conn, CmdQueryGet, "g-"+id, map[string]any{"job": id})
+		r, err := readNext(t, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[id] = mustDecodeData(t, r)["job"]
+	}
+	checkAttentionViews(t, "query.get", got)
+}
+
+func TestAttentionReasons_withoutAcksDirEverythingIsUnacked(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.injectJob(t, "j", map[string]any{"attention": []map[string]any{{"reason": "gates_incomplete", "since": hcT1}}})
+	conn := th.connect(t)
+	_, _ = readNext(t, conn)
+	sendCmd(t, conn, CmdQueryGet, "g", map[string]any{"job": "j"})
+	r, _ := readNext(t, conn)
+	got := reasonsOf(t, mustDecodeData(t, r)["job"])
+	if len(got) != 1 || got[0].Acked {
+		t.Errorf("got %+v, want one unacked reason", got)
+	}
+}
