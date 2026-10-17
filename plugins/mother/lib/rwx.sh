@@ -38,15 +38,18 @@ mother_rwx_gate() {
     [ "$gate" = "ok" ]
 }
 
-# _rwx_run_action <action> <outfile> — runs in the (already cd'd) cwd, writing
-# combined output to <outfile>; exit status is rwx's. rwx runs as a direct child
-# (no $(...) layer) so the watchdog can kill it. No `start` fallback for reset:
-# rwx v3.31 `sandbox reset` starts a sandbox when none exists (live-verified).
+# _rwx_run_action <action> <outfile> [script] — runs in the (already cd'd) cwd,
+# writing combined output to <outfile>; exit status is rwx's. rwx runs as a
+# direct child (no $(...) layer) so the watchdog can kill it. No `start`
+# fallback for reset: rwx v3.31 `sandbox reset` starts a sandbox when none
+# exists (live-verified). `exec` takes the shell script as its third argument
+# and runs it under `bash -c` (the local shell would otherwise split `&&`).
 _rwx_run_action() {
     local action="$1" outfile="$2"
     case "$action" in
         reset) rwx sandbox reset .rwx/sandbox.yml >"$outfile" 2>&1 </dev/null ;;
         stop)  rwx sandbox stop >"$outfile" 2>&1 </dev/null ;;
+        exec)  rwx sandbox exec -- bash -c "${3:-}" >"$outfile" 2>&1 </dev/null ;;
     esac
 }
 
@@ -71,47 +74,25 @@ mother_rwx_sandbox() {
     local dir="${MOTHER_ROOT:-$HOME/.mother}/runner" tmp
     mkdir -p "$dir" 2>/dev/null
     tmp=$(mktemp "$dir/rwx-out.tmp.XXXXXX" 2>/dev/null) || tmp="/tmp/rwx-out.tmp.$$"
-    rm -f "$tmp.timeout" "$tmp.rc"
 
     local started=$SECONDS
-    # Probe: output to a file (never a pipe, so a stuck grandchild can't hold
-    # the caller's stdout open); exit code to a side file.
-    (
-        cd "$work_dir" 2>/dev/null || exit 126
-        _rwx_run_action "$action" "$tmp"
-        echo $? >"$tmp.rc"
-    ) >/dev/null 2>&1 </dev/null &
-    local probe_pid=$!
-    # Watchdog (same background-race pattern as _docker_reachable in
-    # teardown.sh). Its stdio is detached so the orphaned `sleep` can't pin a
-    # $(...) capture open for the full timeout after it is reaped below.
-    (
-        sleep "$timeout"
-        : >"$tmp.timeout"
-        mother_kill_tree "$probe_pid"
-    ) >/dev/null 2>&1 </dev/null &
-    local watchdog_pid=$!
+    mother_watchdog_run "$timeout" "$tmp" "$work_dir" _rwx_run_action "$action" "$tmp"
 
-    wait "$probe_pid" 2>/dev/null
-    mother_kill_tree "$watchdog_pid"
-    wait "$watchdog_pid" 2>/dev/null
-
-    local duration=$((SECONDS - started)) outcome exit_code=0
-    if [ -f "$tmp.timeout" ]; then
-        outcome=timeout; exit_code=124
-    elif [ -f "$tmp.rc" ]; then
-        exit_code=$(cat "$tmp.rc" 2>/dev/null); exit_code="${exit_code:-1}"
-        if [ "$exit_code" = "0" ]; then
-            outcome=ok
-        elif [ "$action" = "stop" ] && grep -q 'No sandbox found' "$tmp" 2>/dev/null; then
-            # Already idled out (or never started): nothing left to stop.
-            outcome=ok
-        else
-            outcome=error
-        fi
-    else
-        outcome=error; exit_code=1
-    fi
+    local duration=$((SECONDS - started)) outcome exit_code="$MOTHER_WD_RC"
+    case "$MOTHER_WD_OUTCOME" in
+        timeout) outcome=timeout ;;
+        done)
+            if [ "$exit_code" = "0" ]; then
+                outcome=ok
+            elif [ "$action" = "stop" ] && grep -q 'No sandbox found' "$tmp" 2>/dev/null; then
+                # Already idled out (or never started): nothing left to stop.
+                outcome=ok
+            else
+                outcome=error
+            fi
+            ;;
+        *) outcome=error ;;
+    esac
 
     local tail_text esc
     esc=$(printf '\033')
@@ -120,7 +101,7 @@ mother_rwx_sandbox() {
         | grep -v -e 'A new release of rwx is available' -e '^To upgrade, run:' \
         | tail -c 300)
 
-    rm -f "$tmp" "$tmp.timeout" "$tmp.rc"
+    rm -f "$tmp"
     jq -nc --arg action "$action" --arg command "$command_str" --arg outcome "$outcome" \
         --argjson exit_code "$exit_code" --argjson duration "$duration" --arg tail "$tail_text" \
         '{action: $action, command: $command, outcome: $outcome, exit_code: $exit_code,

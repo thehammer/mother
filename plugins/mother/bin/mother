@@ -27,6 +27,8 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 #   mother retry <id>
 #   mother await [<id>] --question "..."
 #   mother preview up|wait|info|verify|call|fake|down
+#   mother gates run|check
+#   mother doctor
 #   mother resume <id> "<answer>" | --from-file <path> | -  [--option <id>] [--source <s>] [--session <id>] [--agent <name>]
 #   mother events [--since-cursor <session-id>] [--since <iso-ts>]
 #   mother drafts list|show <id>|rm <id>
@@ -67,6 +69,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 [ -r "$MOTHER_LIB_DIR/decision.sh" ]      && source "$MOTHER_LIB_DIR/decision.sh"
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/config.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/gates.sh" ]         && source "$MOTHER_LIB_DIR/gates.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/preview.sh" ]       && source "$MOTHER_LIB_DIR/preview.sh"
 type mother_preview_main >/dev/null 2>&1 || mother_preview_main() { echo "mother preview: lib/preview.sh is missing" >&2; return 1; }
@@ -254,6 +258,38 @@ for block in blocks:
         print("true" if data.get("no_pr", False) is True else "false")
         sys.exit(0)
 print("false")
+PYEOF
+}
+
+# _parse_plan_gates_max_attempts <plan_file>
+# Prints the plan's optional `gates: {max_attempts: N}` (same yaml block as
+# suggested_config), or nothing when absent. A present-but-invalid value prints
+# `invalid:<value>` so cmd_add can reject it.
+_parse_plan_gates_max_attempts() {
+    local plan_file="$1"
+    python3 - "$plan_file" <<'PYEOF' 2>/dev/null || true
+import sys, re
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    content = f.read()
+
+blocks = re.findall(r'```yaml\n(.*?)```', content, re.DOTALL)
+for block in blocks:
+    if 'suggested_config' in block:
+        data = yaml.safe_load(block.strip()) or {}
+        gates = data.get("gates")
+        if not isinstance(gates, dict) or "max_attempts" not in gates:
+            sys.exit(0)
+        v = gates["max_attempts"]
+        if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 5:
+            print(v)
+        else:
+            print("invalid:%s" % (v,))
+        sys.exit(0)
 PYEOF
 }
 
@@ -558,6 +594,25 @@ cmd_add() {
     suggested_config_json=$(_parse_suggested_config "$plan_file") \
         || _die "add: $suggested_config_json"
 
+    # Quality gates (.mother/crew.yml, read from base_ref — never the worktree).
+    # An invalid file fails the add; a valid one is snapshotted into .crew.
+    local crew_json="" plan_max_attempts
+    plan_max_attempts=$(_parse_plan_gates_max_attempts "$plan_file")
+    case "$plan_max_attempts" in
+        invalid:*) _die "add: plan gates.max_attempts must be an integer between 1 and 5 (got: ${plan_max_attempts#invalid:})" ;;
+    esac
+    if [ "${MOTHER_GATES_ENABLED:-1}" != "0" ] \
+        && git -C "$repo_path" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+        local crew_rc=0
+        crew_json=$(_crew_resolve "$repo_path" "$base_ref" "$repo") || crew_rc=$?
+        case "$crew_rc" in
+            0) [ "$crew_json" = "null" ] && crew_json="" ;;
+            1) _die "add: invalid .mother/crew.yml at $base_ref:
+$(_crew_error_lines "$repo" "$crew_json")" ;;
+            *) crew_json="" ;;
+        esac
+    fi
+
     # Parse the no_pr flag (opt-out of the no_pr_no_push failure check).
     local no_pr_flag
     no_pr_flag=$(_parse_no_pr "$plan_file")
@@ -661,6 +716,12 @@ cmd_add() {
             escalation_count: 0,
             adherence_attempts: 0
         }')
+    # Gates snapshot (G2): absent crew.yml => no `crew` key at all (G1).
+    if [ -n "$crew_json" ]; then
+        job_json=$(printf '%s' "$job_json" | jq \
+            --argjson crew "$crew_json" --arg ma "$plan_max_attempts" \
+            '. + {crew: (if $ma != "" then ($crew | .gates.max_attempts = ($ma | tonumber)) else $crew end)}')
+    fi
     # For pipeline jobs, merge the pipeline object onto the base job JSON.
     # Non-pipeline plans get today's exact shape (no kind, no pipeline key).
     if [ "$is_pipeline" -eq 1 ]; then
@@ -3881,6 +3942,225 @@ cmd_retro() {
 
 # ---------- help ----------
 
+# ---------- quality gates (.mother/crew.yml) ----------
+
+# _crew_resolve <repo_path> <ref> <repo_name>
+# Prints crew_config.py's stdout (resolved JSON, `null`, or {"errors": [...]}).
+# Returns its exit code: 0 ok/none, 1 invalid, 2 ref unusable.
+# MOTHER_PHI_REPOS may live in config.env (env wins), so look there too.
+_crew_resolve() {
+    if [ -z "${MOTHER_PHI_REPOS+x}" ]; then
+        local phi; phi=$(mother_config_get MOTHER_PHI_REPOS 2>/dev/null)
+        [ -n "$phi" ] && export MOTHER_PHI_REPOS="$phi"
+    fi
+    python3 "$MOTHER_LIB_DIR/crew_config.py" resolve "$1" "$2" "$3"
+}
+
+# _crew_error_lines <repo_label> <errors-json> — one `<repo>: .mother/crew.yml: <path>: <message>` per error.
+_crew_error_lines() {
+    printf '%s' "$2" | jq -r --arg repo "$1" \
+        '.errors[] | "\($repo): .mother/crew.yml: \(.path): \(.message)"'
+}
+
+# _crew_default_ref <repo_path> — best guess at the mainline ref.
+_crew_default_ref() {
+    local repo_path="$1" ref
+    for ref in origin/HEAD origin/main origin/master main master HEAD; do
+        if git -C "$repo_path" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+            echo "$ref"; return 0
+        fi
+    done
+    echo HEAD
+}
+
+# _gates_check_one <repo_path> <ref> <label>
+# Prints one status line (or the error lines). Returns 1 only for an invalid config.
+_gates_check_one() {
+    local repo_path="$1" ref="$2" label="$3" out rc=0
+    out=$(_crew_resolve "$repo_path" "$ref" "$label" 2>&1) || rc=$?
+    case "$rc" in
+        0)
+            if [ "$out" = "null" ]; then
+                echo "$label: no .mother/crew.yml at $ref"
+            else
+                echo "$label: .mother/crew.yml: ok ($(printf '%s' "$out" | jq -r '.gates.checks | length') checks at $ref)"
+            fi
+            return 0 ;;
+        1)
+            _crew_error_lines "$label" "$out"
+            return 1 ;;
+        *)
+            echo "$label: .mother/crew.yml: cannot check at $ref: $out"
+            return 1 ;;
+    esac
+}
+
+cmd_gates() {
+    local sub="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        run)   _gates_cmd_run "$@" ;;
+        check) _gates_cmd_check "$@" ;;
+        *)     _die "gates: usage: mother gates run [--job ID] [--repo PATH] [--base REF] [--format text|json] | mother gates check [--repo PATH] [--ref REF]" ;;
+    esac
+}
+
+_gates_cmd_check() {
+    local repo="" ref="" name=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            --ref)  ref="$2"; shift 2 ;;
+            --name) name="$2"; shift 2 ;;
+            *) _die "unknown flag for gates check: $1" ;;
+        esac
+    done
+    [ -n "$repo" ] || repo=$(git rev-parse --show-toplevel 2>/dev/null) || _die "gates check: not in a git repo (pass --repo)"
+    git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || _die "gates check: not a git repo: $repo"
+    [ -n "$ref" ]  || ref=$(_crew_default_ref "$repo")
+    [ -n "$name" ] || name=$(basename "$repo")
+    _gates_check_one "$repo" "$ref" "$name"
+}
+
+_gates_cmd_run() {
+    local job_id="${MOTHER_JOB_ID:-}" repo="" base="" format="text"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --job)    job_id="$2"; shift 2 ;;
+            --repo)   repo="$2"; shift 2 ;;
+            --base)   base="$2"; shift 2 ;;
+            --format) format="$2"; shift 2 ;;
+            *) _die "unknown flag for gates run: $1" ;;
+        esac
+    done
+    case "$format" in text|json) ;; *) _die "gates run: --format must be text or json" ;; esac
+
+    if [ "${MOTHER_GATES_ENABLED:-1}" = "0" ]; then
+        if [ "$format" = "json" ]; then echo '{"status":"disabled"}'; else echo "gates disabled (MOTHER_GATES_ENABLED=0)"; fi
+        return 0
+    fi
+
+    local work_dir="" repo_path="" repo_name="" job_file="" out_name="adhoc"
+    if [ -n "$job_id" ]; then
+        _job_exists "$job_id" || _die "gates run: no such job: $job_id"
+        job_file=$(_job_path "$job_id")
+        repo_path=$(jq -r '.repo_path // empty' "$job_file")
+        repo_name=$(jq -r '.repo // empty' "$job_file")
+        [ -n "$base" ] || base=$(jq -r '.base_ref // empty' "$job_file")
+        if [ -n "$repo" ]; then work_dir="$repo"; else work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file"); fi
+        out_name="$job_id"
+    else
+        [ -n "$repo" ] || repo=$(git rev-parse --show-toplevel 2>/dev/null) || _die "gates run: not in a git repo (pass --repo)"
+        work_dir="$repo"
+    fi
+    [ -n "$work_dir" ] && [ -d "$work_dir" ] || _die "gates run: work dir not found: ${work_dir:-<none>}"
+    git -C "$work_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || _die "gates run: not a git repo: $work_dir"
+    [ -n "$repo_path" ] || repo_path="$work_dir"
+    [ -n "$repo_name" ] || repo_name=$(basename "$repo_path")
+    [ -n "$base" ] || base=$(_crew_default_ref "$work_dir")
+
+    # Config: the job's snapshot when it has one, else resolve from the base ref.
+    local crew_tmp
+    crew_tmp=$(mktemp "${TMPDIR:-/tmp}/mother-crew.XXXXXX") || _die "gates run: mktemp failed"
+    local rc=0
+    _gates_run_with_config "$job_file" "$crew_tmp" "$work_dir" "$repo_path" "$repo_name" "$base" "$out_name" "$format" || rc=$?
+    rm -f "$crew_tmp"
+    return "$rc"
+}
+
+# _gates_run_with_config — body of `gates run` once the work dir and base are known.
+_gates_run_with_config() {
+    local job_file="$1" crew_tmp="$2" work_dir="$3" repo_path="$4" repo_name="$5" base="$6" out_name="$7" format="$8"
+
+    if [ -n "$job_file" ] && jq -e '.crew != null' "$job_file" >/dev/null 2>&1; then
+        jq -c '.crew' "$job_file" >"$crew_tmp"
+    else
+        local resolved rc=0
+        resolved=$(_crew_resolve "$repo_path" "$base" "$repo_name") || rc=$?
+        case "$rc" in
+            0) printf '%s' "$resolved" >"$crew_tmp" ;;
+            1) _crew_error_lines "$repo_name" "$resolved" >&2; return 1 ;;
+            *) _die "gates run: cannot resolve config at $base: $resolved" ;;
+        esac
+    fi
+    if [ "$(jq -r '(.gates.checks // []) | length' "$crew_tmp" 2>/dev/null || echo 0)" = "0" ]; then
+        if [ "$format" = "json" ]; then echo '{"status":"no_gates"}'; else echo "no gates configured"; fi
+        return 0
+    fi
+
+    local out_dir="${MOTHER_ROOT:-$HOME/.mother}/gates/$out_name"
+    mkdir -p "$out_dir" && rm -f "${out_dir:?}"/*.log "${out_dir:?}"/*.excerpt
+    type mother_gates_run >/dev/null 2>&1 || _die "gates run: lib/gates.sh is missing"
+
+    local result status
+    result=$(mother_gates_run "$work_dir" "$crew_tmp" "$base" "$out_dir" --allow-unpushed) \
+        || _die "gates run: runner failed"
+    status=$(printf '%s' "$result" | jq -r '.status')
+    if [ "$format" = "json" ]; then
+        printf '%s\n' "$result"
+    else
+        mother_gates_render_text "$result" "$out_dir" "$crew_tmp"
+        echo
+        echo "gates: $status$(printf '%s' "$result" | jq -r 'if (.not_run | length) > 0 then " (not run: " + (.not_run | join(", ")) + ")" else "" end')"
+    fi
+    case "$status" in
+        passed) return 0 ;;
+        failed) return 1 ;;
+        *)      return 2 ;;
+    esac
+}
+
+# ---------- doctor ----------
+
+cmd_doctor() {
+    local plugin_dir="${MOTHER_PLUGIN_DIR:-$MOTHER_BIN_DIR/..}" rc=0
+    if [ -x "$plugin_dir/scripts/doctor.sh" ]; then
+        "$plugin_dir/scripts/doctor.sh" || rc=1
+    else
+        echo "mother doctor: scripts/doctor.sh not found under $plugin_dir" >&2
+        rc=1
+    fi
+
+    # crew config: every distinct repo among non-archived jobs, plus cwd's repo.
+    echo "crew config:"
+    local seen=$'\n' job_file repo_path base_ref label top n=0
+    for job_file in "$JOBS_DIR"/*.json; do
+        [ -f "$job_file" ] || continue
+        repo_path=$(jq -r '.repo_path // empty' "$job_file" 2>/dev/null)
+        [ -n "$repo_path" ] || continue
+        case "$seen" in *$'\n'"$repo_path"$'\n'*) continue ;; esac
+        seen="${seen}${repo_path}"$'\n'
+        [ -d "$repo_path" ] && git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
+        base_ref=$(jq -r '.base_ref // empty' "$job_file")
+        label=$(jq -r '.repo // empty' "$job_file"); [ -n "$label" ] || label=$(basename "$repo_path")
+        if [ -z "$base_ref" ] || ! git -C "$repo_path" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+            base_ref=$(_crew_default_ref "$repo_path")
+        fi
+        n=$((n + 1))
+        _doctor_crew_one "$repo_path" "$base_ref" "$label" || rc=1
+    done
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""
+    if [ -n "$top" ]; then
+        case "$seen" in
+            *$'\n'"$top"$'\n'*) ;;
+            *)
+                n=$((n + 1))
+                _doctor_crew_one "$top" "$(_crew_default_ref "$top")" "$(basename "$top")" || rc=1
+                ;;
+        esac
+    fi
+    [ "$n" -gt 0 ] || echo "  (no repos to check)"
+    return "$rc"
+}
+
+# _doctor_crew_one <repo_path> <ref> <label> — indented `gates check` line(s); 1 if invalid.
+_doctor_crew_one() {
+    local out rc=0
+    out=$(_gates_check_one "$1" "$2" "$3") || rc=$?
+    printf '%s\n' "$out" | sed 's/^/  /'
+    return "$rc"
+}
+
 cmd_help() {
     cat <<'EOF'
 mother — background work for Claude Code
@@ -3900,6 +4180,10 @@ Usage:
   mother reconcile ID [--pr-url URL] [--auto] [--yes] [--dry-run]
                                               (adopt a real PR without re-running the worker)
   mother adherence-review ID                 (check PR diff against original plan)
+  mother gates run [--job ID] [--repo PATH] [--base REF] [--format text|json]
+                                              (run the repo's .mother/crew.yml quality gates)
+  mother gates check [--repo PATH] [--ref REF]  (validate .mother/crew.yml at a ref)
+  mother doctor                              (dependency checks + crew config check)
   mother review-phase ID --reviewer AGENT    (run one pipeline reviewer: ada|archie|perri)
   mother merge-findings ID                   (merge per-reviewer findings into one array; stdout only)
   mother await [ID] --question TEXT          (worker-side: pause for operator input)
@@ -4195,6 +4479,8 @@ main() {
         merge-findings)    _merge_reviewer_findings "${1:-}" ;;
         await)             cmd_await "$@" ;;
         preview)           cmd_preview "$@" ;;
+        gates)             cmd_gates "$@" ;;
+        doctor)            cmd_doctor "$@" ;;
         resume)            cmd_resume "$@" ;;
         events)            cmd_events "$@" ;;
         drafts)            cmd_drafts "$@" ;;

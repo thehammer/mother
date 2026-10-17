@@ -405,6 +405,41 @@ hook also drops any event older than `MOTHER_EVENTS_MAX_AGE_HOURS` (default 6,
 checkout; plugin versions are bumped so `claude plugin update` refreshes it.
 
 
+## Quality gates
+
+A repo opts in with `.mother/crew.yml` (`version: 1`; `gates:{mode, max_attempts 1..5,
+budget_minutes, checks[]}`; `lenses:` is accepted and ignored until HC-12). A check is `{name
+[a-z0-9][a-z0-9_-]{0,31} unique, run, when:{paths:[globs]} (omitted = always), blocking (default
+true), where: any|sandbox (default any), timeout_s 1..3600 (default 900), hint <= 500 chars}`.
+`**` globs cross directories; `*` and `?` don't cross `/`.
+
+- **Read from the base ref, never the worktree.** `lib/crew_config.py resolve <repo> <ref> <name>`
+  runs `git show <ref>:.mother/crew.yml`, so a worker can't weaken its own gates. Errors are
+  `{path, message}` and print as `<repo>: .mother/crew.yml: <path>: <message>`.
+  `where: sandbox` is only valid when `.rwx/sandbox.yml` exists at that ref.
+- **`mother add`** resolves it from `--base` (skipped when `MOTHER_GATES_ENABLED=0` or the ref doesn't
+  resolve locally): an invalid file fails the add; a valid one is stored as `.crew`
+  `{version, source_ref, source_sha, phi_sensitive, gates, lenses}`, with the plan's optional
+  `gates: {max_attempts: N}` applied. No file means no `crew` key. Nothing reads `.crew` yet (HC-06).
+- **`mother gates run`** (worker-callable; `--job`/`MOTHER_JOB_ID` use the job's work dir, base and
+  `.crew`) always passes `--allow-unpushed` to `mother_gates_run` (`lib/gates.sh`). Exit 0 passed,
+  1 failed, 2 incomplete. Logs/excerpts land in `$MOTHER_ROOT/gates/<job-or-adhoc>/`. `mother gates
+  check [--repo] [--ref]` validates only; `mother doctor` runs `scripts/doctor.sh` then checks every
+  non-archived job's repo (at its base ref) and the cwd repo, exiting non-zero on an invalid config.
+- **Unavailable is never passed.** Sandbox gates are `unavailable` (reason `no_cli`, `disabled`,
+  `no_config`, `head_not_pushed`, `rwx_error` for a failed reset or an exec rwx couldn't run,
+  `rwx_timeout` for a watchdog expiry) and make the overall status `incomplete`. An `exec` that
+  runs and exits non-zero is a normal `failed` (rwx passes the command's exit code through). An
+  `any` check that times out is `failed` (exit 124). Status is `failed` if any blocking check
+  failed, else `incomplete` if any is unavailable, else `passed`.
+- **No output text in JSON.** Full output goes to `<name>.log`, the last 60 lines (<= 4 KB) to
+  `<name>.excerpt`. Every check sees `MOTHER_GATE_BASE` (merge-base sha) and
+  `MOTHER_GATE_CHANGED_FILES` (newline-separated, <= 64 KB); sandbox checks get them prepended to the
+  `bash -c` string because local env doesn't reach the sandbox.
+- **Settings:** `MOTHER_GATES_ENABLED=0` makes `gates run` a no-op (`{"status":"disabled"}`) and
+  skips the add-time snapshot. `MOTHER_PHI_REPOS` (default `admin-portal referral-monitor`, also
+  settable in `config.env`) forces `phi_sensitive: true` for those repo names.
+
 ## Internals reference (lazy-loaded)
 
 Resource teardown (worktrees/containers), PR detection (`lib/prdetect.sh`,

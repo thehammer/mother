@@ -137,6 +137,9 @@ doc (linked from its `CLAUDE.md`) has the exact commands, timings and gotchas. R
   `rwx run .rwx/pr-checks.yml --wait --fail-fast`). If the wait outlives your Bash call,
   re-attach with `rwx results <run-id> --wait --fail-fast`. Fix real failures; list known
   flakes you hit in the PR body.
+- **Quality gates:** if this repo has `.mother/crew.yml`, run `mother gates run` before claiming
+  done; it uses the same checks Mother will run. Fix what it reports as failed and re-run. A gate
+  shown as `unavailable` did not run; say so in your final message rather than calling it passed.
 - **If RWX is unavailable** (`rwx` missing, `rwx whoami` fails, sandbox setup fails twice): say
   so in your final message and the PR body ("tests not run in RWX: <error>"). Use the local
   Docker stack only if it works, and say that you did. If you can't run tests anywhere,

@@ -103,7 +103,7 @@ Then bootstrap the daemon and symlinks:
 
 ```
 plugins/mother/scripts/install.sh   # symlinks bin/* into ~/.local/bin + runs doctor
-mother doctor                        # verify deps
+mother doctor                        # verify deps, then validate any .mother/crew.yml
 mother daemon install                # launchd plist on macOS
 mother daemon start
 ```
