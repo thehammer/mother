@@ -84,6 +84,8 @@ teardown() {
 _gl_install_claude_ok() {
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# A real worker pushes its branch before it finishes; GL_NO_PUSH=1 is one that didn't.
+[ "${GL_NO_PUSH:-0}" = "1" ] || git push -q -u origin HEAD >/dev/null 2>&1 || true
 cat <<'EOF'
 {"type":"assistant","message":{"id":"msg_gl","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}}}
 {"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.01,"modelUsage":{}}
@@ -113,7 +115,8 @@ _gl_crew() {
 }
 
 # _gl_seed_branch <branch> — local-only branch, one commit (app/Foo.php) ahead
-# of origin/main, left checked-out-elsewhere (REPO ends on main).
+# of origin/main, left checked-out-elsewhere (REPO ends on main). The worker
+# stand-in pushes it, as a real worker does (unless GL_NO_PUSH=1).
 _gl_seed_branch() {
     (
         cd "$REPO"
@@ -553,6 +556,26 @@ CLAUDE
     [ "$(_gl_job_json g-g1 '.gates.status')" = "failed" ]
     [ "$(_gl_job_json g-g1 '.gates.head_sha')" = "$(_gl_head feature/gl-g-g1)" ]
     [ "$(_gl_result g-g1 ok result)" = "passed" ]
+}
+
+@test "a PR job whose branch head was never pushed fails the pushed pre-check (gates never run against an unshipped commit)" {
+    _gl_job g-g2 ".crew = $(_gl_crew "$(_gl_check ok 'true')")"
+    export GL_NO_PUSH=1
+    _gl_run g-g2
+    [ "$(_gl_result g-g2 pushed result)" = "failed" ]
+    [ "$(_gl_job_json g-g2 '.gates.status')" = "failed" ]
+}
+
+@test "a gate run that overruns the total budget is cut off and recorded as incomplete, never passed" {
+    _gl_job g-b1 ".crew = $(_gl_crew "$(_gl_check slow 'sleep 30')")"
+    export MOTHER_GATES_TOTAL_TIMEOUT_S=2
+    local t0 t1; t0=$(date +%s)
+    _gl_run g-b1
+    t1=$(date +%s)
+    [ $((t1 - t0)) -lt 25 ]
+    [ "$(_gl_job_json g-b1 '.state')" = "succeeded" ]
+    [ "$(_gl_job_json g-b1 '.gates.status')" = "incomplete" ]
+    [ "$(_gl_job_json g-b1 '.activity // "none"')" != "gating" ]
 }
 
 # ---------------------------------------------------------------------------

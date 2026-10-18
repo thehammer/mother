@@ -769,9 +769,33 @@ _run_gates_observe() {
         '{attempt: $attempt, max_attempts: $max, head_sha: $head, mode: $mode, posture: $posture,
           gates: [$crew[0].gates.checks[].name]}')" 2>/dev/null || true
 
-    local result
-    result=$(mother_gates_run "${work_dir:-}" "$crew_file" "$base_ref" "$out_dir" \
-        --posture "$posture" --attempt "$attempt" --allow-unpushed 2>/dev/null) || result=""
+    # Only a no_pr job may be gated on an unpushed head. A PR job must have
+    # pushed what it is being gated on, or observe-mode results would be
+    # recorded against a commit CI never sees.
+    local -a unpushed_flag=()
+    [ "$(jq -r '.no_pr // false' "$job_file" 2>/dev/null)" = "true" ] && unpushed_flag=(--allow-unpushed)
+
+    # Bound the whole gate run (not just each check): a main-dir job holds the
+    # repo's workspace lock while it gates. Overrunning the budget kills the run
+    # and records it as incomplete, never passed.
+    local budget_min budget_s
+    budget_min=$(jq -r '.crew.gates.budget_minutes // 15' "$job_file" 2>/dev/null) || budget_min=15
+    case "$budget_min" in ''|*[!0-9]*) budget_min=15 ;; esac
+    budget_s="${MOTHER_GATES_TOTAL_TIMEOUT_S:-$((budget_min * 60))}"
+    _GATES_RESULT_FILE="$out_dir/.result.json"
+    rm -f "$_GATES_RESULT_FILE"
+    _gates_run_to_file() { mother_gates_run "$@" >"$_GATES_RESULT_FILE" 2>/dev/null; }
+
+    local result=""
+    mother_watchdog_run "$budget_s" "$out_dir/.total" "${work_dir:-.}" _gates_run_to_file \
+        "${work_dir:-}" "$crew_file" "$base_ref" "$out_dir" \
+        --posture "$posture" --attempt "$attempt" ${unpushed_flag[@]+"${unpushed_flag[@]}"}
+    if [ "${MOTHER_WD_OUTCOME:-}" = "done" ] && [ -s "$_GATES_RESULT_FILE" ]; then
+        result=$(cat "$_GATES_RESULT_FILE" 2>/dev/null) || result=""
+    elif [ "${MOTHER_WD_OUTCOME:-}" = "timeout" ]; then
+        echo "mother-run-job: $id: gates exceeded the total budget of ${budget_s}s; run cut off and recorded as incomplete" >&2
+    fi
+    rm -f "$_GATES_RESULT_FILE"
     printf '%s' "$result" | jq -e 'type == "object" and (.results | type == "array")' >/dev/null 2>&1 \
         || result=$(jq -nc --arg head "$head_sha" --arg posture "$posture" --argjson attempt "$attempt" \
             '{status: "incomplete", head_sha: $head, posture: $posture, results: [], not_run: [], attempt: $attempt}')
