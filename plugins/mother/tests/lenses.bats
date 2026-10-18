@@ -754,6 +754,31 @@ _num_eq() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 == b + 0) }'; }
     ! grep -qF 'FINDING_SENTINEL_INVALID' "$JOBS_DIR/rl15.json"
 }
 
+@test "review-lens: a run that produces no findings block is recorded as error, never as a clean pass" {
+    _make_lens_job rl15b
+    _reply reply_empty.jsonl
+    run mother review-lens rl15b --lens phi-security
+    [ "$status" -eq 2 ]
+    assert_event_kind rl15b review_no_findings_block
+    local sf; sf=$(_side_file rl15b phi-security)
+    [ -f "$sf" ]
+    [ "$(jq -r '.decision' "$sf")" = "error" ]
+    [ "$(jq -r '.state' "$sf")" = "error" ]
+    [ "$(jq '.findings | length' "$sf")" = "0" ]
+}
+
+@test "review-lens: a crashed claude run (non-zero exit, no output) is recorded as error" {
+    _make_lens_job rl15c
+    _reply reply_empty.jsonl
+    export MOCK_CLAUDE_EXIT=1
+    run mother review-lens rl15c --lens correctness
+    [ "$status" -eq 2 ]
+    local sf; sf=$(_side_file rl15c correctness)
+    [ -f "$sf" ]
+    [ "$(jq -r '.decision' "$sf")" = "error" ]
+    [ "$(jq -r '.error_reason' "$sf")" = "exit_nonzero" ]
+}
+
 @test "review-lens: an unknown lens fails with a message and never invokes claude" {
     _make_lens_job rl16
     run mother review-lens rl16 --lens bogus

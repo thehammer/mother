@@ -2889,7 +2889,8 @@ EOF
         --disallowedTools "Write,Edit,NotebookEdit,WebFetch,WebSearch" \
         --max-budget-usd "$budget" "${MOTHER_CLAUDE_ARGS[@]}" \
         -p --output-format stream-json --verbose <<< "$prompt" ) \
-        > "$lens_log" 2>/dev/null || true
+        > "$lens_log" 2>/dev/null
+    local lens_rc=$?
 
     local tmpfile; tmpfile=$(mktemp)
     _extract_transcript_result_text "$lens_log" > "$tmpfile" 2>/dev/null \
@@ -2899,10 +2900,24 @@ EOF
     raw_examined=$(findings_extract_examined "$tmpfile" 2>/dev/null || true)
     rm -f "$tmpfile"
 
-    if [ -z "$raw_findings" ]; then
-        raw_findings="[]"
+    # A lens that crashed or never emitted a findings block did not review
+    # anything: record it as error (contract lens state), never as a clean
+    # pass. An explicit empty findings block ([]) is a genuine clean result.
+    if [ "$lens_rc" -ne 0 ] || [ -z "$raw_findings" ]; then
+        local err_reason="no_findings_block"
+        [ "$lens_rc" -ne 0 ] && err_reason="exit_nonzero"
         _append_event "$id" "review_no_findings_block" \
-            "$(jq -nc --arg r "perri:$lens" '{reviewer: $r}')"
+            "$(jq -nc --arg r "perri:$lens" --arg why "$err_reason" '{reviewer: $r, reason: $why}')"
+        type mother_record_run_usage >/dev/null 2>&1 && mother_record_run_usage "$id" "error" "$lens_log" 0 "" \
+            "review-perri:${lens}" "perri:${lens}" "review" \
+            "$(jq -nc --arg lens "$lens" --arg model "$model" --arg effort "$effort" --argjson budget "$budget" \
+                '{lens: $lens, model: $model, effort: $effort, budget_usd: $budget, decision: "error", finding_count: null}')"
+        local err_dir="$MOTHER_ROOT/crew/$id/wave/c${cycle}"
+        mkdir -p "$err_dir" || _die "review-lens: cannot create $err_dir"
+        _atomic_write "$err_dir/$lens.json" "$(jq -n --arg why "$err_reason" \
+            '{findings: [], examined: [], cost_usd: null, decision: "error", state: "error", error_reason: $why}')"
+        echo "mother: review-lens: perri:$lens produced no review ($err_reason); recorded as error" >&2
+        return 2
     fi
     # examined: an array of strings, else [] (a malformed list must not fail the lens).
     raw_examined=$(printf '%s' "${raw_examined:-[]}" \
