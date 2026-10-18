@@ -212,3 +212,14 @@ _set_findings() { # <lens> <findings-json> [examined-json]
     run python3 "$MERGE_PY" merge "$MOTHER_ROOT/nope" "$REPO" "$SHA" "$MOTHER_ROOT/ch.json"
     [ "$status" -eq 1 ]
 }
+
+@test "claims: one lens's refuted claim does not remove another lens's merged finding" {
+    _only_lens correctness
+    _set_findings correctness '[
+      {"id":"a","target":"cody","severity":"blocking","summary":"x","location":"src/C.php:5","lens":"correctness",
+       "claims":[{"path":"src/C.php","line":5,"quote":"catch (Exception $e)"}]},
+      {"id":"b","target":"cody","severity":"blocking","summary":"y","location":"src/C.php:5","lens":"tests"}]'
+    run _merge; [ "$status" -eq 0 ]
+    [ "$(_m '.refuted | length')" = "0" ]
+    [ "$(_m '.actionable | map(select(.kind != "coverage_gap")) | .[0].severity')" = "blocking" ]
+}

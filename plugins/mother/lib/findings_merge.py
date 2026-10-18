@@ -16,8 +16,11 @@ Rules (all mechanical, zero tokens):
   about whether the finding is correct. A finding with asserts_existing_code
   true and no claims is `unverified`. Findings with neither are `none`.
   MOTHER_CLAIM_VERIFY_ENABLED=0 makes every claim `unverified` (no git calls).
-  A finding's overall verification: refuted if any claim is refuted, else
-  unverified if any is unverified, else verified.
+  A source finding's verification: refuted if any of its claims is refuted, else
+  unverified if any is unverified, else verified. A merged finding is refuted
+  only when every source finding is refuted (one lens's false claim never
+  removes another lens's finding); it is downgraded only when no source is
+  verified or non-asserting.
 
 * Dedup: same location path, line ranges overlapping or within 3 lines, same
   target -> one finding with the highest severity, `lenses` = union, and every
@@ -97,6 +100,19 @@ def overall(finding, statuses):
     return "verified"
 
 
+def combine(member_status):
+    """One source finding's refuted claim must not remove another lens's finding:
+    refuted only when every source is refuted; a source with no assertion
+    (`none`) or a verified one keeps the merged finding un-downgraded."""
+    live = [s for s in member_status if s != "refuted"]
+    if not live:
+        return "refuted"
+    for s in ("verified", "none"):
+        if s in live:
+            return s
+    return "unverified"
+
+
 def overlaps(a, b, slack):
     return a[0] == b[0] and a[1] is not None and b[1] is not None \
         and a[1] <= b[2] + slack and b[1] <= a[2] + slack
@@ -136,12 +152,14 @@ def build(group, idx, verifier):
     ms = group["members"]
     first = dict(ms[0])
     first.pop("reviewer", None)
-    claims, statuses = [], []
+    claims, member_status = [], []
     for m in ms:
+        statuses = []
         for c in m.get("claims") or []:
-            s = verifier.claim(c)
-            claims.append(dict(c, claim_status=s))
-            statuses.append(s)
+            st = verifier.claim(c)
+            claims.append(dict(c, claim_status=st, lens=m.get("lens")))
+            statuses.append(st)
+        member_status.append(overall(m, statuses))
     asserts = any(m.get("asserts_existing_code") for m in ms)
     lenses = sorted({m["lens"] for m in ms if m.get("lens")})
     f = dict(first)
@@ -152,7 +170,7 @@ def build(group, idx, verifier):
         "reviewers": sorted({m["reviewer"] for m in ms if m.get("reviewer")}),
         "merged_from": [m["_orig_id"] for m in ms],
         "claims": claims,
-        "verification": overall({"asserts_existing_code": asserts}, statuses),
+        "verification": combine(member_status),
         "conflict": False,
         "conflicts_with": [],
     })
