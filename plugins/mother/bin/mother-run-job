@@ -91,7 +91,8 @@ type mother_rwx_sandbox >/dev/null 2>&1 || mother_rwx_sandbox() { echo '{"outcom
 type mother_prbody_write_gates >/dev/null 2>&1 || mother_prbody_write_gates() { return 1; }
 # Real definitions come from lib/state.sh / lib/decision.sh, sourced below the
 # SOURCE_ONLY guard; these stubs only keep bats-sourced helpers callable.
-type mother_job_attention_add >/dev/null 2>&1 || mother_job_attention_add() { :; }
+type mother_job_attention_add  >/dev/null 2>&1 || mother_job_attention_add()  { :; }
+type mother_job_attention_drop >/dev/null 2>&1 || mother_job_attention_drop() { :; }
 type mother_decision_open     >/dev/null 2>&1 || mother_decision_open()     { return 1; }
 
 # Best-effort preview-stack teardown (mother_preview_stop). Sourced
@@ -823,9 +824,18 @@ _gates_run_attempt() {
         echo "mother-run-job: $id: gates exceeded the total budget of ${budget_s}s; run cut off and recorded as incomplete" >&2
     fi
     rm -f "$_GATES_RESULT_FILE"
-    printf '%s' "$result" | jq -e 'type == "object" and (.results | type == "array")' >/dev/null 2>&1 \
-        || result=$(jq -nc --arg head "$head_sha" --arg posture "$posture" --argjson attempt "$attempt" \
-            '{status: "incomplete", head_sha: $head, posture: $posture, results: [], not_run: [], attempt: $attempt}')
+    # No result (budget overrun, crash): every check is unavailable, so the
+    # run is incomplete and names exactly what did not run. Never passed.
+    if ! printf '%s' "$result" | jq -e 'type == "object" and (.results | type == "array")' >/dev/null 2>&1; then
+        local why=gates_error
+        [ "${MOTHER_WD_OUTCOME:-}" = "timeout" ] && why=gates_timeout
+        result=$(jq -nc --arg head "$head_sha" --arg posture "$posture" --argjson attempt "$attempt" \
+            --arg why "$why" --slurpfile crew "$crew_file" '
+            [$crew[0].gates.checks[] | {name, result: "unavailable", blocking: (.blocking != false),
+              duration_s: 0, exit_code: null, unavailable_reason: $why, skip_reason: null}] as $r
+            | {status: "incomplete", head_sha: $head, posture: $posture, results: $r,
+               not_run: [$r[].name], attempt: $attempt}')
+    fi
     rm -f "$crew_file"
 
     local finished_at gates_json
@@ -996,12 +1006,13 @@ _new_session_id() {
 # job's existing session (fresh fallback if that can't start). Returns 0 when
 # the fix run completed and the gates should run again; 1 when the run stopped
 # (cancel, await, pause, idle reap, failure, superseded) and the normal
-# post-exit path takes over.
+# post-exit path takes over; 2 when no fix turn could be started (the caller
+# holds the job rather than letting red gates through).
 _gates_fix() {
     local n="$1" max="$2" restore="$3" fixfile red sid spawned=0
     fixfile="$RUNNER_DIR/$id.gatefix.$n.md"
     red=$(mother_gates_red_json "$job_file")
-    _gates_write_fix_prompt "$n" "$max" "$fixfile" || return 1
+    _gates_write_fix_prompt "$n" "$max" "$fixfile" || return 2
 
     # The run that produced this head is over: record its usage before the
     # next spawn moves the log offset, and refresh actual_cost_usd so the
@@ -1058,7 +1069,11 @@ _gates_present() {
             _append_event "pr_draft_unverified" "$(jq -nc --arg url "$url" --arg r "$reason" '{pr_url: $url, action: "ready", reason: $r}')"
         fi
     fi
-    [ "$status" = "incomplete" ] && mother_job_attention_add "$id" gates_incomplete
+    if [ "$status" = "incomplete" ]; then
+        mother_job_attention_add "$id" gates_incomplete
+    else
+        mother_job_attention_drop "$id" gates_incomplete
+    fi
     return 0
 }
 
@@ -1114,6 +1129,22 @@ _gates_hold() {
     return 0
 }
 
+# _gates_still_ours — false (after setting cancel_requested for the post-exit
+# path) when the job was cancelled while the gates ran, or false when a newer
+# supervisor owns it. Gate runs can take budget_minutes; the spawn poll loop
+# is the only other place that notices either.
+_gates_still_ours() {
+    if [ "$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
+        cancel_requested=1
+        return 1
+    fi
+    if [ -n "${worker_pid:-}" ] && \
+       [ "$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)" != "$worker_pid" ]; then
+        return 1
+    fi
+    return 0
+}
+
 # _run_gates_enforce — the enforce gate loop (HC-08). See the section header.
 _run_gates_enforce() {
     local max posture orig_activity n
@@ -1128,9 +1159,14 @@ _run_gates_enforce() {
     _gates_extra_json=$(jq -nc --arg r "${gates_budget_reset_by:-}" \
         'if $r != "" then {budget_reset_by: $r} else {} end')
 
+    # The worker may have marked its PR ready after live capture checked it.
+    _pr_draft_ok_url=""
     _gates_ensure_draft
+    local rc
     while :; do
         _gates_run_attempt "$n" "$max" enforce "$orig_activity" "$posture"
+        # A cancel or a newer supervisor that arrived while the gates ran wins.
+        _gates_still_ours || break
         case "$_gates_status" in
             passed|incomplete) _gates_present "$_gates_status"; break ;;
         esac
@@ -1138,7 +1174,13 @@ _run_gates_enforce() {
             _gates_hold "$n"
             break
         fi
-        _gates_fix "$n" "$max" "$orig_activity" || break
+        rc=0
+        _gates_fix "$n" "$max" "$orig_activity" || rc=$?
+        if [ "$rc" -eq 2 ]; then
+            _gates_hold "$n"
+            break
+        fi
+        [ "$rc" -eq 0 ] || break
         _finalize_pr_url
         _gates_ensure_draft
         n=$((n + 1))
@@ -1165,6 +1207,12 @@ _verify_run_advanced_or_fail() {
     # Without a pre-existing artifact the ordinary no_pr_no_push logic below
     # already catches a run that shipped nothing.
     [ "${run_had_artifact_at_start:-false}" = "true" ] || return 0
+    # Operator guidance on a gate hold may need no new commit (e.g. "re-run,
+    # it was flaky"): green gates on the pushed head are the proof of work.
+    if [ "${gates_budget_reset_by:-}" = "resume" ] \
+       && [ "$(jq -r '.gates.effective_mode == "enforce" and (.gates.status == "passed" or .gates.status == "incomplete")' "$job_file" 2>/dev/null)" = "true" ]; then
+        return 0
+    fi
 
     local ref="${run_remote_ref:-}" start_sha="${run_remote_sha_at_start:-}"
     local end_sha="" origin_check=ok

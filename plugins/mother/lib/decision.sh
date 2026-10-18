@@ -91,8 +91,8 @@ mother_decision_resolve() {
 # Handlers: a hold kind registers `_decision_handler_<kind>_<opt>` (called with
 # the job id) to give `escalate` / `override_open` real behaviour. Without one
 # the option is refused and nothing changes. A kind may also register
-# `_decision_handler_<kind>_resume_with_guidance`, which cmd_resume runs after
-# its own resume write (extra bookkeeping only). HC-08 registers `gate_hold`.
+# `_decision_resume_jq_<kind>` (see _decision_resume_jq) for extra bookkeeping
+# on a guidance answer. HC-08 registers `gate_hold`.
 _decision_apply() {
     local opt="$1" id="$2" kind handler
     kind=$(jq -r '.decision.kind // ""' "$(_job_path "$id")")
@@ -107,13 +107,12 @@ _decision_apply() {
 _decision_apply_escalate()      { _decision_apply escalate "$1"; }
 _decision_apply_override_open() { _decision_apply override_open "$1"; }
 
-# _decision_after_resume <id> <kind> — run the kind's resume_with_guidance hook,
-# if it has one. Called by cmd_resume after the resume write.
-_decision_after_resume() {
-    local id="$1" kind="$2" handler="_decision_handler_${2}_resume_with_guidance"
-    [ -n "$kind" ] || return 0
-    type "$handler" >/dev/null 2>&1 || return 0
-    "$handler" "$id"
+# _decision_resume_jq <kind> — extra jq that cmd_resume folds into its single
+# resume write for a guidance answer to a <kind> hold (one write, so the daemon
+# can never dispatch the job half-updated). Prints `.` for kinds without one.
+_decision_resume_jq() {
+    local fn="_decision_resume_jq_${1:-}"
+    if [ -n "${1:-}" ] && type "$fn" >/dev/null 2>&1; then "$fn"; else echo '.'; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -124,9 +123,10 @@ _decision_after_resume() {
 # ---------------------------------------------------------------------------
 
 # Guidance resumes the held worker session (mother-run-job turns
-# .resume_session_id + .pending_answer into a `--resume` spawn).
-_decision_handler_gate_hold_resume_with_guidance() {
-    mother_job_update "$1" '.resume_session_id = .session_id'
+# .resume_session_id + .pending_answer into a `--resume` spawn) with a fresh
+# gate budget.
+_decision_resume_jq_gate_hold() {
+    echo '.resume_session_id = .session_id | (if .gates != null then .gates.attempt = 0 else . end)'
 }
 
 # Operator-chosen escalation (G14's "never escalate" is about Mother acting
@@ -165,6 +165,12 @@ _decision_handler_gate_hold_escalate() {
 _decision_handler_gate_hold_override_open() {
     local id="$1" job_file red src url no_pr
     job_file=$(_job_path "$id")
+    url=$(jq -r '.pr_url // empty' "$job_file")
+    no_pr=$(jq -r '.no_pr // false' "$job_file")
+    if [ "$no_pr" != "true" ] && [ -z "$url" ]; then
+        echo "mother: resume: invalid_state: job $id has no PR to open; resume with guidance to have the worker open one" >&2
+        return 1
+    fi
     red=$(mother_gates_red_json "$job_file")
     src="${source:-cli}"
     mother_job_update "$id" '
@@ -174,9 +180,7 @@ _decision_handler_gate_hold_override_open() {
         --arg ts "$(_iso_now)" --arg src "$src" --argjson red "$red" || return 1
     mother_event_append "$id" "gates_overridden" "$(jq -nc --argjson red "$red" --arg src "$src" '{red: $red, source: $src}')"
 
-    url=$(jq -r '.pr_url // empty' "$job_file")
-    no_pr=$(jq -r '.no_pr // false' "$job_file")
-    if [ "$no_pr" != "true" ] && [ -n "$url" ]; then
+    if [ "$no_pr" != "true" ]; then
         mother_prbody_write_gates "$url" "$(jq -c '.gates' "$job_file")" \
             || echo "mother: resume: could not write the override note into $url" >&2
         if gh pr ready "$url" >/dev/null 2>&1; then

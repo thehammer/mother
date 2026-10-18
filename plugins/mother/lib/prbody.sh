@@ -22,11 +22,15 @@ _prbody_compose() {
             print cl
         }
         { line = $0; sub(/[ \t\r]+$/, "", line) }
-        line == op { if (!done) { emit(); done = 1 }; skip = 1; next }
+        line == op { if (!done) { emit(); done = 1 }; skip = 1; nheld = 0; next }
         skip && line == cl { skip = 0; next }
-        skip { next }
+        skip { held[++nheld] = $0; next }
         { print; n++ }
-        END { if (!done) { if (n > 0) print ""; emit() } }
+        END {
+            # An opening marker with no closing one: keep what followed it.
+            if (skip) for (i = 1; i <= nheld; i++) print held[i]
+            if (!done) { if (n > 0) print ""; emit() }
+        }
     ' "$body_file"
 }
 

@@ -659,6 +659,7 @@ _recover_orphans() {
                 _log "marking $id $terminal_state (pid $pid gone; cancel_requested=$cancel_req)"
                 _orphan_record_usage_row "$id" "$f" "$terminal_state"
                 _job_transition "$id" "$terminal_state" "$terminal_reason"
+                _job_update "$id" 'if .activity == "gating" or .activity == "gate_fix" then .activity = null else . end'
                 _orphan_restore_autostash "$id" "$f"
                 _orphan_rwx_stop "$id" "$f"
                 _orphan_preview_stop "$id" "$f"

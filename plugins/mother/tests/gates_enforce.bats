@@ -955,3 +955,54 @@ fine"
     [ "$(gh_mock_pr_body "$GE_PR")" = "UNTOUCHED_BODY" ]
     _ge_ev "$id" '[.[] | select(.kind == "gate_fix_started" or .kind == "gates_exhausted" or .kind == "pr_marked_ready" or .kind == "pr_marked_draft" or .kind == "decision_opened")] | length == 0'
 }
+
+# ---------------------------------------------------------------------------
+# Edge cases found in review (Cody)
+
+@test "enforce: plain mother cancel on a gate hold leaves no hold markers behind" {
+    local id="g-x1"
+    _ge_hold "$id"
+    run mother cancel "$id"
+    [ "$status" -eq 0 ]
+    [ "$(_ge_job_json "$id" '.state')" = "cancelled" ]
+    [ "$(_ge_job_json "$id" '.activity // "none"')" = "none" ]
+    [ "$(_ge_job_json "$id" '.paused_reason // "none"')" = "none" ]
+    [ "$(_ge_job_json "$id" '[(.attention // [])[] | select(.reason == "decision_awaiting")] | length')" = "0" ]
+    run mother list
+    [[ "$(printf '%s\n' "$output" | grep -F "$id")" != *"[GATES-HELD]"* ]]
+}
+
+@test "enforce: override_open is refused (job untouched) when a PR job has no PR to open" {
+    local id="g-x2"
+    _ge_hold "$id"
+    merged=$(jq '.pr_url = null' "$JOBS_DIR/$id.json") && printf '%s' "$merged" > "$JOBS_DIR/$id.json"
+    run mother resume "$id" --option override_open
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no PR to open"* ]]
+    [ "$(_ge_job_json "$id" '.state')" = "awaiting" ]
+    [ "$(_ge_job_json "$id" '.gates.status')" = "failed" ]
+    [ "$(_ge_job_json "$id" '.decision.resolved_at // "open"')" = "open" ]
+}
+
+@test "enforce: guidance on a gate hold resets the gate budget in the same write that readies the job" {
+    local id="g-x3"
+    _ge_hold "$id"
+    run mother resume "$id" "try again"
+    [ "$status" -eq 0 ]
+    [ "$(_ge_job_json "$id" '.state')" = "ready" ]
+    [ "$(_ge_job_json "$id" '.resume_session_id == .session_id')" = "true" ]
+    [ "$(_ge_job_json "$id" '.gates.attempt')" = "0" ]
+}
+
+@test "enforce: a gate run that produces no result is incomplete and names every configured gate as not run" {
+    local id="g-x4"
+    _ge_pr "$id"
+    _ge_job "$id" ".crew = $(_ge_crew "$(_ge_check slow 'sleep 30')")"
+    export MOTHER_GATES_TOTAL_TIMEOUT_S=2
+    _ge_run "$id"
+    [ "$(_ge_job_json "$id" '.gates.status')" = "incomplete" ]
+    [ "$(jq -c '.gates.not_run' "$JOBS_DIR/$id.json")" = '["slow"]' ]
+    [ "$(_ge_result "$id" slow unavailable_reason)" = "gates_timeout" ]
+    local block; block=$(gh_mock_last_body "$GE_PR" | _ge_block)
+    [[ "$block" == *"**Gates incomplete: slow did not run**"* ]]
+}

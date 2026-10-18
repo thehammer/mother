@@ -1768,7 +1768,11 @@ cmd_cancel() {
         awaiting)       # No live worker to signal — the job paused itself and
                         # the worker process already exited. Transition direct
                         # to cancelled so it leaves the queue immediately.
-                        _job_transition "$id" cancelled '{"reason":"user_cancelled_awaiting"}' ;;
+                        _job_transition "$id" cancelled '{"reason":"user_cancelled_awaiting"}'
+                        # A cancelled gate hold is no longer a hold.
+                        _job_update "$id" '
+                            (if .activity == "gate_hold" then .activity = null | .paused_reason = null else . end)
+                            | (if .attention == null then . else .attention |= map(select(.reason != "decision_awaiting")) end)' ;;
         running)        # Leave a cancel request; runner picks it up
                         _job_update "$id" '.cancel_requested = true'
                         _append_event "$id" "cancel_requested" '{}'
@@ -3634,6 +3638,7 @@ cmd_resume() {
         | .operator_hold = null
         | .auto_retry_count = 0
         | .state = "ready"
+        | '"$(_decision_resume_jq "$decision_kind")"'
         | '"$MOTHER_DECISION_RESOLVE_JQ"
     merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" \
         --arg opt "$option" --arg src "$source" --arg sess "$session" --arg agent "$agent" \
@@ -3641,7 +3646,6 @@ cmd_resume() {
     _atomic_write "$job_file" "$merged"
     if [ -n "$option" ]; then
         _append_event "$id" "decision_resolved" "$(jq -nc --arg d "$(jq -r '.decision.id' "$job_file")" --arg o "$option" --arg s "$source" '{decision_id: $d, option: $o, source: $s}')"
-        _decision_after_resume "$id" "$decision_kind" || _die "resume: $decision_kind resume hook failed"
     fi
     _append_event "$id" "resumed" \
         "$(jq -nc --arg a "$answer" --arg o "$option" --arg s "$source" \
