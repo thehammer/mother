@@ -555,13 +555,29 @@ _ten_accuracy_jobs() {
     [ "$(echo "$output" | jq -r '.progress_accuracy.overall.coverage_result')" = "PASS" ]
 }
 
-@test "HC11-3: width ratio over the target FAILs, and PASSes once MOTHER_I13_WIDTH_TARGET allows it" {
+@test "HC11-3: the default width target is 5x median remaining (user decision); a stricter MOTHER_I13_WIDTH_TARGET FAILs it" {
     _ten_accuracy_jobs
     run _retro_json
     echo "$output" | jq -e '(.progress_accuracy.overall.width_ratio - 1.22) | fabs < 0.03' >/dev/null
-    [ "$(echo "$output" | jq -r '.progress_accuracy.overall.width_result')" = "FAIL" ]
-    MOTHER_I13_WIDTH_TARGET=5 run _retro_json
+    [ "$(echo "$output" | jq -r '.progress_accuracy.overall.width_target')" = "5" ] || \
+        [ "$(echo "$output" | jq -r '.progress_accuracy.overall.width_target')" = "5.0" ]
     [ "$(echo "$output" | jq -r '.progress_accuracy.overall.width_result')" = "PASS" ]
+    MOTHER_I13_WIDTH_TARGET=1 run _retro_json
+    [ "$(echo "$output" | jq -r '.progress_accuracy.overall.width_result')" = "FAIL" ]
+}
+
+@test "retro text never prints a literal None for a missing value" {
+    run python3 - "$BATS_TEST_DIRNAME/../bin/mother-usage" <<'PY'
+import sys, importlib.machinery, importlib.util
+loader = importlib.machinery.SourceFileLoader("mu", sys.argv[1])
+spec = importlib.util.spec_from_loader("mu", loader)
+mu = importlib.util.module_from_spec(spec); loader.exec_module(mu)
+lines = mu._render_value("overall", {"width_ratio": None, "rows": [{"a": None}]}, 0)
+print("\n".join(lines))
+PY
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"None"* ]]
+    [[ "$output" == *"n/a"* ]]
 }
 
 @test "HC11-3: coverage under 70% FAILs" {

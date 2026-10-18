@@ -1691,7 +1691,9 @@ _TOKEN_KEY_RE = re.compile(r"token")
 
 
 def _fmt_scalar(key, val):
-    if val is None or isinstance(val, bool):
+    if val is None:
+        return "n/a"
+    if isinstance(val, bool):
         return val
     if isinstance(val, (int, float)):
         if _MONEY_KEY_RE.search(key):
@@ -1829,9 +1831,11 @@ _FLAG_OPERATOR_ACTIONS = ("resumed", "cancel_requested", "retried", "escalated")
 
 def _i13_width_target():
     try:
-        return float(os.environ.get("MOTHER_I13_WIDTH_TARGET", "1.0"))
+        # Default 5: median band <= 5x median remaining (active clock), per the
+        # user's 2026-10-17 decision on I13 (the PRD's 1x is out of reach).
+        return float(os.environ.get("MOTHER_I13_WIDTH_TARGET", "5"))
     except ValueError:
-        return 1.0
+        return 5.0
 
 
 def _accuracy_row(samples):

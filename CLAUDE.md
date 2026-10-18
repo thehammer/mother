@@ -587,7 +587,7 @@ change for `progress_updated`. Flags never change state or act on anything. They
 The statusline writes a sibling `${MOTHER_STATUSLINE_CACHE}.progress` (`<id>\t<label>` of the running job with the soonest
 ETA hi; empty if none) next to the **unchanged 6-field cache**; `MOTHER_PROGRESS_ENABLED=0` skips it. `mother retro` reports
 `stage_calibration`, `progress_accuracy` (I13: coverage and median band width / median remaining at the `progress_half` event;
-PASS/FAIL vs 70% and `MOTHER_I13_WIDTH_TARGET`, default `1.0`) and `progress_flags` (real = operator acted while raised, or job
+PASS/FAIL vs 70% and `MOTHER_I13_WIDTH_TARGET`, default `5`, i.e. median band ≤ 5× median remaining per the 2026-10-17 decision) and `progress_flags` (real = operator acted while raised, or job
 failed/cancelled; target >= 50%).
 
 ## Internals reference (lazy-loaded)
