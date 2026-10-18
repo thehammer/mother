@@ -1277,6 +1277,9 @@ _run_adherence_pending() {
         # (retry/escalate/reconcile clear the flag); otherwise it would be
         # re-marked pending and re-capped on every tick.
         [ "$(jq -r '((.needs_attention | objects | .reason) // "")' "$f" 2>/dev/null)" = "adherence_loop_capped" ] && continue
+        # Gates run before adherence; a job whose blocking gates are red is
+        # never reviewed (HC-08; enforce jobs can't reach succeeded red anyway).
+        [ "$(jq -r '.gates.status // ""' "$f" 2>/dev/null)" = "failed" ] && continue
         # Mark as pending if not already.
         if [ "$adherence_pending" != "true" ]; then
             merged=$(jq '.adherence_pending = true' "$f") && _atomic_write "$f" "$merged"
@@ -1297,6 +1300,7 @@ _run_adherence_pending() {
             # Only review jobs that just succeeded (re-queued rework jobs go through
             # succeeded again on their second pass, so this covers both passes).
             case "$state" in succeeded) ;; *) continue ;; esac
+            [ "$(jq -r '.gates.status // ""' "$f" 2>/dev/null)" = "failed" ] && continue
             id=$(jq -r '.id' "$f")
 
             # A human can merge a PR before this automatic loop ever reviews

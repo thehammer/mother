@@ -119,7 +119,9 @@ for display and routing.
 | `running` | `continuation` | Cody re-running after idle_timeout (auto-continuation) |
 | `awaiting` | (none) | Cody asked a question; answer with `mother resume` |
 | `awaiting` | `adherence_blocked` | Archie failed twice; human must review PR, then `resume` or `cancel` |
-| `running` | `gating` | Mother is running the repo's quality gates on the head commit (observe mode); the previous `activity` is restored afterwards |
+| `running` | `gating` | Mother is running the repo's quality gates on the head commit; the previous `activity` is restored afterwards |
+| `running` | `gate_fix` | enforce mode: the worker's same session (`--resume`) is fixing red blocking gates (attempt n/N); `mother list` shows `[GATES-FIXING]` |
+| `awaiting` | `gate_hold` | enforce mode: blocking gates still red after `max_attempts`; `paused_reason: gate_hold`, a `gate_hold` decision and `decision_awaiting` attention. Answer with `mother resume <id> "<guidance>"` or `--option escalate\|override_open\|cancel`; `mother status` shows `[GATES-HELD]` |
 | `awaiting` | `operator_hold` | Mother held a failed job instead of escalating it (see "Failure routing"); `.question` names the next commands. Act with `resume`, `retry`, `reconcile`, or `cancel` |
 | `running` | `pipeline_phase` | pipeline job: a build agent (redd/cody/marty) is actively running |
 | `ready` | `pipeline_phase` | pipeline job: next build agent queued (driver just advanced the phase) |
@@ -159,7 +161,9 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `origin` | object | Provenance captured at `mother add` time: `{project, cwd, session, enqueued_by, label}`. `project` = basename of the enqueuing cwd's git toplevel, or the `--origin-project` override; `session` = `--origin-session` → `$MOTHER_ORIGIN_SESSION` → `$CLAUDE_SESSION_ID` → `""`. Surfaced as `mother list`'s ORIGIN column, filtered by `mother list --project`/`--label`, and rendered by `mother status`'s `=== origin ===` block. |
 | `decision` | object | Structured hold: `{id, kind, options[{id,label,consequence,takes_text}], opened_at, resolved_at, resolution{option,source,session,agent}}` (`lib/decision.sh`; option ids `resume_with_guidance`, `escalate`, `override_open`, `cancel`). Opened by a hold producer via `mother_decision_open`; resolved only by an explicit answer — Mother never selects an option (no timeout, no default). A resolved decision blocks answers only while `paused_reason == decision.kind`. |
 | `crew` | object | Resolved `.mother/crew.yml` snapshot taken at `mother add` (see "Quality gates"). Absent when the repo has no crew.yml: such a job, and any job enqueued before the snapshot existed, never runs gates. |
-| `gates` | object | Observe-mode gate outcome written by `mother-run-job`'s `_run_gates_observe`: `{mode, effective_mode, posture, status, attempt, max_attempts, head_sha, started_at, finished_at, results[{name, result, blocking, duration_s, exit_code, unavailable_reason, skip_reason}], not_run[]}`. Ids, enums, counts and durations only (no output text); `effective_mode` is always `observe` until HC-08. |
+| `gates` | object | Gate outcome written by `mother-run-job`'s `_gates_run_attempt`: `{mode, effective_mode, posture, status, attempt, max_attempts, head_sha, started_at, finished_at, results[{name, result, blocking, duration_s, exit_code, unavailable_reason, skip_reason}], not_run[]}`, plus in enforce mode `budget_reset_by` (`resume`/`escalate`) and, after `override_open`, `status: "overridden"` and `override {at, source, red[]}`. Ids, enums, counts and durations only (no output text); `effective_mode` is `enforce` only for non-pipeline jobs in an enforce repo. |
+| `attention` | array | Typed attention `[{reason, since}]` (`lib/state.sh` `mother_job_attention_add/drop`). HC-08 adds `gates_incomplete` and `decision_awaiting`; resolving a decision option drops `decision_awaiting`. |
+| `resume_session_id` | string | Set by the `gate_hold` `resume_with_guidance` hook. The next run resumes that session (`--resume`) with `pending_answer` as its prompt (fresh fallback if it can't), then clears it. |
 | `last_answer` | object | `{source, session, agent, option, at}` of the most recent `mother resume` / broker `answer`. `source` is `nostromo_app`, `cli` or `broker_client`; `option` is null for a plain-text answer to a decision-less job. |
 
 ### Kill switches
@@ -495,6 +499,23 @@ true), where: any|sandbox (default any), timeout_s 1..3600 (default 900), hint <
   `<name>.excerpt`. Every check sees `MOTHER_GATE_BASE` (merge-base sha) and
   `MOTHER_GATE_CHANGED_FILES` (newline-separated, <= 64 KB); sandbox checks get them prepended to the
   `bash -c` string because local env doesn't reach the sandbox.
+- **Enforce mode (HC-08).** `crew.gates.mode: enforce` on a non-pipeline job: the prompt gets
+  `templates/gates-enforce.md` (open the PR as a draft); `_gates_ensure_draft` converts a non-draft PR
+  back to draft (`pr_marked_draft` / `pr_draft_unverified`). `_run_gates_enforce` (one function) loops:
+  attempt n → passed/incomplete: gates block in the PR body (`lib/prbody.sh`, `<!-- mother:gates -->`),
+  `gh pr ready`, `pr_marked_ready`, incomplete adds `gates_incomplete` attention; failed and n < max:
+  `$RUNNER_DIR/<id>.gatefix.<n>.md` (red gates, excerpts, hints) → `activity: gate_fix`,
+  `gate_fix_started`, `_spawn_and_wait resume` (fresh fallback `mode: fresh_fallback`), usage row
+  `run_kind: gate_fix`; failed and n == max: push HEAD if origin is behind (never force),
+  `gates_exhausted`, hold `awaiting`/`gate_hold` with a decision. `max` = repo `max_attempts` (a plan can
+  only lower it), 1 under `conservative`. A continuation keeps counting; other runs start a fresh budget.
+  The loop never touches `current_tier`, `escalation_count` or `retry_count`. `no_pr` jobs make no PR
+  calls. Decision handlers (`lib/decision.sh`): `resume_with_guidance` sets `.resume_session_id`;
+  `escalate` = one tier up (cap `tier_3`), `escalation_count` +1, `.gates.attempt = 0`, state `ready`
+  with a gate summary as `pending_answer`, fresh session; `override_open` = `.gates.status: overridden`,
+  `.gates.override`, `gates_overridden`, PR-body note, `gh pr ready`, `succeeded`; `cancel` = `cmd_cancel`.
+  The runner never runs adherence on a job whose `.gates.status` is `failed`; the adherence prompt gets a
+  `## Gate results` section (names and results only).
 - **Observe mode in the job lifecycle (HC-06).** `_run_gates_observe` (`mother-run-job`) runs right after
   `_finalize_pr_url`, before `_rwx_post_exit` and the main-dir restore/lock release (HEAD must still be
   the job branch). It runs only when the job has `.crew.gates`, `MOTHER_GATES_ENABLED` is not `0`, the run
@@ -502,8 +523,8 @@ true), where: any|sandbox (default any), timeout_s 1..3600 (default 900), hint <
   and this supervisor still owns `worker_pid`. It sets `activity=gating`, emits `gates_started`, runs
   `mother_gates_run … --attempt 1 --allow-unpushed` (logs in `$MOTHER_ROOT/crew/<id>/gates/1/`), emits one
   `gate_result` per result and `gates_completed`, writes `.gates` and restores the previous `activity`.
-  It never changes `state`, `failure_reason`, the PR or a prompt; `mode: enforce` is recorded as
-  `.gates.mode = "enforce"`, `.gates.effective_mode = "observe"`. A gate run that produces no result is
+  It never changes `state`, `failure_reason`, the PR or a prompt. Pipeline jobs in an enforce repo stay on
+  this path (`.gates.mode = "enforce"`, `.gates.effective_mode = "observe"`). A gate run that produces no result is
   recorded `incomplete`, never `passed`. `mother status <id>` renders a `=== gates ===` section (the only
   place excerpts appear, read from the side files); `mother list` shows `[gating]`.
 - **Settings:** `MOTHER_GATES_ENABLED=0` makes `gates run` a no-op (`{"status":"disabled"}`) and

@@ -21,6 +21,13 @@ unset _mother_gates_lib_dir
 
 _GATES_CHANGED_FILES_CAP=65536
 
+# mother_gates_red_json <job-file> — the failing blocking gates of the job's
+# last attempt, as a JSON array of names.
+mother_gates_red_json() {
+    jq -c '[.gates.results[]? | select(.result == "failed" and .blocking != false) | .name]' "$1" 2>/dev/null \
+        || echo '[]'
+}
+
 # _gates_exec_any <log> <run> — runs inside the watchdog subshell (cwd =
 # work_dir). The gate env is set here, scoped to this subshell.
 _gates_exec_any() {

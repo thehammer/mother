@@ -528,7 +528,7 @@ CLAUDE
 MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 # Simulate a resume cycle having handed the job to a newer supervisor.
 sleep 1
-f="$MOTHER_ROOT/jobs/${MOTHER_JOB_ID}.json"
+f="${MOTHER_LIVE_ROOT:-$MOTHER_ROOT}/jobs/${MOTHER_JOB_ID}.json"
 merged=$(jq '.worker_pid = 99999' "$f") && printf '%s' "$merged" > "$f"
 exit 0
 CLAUDE
@@ -595,16 +595,22 @@ CLAUDE
 # ---------------------------------------------------------------------------
 # Mode, availability and scoping
 
-@test "mode enforce is recorded as enforce but run as observe: the job still succeeds" {
+@test "mode enforce is no longer observe-only: a failing blocking gate holds the job instead of letting it succeed" {
+    # HC-06 recorded `enforce` but ran it as observe. HC-08 enforces: with one
+    # attempt allowed and a red blocking gate the job is held for the operator
+    # (awaiting/gate_hold) and is never `succeeded`. The full enforce contract
+    # (fix runs, PR draft discipline, decision options) is in gates_enforce.bats.
+    GL_MAX=1
     _gl_job g-m1 ".crew = $(GL_MODE=enforce _gl_crew "$(_gl_check bad 'exit 1')")"
     _gl_run g-m1
-    [ "$(_gl_job_json g-m1 '.state')" = "succeeded" ]
-    [ "$(_gl_job_json g-m1 '.failure_reason // "none"')" = "none" ]
+    [ "$(_gl_job_json g-m1 '.state')" = "awaiting" ]
+    [ "$(_gl_job_json g-m1 '.activity')" = "gate_hold" ]
     [ "$(_gl_job_json g-m1 '.gates.mode')" = "enforce" ]
-    [ "$(_gl_job_json g-m1 '.gates.effective_mode')" = "observe" ]
+    [ "$(_gl_job_json g-m1 '.gates.effective_mode')" = "enforce" ]
     [ "$(_gl_job_json g-m1 '.gates.status')" = "failed" ]
     run mother status g-m1
-    [[ "$(_gl_section "$output")" == *"effective: observe"* ]]
+    [[ "$(_gl_section "$output")" == *"enforce"* ]]
+    [[ "$(_gl_section "$output")" != *"effective: observe"* ]]
 }
 
 @test "an unavailable gate makes the status incomplete and is listed in not_run; the job still succeeds" {

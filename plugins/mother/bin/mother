@@ -70,6 +70,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/decision.sh" ]      && source "$MOTHER_LIB_DIR/decision.sh"
 # shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/prbody.sh" ]        && source "$MOTHER_LIB_DIR/prbody.sh"
+# shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/config.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/gates.sh" ]         && source "$MOTHER_LIB_DIR/gates.sh"
@@ -807,7 +809,7 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
     if [ -n "$crew_json" ]; then
         job_json=$(printf '%s' "$job_json" | jq \
             --argjson crew "$crew_json" --arg ma "$plan_max_attempts" \
-            '. + {crew: (if $ma != "" then ($crew | .gates.max_attempts = ($ma | tonumber)) else $crew end)}')
+            '. + {crew: (if $ma != "" then ($crew | .gates.max_attempts = ([(.gates.max_attempts // 3), ($ma | tonumber)] | min)) else $crew end)}')
         if [ -n "$plan_lenses_json" ]; then
             job_json=$(printf '%s' "$job_json" | jq --argjson pl "$plan_lenses_json" \
                 '.crew.lenses = ((.crew.lenses // {}) + {plan: $pl})')
@@ -1022,6 +1024,10 @@ cmd_list() {
                     # activity=adherence_blocked, and rendering both would read
                     # "awaiting [adherence_blocked] [ADHERENCE-BLOCKED]".
                     state_display="$st [ADHERENCE-BLOCKED]"
+                elif [ "${activity:-}" = "gate_fix" ]; then
+                    state_display="$st [GATES-FIXING]"
+                elif [ "${activity:-}" = "gate_hold" ]; then
+                    state_display="$st [GATES-HELD]"
                 else
                     [ -n "$activity" ] && state_display="$st [$activity]"
                 fi
@@ -1158,6 +1164,7 @@ _status_gates_section() {
         | "  Mode:      \($g.mode // "observe") (effective: \($g.effective_mode // $g.mode // "observe"))",
           "  Posture:   \($g.posture // "normal")",
           "  Attempt:   \($g.attempt // 1)/\($g.max_attempts // "?")",
+          (if .activity == "gate_fix" then "  Fixing:    gate-fix turn after attempt \($g.attempt // 1)/\($g.max_attempts // "?") (same session)" else empty end),
           "  Head:      \(($g.head_sha // "") | .[0:7] | if . == "" then "-" else . end)",
           "  Status:    \($g.status // "unknown")",
           (($g.results // [])[] |
@@ -1166,18 +1173,26 @@ _status_gates_section() {
               + (if .result == "unavailable" then "  (\(.unavailable_reason // "unavailable"))" else "" end)
               + (if .result == "skipped" and .skip_reason != null then "  (\(.skip_reason))" else "" end)),
           (if (($g.not_run // []) | length) > 0 then "  gates incomplete: \(($g.not_run | join(", ")))" else empty end),
+          (if $g.override != null then "  Override:  opened with red gates (operator override, \($g.override.source // "cli"), \($g.override.at // "")): \(($g.override.red // []) | join(", "))" else empty end),
+          (if ($g.budget_reset_by // null) != null then "  Budget reset by: \($g.budget_reset_by)" else empty end),
           "  Budget:    \(if $b == null then "-" else "\($b)m" end) (actual \($actual)s)"
     ' "$job_file"
-    local attempt name excerpt_file
+    _status_gate_excerpts "$id" "$job_file" "  "
+    echo
+}
+
+# _status_gate_excerpts <id> <job_file> <indent> — each failing gate's last
+# excerpt, read from the local side file of the latest attempt.
+_status_gate_excerpts() {
+    local id="$1" job_file="$2" indent="$3" attempt name excerpt_file
     attempt=$(jq -r '.gates.attempt // 1' "$job_file")
     for name in $(jq -r '.gates.results[]? | select(.result == "failed") | .name' "$job_file"); do
         excerpt_file="$MOTHER_ROOT/crew/$id/gates/$attempt/$name.excerpt"
         [ -s "$excerpt_file" ] || continue
         echo
-        echo "  --- $name ---"
-        sed 's/^/    /' "$excerpt_file"
+        echo "$indent--- $name ---"
+        sed "s/^/$indent  /" "$excerpt_file"
     done
-    echo
 }
 
 cmd_status() {
@@ -1237,6 +1252,19 @@ cmd_status() {
             echo ""
             echo "⚠️  [OPERATOR-HOLD] Mother held this job instead of escalating."
             jq -r '.question // empty' "$job_file" | sed 's/^/   /'
+            echo ""
+        fi
+        if [ "$activity" = "gate_hold" ]; then
+            echo ""
+            echo "⚠️  [GATES-HELD] Blocking quality gates are still red after the attempt budget."
+            jq -r '.question // empty' "$job_file" | sed 's/^/   /'
+            _status_gate_excerpts "$id" "$job_file" "   "
+            echo ""
+        fi
+        if [ "$(jq -r '.gates.status // ""' "$job_file")" = "incomplete" ]; then
+            echo ""
+            echo "⚠️  [GATES-INCOMPLETE] Gates incomplete: $(jq -r '(.gates.not_run // []) | join(", ")' "$job_file") did not run."
+            echo "   These gates are NOT counted as passed. Check them by hand before merging."
             echo ""
         fi
         if [ "$activity" = "pipeline_blocked" ]; then
@@ -3193,6 +3221,19 @@ cmd_adherence_review() {
 (none recorded — the operator never answered a question on this job)"
     fi
 
+    # Gate results (HC-08): names and results only, never gate output.
+    local gate_results_section=""
+    if jq -e '.gates != null' "$job_file" >/dev/null 2>&1; then
+        gate_results_section=$(jq -r '
+            "## Gate results",
+            "",
+            "Status: \(.gates.status // "unknown") (attempt \(.gates.attempt // 1)/\(.gates.max_attempts // "?"), mode \(.gates.effective_mode // .gates.mode // "observe"))",
+            "",
+            ((.gates.results // [])[] | "- \(.name): \(.result)\(if .blocking == false then " (advisory)" else "" end)"),
+            "",
+            "Gates already enforce these; do not re-report lint/test failures they cover."' "$job_file")
+    fi
+
     # Build the prompt from template + artifacts.
     local review_prompt
     review_prompt=$(cat "$template_file")
@@ -3203,6 +3244,7 @@ cmd_adherence_review() {
         "$pr_diff" \
         "$pr_checks" \
         "$pr_comments")
+    [ -z "$gate_results_section" ] || review_prompt=$(printf '%s\n\n%s\n' "$review_prompt" "$gate_results_section")
 
     # Invoke Archie for the review.
     # Apply posture bias: conservative posture clamps to sonnet; all others
@@ -3579,7 +3621,8 @@ cmd_resume() {
     # grant on the next failure shouldn't be foreclosed by a budget spent
     # before the operator stepped in.
     local merged
-    local resume_jq
+    local resume_jq decision_kind
+    decision_kind=$(jq -r 'if .decision != null and .decision.resolved_at == null then .decision.kind // "" else "" end' "$job_file")
     resume_jq='
         .pending_answer = $a
         | .resumed_at = $ts
@@ -3598,6 +3641,7 @@ cmd_resume() {
     _atomic_write "$job_file" "$merged"
     if [ -n "$option" ]; then
         _append_event "$id" "decision_resolved" "$(jq -nc --arg d "$(jq -r '.decision.id' "$job_file")" --arg o "$option" --arg s "$source" '{decision_id: $d, option: $o, source: $s}')"
+        _decision_after_resume "$id" "$decision_kind" || _die "resume: $decision_kind resume hook failed"
     fi
     _append_event "$id" "resumed" \
         "$(jq -nc --arg a "$answer" --arg o "$option" --arg s "$source" \

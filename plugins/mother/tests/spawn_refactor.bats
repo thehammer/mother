@@ -15,7 +15,7 @@
 #      `_record_run_usage_for_last_spawn` directly by sourcing mother-run-job
 #      with SOURCE_ONLY=1 inside a child bash (so set -u / globals never leak
 #      into bats), against the mock `claude`.
-#   4. HC04-4 — nothing calls resume mode yet.
+#   4. HC04-4 — resume-mode callers (HC-08) always have a fresh fallback.
 #
 # Assumptions about the function's environment (the globals a caller of
 # `_spawn_and_wait` must have set) are listed at the _rs_run helper below.
@@ -566,20 +566,20 @@ _record_run_usage_for_last_spawn failed gate_fix
 }
 
 # ---------------------------------------------------------------------------
-# 4. HC04-4 — no caller uses resume mode yet
+# 4. HC04-4 — resume mode is used, but never without a fresh fallback
+# (HC-08 added the callers: gate-fix turns and gate-hold guidance resumes.)
 # ---------------------------------------------------------------------------
 
-@test "mother-run-job has exactly one _spawn_and_wait call, in fresh mode, and none in resume mode" {
+@test "every _spawn_and_wait resume call in mother-run-job is followed by a fresh-fallback check" {
     # Executable lines only (comments dropped); function definitions excluded.
-    local calls
+    local calls resumes checks
     calls=$(grep -vE '^[[:space:]]*#' "$MOTHER_RUN_JOB" \
         | grep -E '(^|[^_[:alnum:]])_spawn_and_wait[[:space:]]' \
         | grep -vE '_spawn_and_wait[[:space:]]*\(\)|function[[:space:]]+_spawn_and_wait' || true)
-
-    [ -n "$calls" ]
-    [ "$(printf '%s\n' "$calls" | wc -l | tr -d ' ')" = "1" ]
     printf '%s\n' "$calls" | grep -Eq '_spawn_and_wait[[:space:]]+fresh([[:space:]]|$|;|&)'
-    if printf '%s\n' "$calls" | grep -q '_spawn_and_wait[[:space:]]\+resume'; then
-        echo "a _spawn_and_wait resume call exists" >&2; return 1
-    fi
+    resumes=$(printf '%s\n' "$calls" | grep -c '_spawn_and_wait[[:space:]]\+resume' || true)
+    checks=$(grep -vE '^[[:space:]]*#' "$MOTHER_RUN_JOB" \
+        | grep -E '_gates_spawn_failed_immediately[[:space:]]+"' | grep -vc '()' || true)
+    [ "$resumes" -ge 1 ]
+    [ "$resumes" = "$checks" ]
 }

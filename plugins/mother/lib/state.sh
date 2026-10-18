@@ -161,6 +161,20 @@ mother_job_update() {
     _atomic_write "$_jobpath" "$merged"
 }
 
+# Typed attention on a job (`.attention[]`, `{reason, since}`; reasons are the
+# contract's attention enum). Adding a reason that is already present keeps
+# its original `since`. Usage: mother_job_attention_add|drop <id> <reason>
+mother_job_attention_add() {
+    mother_job_update "$1" '
+        if ((.attention // []) | map(.reason) | index($r)) != null then .
+        else .attention = ((.attention // []) + [{reason: $r, since: $ts}]) end' \
+        --arg r "$2" --arg ts "$(_iso_now)"
+}
+mother_job_attention_drop() {
+    mother_job_update "$1" 'if .attention == null then . else .attention |= map(select(.reason != $r)) end' \
+        --arg r "$2"
+}
+
 # Compute the persisted `.failure_reason` literal (compact JSON, always a
 # quoted string) from a failure transition's detail payload: the detail's
 # `.reason` verbatim, or the literal string "unspecified" when it's missing

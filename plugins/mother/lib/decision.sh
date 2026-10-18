@@ -29,6 +29,7 @@ EOF
 }
 
 # jq fragment that records an answer. Callers supply --arg ts/opt/src/sess/agent.
+# Resolving an option also drops the `decision_awaiting` attention reason.
 # `.decision` is only touched when an option is being resolved ($opt non-empty),
 # so a text answer to a job with no open decision just records `.last_answer`
 # (option null) and never rewrites an earlier decision's resolution.
@@ -37,6 +38,7 @@ MOTHER_DECISION_RESOLVE_JQ='
     (if .decision != null and $opt != "" then
         .decision.resolved_at = $ts
         | .decision.resolution = {option: $opt, source: $src, session: $sess, agent: $agent}
+        | (if .attention == null then . else .attention |= map(select(.reason != "decision_awaiting")) end)
      else . end)
     | .last_answer = {source: $src, session: $sess, agent: $agent,
                       option: (if $opt == "" then null else $opt end), at: $ts}'
@@ -88,7 +90,9 @@ mother_decision_resolve() {
 
 # Handlers: a hold kind registers `_decision_handler_<kind>_<opt>` (called with
 # the job id) to give `escalate` / `override_open` real behaviour. Without one
-# the option is refused and nothing changes. HC-08 registers `gate_hold`.
+# the option is refused and nothing changes. A kind may also register
+# `_decision_handler_<kind>_resume_with_guidance`, which cmd_resume runs after
+# its own resume write (extra bookkeeping only). HC-08 registers `gate_hold`.
 _decision_apply() {
     local opt="$1" id="$2" kind handler
     kind=$(jq -r '.decision.kind // ""' "$(_job_path "$id")")
@@ -102,3 +106,86 @@ _decision_apply() {
 }
 _decision_apply_escalate()      { _decision_apply escalate "$1"; }
 _decision_apply_override_open() { _decision_apply override_open "$1"; }
+
+# _decision_after_resume <id> <kind> — run the kind's resume_with_guidance hook,
+# if it has one. Called by cmd_resume after the resume write.
+_decision_after_resume() {
+    local id="$1" kind="$2" handler="_decision_handler_${2}_resume_with_guidance"
+    [ -n "$kind" ] || return 0
+    type "$handler" >/dev/null 2>&1 || return 0
+    "$handler" "$id"
+}
+
+# ---------------------------------------------------------------------------
+# gate_hold (HC-08): blocking quality gates still red after the attempt budget.
+# The job is `awaiting`/`gate_hold`; mother-run-job opened the decision.
+# The answer source comes from cmd_resume's `source` local (bash dynamic
+# scope), defaulting to cli.
+# ---------------------------------------------------------------------------
+
+# Guidance resumes the held worker session (mother-run-job turns
+# .resume_session_id + .pending_answer into a `--resume` spawn).
+_decision_handler_gate_hold_resume_with_guidance() {
+    mother_job_update "$1" '.resume_session_id = .session_id'
+}
+
+# Operator-chosen escalation (G14's "never escalate" is about Mother acting
+# alone): one tier up, a fresh session, a fresh gate budget.
+_decision_handler_gate_hold_escalate() {
+    local id="$1" job_file cur next esc red summary
+    job_file=$(_job_path "$id")
+    cur=$(jq -r '.current_tier // "tier_0"' "$job_file")
+    case "$cur" in
+        tier_0) next=tier_1 ;; tier_1) next=tier_2 ;; tier_2) next=tier_3 ;;
+        tier_3) echo "mother: resume: job $id is already at the top tier (tier_3)" >&2; return 1 ;;
+        *) next=tier_1 ;;
+    esac
+    esc=$(jq -r '(.escalation_count // 0) + 1' "$job_file")
+    red=$(mother_gates_red_json "$job_file" | jq -r 'join(", ")')
+    summary="The operator escalated this job to $next after quality gates stayed red: $red. Fix the cause of each failing gate (run \`mother gates run\` to see them), then commit and push to the same branch. Do not open a second PR."
+    mother_job_update "$id" '
+        .state = "ready"
+        | .current_tier = $tier
+        | .escalation_count = ($esc | tonumber)
+        | .pending_answer = $pa
+        | .resumed_at = $ts
+        | .activity = null | .paused_reason = null | .paused_at = null
+        | .resume_session_id = null
+        | .worker_pid = null | .finished_at = null | .final_result_at = null
+        | .cancel_requested = null | .pause_requested = null
+        | (if .gates != null then .gates.attempt = 0 | .gates.budget_reset_by = "escalate" else . end)' \
+        --arg tier "$next" --arg esc "$esc" --arg pa "$summary" --arg ts "$(_iso_now)" || return 1
+    mother_event_append "$id" "escalated" "$(jq -nc --arg from "$cur" --arg to "$next" --argjson esc "$esc" \
+        '{from_tier: $from, to_tier: $to, from_state: "awaiting", to_state: "ready", escalation_count: $esc, reason: "gate_hold"}')"
+    echo "$id: escalated $cur -> $next after gate hold (worker will spawn on next daemon tick)"
+}
+
+# Open the PR for review with the red gates recorded as an operator override,
+# then mark the job succeeded.
+_decision_handler_gate_hold_override_open() {
+    local id="$1" job_file red src url no_pr
+    job_file=$(_job_path "$id")
+    red=$(mother_gates_red_json "$job_file")
+    src="${source:-cli}"
+    mother_job_update "$id" '
+        .gates.status = "overridden"
+        | .gates.override = {at: $ts, source: $src, red: $red}
+        | .activity = null | .paused_reason = null | .question = null' \
+        --arg ts "$(_iso_now)" --arg src "$src" --argjson red "$red" || return 1
+    mother_event_append "$id" "gates_overridden" "$(jq -nc --argjson red "$red" --arg src "$src" '{red: $red, source: $src}')"
+
+    url=$(jq -r '.pr_url // empty' "$job_file")
+    no_pr=$(jq -r '.no_pr // false' "$job_file")
+    if [ "$no_pr" != "true" ] && [ -n "$url" ]; then
+        mother_prbody_write_gates "$url" "$(jq -c '.gates' "$job_file")" \
+            || echo "mother: resume: could not write the override note into $url" >&2
+        if gh pr ready "$url" >/dev/null 2>&1; then
+            mother_event_append "$id" "pr_marked_ready" "$(jq -nc --arg url "$url" '{reason: "override", pr_url: $url}')"
+        else
+            mother_event_append "$id" "pr_draft_unverified" "$(jq -nc --arg url "$url" '{pr_url: $url, action: "ready", reason: "override"}')"
+            echo "mother: resume: could not mark $url ready; mark it ready by hand" >&2
+        fi
+    fi
+    _job_transition "$id" succeeded "$(jq -nc --arg pr "$url" '{pr_url: $pr, gates: "overridden"}')"
+    echo "$id: gates overridden; job succeeded"
+}

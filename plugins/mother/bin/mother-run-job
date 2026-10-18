@@ -84,6 +84,16 @@ type mother_rwx_sandbox >/dev/null 2>&1 || mother_rwx_sandbox() { echo '{"outcom
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/gates.sh" ] && source "$MOTHER_LIB_DIR/gates.sh"
 
+# PR-body blocks (mother_prbody_write_gates) for the enforce-mode gate loop.
+# Pre-guard for bats; a missing lib means "no body edit".
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/prbody.sh" ] && source "$MOTHER_LIB_DIR/prbody.sh"
+type mother_prbody_write_gates >/dev/null 2>&1 || mother_prbody_write_gates() { return 1; }
+# Real definitions come from lib/state.sh / lib/decision.sh, sourced below the
+# SOURCE_ONLY guard; these stubs only keep bats-sourced helpers callable.
+type mother_job_attention_add >/dev/null 2>&1 || mother_job_attention_add() { :; }
+type mother_decision_open     >/dev/null 2>&1 || mother_decision_open()     { return 1; }
+
 # Best-effort preview-stack teardown (mother_preview_stop). Sourced
 # pre-SOURCE_ONLY-guard so _preview_pre_spawn / _preview_post_exit are
 # bats-callable. A missing lib degrades to "nothing to stop".
@@ -335,6 +345,7 @@ _live_capture_pr_url() {
         if _accept_scraped_pr_url "$url"; then
             _job_update ".pr_url = \"$url\""
             _append_event "pr_opened" "$(jq -nc --arg url "$url" '{url: $url}')"
+            pr_url="$url" _gates_ensure_draft
             return 0
         fi
         _reject_scraped_pr_url "$url" "$_pr_gate_reason"
@@ -713,17 +724,23 @@ _preview_post_exit() {
 }
 
 # ---------------------------------------------------------------------------
-# Quality gates, observe mode (HC-06). After the worker exits and the PR url is
-# settled, run the job's `.crew` gates against the head commit and record the
-# outcome as `.gates` plus gates_started / gate_result / gates_completed events.
-# Observe never changes state, failure_reason, the PR or any prompt: every
-# failure path here degrades to "recorded as incomplete" or "not run".
+# Quality gates (HC-06 observe, HC-08 enforce). After the worker exits and the
+# PR url is settled, run the job's `.crew` gates against the head commit and
+# record the outcome as `.gates` plus gates_started / gate_result /
+# gates_completed events.
+#
+# Observe (HC-06) never changes state, failure_reason, the PR or any prompt.
+# Enforce (HC-08, `.crew.gates.mode == "enforce"`, non-pipeline jobs) keeps the
+# PR a draft, sends blocking failures back to the same worker session, and on
+# exhaustion holds the job (`awaiting`/`gate_hold`) with a decision. It never
+# touches current_tier, escalation_count or retry_count (G14).
+#
 # Must run before the main-dir restore / lock release (HEAD must still be the
 # job branch). Runs only for a run heading for success, never for a cancelled,
 # paused or superseded one. `.gates` carries ids, enums, counts and durations
 # only: gate output stays in $MOTHER_ROOT/crew/<id>/gates/<attempt>/.
 # ---------------------------------------------------------------------------
-_gates_observe_applicable() {
+_gates_applicable() {
     [ "${MOTHER_GATES_ENABLED:-1}" != "0" ] || return 1
     type mother_gates_run >/dev/null 2>&1 || return 1
     jq -e '(.crew.gates.checks // []) | length > 0' "$job_file" >/dev/null 2>&1 || return 1
@@ -742,21 +759,31 @@ _gates_observe_applicable() {
     return 0
 }
 
-_run_gates_observe() {
-    _gates_observe_applicable || return 0
+# True when this job's gates are enforced: crew mode enforce, gates enabled,
+# not a pipeline job (pipelines are gated in observe only until HC-15).
+_gates_enforced() {
+    [ "${MOTHER_GATES_ENABLED:-1}" != "0" ] || return 1
+    jq -e '.crew.gates.mode == "enforce" and ((.crew.gates.checks // []) | length > 0)
+           and (.kind // "") != "pipeline"' "$job_file" >/dev/null 2>&1
+}
 
-    local attempt=1 mode max_attempts posture started_at prev_activity
+# Extra keys merged into `.gates` by enforce-mode attempts ('{}' for observe).
+_gates_extra_json='{}'
+# Status of the last _gates_run_attempt.
+_gates_status=""
+
+# _gates_run_attempt <attempt> <max> <effective_mode> <restore-activity-json> <posture>
+# One gate pass: sets activity=gating, runs mother_gates_run (bounded by the
+# budget), emits the gate events, writes `.gates` and restores the activity.
+# Sets _gates_status.
+_gates_run_attempt() {
+    local attempt="$1" max_attempts="$2" effective_mode="$3" restore_activity="$4" posture="$5"
+    local mode started_at head_sha crew_file out_dir
+    _gates_status="incomplete"
     mode=$(jq -r '.crew.gates.mode // "observe"' "$job_file" 2>/dev/null) || mode=observe
-    max_attempts=$(jq -r '.crew.gates.max_attempts // 3' "$job_file" 2>/dev/null) || max_attempts=3
-    prev_activity=$(jq -c '.activity // null' "$job_file" 2>/dev/null) || prev_activity=null
-    posture=$(_resolve_posture 2>/dev/null) || posture=normal
-    [ -n "$posture" ] || posture=normal
     started_at=$(iso_now)
-
-    local head_sha
     head_sha=$(git -C "${work_dir:-.}" rev-parse HEAD 2>/dev/null) || head_sha=""
 
-    local crew_file out_dir
     crew_file=$(mktemp "${TMPDIR:-/tmp}/mother-crew.XXXXXX" 2>/dev/null) || return 0
     jq -c '.crew' "$job_file" >"$crew_file" 2>/dev/null || { rm -f "$crew_file"; return 0; }
     out_dir="$MOTHER_ROOT/crew/$id/gates/$attempt"
@@ -770,10 +797,10 @@ _run_gates_observe() {
           gates: [$crew[0].gates.checks[].name]}')" 2>/dev/null || true
 
     # Only a no_pr job may be gated on an unpushed head. A PR job must have
-    # pushed what it is being gated on, or observe-mode results would be
-    # recorded against a commit CI never sees.
+    # pushed what it is being gated on, or results would be recorded against a
+    # commit CI never sees.
     local -a unpushed_flag=()
-    [ "$(jq -r '.no_pr // false' "$job_file" 2>/dev/null)" = "true" ] && unpushed_flag=(--allow-unpushed)
+    ! _gates_job_no_pr || unpushed_flag=(--allow-unpushed)
 
     # Bound the whole gate run (not just each check): a main-dir job holds the
     # repo's workspace lock while it gates. Overrunning the budget kills the run
@@ -804,13 +831,13 @@ _run_gates_observe() {
     local finished_at gates_json
     finished_at=$(iso_now)
     gates_json=$(printf '%s' "$result" | jq -c \
-        --arg mode "$mode" --argjson max "$max_attempts" --argjson attempt "$attempt" \
-        --arg started "$started_at" --arg finished "$finished_at" '
-        {mode: $mode, effective_mode: "observe", posture: .posture, status: .status,
+        --arg mode "$mode" --arg eff "$effective_mode" --argjson max "$max_attempts" --argjson attempt "$attempt" \
+        --arg started "$started_at" --arg finished "$finished_at" --argjson extra "$_gates_extra_json" '
+        {mode: $mode, effective_mode: $eff, posture: .posture, status: .status,
          attempt: $attempt, max_attempts: $max, head_sha: .head_sha,
          started_at: $started, finished_at: $finished,
          results: [.results[] | {name, result, blocking, duration_s, exit_code, unavailable_reason, skip_reason}],
-         not_run: .not_run}')
+         not_run: .not_run} + $extra')
 
     local ev
     while IFS= read -r ev; do
@@ -825,7 +852,295 @@ _run_gates_observe() {
          unavailable: ([.results[] | select(.result == "unavailable")] | length),
          not_run}')" 2>/dev/null || true
 
-    _job_update ".gates = $gates_json | .activity = $prev_activity" 2>/dev/null || true
+    _job_update ".gates = $gates_json | .activity = $restore_activity" 2>/dev/null || true
+    _gates_status=$(printf '%s' "$gates_json" | jq -r '.status // "incomplete"')
+    return 0
+}
+
+_run_gates_observe() {
+    _gates_applicable || return 0
+    local max_attempts posture prev_activity
+    max_attempts=$(jq -r '.crew.gates.max_attempts // 3' "$job_file" 2>/dev/null) || max_attempts=3
+    prev_activity=$(jq -c '.activity // null' "$job_file" 2>/dev/null) || prev_activity=null
+    posture=$(_resolve_posture 2>/dev/null) || posture=normal
+    [ -n "$posture" ] || posture=normal
+    _gates_extra_json='{}'
+    _gates_run_attempt 1 "$max_attempts" observe "$prev_activity" "$posture"
+    return 0
+}
+
+# _run_gates — the post-run gate step: enforce loop or observe pass.
+_run_gates() {
+    _gates_applicable || return 0
+    if _gates_enforced; then
+        _run_gates_enforce
+    else
+        _run_gates_observe
+    fi
+}
+
+# True when the job is a no_pr job (no push or PR calls are made for it).
+_gates_job_no_pr() {
+    [ "$(jq -r '.no_pr // false' "$job_file" 2>/dev/null)" = "true" ]
+}
+
+# The job's PR url: the captured global, else the stored one.
+_gates_pr_url() {
+    local url="${pr_url:-}"
+    [ -n "$url" ] || url=$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)
+    printf '%s' "$url"
+}
+
+# First attempt number for this run. A continuation resumes the attempt count
+# of the run it continues (a fix run that idled out); every other run starts
+# a fresh budget.
+_gates_start_attempt() {
+    local max="$1" prev n=1
+    if [ "${run_activity_at_start:-}" = "continuation" ]; then
+        prev=$(jq -r 'if .gates.effective_mode == "enforce" and .gates.status == "failed"
+                      then (.gates.attempt // 0) else 0 end' "$job_file" 2>/dev/null) || prev=0
+        case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+        n=$((prev + 1))
+        [ "$n" -le "$max" ] || n="$max"
+    fi
+    echo "$n"
+}
+
+# Draft discipline (B3): an enforce-mode PR stays a draft until Mother marks it
+# ready. Converts a non-draft PR back to draft; checked once per URL per run.
+_pr_draft_ok_url=""
+_gates_ensure_draft() {
+    local url is_draft
+    url=$(_gates_pr_url)
+    [ -n "$url" ] || return 0
+    [ "$url" != "$_pr_draft_ok_url" ] || return 0
+    _gates_enforced || return 0
+    ! _gates_job_no_pr || return 0
+    is_draft=$(gh pr view "$url" --json isDraft --jq '.isDraft' 2>/dev/null) || is_draft=""
+    case "$is_draft" in
+        true) _pr_draft_ok_url="$url" ;;
+        false)
+            if gh pr ready "$url" --undo >/dev/null 2>&1; then
+                _pr_draft_ok_url="$url"
+                _append_event "pr_marked_draft" "$(jq -nc --arg url "$url" '{reason: "gates_pending", pr_url: $url}')"
+            else
+                _append_event "pr_draft_unverified" "$(jq -nc --arg url "$url" '{pr_url: $url, action: "undo_ready"}')"
+            fi ;;
+        *)
+            _append_event "pr_draft_unverified" "$(jq -nc --arg url "$url" '{pr_url: $url, action: "view"}')" ;;
+    esac
+    return 0
+}
+
+# _gates_write_fix_prompt <attempt> <max> <file> — the gate-fix turn sent to
+# the worker: each red blocking gate with its excerpt (read from the side
+# file; it goes to the worker, never on the wire) and hint.
+_gates_write_fix_prompt() {
+    local n="$1" max="$2" file="$3" name excerpt_file hint exit_c head
+    head=$(jq -r '(.gates.head_sha // "") | .[0:12]' "$job_file" 2>/dev/null)
+    {
+        printf '# Quality gates failed: attempt %s/%s\n\n' "$n" "$max"
+        printf 'Mother ran the quality gates on your head commit `%s` and these blocking gates failed.\n\n' "$head"
+        for name in $(mother_gates_red_json "$job_file" | jq -r '.[]'); do
+            exit_c=$(jq -r --arg n "$name" '.gates.results[] | select(.name == $n) | .exit_code // "?"' "$job_file")
+            case "$name" in
+                clean_tree) hint="commit or discard your changes" ;;
+                pushed)     hint="push your branch to origin" ;;
+                *)          hint=$(jq -r --arg n "$name" '.crew.gates.checks[]? | select(.name == $n) | .hint // empty' "$job_file") ;;
+            esac
+            printf '## Gate `%s` (exit %s)\n\n' "$name" "$exit_c"
+            excerpt_file="$MOTHER_ROOT/crew/$id/gates/$n/$name.excerpt"
+            if [ -s "$excerpt_file" ]; then
+                printf 'Output excerpt (last lines):\n\n````\n'
+                cat "$excerpt_file"
+                printf '\n````\n\n'
+            else
+                printf '(no output captured)\n\n'
+            fi
+            [ -n "$hint" ] && printf 'Hint: %s\n\n' "$hint"
+        done
+        printf -- '---\n\n'
+        printf 'Fix the cause of each failure above, then commit and push to the same branch (`%s`).\n' "$branch"
+        printf 'Do not open a second PR. Never suppress a check, add a baseline or ignore entry, or skip a test\n'
+        printf 'to turn a gate green, unless the plan says to. Once you have pushed, stop: Mother re-runs the\n'
+        printf 'gates. This was attempt %s of %s.\n' "$n" "$max"
+    } >"$file" 2>/dev/null
+}
+
+# _gates_spawn_failed_immediately <spawned 0|1> — after a resume spawn: true
+# when it never started, exited non-zero or produced no result event (session
+# not found and the like). Cancel, pause and reaps go their normal ways.
+_gates_spawn_failed_immediately() {
+    [ "${1:-0}" = "1" ] || return 0
+    [ "${cancel_requested:-0}" -eq 0 ] || return 1
+    [ "$(jq -r '.state // ""' "$job_file" 2>/dev/null)" != "awaiting" ] || return 1
+    [ -z "${reaped_reason:-}" ] || return 1
+    [ "${exit_code:-1}" = "0" ] || return 0
+    tail -c "+$((${log_offset_at_spawn:-0} + 1))" "$log_path" 2>/dev/null \
+        | grep -Eq '"type"[[:space:]]*:[[:space:]]*"result"' && return 1
+    return 0
+}
+
+# _new_session_id — a fresh lower-case uuid (or empty).
+_new_session_id() {
+    local sid
+    sid=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')
+    if [ -z "$sid" ] && [ -r /proc/sys/kernel/random/uuid ]; then
+        sid=$(cat /proc/sys/kernel/random/uuid)
+    fi
+    printf '%s' "$sid"
+}
+
+# _gates_fix <attempt> <max> <restore-activity-json> — one gate-fix turn in the
+# job's existing session (fresh fallback if that can't start). Returns 0 when
+# the fix run completed and the gates should run again; 1 when the run stopped
+# (cancel, await, pause, idle reap, failure, superseded) and the normal
+# post-exit path takes over.
+_gates_fix() {
+    local n="$1" max="$2" restore="$3" fixfile red sid spawned=0
+    fixfile="$RUNNER_DIR/$id.gatefix.$n.md"
+    red=$(mother_gates_red_json "$job_file")
+    _gates_write_fix_prompt "$n" "$max" "$fixfile" || return 1
+
+    # The run that produced this head is over: record its usage before the
+    # next spawn moves the log offset, and refresh actual_cost_usd so the
+    # fix run's --max-cost check counts it.
+    _record_run_usage_for_last_spawn "gates_failed" "${last_run_kind:-worker}"
+    mother_recompute_job_cost "$id" 2>/dev/null || true
+
+    _job_update '.activity = "gate_fix"'
+    sid=$(jq -r '.session_id // ""' "$job_file" 2>/dev/null)
+    _append_event "gate_fix_started" "$(jq -nc --argjson a "$n" --argjson m "$max" --arg s "$sid" --argjson red "$red" \
+        '{attempt: $a, max_attempts: $m, session_id: $s, red: $red, mode: "resume"}')"
+    _spawn_and_wait resume "$fixfile" && spawned=1
+    last_run_kind=gate_fix
+
+    if _gates_spawn_failed_immediately "$spawned"; then
+        if [ "$spawned" = "1" ]; then
+            _record_run_usage_for_last_spawn "failed" gate_fix '{"resume_failed": true}'
+            mother_recompute_job_cost "$id" 2>/dev/null || true
+        fi
+        next_session_id=$(_new_session_id)
+        _append_event "gate_fix_started" "$(jq -nc --argjson a "$n" --argjson m "$max" --arg s "$next_session_id" --argjson red "$red" \
+            '{attempt: $a, max_attempts: $m, session_id: $s, red: $red, mode: "fresh_fallback"}')"
+        spawn_prompt_prefix_file="$fixfile"
+        _spawn_and_wait fresh
+        spawn_prompt_prefix_file=""
+        next_session_id=""
+    fi
+    rm -f "$fixfile"
+
+    # A superseded supervisor must not touch the job again.
+    if [ -n "${worker_pid:-}" ] && \
+       [ "$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)" != "$worker_pid" ]; then
+        return 1
+    fi
+    _job_update ".activity = $restore"
+    _gates_applicable
+}
+
+# _gates_present <passed|incomplete> — present the PR for human review: gates
+# block in the body, mark ready. Incomplete adds `gates_incomplete` attention.
+# no_pr jobs (and jobs without a PR url) make no PR calls (G19).
+_gates_present() {
+    local status="$1" url reason="gates_passed"
+    [ "$status" = "incomplete" ] && reason="gates_incomplete"
+    url=$(_gates_pr_url)
+    if ! _gates_job_no_pr && [ -n "$url" ]; then
+        mother_prbody_write_gates "$url" "$(jq -c '.gates' "$job_file")" \
+            || echo "mother-run-job: $id: could not write the gates block into $url" >&2
+        if gh pr ready "$url" >/dev/null 2>&1; then
+            _append_event "pr_marked_ready" "$(jq -nc --arg r "$reason" --arg url "$url" '{reason: $r, pr_url: $url}')"
+        else
+            _append_event "pr_draft_unverified" "$(jq -nc --arg url "$url" --arg r "$reason" '{pr_url: $url, action: "ready", reason: $r}')"
+        fi
+    fi
+    [ "$status" = "incomplete" ] && mother_job_attention_add "$id" gates_incomplete
+    return 0
+}
+
+# _gates_hold <attempts> — the attempt budget is spent and blocking gates are
+# still red: make sure the branch is on origin (never force), then hold the job
+# for the operator with a gate_hold decision. Never succeeded, failed or
+# escalated. `.question` is Mother-written and carries no gate output.
+_gates_hold() {
+    local n="$1" red red_csv push_ref head remote="" pushed=false location q
+    red=$(mother_gates_red_json "$job_file")
+    red_csv=$(printf '%s' "$red" | jq -r 'join(", ")')
+    push_ref=$(jq -r '.actual_branch // .branch // empty' "$job_file" 2>/dev/null)
+    [ -n "$push_ref" ] || push_ref="$branch"
+    head=$(git -C "${work_dir:-.}" rev-parse HEAD 2>/dev/null) || head=""
+
+    if _gates_job_no_pr; then
+        location="not pushed: no_pr job; local branch $branch in $work_dir at ${head:0:12}"
+    else
+        remote=$(_run_remote_sha "$push_ref" 2>/dev/null) || remote=""
+        if [ -n "$head" ] && [ "$remote" = "$head" ]; then
+            pushed=true
+        elif [ -n "$head" ] && (cd "$work_dir" && GIT_TERMINAL_PROMPT=0 git push -q origin "HEAD:refs/heads/$push_ref" >/dev/null 2>&1); then
+            pushed=true
+        fi
+        if [ "$pushed" = "true" ]; then
+            location="pushed to origin/$push_ref at ${head:0:12}"
+        else
+            location="not pushed: git push of HEAD to origin/$push_ref failed or was rejected; local branch $branch in $work_dir at ${head:0:12}"
+        fi
+    fi
+
+    _append_event "gates_exhausted" "$(jq -nc --argjson a "$n" --argjson red "$red" --arg h "$head" --argjson p "$pushed" \
+        '{attempts: $a, red: $red, head_sha: $h, pushed: $p}')"
+
+    q=$(printf '%s\n' \
+        "Quality gates are still failing after $n/$n attempt(s): $red_csv." \
+        "Branch: $location." \
+        "Gate output and hints: mother status $id" \
+        "Choose one:" \
+        "  mother resume $id \"<guidance>\"            resume this worker session with your guidance" \
+        "  mother resume $id --option escalate       re-run one model tier higher" \
+        "  mother resume $id --option override_open  open the PR for review anyway (override recorded)" \
+        "  mother resume $id --option cancel         cancel the job; the branch is left in place")
+
+    local merged
+    merged=$(jq --arg q "$q" --arg ts "$(iso_now)" '
+        .state = "awaiting" | .activity = "gate_hold" | .paused_reason = "gate_hold"
+        | .paused_at = $ts | .question = $q' "$job_file") && _atomic_write "$job_file" "$merged"
+    mother_decision_open "$id" gate_hold '["resume_with_guidance","escalate","override_open","cancel"]' >/dev/null \
+        || echo "mother-run-job: $id: could not open the gate_hold decision" >&2
+    mother_job_attention_add "$id" decision_awaiting
+    _append_event "awaiting_input" "$(jq -nc --arg q "$q" '{question: $q, paused_reason: "gate_hold"}')"
+    return 0
+}
+
+# _run_gates_enforce — the enforce gate loop (HC-08). See the section header.
+_run_gates_enforce() {
+    local max posture orig_activity n
+    posture=$(_resolve_posture 2>/dev/null) || posture=normal
+    [ -n "$posture" ] || posture=normal
+    max=$(jq -r '.crew.gates.max_attempts // 3' "$job_file" 2>/dev/null) || max=3
+    case "$max" in ''|*[!0-9]*|0) max=3 ;; esac
+    [ "$posture" = "conservative" ] && max=1
+    orig_activity=$(jq -c '.activity // null' "$job_file" 2>/dev/null) || orig_activity=null
+    case "$orig_activity" in '"gating"'|'"gate_fix"'|'"gate_hold"') orig_activity=null ;; esac
+    n=$(_gates_start_attempt "$max")
+    _gates_extra_json=$(jq -nc --arg r "${gates_budget_reset_by:-}" \
+        'if $r != "" then {budget_reset_by: $r} else {} end')
+
+    _gates_ensure_draft
+    while :; do
+        _gates_run_attempt "$n" "$max" enforce "$orig_activity" "$posture"
+        case "$_gates_status" in
+            passed|incomplete) _gates_present "$_gates_status"; break ;;
+        esac
+        if [ "$n" -ge "$max" ]; then
+            _gates_hold "$n"
+            break
+        fi
+        _gates_fix "$n" "$max" "$orig_activity" || break
+        _finalize_pr_url
+        _gates_ensure_draft
+        n=$((n + 1))
+    done
+    _gates_extra_json='{}'
     return 0
 }
 
@@ -1362,10 +1677,10 @@ _spawn_and_wait() {
         # `mother peek` can't tell them apart — it falls back to newest-mtime,
         # which conflates sibling workers and any user's foreground Claude session
         # in the same directory.
-        session_id=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')
-        if [ -z "$session_id" ] && [ -r /proc/sys/kernel/random/uuid ]; then
-            session_id=$(cat /proc/sys/kernel/random/uuid)
-        fi
+        # (A caller may preset next_session_id, e.g. to name the session in an
+        # event before the spawn.)
+        session_id="${next_session_id:-}"
+        [ -n "$session_id" ] || session_id=$(_new_session_id)
         if [ -n "$session_id" ]; then
             _job_update ".session_id = \"$session_id\""
         fi
@@ -1394,6 +1709,7 @@ _spawn_and_wait() {
 
         spawn_prompt="$RUNNER_DIR/$id.prompt.md"
         preamble_path="${MOTHER_PREAMBLE_PATH:-$MOTHER_LIB_DIR/../templates/preamble.md}"
+        gates_enforce_path="$MOTHER_LIB_DIR/../templates/gates-enforce.md"
         pending_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null || echo "")
         prev_question=$(jq -r '.question // empty'       "$job_file" 2>/dev/null || echo "")
 
@@ -1403,9 +1719,22 @@ _spawn_and_wait() {
                 printf '\n---\n\n'
             fi
 
+            # Enforce-mode gates (HC-08): draft PRs, same-session gate fixes.
+            if _gates_enforced && [ -r "$gates_enforce_path" ]; then
+                cat "$gates_enforce_path"
+                printf '\n---\n\n'
+            fi
+
             # Routing context stanza: insert after preamble, before plan (or resume context).
             # Tells the worker agent which model/effort it's running at and how to configure sub-agents.
             printf '%s\n\n' "$routing_context"
+
+            # A gate-fix turn that could not resume its session (fresh
+            # fallback) carries the gate-fix text ahead of the plan.
+            if [ -n "${spawn_prompt_prefix_file:-}" ] && [ -r "$spawn_prompt_prefix_file" ]; then
+                cat "$spawn_prompt_prefix_file"
+                printf '\n---\n\n'
+            fi
 
             if [ "$kind" = "pipeline" ] && [ -n "$phase_agent" ]; then
                 # ---- Pipeline phase prompt: request-type-driven ----
@@ -1763,6 +2092,10 @@ USAGE_EOF
                         [ -n "$_cap_by_model" ] || _cap_by_model='{}'
                     fi
                     _cap_summary="Mother cost cap reached on job $id: spent \$${job_spend} of the \$${max_cost_usd} cap across all runs. Per-actor breakdown: ${_cap_by_actor}. Per-model breakdown: ${_cap_by_model}. Total tokens: ${job_tokens}. To continue: mother resume $id --max-cost <usd> \"<instructions>\". To stop: mother cancel $id."
+                    _cap_red=""
+                    [ "$(jq -r '.gates.status // ""' "$job_file" 2>/dev/null)" = "failed" ] \
+                        && _cap_red=$(mother_gates_red_json "$job_file" | jq -r 'join(", ")' 2>/dev/null)
+                    [ -z "$_cap_red" ] || _cap_summary="$_cap_summary Gates red: $_cap_red."
                     printf '%s\n' "$_cap_summary" > "$cost_cap_flag"
                     _job_update ".cost_cap_breached_at = \"$(iso_now)\""
                     _append_event "cost_cap_breached" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" --argjson by_actor "$_cap_by_actor" --argjson by_model "$_cap_by_model" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber), by_actor: $by_actor, by_model: $by_model}')"
@@ -1888,8 +2221,11 @@ _record_run_usage_for_last_spawn() {
         "${phase_agent:-cody}" "$usage_main_actor" "$run_kind" "$extra"
 }
 
+# last_run_kind: what the most recent spawn was (worker | gate_fix), so the
+# final row of a run that ended in a gate-fix turn is recorded as one.
+last_run_kind=worker
 _append_metrics() {
-    _record_run_usage_for_last_spawn "$1" worker "${2:-}"
+    _record_run_usage_for_last_spawn "$1" "${last_run_kind:-worker}" "${2:-}"
 }
 
 # Allow sourcing helpers without running job logic (used by bats tests).
@@ -1905,6 +2241,8 @@ job_file="$JOBS_DIR/$id.json"
 source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/worktree.sh"
+# shellcheck source=/dev/null
+source "$MOTHER_LIB_DIR/decision.sh"
 # shellcheck source=/dev/null
 source "$MOTHER_LIB_DIR/locks.sh"
 # shellcheck source=/dev/null
@@ -1956,8 +2294,8 @@ _runner_died_trap() {
     if [ "$cur" = "running" ]; then
         _transition failed "$(jq -nc --argjson rc "$rc" \
             '{reason: "runner_died_early", exit_code: $rc}')" 2>/dev/null || true
-        # Died mid-gating: don't leave a terminal job looking like it is gating.
-        _job_update 'if .activity == "gating" then .activity = null else . end' 2>/dev/null || true
+        # Died mid-gating or mid-fix: don't leave a terminal job looking like it is.
+        _job_update 'if .activity == "gating" or .activity == "gate_fix" then .activity = null else . end' 2>/dev/null || true
     fi
     # Stop the RWX sandbox first (idempotent; best-effort) — before the
     # main-dir restore switches the checkout away from the job branch.
@@ -2330,7 +2668,48 @@ detection work and operator confusion.
 
 ---"
 
-_spawn_and_wait fresh
+# An operator who answered a gate hold with guidance resumes the held session
+# (decision.sh sets .resume_session_id): the answer goes to the same session as
+# its next turn. If that session can't be resumed, fall back to a fresh spawn
+# that carries the answer the usual way.
+run_activity_at_start=$(jq -r '.activity // ""' "$job_file" 2>/dev/null)
+gates_budget_reset_by=""
+if [ "$(jq -r '(.gates.attempt // -1) == 0 and (.gates.budget_reset_by // "") == "escalate"' "$job_file" 2>/dev/null)" = "true" ]; then
+    gates_budget_reset_by="escalate"
+fi
+resume_sid=$(jq -r '.resume_session_id // empty' "$job_file" 2>/dev/null)
+resume_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null)
+if [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ]; then
+    gates_budget_reset_by="resume"
+    resume_question=$(jq -r '.question // empty' "$job_file" 2>/dev/null)
+    resume_prompt_file="$RUNNER_DIR/$id.resume.md"
+    {
+        printf '# The operator answered your gate hold\n\n'
+        printf 'Mother held this job because quality gates stayed red. The operator replied:\n\n'
+        printf '%s\n\n' "$resume_answer"
+        printf -- '---\n\n'
+        printf 'Act on that guidance, then commit and push to the same branch (`%s`). Do not open a second PR.\n' "$branch"
+        printf 'Once you have pushed, stop: Mother re-runs the gates with a fresh attempt budget.\n'
+    } >"$resume_prompt_file"
+    _resume_merged=$(jq --arg s "$resume_sid" \
+        '.session_id = $s | .resume_session_id = null | .pending_answer = null | .question = null' "$job_file") \
+        && _atomic_write "$job_file" "$_resume_merged"
+    _append_event "resumed_from_input" "$(jq -nc --arg q "$resume_question" --arg a "$resume_answer" \
+        --arg p "$resume_prompt_file" '{question: $q, answer: $a, resume_prompt: $p, mode: "resume"}')"
+    _resume_spawned=0
+    _spawn_and_wait resume "$resume_prompt_file" && _resume_spawned=1
+    rm -f "$resume_prompt_file"
+    if _gates_spawn_failed_immediately "$_resume_spawned"; then
+        [ "$_resume_spawned" = "1" ] && _record_run_usage_for_last_spawn "failed" worker '{"resume_failed": true}'
+        _resume_merged=$(jq --arg a "$resume_answer" --arg q "$resume_question" \
+            '.pending_answer = $a | .question = (if $q == "" then null else $q end)' "$job_file") \
+            && _atomic_write "$job_file" "$_resume_merged"
+        _spawn_and_wait fresh
+    fi
+else
+    [ -z "$resume_sid" ] || _job_update '.resume_session_id = null'
+    _spawn_and_wait fresh
+fi
 
 # _split_pr_hit, _maybe_emit_pr_opened, and _finalize_pr_url are defined up
 # near _verify_artifact_or_fail (before the SOURCE_ONLY guard) so bats can
@@ -2341,10 +2720,11 @@ _spawn_and_wait fresh
 # full contract. Sets the global `pr_url`.
 _finalize_pr_url
 
-# Quality gates in observe mode: record-only, never changes state or the PR.
-# Before the sandbox stop (sandbox gates reuse the sandbox) and before the
-# main-dir restore (HEAD must still be the job branch).
-_run_gates_observe
+# Quality gates: observe records only; enforce keeps the PR a draft, runs
+# same-session fix turns and holds on exhaustion (state awaiting, handled by
+# the paused exit below). Before the sandbox stop (sandbox gates reuse the
+# sandbox) and before the main-dir restore (HEAD must still be the job branch).
+_run_gates
 
 # Stop the RWX sandbox now: before the main-dir stash-restore below switches the
 # checkout back to the operator's branch, and before the lock release lets
@@ -2381,13 +2761,13 @@ if [ "$current_state" = "awaiting" ]; then
         "$(jq -nc --arg pr "${pr_url:-}" '{pr_url: $pr}')"
     _paused_reason=$(jq -r '.paused_reason // "user"' "$job_file" 2>/dev/null)
     mother_record_run_usage "$id" "paused" "$log_path" "$log_offset_at_spawn" "" \
-        "${phase_agent:-cody}" "$usage_main_actor" "worker" \
+        "${phase_agent:-cody}" "$usage_main_actor" "${last_run_kind:-worker}" \
         "$(jq -nc --arg model "$worker_model" --arg effort "$worker_effort" --arg tier "$current_tier" \
             --argjson retry_count "$(jq -r '.retry_count // 0' "$job_file" 2>/dev/null)" \
             --argjson escalation_count "${escalation_count:-0}" \
             --arg pr_url "${pr_url:-}" --arg paused_reason "$_paused_reason" \
             '{model: $model, effort: $effort, tier: $tier, retry_count: $retry_count, escalation_count: $escalation_count, pr_url: $pr_url, paused_reason: $paused_reason}')"
-    rm -f "$marker_file" "$wrapper" "$spawn_prompt" "$usage_state_file"
+    rm -f "$marker_file" "$wrapper" "${spawn_prompt:-}" "$usage_state_file"
     # The runner_died_early trap only fires while state == "running"; awaiting
     # is safe by virtue of that, but disarm anyway for clarity.
     trap - EXIT
