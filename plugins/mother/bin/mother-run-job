@@ -89,6 +89,11 @@ type mother_rwx_sandbox >/dev/null 2>&1 || mother_rwx_sandbox() { echo '{"outcom
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/prbody.sh" ] && source "$MOTHER_LIB_DIR/prbody.sh"
 type mother_prbody_write_gates >/dev/null 2>&1 || mother_prbody_write_gates() { return 1; }
+type mother_prbody_write_review >/dev/null 2>&1 || mother_prbody_write_review() { return 1; }
+# Findings exit rules (findings_exit_decision) for the review wave. Pre-guard
+# for bats; sourced again below with the other pipeline libs.
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/findings.sh" ] && source "$MOTHER_LIB_DIR/findings.sh"
 # Real definitions come from lib/state.sh / lib/decision.sh, sourced below the
 # SOURCE_ONLY guard; these stubs only keep bats-sourced helpers callable.
 type mother_job_attention_add  >/dev/null 2>&1 || mother_job_attention_add()  { :; }
@@ -745,6 +750,13 @@ _gates_applicable() {
     [ "${MOTHER_GATES_ENABLED:-1}" != "0" ] || return 1
     type mother_gates_run >/dev/null 2>&1 || return 1
     jq -e '(.crew.gates.checks // []) | length > 0' "$job_file" >/dev/null 2>&1 || return 1
+    _run_heading_for_success
+}
+
+# True when the last worker run is heading for success: not cancelled, exited
+# 0 (or reaped after its final result), not awaiting, and this supervisor still
+# owns the worker. Gates and the review wave only ever run on such a run.
+_run_heading_for_success() {
     [ "${cancel_requested:-0}" -eq 0 ] || return 1
     if [ -n "${reaped_reason:-}" ]; then
         [ "${final_result_epoch:-0}" -gt 0 ] || return 1
@@ -766,6 +778,25 @@ _gates_enforced() {
     [ "${MOTHER_GATES_ENABLED:-1}" != "0" ] || return 1
     jq -e '.crew.gates.mode == "enforce" and ((.crew.gates.checks // []) | length > 0)
            and (.kind // "") != "pipeline"' "$job_file" >/dev/null 2>&1
+}
+
+# True when this job runs a review wave (HC-14): lenses enabled, the crew
+# snapshot has a `lenses` section, not a pipeline job (HC-15).
+_wave_configured() {
+    [ "${MOTHER_LENSES_ENABLED:-1}" != "0" ] || return 1
+    jq -e '(.crew.lenses | type) == "object" and (.kind // "") != "pipeline"' "$job_file" >/dev/null 2>&1
+}
+
+# True when the review wave is in enforce mode (it can rework and hold).
+_wave_enforced() {
+    _wave_configured || return 1
+    jq -e '.crew.lenses.mode == "enforce"' "$job_file" >/dev/null 2>&1
+}
+
+# True when Mother owns the PR's draft state: it keeps the PR a draft and marks
+# it ready itself (enforced gates, or an enforce-mode review wave).
+_pr_draft_managed() {
+    _gates_enforced || _wave_enforced
 }
 
 # Extra keys merged into `.gates` by enforce-mode attempts ('{}' for observe).
@@ -869,6 +900,7 @@ _gates_run_attempt() {
 
 _run_gates_observe() {
     _gates_applicable || return 0
+    _gates_outcome=presented
     local max_attempts posture prev_activity
     max_attempts=$(jq -r '.crew.gates.max_attempts // 3' "$job_file" 2>/dev/null) || max_attempts=3
     prev_activity=$(jq -c '.activity // null' "$job_file" 2>/dev/null) || prev_activity=null
@@ -879,8 +911,16 @@ _run_gates_observe() {
     return 0
 }
 
+# Outcome of the last _run_gates: skipped (no gates ran), presented (passed,
+# incomplete or observe: the PR may be presented), held (gate_hold) or stopped
+# (cancel, pause, a newer supervisor, a fix run that did not finish).
+_gates_outcome=skipped
+# pr_marked_ready reason of gates that passed while a review wave was pending.
+_pr_ready_reason=""
+
 # _run_gates — the post-run gate step: enforce loop or observe pass.
 _run_gates() {
+    _gates_outcome=skipped
     _gates_applicable || return 0
     if _gates_enforced; then
         _run_gates_enforce
@@ -925,7 +965,7 @@ _gates_ensure_draft() {
     url=$(_gates_pr_url)
     [ -n "$url" ] || return 0
     [ "$url" != "$_pr_draft_ok_url" ] || return 0
-    _gates_enforced || return 0
+    _pr_draft_managed || return 0
     ! _gates_job_no_pr || return 0
     is_draft=$(gh pr view "$url" --json isDraft --jq '.isDraft' 2>/dev/null) || is_draft=""
     case "$is_draft" in
@@ -1055,7 +1095,8 @@ _gates_fix() {
 
 # _gates_present <passed|incomplete> — present the PR for human review: gates
 # block in the body, mark ready. Incomplete adds `gates_incomplete` attention.
-# no_pr jobs (and jobs without a PR url) make no PR calls (G19).
+# no_pr jobs (and jobs without a PR url) make no PR calls (G19). With a review
+# wave configured, marking ready waits for the wave (HC-14).
 _gates_present() {
     local status="$1" url reason="gates_passed"
     [ "$status" = "incomplete" ] && reason="gates_incomplete"
@@ -1063,11 +1104,11 @@ _gates_present() {
     if ! _gates_job_no_pr && [ -n "$url" ]; then
         mother_prbody_write_gates "$url" "$(jq -c '.gates' "$job_file")" \
             || echo "mother-run-job: $id: could not write the gates block into $url" >&2
-        if gh pr ready "$url" >/dev/null 2>&1; then
-            _append_event "pr_marked_ready" "$(jq -nc --arg r "$reason" --arg url "$url" '{reason: $r, pr_url: $url}')"
-        else
-            _append_event "pr_draft_unverified" "$(jq -nc --arg url "$url" --arg r "$reason" '{pr_url: $url, action: "ready", reason: $r}')"
-        fi
+    fi
+    if _wave_configured; then
+        _pr_ready_reason="$reason"
+    else
+        _pr_mark_ready "$reason"
     fi
     if [ "$status" = "incomplete" ]; then
         mother_job_attention_add "$id" gates_incomplete
@@ -1075,6 +1116,19 @@ _gates_present() {
         mother_job_attention_drop "$id" gates_incomplete
     fi
     return 0
+}
+
+# _pr_mark_ready <reason> — mark the job's PR ready for review (no-op for
+# no_pr jobs and jobs without a PR url).
+_pr_mark_ready() {
+    local reason="$1" url
+    url=$(_gates_pr_url)
+    ! _gates_job_no_pr && [ -n "$url" ] || return 0
+    if gh pr ready "$url" >/dev/null 2>&1; then
+        _append_event "pr_marked_ready" "$(jq -nc --arg r "$reason" --arg url "$url" '{reason: $r, pr_url: $url}')"
+    else
+        _append_event "pr_draft_unverified" "$(jq -nc --arg url "$url" --arg r "$reason" '{pr_url: $url, action: "ready", reason: $r}')"
+    fi
 }
 
 # _gates_hold <attempts> — the attempt budget is spent and blocking gates are
@@ -1154,7 +1208,9 @@ _run_gates_enforce() {
     case "$max" in ''|*[!0-9]*|0) max=3 ;; esac
     [ "$posture" = "conservative" ] && max=1
     orig_activity=$(jq -c '.activity // null' "$job_file" 2>/dev/null) || orig_activity=null
-    case "$orig_activity" in '"gating"'|'"gate_fix"'|'"gate_hold"') orig_activity=null ;; esac
+    case "$orig_activity" in
+        '"gating"'|'"gate_fix"'|'"gate_hold"'|'"review_wave"'|'"review_rework"'|'"review_hold"') orig_activity=null ;;
+    esac
     n=$(_gates_start_attempt "$max")
     _gates_extra_json=$(jq -nc --arg r "${gates_budget_reset_by:-}" \
         'if $r != "" then {budget_reset_by: $r} else {} end')
@@ -1163,21 +1219,24 @@ _run_gates_enforce() {
     _pr_draft_ok_url=""
     _gates_ensure_draft
     local rc
+    _gates_outcome=stopped
     while :; do
         _gates_run_attempt "$n" "$max" enforce "$orig_activity" "$posture"
         # A cancel or a newer supervisor that arrived while the gates ran wins.
         _gates_still_ours || break
         case "$_gates_status" in
-            passed|incomplete) _gates_present "$_gates_status"; break ;;
+            passed|incomplete) _gates_present "$_gates_status"; _gates_outcome=presented; break ;;
         esac
         if [ "$n" -ge "$max" ]; then
             _gates_hold "$n"
+            _gates_outcome=held
             break
         fi
         rc=0
         _gates_fix "$n" "$max" "$orig_activity" || rc=$?
         if [ "$rc" -eq 2 ]; then
             _gates_hold "$n"
+            _gates_outcome=held
             break
         fi
         [ "$rc" -eq 0 ] || break
@@ -1186,6 +1245,567 @@ _run_gates_enforce() {
         n=$((n + 1))
     done
     _gates_extra_json='{}'
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Review wave (HC-14)
+#
+# In a repo whose crew snapshot has a `lenses` section, the PR is not presented
+# until a review wave has run on the gated commit: adherence (`mother
+# adherence-review --pre-ready`) and every selected lens (`mother review-lens`)
+# start together, their findings are merged (`mother merge-findings --wave`),
+# and findings_exit_decision on the blocking subset (plus the adherence
+# verdict) decides:
+#
+#   ship         review block in the PR body, then the deferred `gh pr ready`.
+#   continue     blocking redd/cody/marty findings (or adherence fail): resume
+#                the worker's session with them (activity review_rework,
+#                run_kind review_rework), re-finalize the PR url, re-run the
+#                gates, then the next cycle. Bounded by crew.lenses.cycle_cap
+#                cycles per run; never touches current_tier/escalation_count.
+#   block_human  (or the cycle cap) hold: awaiting/review_hold with a decision.
+#
+# Observe mode records everything and always ships, with no rework, hold or
+# PR-body edit. `.review_wave` (job JSON) carries states, counts and costs
+# only; finding text stays in $MOTHER_ROOT/crew/<id>/ side files and the
+# worker's rework prompt.
+# ---------------------------------------------------------------------------
+
+# Minimum per-lens budget: an over-budget mandatory lens still runs with it.
+MOTHER_WAVE_MIN_LENS_BUDGET="0.5"
+
+# _wave_applicable — the wave runs after this run's gates: wave configured,
+# the run heading for success, and a PR to present (or a no_pr job).
+_wave_applicable() {
+    _wave_configured || return 1
+    _run_heading_for_success || return 1
+    _gates_job_no_pr || [ -n "$(_gates_pr_url)" ]
+}
+
+# _wave_locked_update <filter> [jq args...] — job write under the job file's
+# lock: `mother adherence-review --pre-ready` writes the same file while the
+# reviewers run.
+_wave_locked_update_inner() {
+    local filter="$1" merged
+    shift
+    merged=$(jq "$@" "$filter" "$job_file") || return 1
+    _atomic_write "$job_file" "$merged"
+}
+_wave_locked_update() {
+    _with_lock "$job_file" _wave_locked_update_inner "$@"
+}
+
+# _wave_mandatory_json — the lenses that always run: crew mandatory, plus
+# phi-security in a PHI-sensitive repo.
+_wave_mandatory_json() {
+    jq -c '((.crew.lenses.mandatory // [])
+            + (if .crew.phi_sensitive == true then ["phi-security"] else [] end)) | unique' \
+        "$job_file" 2>/dev/null || echo '[]'
+}
+
+# _wave_select <posture> <changed-files-file> — crew_config.select's
+# [{reviewer, lens, run, skip_reason}]. If selection itself fails, every
+# default lens runs (more review, never a silent pass).
+_wave_select() {
+    local posture="$1" changed="$2" crew_file plan out=""
+    crew_file=$(mktemp "${TMPDIR:-/tmp}/mother-wave-crew.XXXXXX" 2>/dev/null) || crew_file=""
+    if [ -n "$crew_file" ] && jq -c '.crew' "$job_file" >"$crew_file" 2>/dev/null; then
+        plan=$(jq -c '.crew.lenses.plan // null' "$job_file" 2>/dev/null) || plan=null
+        [ "$plan" = "null" ] && plan=""
+        out=$(python3 "$MOTHER_LIB_DIR/crew_config.py" select "$crew_file" "$posture" "$plan" - <"$changed" 2>/dev/null) || out=""
+    fi
+    rm -f "$crew_file"
+    if ! printf '%s' "$out" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        out=$(jq -c '[(.crew.lenses.default // [])[] | {reviewer: ("perri:" + .), lens: ., run: true, skip_reason: null}]' "$job_file")
+    fi
+    printf '%s' "$out"
+}
+
+# _wave_changed_files <out-file> — files changed on the branch (merge base..HEAD).
+_wave_changed_files() {
+    local out="$1" mb
+    mb=$(git -C "${work_dir:-.}" merge-base "$base_ref" HEAD 2>/dev/null) || mb=""
+    if [ -n "$mb" ]; then
+        git -C "${work_dir:-.}" diff --name-only "$mb" HEAD 2>/dev/null >"$out" || : >"$out"
+    else
+        : >"$out"
+    fi
+}
+
+# Set by _wave_cycle: this cycle's decision, adherence outcome, and the
+# merged-findings file (for the rework prompt and the PR-body block).
+_wave_decision=""
+_wave_adherence=""
+_wave_merged=""
+
+# _wave_lens_finished <cycle> <lens> <rc> — record one lens reviewer's result
+# in `.review_wave`. A lens that left no side file (crash, invalid findings)
+# gets an error side file so the merge reports it, never a clean pass.
+_wave_lens_finished() {
+    local n="$1" lens="$2" rc="$3" side row
+    side="$MOTHER_ROOT/crew/$id/wave/c$n/$lens.json"
+    if [ ! -s "$side" ] || ! jq -e 'type == "object"' "$side" >/dev/null 2>&1; then
+        _atomic_write "$side" "$(jq -nc --argjson rc "$rc" \
+            '{findings: [], examined: [], cost_usd: null, decision: "error", state: "error",
+              error_reason: (if $rc == 2 then "invalid_findings" else "reviewer_failed" end)}')"
+    fi
+    row=$(jq -c '{state: (if .state == "error" or .decision == "error" then "error" else "done" end),
+                  findings: {blocking: ([(.findings // [])[] | select(.severity == "blocking")] | length),
+                             advisory: ([(.findings // [])[] | select(.severity == "advisory")] | length)},
+                  cost_usd: (.cost_usd // null),
+                  examined_files: ((.examined // []) | length)}' "$side" 2>/dev/null) \
+        || row='{"state":"error","findings":{"blocking":0,"advisory":0},"cost_usd":null,"examined_files":0}'
+    _wave_locked_update '
+        .review_wave.lenses |= map(if .lens == $lens then . + $row else . end)
+        | .review_wave.pending_reviewers -= ["perri:" + $lens]
+        | .review_wave.cycles[-1].pending_reviewers -= ["perri:" + $lens]' \
+        --arg lens "$lens" --argjson row "$row" || true
+}
+
+# _wave_adherence_finished <cycle> <rc> — record the adherence reviewer's
+# result; sets _wave_adherence to pass|fail|fail_again|error. The side file
+# (written by adherence-review itself) is authoritative over the exit code.
+_wave_adherence_finished() {
+    local n="$1" rc="$2" side status verdict cost decision fc=0
+    side="$MOTHER_ROOT/crew/$id/adherence/c$n.json"
+    status=$(jq -r '.status // "error"' "$side" 2>/dev/null) || status=error
+    case "$status" in
+        passed)            _wave_adherence=pass;       decision=ship ;;
+        failed_first)      _wave_adherence=fail;       decision=continue;    fc=1 ;;
+        blocked_for_human) _wave_adherence=fail_again; decision=block_human; fc=1 ;;
+        *)                 _wave_adherence=error;      decision=error ;;
+    esac
+    verdict=$(jq -c '.verdict // null' "$side" 2>/dev/null) || verdict=null
+    cost=$(jq -c '.cost_usd // null' "$side" 2>/dev/null) || cost=null
+    [ -n "$verdict" ] || verdict=null
+    [ -n "$cost" ] || cost=null
+    _wave_locked_update '
+        .review_wave.adherence = {state: (if $d == "error" then "error" else "done" end), verdict: $v, cost_usd: $c}
+        | .review_wave.pending_reviewers -= ["archie:adherence"]
+        | .review_wave.cycles[-1].pending_reviewers -= ["archie:adherence"]' \
+        --arg d "$decision" --argjson v "$verdict" --argjson c "$cost" || true
+    if [ "$decision" != "error" ]; then
+        _append_event "reviewed" "$(jq -nc --argjson fc "$fc" --arg d "$decision" \
+            '{reviewer: "archie:adherence", finding_count: $fc, decision: $d}')"
+    fi
+}
+
+# _wave_stop_reviewers <pid>... — a cancel arrived mid-wave: stop the reviewer
+# processes this supervisor started (and their direct children), by pid.
+_wave_stop_reviewers() {
+    local p kids
+    for p in "$@"; do
+        kids=$(pgrep -P "$p" 2>/dev/null || true)
+        [ -n "$kids" ] && kill -TERM $kids 2>/dev/null
+        kill -TERM "$p" 2>/dev/null
+    done
+    return 0
+}
+
+# _wave_cycle <cycle> <restore-activity-json> — one wave cycle: select, launch
+# every reviewer at once, record each as it finishes, merge, decide. Sets
+# _wave_decision (ship|continue|block_human|stopped), _wave_adherence and
+# _wave_merged.
+_wave_cycle() {
+    local n="$1" restore="$2"
+    local posture changed head sel mandatory budget spent remaining over=false per_lens
+    local wave_dir out_dir
+    _wave_decision=stopped
+    _wave_adherence=""
+    wave_dir="$MOTHER_ROOT/crew/$id/wave/c$n"
+    out_dir="$MOTHER_ROOT/crew/$id/wave-runs/c$n"
+    mkdir -p "$wave_dir" "$out_dir" 2>/dev/null
+    rm -f "${wave_dir:?}"/*.json "$MOTHER_ROOT/crew/$id/adherence/c$n.json" 2>/dev/null
+
+    posture=$(_resolve_posture 2>/dev/null) || posture=normal
+    [ -n "$posture" ] || posture=normal
+    head=$(git -C "${work_dir:-.}" rev-parse HEAD 2>/dev/null) || head=""
+    changed="$out_dir/changed.txt"
+    _wave_changed_files "$changed"
+    sel=$(_wave_select "$posture" "$changed")
+    mandatory=$(_wave_mandatory_json)
+
+    # Budget: lens spend across the job's cycles against crew.lenses.budget_usd.
+    budget=$(jq -r '.crew.lenses.budget_usd // 3' "$job_file" 2>/dev/null) || budget=3
+    spent=$(jq -r '.review_wave.spent_usd // 0' "$job_file" 2>/dev/null) || spent=0
+    remaining=$(awk -v b="$budget" -v s="$spent" 'BEGIN { printf "%.4f", b - s }')
+    if awk -v r="$remaining" 'BEGIN { exit !(r <= 0) }'; then
+        over=true
+        sel=$(printf '%s' "$sel" | jq -c --argjson m "$mandatory" '
+            map(if .run and (.lens as $l | $m | index($l) | not)
+                then .run = false | .skip_reason = "budget" else . end)')
+        per_lens="$MOTHER_WAVE_MIN_LENS_BUDGET"
+    else
+        local nrun
+        nrun=$(printf '%s' "$sel" | jq '[.[] | select(.run)] | length')
+        [ "$nrun" -gt 0 ] || nrun=1
+        per_lens=$(awk -v r="$remaining" -v n="$nrun" -v m="$MOTHER_WAVE_MIN_LENS_BUDGET" \
+            'BEGIN { x = r / n; if (x < m) x = m; if (x > 20) x = 20
+                     s = sprintf("%.2f", x); sub(/0+$/, "", s); sub(/\.$/, "", s); print s }')
+    fi
+
+    local reviewers lenses_json
+    reviewers=$(printf '%s' "$sel" | jq -c '["archie:adherence"] + [.[] | select(.run) | .reviewer]')
+    lenses_json=$(printf '%s' "$sel" | jq -c --argjson b "$per_lens" '
+        map({reviewer, lens, state: (if .run then "pending" else "skipped" end), skip_reason,
+             findings: {blocking: 0, advisory: 0}, cost_usd: null, examined_files: 0,
+             budget_usd: (if .run then $b else null end)})')
+
+    _wave_locked_update '
+        .activity = "review_wave"
+        | .review_wave.cycle = $n
+        | .review_wave.status = "running"
+        | .review_wave.decision = null
+        | .review_wave.head_sha = $head
+        | .review_wave.posture = $posture
+        | .review_wave.over_budget = $over
+        | .review_wave.pending_reviewers = $rv
+        | .review_wave.lenses = $lenses
+        | .review_wave.adherence = {state: "running", verdict: null, cost_usd: null}
+        | .review_wave.coverage_gaps = 0
+        | .review_wave.claims = {verified: 0, refuted: 0, unverified: 0}
+        | .review_wave.cycles = ((.review_wave.cycles // [])
+            + [{cycle: $n, reviewers: $rv, pending_reviewers: $rv, decision: null}])' \
+        --argjson n "$n" --arg head "$head" --arg posture "$posture" --argjson over "$over" \
+        --argjson rv "$reviewers" --argjson lenses "$lenses_json" || true
+
+    _append_event "review_cycle_started" "$(jq -nc --argjson n "$n" --argjson rv "$reviewers" \
+        '{cycle: $n, reviewers: $rv, pending_reviewers: $rv, wave: true}')"
+    local ev
+    while IFS= read -r ev; do
+        [ -n "$ev" ] && _append_event "lens_skipped" "$ev"
+    done < <(printf '%s' "$sel" | jq -c --argjson n "$n" '.[] | select(.run | not) | {reviewer, lens, reason: .skip_reason, cycle: $n}')
+
+    # Launch every reviewer at once. Reviewers are Mother's own CLI; like a
+    # worker they get the live root as MOTHER_LIVE_ROOT, never MOTHER_ROOT.
+    local -a pids=() names=()
+    local lens
+    env -u MOTHER_ROOT MOTHER_LIVE_ROOT="$MOTHER_ROOT" \
+        "$MOTHER_BIN_DIR/mother" adherence-review "$id" --pre-ready >"$out_dir/adherence.out" 2>&1 &
+    pids+=("$!"); names+=("archie:adherence")
+    _wave_locked_update '.review_wave.lenses |= map(if .state == "pending" then .state = "running" else . end)' || true
+    for lens in $(printf '%s' "$sel" | jq -r '.[] | select(.run) | .lens'); do
+        env -u MOTHER_ROOT MOTHER_LIVE_ROOT="$MOTHER_ROOT" \
+            "$MOTHER_BIN_DIR/mother" review-lens "$id" --lens "$lens" --budget-usd "$per_lens" \
+            >"$out_dir/$lens.out" 2>&1 &
+        pids+=("$!"); names+=("$lens")
+    done
+
+    # Record each reviewer as it finishes (bash 3.2: no `wait -n`, so poll).
+    local remaining_n=${#pids[@]} i rc
+    local -a done_flags=()
+    for i in "${!pids[@]}"; do done_flags[$i]=0; done
+    while [ "$remaining_n" -gt 0 ]; do
+        for i in "${!pids[@]}"; do
+            [ "${done_flags[$i]}" = "0" ] || continue
+            kill -0 "${pids[$i]}" 2>/dev/null && continue
+            rc=0; wait "${pids[$i]}" 2>/dev/null || rc=$?
+            done_flags[$i]=1
+            remaining_n=$((remaining_n - 1))
+            if [ "${names[$i]}" = "archie:adherence" ]; then
+                _wave_adherence_finished "$n" "$rc"
+            else
+                _wave_lens_finished "$n" "${names[$i]}" "$rc"
+            fi
+        done
+        [ "$remaining_n" -gt 0 ] || break
+        if [ "$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
+            cancel_requested=1
+            _wave_stop_reviewers "${pids[@]}"
+            for i in "${!pids[@]}"; do wait "${pids[$i]}" 2>/dev/null || true; done
+            _wave_locked_update '.review_wave.status = "stopped" | .activity = $r' --argjson r "$restore" || true
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    # Merge (claims verified at HEAD) and record counts, claims, coverage, spend.
+    local actionable summary cycle_cost
+    actionable=$(env -u MOTHER_ROOT MOTHER_LIVE_ROOT="$MOTHER_ROOT" \
+        "$MOTHER_BIN_DIR/mother" merge-findings "$id" --wave "$id" --cycle "$n" 2>"$out_dir/merge.err") || actionable=""
+    _wave_merged="$wave_dir/merged.json"
+    if ! printf '%s' "$actionable" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        # The merge failed: nothing was verified, so a human has to look.
+        actionable='[{"id":"merge-error","target":"human","severity":"blocking","kind":"merge_error"}]'
+        _wave_merged=""
+    fi
+    summary=$(cat "$wave_dir/summary.json" 2>/dev/null) || summary='{}'
+    printf '%s' "$summary" | jq -e 'type == "object"' >/dev/null 2>&1 || summary='{}'
+    cycle_cost=$(jq -r '[.review_wave.lenses[]? | .cost_usd // 0] | add // 0' "$job_file" 2>/dev/null) || cycle_cost=0
+    local refuted_by_lens='{}'
+    [ -n "$_wave_merged" ] && refuted_by_lens=$(jq -c '
+        [(.refuted // [])[] | (.lenses // [])[]] | group_by(.) | map({key: .[0], value: length}) | from_entries' \
+        "$_wave_merged" 2>/dev/null || echo '{}')
+
+    # Decision: blocking actionable findings plus the adherence verdict
+    # (fail = a cody-targeted blocking finding; a second fail or no verdict =
+    # human-blocking). Advisories never trigger rework.
+    local adh_item='[]' blocking decision findings_count gaps
+    case "$_wave_adherence" in
+        fail)             adh_item='[{"target":"cody","severity":"blocking","kind":"adherence"}]' ;;
+        fail_again|error) adh_item='[{"target":"human","severity":"blocking","kind":"adherence"}]' ;;
+    esac
+    blocking=$(printf '%s' "$actionable" | jq -c --argjson a "$adh_item" '[.[] | select(.severity == "blocking")] + $a')
+    if type findings_exit_decision >/dev/null 2>&1; then
+        decision=$(findings_exit_decision "$blocking")
+    else
+        decision=$(printf '%s' "$blocking" | jq -r '
+            if any(.[]; .target == "human") then "block_human"
+            elif length > 0 then "continue" else "ship" end')
+    fi
+    case "$decision" in ship|continue|block_human) ;; *) decision=block_human ;; esac
+    findings_count=$(printf '%s' "$actionable" | jq --argjson a "$adh_item" 'length + ($a | length)')
+    gaps=$(printf '%s' "$summary" | jq '.coverage_gaps // 0')
+
+    _wave_locked_update '
+        .review_wave.decision = $d
+        | .review_wave.cycles[-1].decision = $d
+        | .review_wave.pending_reviewers = []
+        | .review_wave.coverage_gaps = $gaps
+        | .review_wave.claims = ($sum.claims // {verified: 0, refuted: 0, unverified: 0})
+        | .review_wave.spent_usd = (((.review_wave.spent_usd // 0) + $cost) * 10000 | round / 10000)
+        | .review_wave.lenses |= map(. + {refuted: ($ref[.lens] // 0)})
+        | .activity = $r' \
+        --arg d "$decision" --argjson gaps "$gaps" --argjson sum "$summary" --argjson cost "$cycle_cost" \
+        --argjson ref "$refuted_by_lens" --argjson r "$restore" || true
+    _append_event "review_cycle_completed" "$(jq -nc --argjson n "$n" --arg d "$decision" \
+        --argjson fc "$findings_count" --argjson g "$gaps" \
+        '{cycle: $n, decision: $d, findings_count: $fc, coverage_gaps: $g, wave: true}')"
+    _wave_decision="$decision"
+    return 0
+}
+
+# _wave_write_rework_prompt <cycle> <cap> <file> — the review-rework turn sent
+# to the worker: blocking redd/cody/marty findings from `actionable` (refuted
+# findings are never in it) and the adherence notes. Prints the ids sent.
+_wave_write_rework_prompt() {
+    local n="$1" cap="$2" file="$3" head notes=""
+    head=$(git -C "${work_dir:-.}" rev-parse --short=12 HEAD 2>/dev/null)
+    [ "$_wave_adherence" = "fail" ] && \
+        notes=$(jq -r '.notes // ""' "$MOTHER_ROOT/crew/$id/adherence/c$n.json" 2>/dev/null)
+    {
+        printf '# Review wave findings: cycle %s of %s\n\n' "$n" "$cap"
+        printf 'Mother ran the review wave (plan adherence and the review lenses) on your head commit `%s`.\n' "$head"
+        printf 'These blocking findings need changes before the PR is presented for human review.\n\n'
+        if [ -n "$_wave_merged" ] && [ -r "$_wave_merged" ]; then
+            jq -r '
+                .actionable[]
+                | select(.severity == "blocking" and (.target == "redd" or .target == "cody" or .target == "marty"))
+                | "## \(.id) [\((.lenses // []) | join(","))] blocking, for \(.target)"
+                  + (if .location then ": `\(.location)`" else "" end),
+                  "",
+                  (.summary // empty),
+                  "",
+                  (.detail // empty),
+                  ""' "$_wave_merged"
+        fi
+        if [ "$_wave_adherence" = "fail" ]; then
+            printf '## Plan adherence (archie:adherence): fail\n\n'
+            printf 'The plan-adherence review found the work does not match the plan yet. Reviewer notes:\n\n'
+            printf '%s\n\n' "${notes:-(no notes)}"
+        fi
+        printf -- '---\n\n'
+        printf 'Fix each finding above, run the relevant tests, then commit and push to the same branch (`%s`).\n' "$branch"
+        printf 'Do not open a second PR. If you are confident a finding is wrong, leave the code as it is and say\n'
+        printf 'why in your final message. Once you have pushed, stop: Mother re-runs the gates and the review\n'
+        printf 'wave. This was review cycle %s of %s.\n' "$n" "$cap"
+    } >"$file" 2>/dev/null
+}
+
+# Extra detail for the review_rework runs.jsonl row (see
+# _record_run_usage_for_last_spawn): {cycle, findings_sent, refuted_sent}.
+_review_rework_extra='{}'
+
+# _wave_rework <cycle> <cap> <restore-activity-json> — one review-rework turn in
+# the job's session (fresh fallback if it can't start). Returns 0 when the run
+# completed and the gates and wave should run again; 1 when the run stopped
+# (the normal post-exit path takes over); 2 when no turn could be started.
+_wave_rework() {
+    local n="$1" cap="$2" restore="$3" file sid spawned=0 sent refuted_sent
+    file="$RUNNER_DIR/$id.reviewfix.$n.md"
+    _wave_write_rework_prompt "$n" "$cap" "$file" || return 2
+    sent=$( { [ -n "$_wave_merged" ] && jq -c '[.actionable[]
+                | select(.severity == "blocking" and (.target == "redd" or .target == "cody" or .target == "marty")) | .id]' \
+                "$_wave_merged" 2>/dev/null; } || echo '[]')
+    [ -n "$sent" ] || sent='[]'
+    refuted_sent=0
+    [ -n "$_wave_merged" ] && refuted_sent=$(jq --argjson s "$sent" \
+        '[(.refuted // [])[] | .id as $i | select($s | index($i))] | length' "$_wave_merged" 2>/dev/null || echo 0)
+    [ "$_wave_adherence" = "fail" ] && sent=$(printf '%s' "$sent" | jq -c '. + ["adherence"]')
+
+    # The run that produced this head is over: record it before the next spawn.
+    _record_run_usage_for_last_spawn "review_findings" "${last_run_kind:-worker}"
+    mother_recompute_job_cost "$id" 2>/dev/null || true
+
+    _job_update '.activity = "review_rework"'
+    sid=$(jq -r '.session_id // ""' "$job_file" 2>/dev/null)
+    _append_event "review_rework_started" "$(jq -nc --argjson n "$n" --arg s "$sid" --argjson f "$(printf '%s' "$sent" | jq 'length')" \
+        '{cycle: $n, session_id: $s, findings: $f, mode: "resume"}')"
+    _review_rework_extra=$(jq -nc --argjson n "$n" --argjson f "$(printf '%s' "$sent" | jq 'length')" --argjson r "${refuted_sent:-0}" \
+        '{cycle: $n, findings_sent: $f, refuted_sent: $r}')
+    _spawn_and_wait resume "$file" && spawned=1
+    last_run_kind=review_rework
+
+    if _gates_spawn_failed_immediately "$spawned"; then
+        if [ "$spawned" = "1" ]; then
+            _record_run_usage_for_last_spawn "failed" review_rework '{"resume_failed": true}'
+            mother_recompute_job_cost "$id" 2>/dev/null || true
+        fi
+        next_session_id=$(_new_session_id)
+        _append_event "review_rework_started" "$(jq -nc --argjson n "$n" --arg s "$next_session_id" \
+            --argjson f "$(printf '%s' "$sent" | jq 'length')" '{cycle: $n, session_id: $s, findings: $f, mode: "fresh_fallback"}')"
+        spawn_prompt_prefix_file="$file"
+        _spawn_and_wait fresh
+        spawn_prompt_prefix_file=""
+        next_session_id=""
+    fi
+    rm -f "$file"
+    _pr_draft_ok_url=""
+
+    if [ -n "${worker_pid:-}" ] && \
+       [ "$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)" != "$worker_pid" ]; then
+        return 1
+    fi
+    _job_update ".activity = $restore"
+    _run_heading_for_success
+}
+
+# _wave_hold <cycles-run> <reason: block_human|cycle_cap|rework_failed> — hold
+# the job for the operator with a review_hold decision. `.question` is
+# Mother-written: per-reviewer counts and where to look, never finding text.
+_wave_hold() {
+    local cycles="$1" why="$2" n q summary lead
+    n=$(jq -r '.review_wave.cycle // 0' "$job_file")
+    case "$why" in
+        cycle_cap)     lead="Blocking review findings remain after $cycles review cycle(s) (the cap for one run)." ;;
+        rework_failed) lead="The worker's review-rework turn could not be started." ;;
+        *)             lead="A reviewer raised a blocking finding that needs your judgement." ;;
+    esac
+    summary=$(jq -r '
+        .review_wave as $w
+        | ["archie:adherence " + (if ($w.adherence.state // "") == "error" then "error (no verdict)"
+                                  else ($w.adherence.verdict // "-") end)]
+          + [($w.lenses // [])[] | "\(.reviewer) "
+              + (if .state == "skipped" then "skipped (\(.skip_reason // "-"))"
+                 elif .state == "error" then "error (did not complete)"
+                 else "\(.findings.blocking // 0) blocking, \(.findings.advisory // 0) advisory" end)]
+        | map("  " + .) | join("\n")' "$job_file")
+    q=$(printf '%s\n' \
+        "Review wave (cycle $n) held this job before the PR was marked ready. $lead" \
+        "Per reviewer:" \
+        "$summary" \
+        "Findings, claim checks and coverage: mother status $id" \
+        "Choose one:" \
+        "  mother resume $id \"<guidance>\"            resume this worker session with your guidance" \
+        "  mother resume $id --option override_open  present the PR with the open findings listed as advisories" \
+        "  mother resume $id --option cancel         cancel the job; the branch is left in place")
+
+    local merged
+    merged=$(jq --arg q "$q" --arg ts "$(iso_now)" '
+        .state = "awaiting" | .activity = "review_hold" | .paused_reason = "review_hold"
+        | .paused_at = $ts | .question = $q | .review_wave.status = "held"' "$job_file") \
+        && _atomic_write "$job_file" "$merged"
+    mother_decision_open "$id" review_hold '["resume_with_guidance","override_open","cancel"]' >/dev/null \
+        || echo "mother-run-job: $id: could not open the review_hold decision" >&2
+    mother_job_attention_add "$id" decision_awaiting
+    _append_event "review_wave_completed" "$(jq -nc --argjson c "$cycles" '{cycles: $c, status: "held"}')"
+    _append_event "awaiting_input" "$(jq -nc --arg q "$q" '{question: $q, paused_reason: "review_hold"}')"
+    return 0
+}
+
+# _wave_ship <cycles-run> — present the PR: review block in the body (enforce
+# mode only), then the deferred `gh pr ready` (when Mother owns the draft).
+_wave_ship() {
+    local cycles="$1" mode status url
+    mode=$(jq -r '.crew.lenses.mode // "observe"' "$job_file")
+    status=shipped
+    [ "$mode" = "observe" ] && status=observed
+    _job_update ".review_wave.status = \"$status\""
+    url=$(_gates_pr_url)
+    if [ "$mode" != "observe" ] && ! _gates_job_no_pr && [ -n "$url" ]; then
+        mother_prbody_write_review "$url" "${_wave_merged:-}" "$(jq -c '.review_wave' "$job_file")" 0 \
+            || echo "mother-run-job: $id: could not write the review block into $url" >&2
+    fi
+    _pr_draft_managed && _pr_mark_ready "${_pr_ready_reason:-review_wave}"
+    _append_event "review_wave_completed" "$(jq -nc --argjson c "$cycles" --arg s "$status" '{cycles: $c, status: $s}')"
+    return 0
+}
+
+# _run_review_wave — the wave loop. See the section header.
+_run_review_wave() {
+    local mode cap restore cycles_run=0 n rc budget
+    mode=$(jq -r '.crew.lenses.mode // "observe"' "$job_file" 2>/dev/null) || mode=observe
+    cap=$(jq -r '.crew.lenses.cycle_cap // 2' "$job_file" 2>/dev/null) || cap=2
+    case "$cap" in 1|2|3) ;; *) cap=2 ;; esac
+    restore=$(jq -c '.activity // null' "$job_file" 2>/dev/null) || restore=null
+    case "$restore" in
+        '"gating"'|'"gate_fix"'|'"gate_hold"'|'"review_wave"'|'"review_rework"'|'"review_hold"') restore=null ;;
+    esac
+    budget=$(jq -c '.crew.lenses.budget_usd // 3' "$job_file" 2>/dev/null) || budget=3
+    # Spend, cycle numbering and cycle history carry over from earlier runs.
+    _wave_locked_update '
+        (.review_wave // {}) as $w
+        | .review_wave = ($w + {mode: $m, cycle_cap: $cap, budget_usd: $b, status: "running",
+                                spent_usd: ($w.spent_usd // 0), cycle: ($w.cycle // 0),
+                                cycles: ($w.cycles // [])})' \
+        --arg m "$mode" --argjson cap "$cap" --argjson b "$budget" || true
+    # The worker may have marked its PR ready after live capture checked it.
+    _pr_draft_ok_url=""
+    _gates_ensure_draft
+
+    while :; do
+        cycles_run=$((cycles_run + 1))
+        n=$(( $(jq -r '.review_wave.cycle // 0' "$job_file") + 1 ))
+        _wave_cycle "$n" "$restore"
+        if [ "$_wave_decision" = "stopped" ] || ! _gates_still_ours; then
+            _wave_locked_update '.review_wave.status = "stopped"' || true
+            return 0
+        fi
+        if [ "$mode" = "observe" ]; then
+            _wave_ship "$cycles_run"
+            return 0
+        fi
+        case "$_wave_decision" in
+            ship)        _wave_ship "$cycles_run"; return 0 ;;
+            block_human) _wave_hold "$cycles_run" block_human; return 0 ;;
+        esac
+        if [ "$cycles_run" -ge "$cap" ]; then
+            _wave_hold "$cycles_run" cycle_cap
+            return 0
+        fi
+        rc=0
+        _wave_rework "$n" "$cap" "$restore" || rc=$?
+        if [ "$rc" -eq 2 ]; then
+            _wave_hold "$cycles_run" rework_failed
+            return 0
+        fi
+        if [ "$rc" -ne 0 ]; then
+            _wave_locked_update '.review_wave.status = "stopped"' || true
+            return 0
+        fi
+        _finalize_pr_url
+        _gates_ensure_draft
+        _run_gates
+        case "$_gates_outcome" in
+            held|stopped)
+                _wave_locked_update '.review_wave.status = "stopped"' || true
+                return 0 ;;
+        esac
+    done
+}
+
+# _run_post_run_checks — gates (enforce loop or observe), then the review wave
+# when one applies. Runs before the sandbox stop and the main-dir restore.
+_run_post_run_checks() {
+    _pr_ready_reason=""
+    _run_gates
+    case "$_gates_outcome" in held|stopped) return 0 ;; esac
+    if _wave_applicable; then
+        _run_review_wave
+    elif [ -n "$_pr_ready_reason" ]; then
+        _pr_mark_ready "$_pr_ready_reason"
+    fi
     return 0
 }
 
@@ -1761,6 +2381,7 @@ _spawn_and_wait() {
         spawn_prompt="$RUNNER_DIR/$id.prompt.md"
         preamble_path="${MOTHER_PREAMBLE_PATH:-$MOTHER_LIB_DIR/../templates/preamble.md}"
         gates_enforce_path="$MOTHER_LIB_DIR/../templates/gates-enforce.md"
+        lenses_enforce_path="$MOTHER_LIB_DIR/../templates/lenses-enforce.md"
         pending_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null || echo "")
         prev_question=$(jq -r '.question // empty'       "$job_file" 2>/dev/null || echo "")
 
@@ -1773,6 +2394,11 @@ _spawn_and_wait() {
             # Enforce-mode gates (HC-08): draft PRs, same-session gate fixes.
             if _gates_enforced && [ -r "$gates_enforce_path" ]; then
                 cat "$gates_enforce_path"
+                printf '\n---\n\n'
+            fi
+            # Enforce-mode review wave (HC-14): draft PRs, same-session rework.
+            if _wave_enforced && [ -r "$lenses_enforce_path" ]; then
+                cat "$lenses_enforce_path"
                 printf '\n---\n\n'
             fi
 
@@ -2244,6 +2870,11 @@ _record_run_usage_for_last_spawn() {
     local retry_count; retry_count=$(jq -r '.retry_count // 0' "$job_file" 2>/dev/null)
     local esc_count_val; esc_count_val=$(jq -r '.escalation_count // 0' "$job_file" 2>/dev/null)
 
+    # A review-rework row carries {cycle, findings_sent, refuted_sent}.
+    if [ "$run_kind" = "review_rework" ] && [ -n "${_review_rework_extra:-}" ]; then
+        extra_detail=$(jq -nc --argjson a "$extra_detail" --argjson b "$_review_rework_extra" '$b + $a' 2>/dev/null) \
+            || extra_detail='{}'
+    fi
     local extra
     extra=$(jq -nc \
         --arg model "$worker_model" \
@@ -2272,7 +2903,8 @@ _record_run_usage_for_last_spawn() {
         "${phase_agent:-cody}" "$usage_main_actor" "$run_kind" "$extra"
 }
 
-# last_run_kind: what the most recent spawn was (worker | gate_fix), so the
+# last_run_kind: what the most recent spawn was (worker | gate_fix |
+# review_rework), so the
 # final row of a run that ended in a gate-fix turn is recorded as one.
 last_run_kind=worker
 _append_metrics() {
@@ -2734,13 +3366,23 @@ if [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ];
     gates_budget_reset_by="resume"
     resume_question=$(jq -r '.question // empty' "$job_file" 2>/dev/null)
     resume_prompt_file="$RUNNER_DIR/$id.resume.md"
+    resume_hold_kind=$(jq -r '.decision.kind // "gate_hold"' "$job_file" 2>/dev/null)
     {
-        printf '# The operator answered your gate hold\n\n'
-        printf 'Mother held this job because quality gates stayed red. The operator replied:\n\n'
+        if [ "$resume_hold_kind" = "review_hold" ]; then
+            printf '# The operator answered your review hold\n\n'
+            printf 'Mother held this job because the review wave raised findings that needed a human. The operator replied:\n\n'
+        else
+            printf '# The operator answered your gate hold\n\n'
+            printf 'Mother held this job because quality gates stayed red. The operator replied:\n\n'
+        fi
         printf '%s\n\n' "$resume_answer"
         printf -- '---\n\n'
         printf 'Act on that guidance, then commit and push to the same branch (`%s`). Do not open a second PR.\n' "$branch"
-        printf 'Once you have pushed, stop: Mother re-runs the gates with a fresh attempt budget.\n'
+        if [ "$resume_hold_kind" = "review_hold" ]; then
+            printf 'Once you have pushed, stop: Mother re-runs the gates and a fresh review wave.\n'
+        else
+            printf 'Once you have pushed, stop: Mother re-runs the gates with a fresh attempt budget.\n'
+        fi
     } >"$resume_prompt_file"
     _resume_merged=$(jq --arg s "$resume_sid" \
         '.session_id = $s | .resume_session_id = null | .pending_answer = null | .question = null' "$job_file") \
@@ -2773,9 +3415,11 @@ _finalize_pr_url
 
 # Quality gates: observe records only; enforce keeps the PR a draft, runs
 # same-session fix turns and holds on exhaustion (state awaiting, handled by
-# the paused exit below). Before the sandbox stop (sandbox gates reuse the
-# sandbox) and before the main-dir restore (HEAD must still be the job branch).
-_run_gates
+# the paused exit below). Then, in a repo with review lenses, the review wave
+# (HC-14) before the PR is marked ready. Before the sandbox stop (sandbox gates
+# reuse the sandbox) and before the main-dir restore (HEAD must still be the
+# job branch).
+_run_post_run_checks
 
 # Stop the RWX sandbox now: before the main-dir stash-restore below switches the
 # checkout back to the operator's branch, and before the lock release lets

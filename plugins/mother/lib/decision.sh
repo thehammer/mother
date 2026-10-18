@@ -92,7 +92,7 @@ mother_decision_resolve() {
 # the job id) to give `escalate` / `override_open` real behaviour. Without one
 # the option is refused and nothing changes. A kind may also register
 # `_decision_resume_jq_<kind>` (see _decision_resume_jq) for extra bookkeeping
-# on a guidance answer. HC-08 registers `gate_hold`.
+# on a guidance answer. HC-08 registers `gate_hold`, HC-14 `review_hold`.
 _decision_apply() {
     local opt="$1" id="$2" kind handler
     kind=$(jq -r '.decision.kind // ""' "$(_job_path "$id")")
@@ -192,4 +192,48 @@ _decision_handler_gate_hold_override_open() {
     fi
     _job_transition "$id" succeeded "$(jq -nc --arg pr "$url" '{pr_url: $pr, gates: "overridden"}')"
     echo "$id: gates overridden; job succeeded"
+}
+
+# ---------------------------------------------------------------------------
+# review_hold (HC-14): the review wave found a human-blocking finding, or its
+# rework cycles ran out. The job is `awaiting`/`review_hold`; mother-run-job
+# opened the decision with resume_with_guidance, override_open and cancel.
+# ---------------------------------------------------------------------------
+
+# Guidance resumes the held worker session; the next run re-gates and runs a
+# fresh wave (a new cycle budget, the cycle numbering carries on).
+_decision_resume_jq_review_hold() {
+    echo '.resume_session_id = .session_id'
+}
+
+# Present the PR with the open findings listed as advisories (recorded as an
+# operator override), then mark the job succeeded.
+_decision_handler_review_hold_override_open() {
+    local id="$1" job_file url no_pr cycle merged wave
+    job_file=$(_job_path "$id")
+    url=$(jq -r '.pr_url // empty' "$job_file")
+    no_pr=$(jq -r '.no_pr // false' "$job_file")
+    if [ "$no_pr" != "true" ] && [ -z "$url" ]; then
+        echo "mother: resume: invalid_state: job $id has no PR to open; resume with guidance to have the worker open one" >&2
+        return 1
+    fi
+    mother_job_update "$id" '
+        .review_wave.status = "overridden"
+        | .activity = null | .paused_reason = null | .question = null' || return 1
+
+    if [ "$no_pr" != "true" ]; then
+        cycle=$(jq -r '.review_wave.cycle // 0' "$job_file")
+        merged="$MOTHER_ROOT/crew/$id/wave/c${cycle}/merged.json"
+        wave=$(jq -c '.review_wave' "$job_file")
+        mother_prbody_write_review "$url" "$merged" "$wave" 1 \
+            || echo "mother: resume: could not write the review block into $url" >&2
+        if gh pr ready "$url" >/dev/null 2>&1; then
+            mother_event_append "$id" "pr_marked_ready" "$(jq -nc --arg url "$url" '{reason: "override", pr_url: $url}')"
+        else
+            mother_event_append "$id" "pr_draft_unverified" "$(jq -nc --arg url "$url" '{pr_url: $url, action: "ready", reason: "override"}')"
+            echo "mother: resume: could not mark $url ready; mark it ready by hand" >&2
+        fi
+    fi
+    _job_transition "$id" succeeded "$(jq -nc --arg pr "$url" '{pr_url: $pr, review: "overridden"}')"
+    echo "$id: review findings overridden; job succeeded"
 }

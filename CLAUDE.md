@@ -121,6 +121,9 @@ for display and routing.
 | `awaiting` | `adherence_blocked` | Archie failed twice; human must review PR, then `resume` or `cancel` |
 | `running` | `gating` | Mother is running the repo's quality gates on the head commit; the previous `activity` is restored afterwards |
 | `running` | `gate_fix` | enforce mode: the worker's same session (`--resume`) is fixing red blocking gates (attempt n/N); `mother list` shows `[GATES-FIXING]` |
+| `running` | `review_wave` | HC-14: adherence and the selected lenses are reviewing the gated commit (before `gh pr ready`) |
+| `running` | `review_rework` | HC-14: the worker's same session (`--resume`) is addressing blocking wave findings (cycle n of `cycle_cap`) |
+| `awaiting` | `review_hold` | HC-14: a human-blocking finding, a lens error, a second adherence fail or the wave cycle cap; `paused_reason: review_hold`, a `review_hold` decision (`resume_with_guidance`, `override_open`, `cancel`) and `decision_awaiting` attention |
 | `awaiting` | `gate_hold` | enforce mode: blocking gates still red after `max_attempts`; `paused_reason: gate_hold`, a `gate_hold` decision and `decision_awaiting` attention. Answer with `mother resume <id> "<guidance>"` or `--option escalate\|override_open\|cancel`; `mother status` shows `[GATES-HELD]` |
 | `awaiting` | `operator_hold` | Mother held a failed job instead of escalating it (see "Failure routing"); `.question` names the next commands. Act with `resume`, `retry`, `reconcile`, or `cancel` |
 | `running` | `pipeline_phase` | pipeline job: a build agent (redd/cody/marty) is actively running |
@@ -164,6 +167,7 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `gates` | object | Gate outcome written by `mother-run-job`'s `_gates_run_attempt`: `{mode, effective_mode, posture, status, attempt, max_attempts, head_sha, started_at, finished_at, results[{name, result, blocking, duration_s, exit_code, unavailable_reason, skip_reason}], not_run[]}`, plus in enforce mode `budget_reset_by` (`resume`/`escalate`) and, after `override_open`, `status: "overridden"` and `override {at, source, red[]}`. Ids, enums, counts and durations only (no output text); `effective_mode` is `enforce` only for non-pipeline jobs in an enforce repo. |
 | `attention` | array | Typed attention `[{reason, since}]` (`lib/state.sh` `mother_job_attention_add/drop`). HC-08 adds `gates_incomplete` and `decision_awaiting`; resolving a decision option drops `decision_awaiting`. |
 | `resume_session_id` | string | Set by the `gate_hold` `resume_with_guidance` hook. The next run resumes that session (`--resume`) with `pending_answer` as its prompt (fresh fallback if it can't), then clears it. |
+| `review_wave` | object | HC-14, written by `mother-run-job`'s `_run_review_wave`: `{mode, cycle, cycle_cap, status: running\|shipped\|held\|observed\|overridden\|stopped, decision, budget_usd, spent_usd, over_budget, head_sha, posture, pending_reviewers[], lenses[{reviewer, lens, state: pending\|running\|done\|skipped\|error, skip_reason, findings{blocking, advisory}, cost_usd, examined_files, budget_usd, refuted}], adherence{state, verdict, cost_usd}, coverage_gaps, claims{verified, refuted, unverified}, cycles[{cycle, reviewers, pending_reviewers, decision}]}`. States, counts and costs only: finding text, claim quotes and adherence notes stay in `$MOTHER_ROOT/crew/<id>/wave/c<N>/` and `crew/<id>/adherence/c<N>.json`. `spent_usd` (lens spend), `cycle` numbering and `cycles` carry over across runs; the cycle cap is per run. |
 | `last_answer` | object | `{source, session, agent, option, at}` of the most recent `mother resume` / broker `answer`. `source` is `nostromo_app`, `cli` or `broker_client`; `option` is null for a plain-text answer to a decision-less job. |
 
 ### Kill switches
@@ -198,6 +202,7 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_FAILURE_ROUTING_ENABLED=0` — restore the pre-routing behavior: every `failed` job takes the legacy reconcile-then-escalate path in `_auto_escalate_failed`, regardless of `.failure_reason` (default: `1`).
 - `MOTHER_REWORK_ADVANCE_CHECK_ENABLED=0` — disable `_verify_run_advanced_or_fail` (default: `1`), so a run that starts with an existing PR/pushed branch can report `succeeded` without pushing anything new.
 - `MOTHER_ADHERENCE_MAX_RUNS_PER_SHA=N` — adherence review spawns per job per PR head SHA before the runner flags the job for attention instead of looping (default: 3). `MOTHER_ADHERENCE_LOOP_THRESHOLD=N` (default 5) — reviews per hour on one job above which the `adherence_loop` needs-attention item / `mother doctor` warning appears.
+- `MOTHER_LENSES_ENABLED=0` — disable the HC-14 review wave: jobs with a `lenses` crew section behave as repos without one (gates, then `gh pr ready`, then post-PR adherence).
 - `MOTHER_ADHERENCE_EFFORT=<low|medium|high|xhigh|max>` — pass `--effort` to the adherence-review `claude` invocation. Unset (default) means no `--effort` flag, i.e. today's behavior.
 - `MOTHER_TEARDOWN_PROBE_FAILED_MAX_DEFERRALS=N` — stalled passes before a `worktree_probe_failed` teardown is flagged (default: 2, about two hourly sweeps). Other stall reasons use `MOTHER_TEARDOWN_MAX_DEFERRALS`.
 - `MOTHER_TEARDOWN_PR_OPEN_ATTENTION_DAYS=N` — days a teardown may wait on an open PR before it is listed under needs-attention (default: 7).
@@ -530,6 +535,23 @@ true), where: any|sandbox (default any), timeout_s 1..3600 (default 900), hint <
 - **Settings:** `MOTHER_GATES_ENABLED=0` makes `gates run` a no-op (`{"status":"disabled"}`) and
   skips the add-time snapshot. `MOTHER_PHI_REPOS` (default `admin-portal referral-monitor`, also
   settable in `config.env`) forces `phi_sensitive: true` for those repo names.
+
+### Review wave (HC-14)
+
+`_run_post_run_checks` (`mother-run-job`) = the gate step, then `_run_review_wave` when `_wave_applicable`
+(`.crew.lenses` object, `MOTHER_LENSES_ENABLED` != 0, not pipeline, run heading for success, a PR url or
+`no_pr`). While a wave is configured, `_gates_present` defers `gh pr ready` (`_pr_ready_reason`) to
+`_wave_ship`; `_pr_draft_managed` (gates enforce **or** lenses enforce) owns draft discipline. Per cycle
+(`_wave_cycle`): select (`crew_config.py select`, posture, changed files), budget split, launch
+`mother adherence-review --pre-ready` and one `mother review-lens` per lens with `&` (reviewers get
+`MOTHER_LIVE_ROOT`, not `MOTHER_ROOT`), poll so each finished reviewer updates `.review_wave` under
+`_with_lock "$job_file"` (adherence-review --pre-ready writes the same file under the same lock), then
+`mother merge-findings --wave`, then `findings_exit_decision` on blocking findings + adherence. `continue` →
+`_wave_rework` (`_spawn_and_wait resume`, `$RUNNER_DIR/<id>.reviewfix.<n>.md`), `_finalize_pr_url`,
+`_run_gates`, next cycle; `block_human`/cap → `_wave_hold`; `ship` → `_wave_ship`. Observe mode always ships.
+Decision handlers for `review_hold` live next to `gate_hold` in `lib/decision.sh`; the PR-body block is
+`mother_prbody_write_review` (`lib/prbody.sh`, `<!-- mother:review -->`). A lens with no side file after it
+exits gets an `error` side file (merge then reports it as a human-blocking `lens_error`).
 
 ### Reviewer lenses (HC-12)
 

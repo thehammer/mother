@@ -800,7 +800,8 @@ On the wire an event is `{v, dir:"event", t:<kind>, id, ts, data}` with `data` =
 | `reviewed` *(existing)* | `reviewer, finding_count, decision` |
 | `claims_verified` | `verified, refuted, unverified` |
 | `review_cycle_completed` *(existing)* | `cycle, decision, findings_count`, plus `coverage_gaps` for a wave |
-| `review_wave_completed` | `cycles, status` |
+| `review_wave_completed` | `cycles, status` (`shipped\|held\|observed`) |
+| `review_rework_started` | `cycle, session_id, findings` (count sent to the worker), `mode: resume\|fresh_fallback` |
 | `decision_opened` | `decision_id, kind, options[]` (option ids) |
 | `decision_resolved` | `decision_id, option, source` |
 | `resumed` *(existing)* | gains `option` and `source` |

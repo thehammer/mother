@@ -951,7 +951,8 @@ cmd_list() {
 
     if [ "$format" = "json" ]; then
         # Attach derived keys: `attention_reasons` on every job (typed
-        # attention, see lib/attention.sh) and, for pipeline jobs, `cycles`.
+        # attention, see lib/attention.sh) and, for pipeline jobs and jobs with
+        # a review wave (HC-14), `cycles`.
         echo "$rows" | jq -c '.[]' | while IFS= read -r job_json; do
             local kind job_id reasons cycles
             kind=$(printf '%s' "$job_json" | jq -r '.kind // ""' 2>/dev/null) || kind=""
@@ -963,6 +964,8 @@ cmd_list() {
                 if [ -n "${cycles:-}" ]; then
                     job_json=$(printf '%s' "$job_json" | jq -c --argjson cycles "$cycles" '. + {cycles: $cycles}')
                 fi
+            else
+                job_json=$(printf '%s' "$job_json" | jq -c "$MOTHER_WAVE_CYCLES_JQ")
             fi
             printf '%s\n' "$job_json"
         done | jq -cs --argjson pm "$pmap" \
@@ -1022,6 +1025,12 @@ cmd_list() {
                     local pl_label
                     pl_label=$(_pipeline_list_label "$(_job_path "$id")" 2>/dev/null) || pl_label=""
                     [ -n "${pl_label:-}" ] && state_display="$st [$pl_label]"
+                elif [ "${activity:-}" = "review_hold" ]; then
+                    # Checked before adherence: a wave hold after a second
+                    # adherence fail also carries adherence_status=blocked_for_human.
+                    state_display="$st [REVIEW-HELD]"
+                elif [ "${activity:-}" = "review_rework" ]; then
+                    state_display="$st [REVIEW-REWORK]"
                 elif [ "${adherence:-}" = "blocked_for_human" ]; then
                     # Uppercase marker mirrors cmd_status's [ADHERENCE-BLOCKED]
                     # banner. It *replaces* the activity bracket rather than
@@ -1168,6 +1177,43 @@ _status_overview() {
     mother_attention_render_text "$items"
 }
 
+# jq filter: a non-pipeline job with a review wave (HC-14) gets the derived
+# `cycles` array, one {cycle, reviewers, pending_reviewers, decision} per wave
+# cycle with lens-qualified reviewer names. No-op for other jobs.
+# shellcheck disable=SC2016
+MOTHER_WAVE_CYCLES_JQ='
+    if (.review_wave | type) == "object" and ((.review_wave.cycles // []) | length) > 0
+    then . + {cycles: [.review_wave.cycles[] | {cycle, reviewers, pending_reviewers, decision}]}
+    else . end'
+
+# _status_review_wave_section <job_file> — the `=== review wave ===` block of
+# `mother status`: states, counts and costs from `.review_wave`. The findings
+# themselves are rendered from the local side files after it.
+_status_review_wave_section() {
+    local job_file="$1"
+    jq -e '(.review_wave | type) == "object"' "$job_file" >/dev/null 2>&1 || return 0
+    echo "=== review wave ==="
+    jq -r '
+        def usd: if . == null then "-" else "$\(.)" end;
+        .review_wave as $w
+        | "  Mode:      \($w.mode // "enforce")"
+            + (if $w.mode == "observe" then " (observe: recorded only, never blocks)" else "" end),
+          "  Status:    \($w.status // "-")  cycle \($w.cycle // 0) (cap \($w.cycle_cap // "?") per run)"
+            + (if $w.decision != null then "  decision \($w.decision)" else "" end),
+          "  Budget:    \($w.spent_usd // 0 | usd) spent of \($w.budget_usd | usd)"
+            + (if $w.over_budget == true then "  (over review budget)" else "" end),
+          "  archie:adherence  \($w.adherence.state // "-")"
+            + (if $w.adherence.verdict != null then " (\($w.adherence.verdict))" else "" end)
+            + "  cost \($w.adherence.cost_usd | usd)",
+          (($w.lenses // [])[] | "  \(.reviewer)  \(.state)"
+            + (if .state == "skipped" then " (\(.skip_reason // "-"))"
+               else "  blocking \(.findings.blocking // 0), advisory \(.findings.advisory // 0)  cost \(.cost_usd | usd)  examined \(.examined_files // 0)" end)),
+          "  Coverage gaps: \($w.coverage_gaps // 0)",
+          "  Claims:    verified \($w.claims.verified // 0), refuted \($w.claims.refuted // 0), unverified \($w.claims.unverified // 0)"
+    ' "$job_file"
+    echo
+}
+
 # _status_gates_section <id> <job_file> — the `=== gates ===` block of `mother
 # status`. Nothing for a job without `.gates`. Failing-gate excerpts are read
 # from the side files under $MOTHER_ROOT/crew/<id>/gates/<attempt>/ (local
@@ -1247,6 +1293,8 @@ cmd_status() {
             local cycles
             cycles=$(_pipeline_cycles_json "$job_file" 2>/dev/null) || cycles=""
             [ -n "${cycles:-}" ] && derived=$(printf '%s' "$derived" | jq -c --argjson c "$cycles" '. + {cycles: $c}')
+        else
+            derived=$(jq -c --argjson d "$derived" "$MOTHER_WAVE_CYCLES_JQ"' | $d + (if has("cycles") then {cycles} else {} end)' "$job_file")
         fi
         jq -s --argjson d "$derived" '{job: (.[0] + $d), events: .[1]}' \
             "$job_file" \
@@ -1279,6 +1327,12 @@ cmd_status() {
             echo "⚠️  [GATES-HELD] Blocking quality gates are still red after the attempt budget."
             jq -r '.question // empty' "$job_file" | sed 's/^/   /'
             _status_gate_excerpts "$id" "$job_file" "   "
+            echo ""
+        fi
+        if [ "$activity" = "review_hold" ]; then
+            echo ""
+            echo "⚠️  [REVIEW-HELD] The review wave held this job before the PR was marked ready."
+            jq -r '.question // empty' "$job_file" | sed 's/^/   /'
             echo ""
         fi
         if [ "$(jq -r '.gates.status // ""' "$job_file")" = "incomplete" ]; then
@@ -1430,6 +1484,7 @@ cmd_status() {
         fi
 
         _status_gates_section "$id" "$job_file"
+        _status_review_wave_section "$job_file"
         local _wd
         for _wd in $(ls -d "$MOTHER_ROOT/crew/$id/wave"/c* 2>/dev/null | sort -V | tail -n 1); do
             _render_review_findings "$_wd"
@@ -2970,7 +3025,8 @@ cmd_review_lens() {
     base_ref=$(jq -r '.base_ref // empty' "$job_file")
     prd_path=$(jq -r '.prd_path // empty' "$job_file")
     pr_url=$(jq -r '.pr_url // empty' "$job_file")
-    cycle=$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null)
+    # A review wave (HC-14) numbers its own cycles; pipeline jobs use theirs.
+    cycle=$(jq -r '.review_wave.cycle // .pipeline.review_cycle // 0' "$job_file" 2>/dev/null)
     if [ -z "$work_dir" ] || [ ! -d "$work_dir" ]; then
         _append_event "$id" "review_workdir_missing" \
             "$(jq -nc --arg wd "$work_dir" --arg jb "$(jq -r '.branch // empty' "$job_file")" --arg pr "${pr_url:-}" \
@@ -3005,7 +3061,8 @@ EOF
     local lens_log="$LOGS_DIR/$id.lens-${lens}-c${cycle}.log"
     # Read-only by construction: no --dangerously-skip-permissions. Headless runs
     # can't prompt, so anything outside the allowlist is denied.
-    ( cd "$work_dir" && claude --agent perri-lens --model "$model" \
+    # MOTHER_REVIEW_LENS tells a test stand-in which lens it is answering for.
+    ( cd "$work_dir" && MOTHER_REVIEW_LENS="$lens" claude --agent perri-lens --model "$model" \
         --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(cat:*),Bash(rg:*),Bash(grep:*)" \
         --disallowedTools "Write,Edit,NotebookEdit,WebFetch,WebSearch" \
         --max-budget-usd "$budget" "${MOTHER_CLAUDE_ARGS[@]}" \
@@ -3194,6 +3251,54 @@ _render_review_findings() {
     echo
 }
 
+# _adherence_pre_ready_side_file <id> <cycle> <verdict> <status> <notes> <head>
+# The wave's local record of one pre-ready adherence review (notes included).
+_adherence_pre_ready_side_file() {
+    local id="$1" cycle="$2" verdict="$3" status="$4" notes="$5" head="$6" dir cost
+    dir="$MOTHER_ROOT/crew/$id/adherence"
+    mkdir -p "$dir" || return 1
+    cost=$(grep -F "\"job_id\":\"$id\"" "$MOTHER_ROOT/metrics/runs.jsonl" 2>/dev/null \
+        | grep -F '"stage":"adherence"' | tail -n 1 | jq -c '.cost_usd // null' 2>/dev/null)
+    [ -n "$cost" ] || cost=null
+    _atomic_write "$dir/c${cycle}.json" "$(jq -n --arg v "$verdict" --arg s "$status" --arg n "$notes" \
+        --arg h "$head" --argjson c "$cost" \
+        '{verdict: (if $v == "" then null else $v end), status: $s, notes: $n, head_sha: $h, cost_usd: $c}')"
+}
+
+# _adherence_record_pre_ready <id> <verdict> <notes> <attempts> <cycle> <head>
+# Records a pre-ready verdict (see cmd_adherence_review). The job write takes
+# the job file's lock: the wave updates the same file while reviewers run.
+_adherence_record_pre_ready() {
+    local id="$1" verdict="$2" notes="$3" attempts="$4" cycle="$5" head="$6"
+    local job_file prev status rc
+    job_file=$(_job_path "$id")
+    prev=$(jq -r '.adherence_status // ""' "$job_file")
+    if [ "$verdict" = "pass" ]; then
+        status=passed; rc=0
+    elif [ "$prev" = "failed_first" ]; then
+        status=blocked_for_human; rc=3
+    else
+        status=failed_first; rc=1
+    fi
+    _adherence_pre_ready_side_file "$id" "$cycle" "$verdict" "$status" "$notes" "$head" \
+        || echo "mother: adherence-review: could not write the side file for $id" >&2
+    _with_lock "$job_file" mother_job_update "$id" '
+        .adherence_status = $status
+        | .adherence_attempts = $attempts
+        | .adherence_pending = false
+        | .adherence_notes = null
+        | .adherence_sha_runs = (if $sha != "" and .adherence_reviewed_sha == $sha
+                                 then (.adherence_sha_runs // 0) + 1 else 1 end)
+        | .adherence_reviewed_sha = (if $sha == "" then "unknown" else $sha end)' \
+        --arg status "$status" --argjson attempts "$attempts" --arg sha "$head" \
+        || echo "mother: adherence-review: failed to record the verdict for $id" >&2
+    _append_event "$id" "adherence_reviewed" \
+        "$(jq -nc --arg v "$verdict" --argjson a "$attempts" --arg s "$status" --argjson c "$cycle" \
+            '{verdict: $v, attempts: $a, status: $s, pre_ready: true, cycle: $c}')"
+    echo "$id: adherence review (pre-ready): $(printf '%s' "$verdict" | tr '[:lower:]' '[:upper:]') ($status)"
+    return "$rc"
+}
+
 # ---------- adherence-review ----------
 #
 # Spawn Archie to review whether a job's PR diff matches the original plan.
@@ -3201,38 +3306,82 @@ _render_review_findings() {
 # constructs a structured prompt, and calls claude --agent archie in headless mode.
 # Parses the verdict (pass/fail) and stores it on the job JSON.
 # Returns 0 on pass, 1 on fail, 2 on error.
+#
+# --pre-ready (HC-14): one reviewer of a review wave, run by mother-run-job on
+# the gated commit before the PR is marked ready. The job is still `running`
+# (a draft PR is fine). It records the same adherence_* fields (with
+# adherence_reviewed_sha = the work dir HEAD, so the post-PR loop never
+# re-reviews a head the wave passed) but never touches state, activity or
+# pending_answer: the wave reworks in-session or holds. Notes text goes to
+# $MOTHER_ROOT/crew/<id>/adherence/c<cycle>.json only, never job JSON or events.
+# Returns 0 pass, 1 fail, 3 fail again (previous status failed_first), 2 error.
 
 cmd_adherence_review() {
-    local id="${1:-}"
+    local id="" pre_ready=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --pre-ready) pre_ready=1; shift ;;
+            -*) _die "adherence-review: unknown flag: $1" ;;
+            *)
+                if [ -z "$id" ]; then id="$1"; shift
+                else _die "adherence-review: unexpected argument: $1"
+                fi ;;
+        esac
+    done
     [ -n "$id" ] || _die "adherence-review: <id> required"
     _job_exists "$id" || _die "no such job: $id"
     local job_file; job_file=$(_job_path "$id")
     local state; state=$(jq -r .state "$job_file")
-    case "$state" in succeeded) ;; *) _die "adherence-review: job must be in succeeded state (state=$state)" ;; esac
+    local kind; kind=$(jq -r '.kind // ""' "$job_file")
+    if [ "$pre_ready" -eq 1 ]; then
+        [ "$kind" != "pipeline" ] || _die "adherence-review: --pre-ready does not apply to pipeline jobs"
+        case "$state" in running|succeeded) ;; *) _die "adherence-review: --pre-ready needs a running job (state=$state)" ;; esac
+    else
+        case "$state" in succeeded) ;; *) _die "adherence-review: job must be in succeeded state (state=$state)" ;; esac
+    fi
 
     # Pipeline jobs delegate to the structured findings path.
-    local kind; kind=$(jq -r '.kind // ""' "$job_file")
     if [ "$kind" = "pipeline" ]; then
         cmd_review_phase "$id" --reviewer archie
         return $?
     fi
 
     local pr_url; pr_url=$(jq -r '.pr_url // empty' "$job_file")
-    [ -n "$pr_url" ] || _die "adherence-review: job $id has no pr_url"
+    # A pre-ready review reads the local diff, so a no_pr job needs no PR.
+    if [ -z "$pr_url" ] && { [ "$pre_ready" -eq 0 ] || [ "$(jq -r '.no_pr // false' "$job_file")" != "true" ]; }; then
+        _die "adherence-review: job $id has no pr_url"
+    fi
 
-    # Resolve the plan file.
-    local plan_file; plan_file=$(_plan_path "$id")
+    # Resolve the plan file: the job's plan_path, else the events-dir copy.
+    local plan_file; plan_file=$(jq -r '.plan_path // empty' "$job_file")
+    [ -n "$plan_file" ] && [ -f "$plan_file" ] || plan_file=$(_plan_path "$id")
     [ -f "$plan_file" ] || _die "adherence-review: plan file not found for $id"
 
     # Resolve the adherence prompt template.
     local template_file="$MOTHER_BIN_DIR/../templates/adherence-prompt.md"
     [ -f "$template_file" ] || _die "adherence-review: template not found at $template_file"
 
-    # Gather artifacts (best-effort).
-    local pr_diff pr_checks pr_comments
-    pr_diff=$(gh pr diff "$pr_url" 2>/dev/null || echo "(diff unavailable)")
-    pr_checks=$(gh pr checks "$pr_url" 2>/dev/null || echo "(CI status unavailable)")
-    pr_comments=$(gh pr view "$pr_url" --comments 2>/dev/null || echo "(comments unavailable)")
+    # Gather artifacts (best-effort). Pre-ready reviews the gated commit
+    # itself: the local diff from the merge base, falling back to the PR's.
+    local pr_diff pr_checks pr_comments pre_head="" pre_cycle=0 pre_work_dir=""
+    if [ "$pre_ready" -eq 1 ]; then
+        pre_work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
+        pre_head=$(git -C "${pre_work_dir:-.}" rev-parse HEAD 2>/dev/null) || pre_head=""
+        pre_cycle=$(jq -r '.review_wave.cycle // 0' "$job_file")
+        local pre_base pre_mb
+        pre_base=$(jq -r '.base_ref // empty' "$job_file")
+        pre_mb=$(git -C "${pre_work_dir:-.}" merge-base "$pre_base" HEAD 2>/dev/null) || pre_mb=""
+        [ -n "$pre_mb" ] && pr_diff=$(git -C "$pre_work_dir" diff "$pre_mb" HEAD 2>/dev/null)
+    fi
+    if [ -n "$pr_url" ]; then
+        [ -n "${pr_diff:-}" ] || pr_diff=$(gh pr diff "$pr_url" 2>/dev/null || echo "(diff unavailable)")
+        pr_checks=$(gh pr checks "$pr_url" 2>/dev/null || echo "(CI status unavailable)")
+        pr_comments=$(gh pr view "$pr_url" --comments 2>/dev/null || echo "(comments unavailable)")
+    else
+        [ -n "${pr_diff:-}" ] || pr_diff="(diff unavailable)"
+        pr_checks="(no PR: no_pr job)"
+        pr_comments="(no PR: no_pr job)"
+    fi
 
     # Operator resume answers are live amendments to the plan document — the
     # plan itself is never rewritten when the operator resumes, so hand the
@@ -3325,7 +3474,9 @@ cmd_adherence_review() {
                 --argjson posture_clamped "$posture_clamped" \
                 --arg effort "$archie_effort" \
                 --argjson attempt "$adherence_attempt" \
+                --argjson pre_ready "$([ "$pre_ready" -eq 1 ] && echo true || echo false)" \
                 '{
+                    pre_ready: $pre_ready,
                     verdict: (if ($verdict | length) > 0 then $verdict else null end),
                     model: $model, model_requested: "opus",
                     posture: $posture, posture_clamped: $posture_clamped,
@@ -3337,6 +3488,7 @@ cmd_adherence_review() {
     if [ -z "$verdict" ]; then
         # Could not parse verdict — treat as error, don't mutate job state.
         _record_adherence_usage "" "error"
+        [ "$pre_ready" -eq 1 ] && _adherence_pre_ready_side_file "$id" "$pre_cycle" "" error "" "$pre_head"
         echo "mother: adherence-review: could not parse ADHERENCE line from Archie's response" >&2
         echo "Raw response preview:" >&2
         printf '%s\n' "$raw_verdict" | head -20 >&2
@@ -3347,6 +3499,11 @@ cmd_adherence_review() {
 
     local new_attempts=$adherence_attempt
     local adherence_status
+
+    if [ "$pre_ready" -eq 1 ]; then
+        _adherence_record_pre_ready "$id" "$verdict" "$notes" "$new_attempts" "$pre_cycle" "$pre_head"
+        return $?
+    fi
 
     if [ "$verdict" = "pass" ]; then
         adherence_status="passed"
@@ -4801,7 +4958,7 @@ Usage:
   mother escalate ID [--yes]                 (bump failed job to next model tier)
   mother reconcile ID [--pr-url URL] [--auto] [--yes] [--dry-run]
                                               (adopt a real PR without re-running the worker)
-  mother adherence-review ID                 (check PR diff against original plan)
+  mother adherence-review ID [--pre-ready]   (check PR diff against original plan; --pre-ready: review-wave reviewer)
   mother gates run [--job ID] [--repo PATH] [--base REF] [--format text|json]
                                               (run the repo's .mother/crew.yml quality gates)
   mother check CRITERION-ID [--done|--open] [--evidence SHA|TEST] [--job ID]

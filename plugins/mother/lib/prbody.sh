@@ -4,7 +4,7 @@
 # A block is the text between `<!-- mother:<name> -->` and
 # `<!-- /mother:<name> -->` (markers on their own lines). Rewriting a block
 # replaces it in place; text outside the markers is never touched. HC-08 writes
-# the `gates` block; HC-14 reuses the same writer for the review block.
+# the `gates` block; HC-14 writes the `review` block with the same writer.
 #
 # PR bodies go to GitHub: never put gate output (excerpts, logs) in a block.
 # Sourced under `set -u`, bash 3.2. Functions return non-zero on gh failure and
@@ -87,6 +87,55 @@ mother_prbody_write_gates() {
     block_file=$(mktemp "${TMPDIR:-/tmp}/mother-gates-block.XXXXXX") || return 1
     mother_prbody_gates_block "$2" >"$block_file" 2>/dev/null
     mother_prbody_upsert "$url" gates "$block_file"
+    rc=$?
+    rm -f "$block_file"
+    return "$rc"
+}
+
+# mother_prbody_review_block <merged-json-file|""> <review-wave-json> [override 0|1]
+# Prints the markdown body of the `review` block (HC-14): one line per
+# actionable advisory as `- [<lens>] <severity>: <summary>` (coverage gaps as
+# `[coverage]`), and the refuted-claim count. With override=1 the open blocking
+# findings are listed too, as advisories (the operator chose to open the PR
+# with them). Finding summaries go to GitHub here; never into job JSON/events.
+mother_prbody_review_block() {
+    local merged="${1:-}" wave="$2" override="${3:-0}" doc='{}'
+    [ -n "$merged" ] && [ -r "$merged" ] && doc=$(cat "$merged")
+    jq -rn --argjson m "$doc" --argjson w "$wave" --argjson ov "$override" '
+        def lenstag: if .kind == "coverage_gap" then "coverage"
+                     elif .kind == "lens_error" then (.location // "lens")
+                     else ((.lenses // []) | if length == 0 then "review" else join(",") end) end;
+        def text: if .kind == "coverage_gap" then "\(.location) was not examined by any lens"
+                  elif .kind == "lens_error" then "lens did not complete (\(.reason // "error"))"
+                  else (.summary // .detail // "(no summary)") | gsub("[\r\n]+"; " ") end;
+        ($m.actionable // []) as $a
+        | [$a[] | select(.severity == "advisory")] as $adv
+        | (if $ov == 1 then [$a[] | select(.severity == "blocking")] else [] end) as $open
+        | ($ov == 1 and ($w.adherence.verdict // "") == "fail") as $adh_open
+        | (($w.lenses // []) | map(select(.state != "skipped") | .reviewer)) as $ran
+        | (($w.lenses // []) | map(select(.state == "skipped") | "\(.reviewer) (\(.skip_reason // "-"))")) as $skipped
+        | "### Mother review wave",
+          "",
+          (if $ov == 1 then "**Opened with open review findings (operator override); they are listed below as advisories.**", "" else empty end),
+          (if $w.mode == "observe" then "_Observe mode: findings are recorded, never block._", "" else empty end),
+          "_Cycle \($w.cycle // 1); reviewers: \((["archie:adherence"] + $ran) | join(", "))"
+            + (if ($skipped | length) > 0 then "; skipped: \($skipped | join(", "))" else "" end)
+            + ". Refuted claims: \(($m.refuted // []) | length) (never sent to the worker)._",
+          "",
+          (if ($open | length) + ($adv | length) == 0 and ($adh_open | not) then "No advisories."
+           else
+             ($open[] | "- [\(lenstag)] advisory: \(text) (open blocking finding)"),
+             (if $adh_open then "- [adherence] advisory: the plan-adherence review did not pass (see `mother status`)" else empty end),
+             ($adv[] | "- [\(lenstag)] \(.severity): \(text)")
+           end)'
+}
+
+# mother_prbody_write_review <pr-url> <merged-json-file|""> <review-wave-json> [override 0|1]
+mother_prbody_write_review() {
+    local url="$1" block_file rc
+    block_file=$(mktemp "${TMPDIR:-/tmp}/mother-review-block.XXXXXX") || return 1
+    mother_prbody_review_block "$2" "$3" "${4:-0}" >"$block_file" 2>/dev/null || { rm -f "$block_file"; return 1; }
+    mother_prbody_upsert "$url" review "$block_file"
     rc=$?
     rm -f "$block_file"
     return "$rc"

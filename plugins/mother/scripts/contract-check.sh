@@ -56,6 +56,7 @@ read -r -d '' CONTRACT_TABLE <<'JSON'
     "lens_skipped":         ["reviewer", "lens", "reason"],
     "claims_verified":      ["verified", "refuted", "unverified"],
     "review_wave_completed": ["cycles", "status"],
+    "review_rework_started": ["cycle", "session_id", "findings"],
     "decision_opened":      ["decision_id", "kind", "options"],
     "decision_resolved":    ["decision_id", "option", "source"],
     "attention_raised":     ["reason"],

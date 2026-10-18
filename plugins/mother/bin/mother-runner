@@ -1256,6 +1256,17 @@ _auto_escalate_failed() {
 
 _ADHERENCE_LOCK="$RUNNER_DIR/adherence-review.lockdir"
 
+# _adherence_wave_owned <job-file> — true while the job's review wave is
+# running, or after its findings were overridden by the operator. A wave that
+# shipped needs no exception: it passed adherence on the head it presented,
+# so the per-SHA guard below skips it.
+_adherence_wave_owned() {
+    case "$(jq -r '.review_wave.status // ""' "$1" 2>/dev/null)" in
+        running|overridden) return 0 ;;
+    esac
+    return 1
+}
+
 _run_adherence_pending() {
     [ "$MOTHER_ADHERENCE_ENABLED" = "1" ] || return 0
 
@@ -1281,6 +1292,10 @@ _run_adherence_pending() {
         # Gates run before adherence; a job whose blocking gates are red is
         # never reviewed (HC-08; enforce jobs can't reach succeeded red anyway).
         [ "$(jq -r '.gates.status // ""' "$f" 2>/dev/null)" = "failed" ] && continue
+        # A review wave (HC-14) runs adherence itself, pre-ready: never start a
+        # post-PR review while one is running, or after the operator opened
+        # the PR over the wave's findings (override_open).
+        _adherence_wave_owned "$f" && continue
         # Mark as pending if not already.
         if [ "$adherence_pending" != "true" ]; then
             merged=$(jq '.adherence_pending = true' "$f") && _atomic_write "$f" "$merged"
@@ -1302,6 +1317,7 @@ _run_adherence_pending() {
             # succeeded again on their second pass, so this covers both passes).
             case "$state" in succeeded) ;; *) continue ;; esac
             [ "$(jq -r '.gates.status // ""' "$f" 2>/dev/null)" = "failed" ] && continue
+            _adherence_wave_owned "$f" && continue
             id=$(jq -r '.id' "$f")
 
             # A human can merge a PR before this automatic loop ever reviews

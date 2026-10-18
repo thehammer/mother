@@ -16,6 +16,19 @@
 #                              Lets a test keep the "worker" alive long enough for
 #                              mother-run-job's poll loop to observe a few ticks
 #                              (e.g. cost-cap breach detection) before it exits.
+#   MOCK_CLAUDE_STDOUT_BY_AGENT_DIR
+#                              optional directory of per-agent canned replies, for tests
+#                              that drive several reviewers through one `claude` stand-in
+#                              (the HC-14 review wave: archie adherence + perri-lens
+#                              lenses). When set and argv contains `--agent <name>`:
+#                                1. $DIR/<name>.<MOTHER_REVIEW_LENS>.jsonl is printed when
+#                                   MOTHER_REVIEW_LENS is set and that file exists;
+#                                2. else $DIR/<name>.jsonl is printed when it exists;
+#                                3. else the mock falls through to MOCK_CLAUDE_STDOUT_FILE /
+#                                   MOCK_CLAUDE_STDOUT exactly as before.
+#                              `mother review-lens` exports MOTHER_REVIEW_LENS=<lens> into
+#                              the claude invocation's environment so the lenses (all
+#                              `--agent perri-lens`) can be told apart. Unset by default.
 #   MOCK_CLAUDE_ENV_FILE       if set, the worker environment is recorded here as
 #                              KEY=VALUE lines (TMPDIR, TMPDIR_EXISTS=yes|no — whether
 #                              $TMPDIR is an existing directory at worker start —,
@@ -47,7 +60,27 @@ fi
 printf '%s\n' "$@" >> "$args_file"
 echo "---" >> "$args_file"
 
-if [ -n "${MOCK_CLAUDE_STDOUT_FILE:-}" ]; then
+# Per-agent canned reply (opt-in): see MOCK_CLAUDE_STDOUT_BY_AGENT_DIR above.
+agent_reply=""
+if [ -n "${MOCK_CLAUDE_STDOUT_BY_AGENT_DIR:-}" ]; then
+    agent_name=""; prev_arg=""
+    for arg in "$@"; do
+        [ "$prev_arg" = "--agent" ] && { agent_name="$arg"; break; }
+        prev_arg="$arg"
+    done
+    if [ -n "$agent_name" ]; then
+        if [ -n "${MOTHER_REVIEW_LENS:-}" ] \
+            && [ -f "$MOCK_CLAUDE_STDOUT_BY_AGENT_DIR/$agent_name.$MOTHER_REVIEW_LENS.jsonl" ]; then
+            agent_reply="$MOCK_CLAUDE_STDOUT_BY_AGENT_DIR/$agent_name.$MOTHER_REVIEW_LENS.jsonl"
+        elif [ -f "$MOCK_CLAUDE_STDOUT_BY_AGENT_DIR/$agent_name.jsonl" ]; then
+            agent_reply="$MOCK_CLAUDE_STDOUT_BY_AGENT_DIR/$agent_name.jsonl"
+        fi
+    fi
+fi
+
+if [ -n "$agent_reply" ]; then
+    cat "$agent_reply"
+elif [ -n "${MOCK_CLAUDE_STDOUT_FILE:-}" ]; then
     cat "$MOCK_CLAUDE_STDOUT_FILE"
 elif [ -n "${MOCK_CLAUDE_STDOUT:-}" ]; then
     printf '%s\n' "$MOCK_CLAUDE_STDOUT"

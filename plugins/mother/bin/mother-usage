@@ -1228,6 +1228,111 @@ def _retro_gates_tables(root, in_window, rows_by_job, backfill):
     return gates_table, agreement_table, red, interruptions_table
 
 
+def _retro_review_wave_tables(root, in_window, rows_by_job):
+    """Build the review_wave and refuted_claims tables (HC-14): per-lens runs,
+    skips by reason, findings by severity (from the local wave side files),
+    median cost and cost share of review-wave spend; refuted claims per lens
+    and how many refuted findings were ever sent to a worker (must be 0)."""
+    lenses = {}
+    adh_costs = []
+    jobs = cycles = 0
+    decisions = {}
+    refuted_by_lens = {}
+    refuted_sent = 0
+
+    def lens_entry(reviewer):
+        return lenses.setdefault(reviewer, {"runs": 0, "errors": 0, "skips": {},
+                                            "findings": {"blocking": 0, "advisory": 0},
+                                            "costs": []})
+
+    for job, path, archived in in_window:
+        jid = job.get("id")
+        events = _load_events(_events_path_for(root, job, archived))
+        wave_events = [e for e in events if e.get("kind") == "review_cycle_started"
+                       and (e.get("detail") or {}).get("wave") is True]
+        rows = rows_by_job.get(jid, [])
+        if not wave_events and not job.get("review_wave"):
+            continue
+        jobs += 1
+        cycles += len(wave_events)
+        for e in events:
+            d = e.get("detail") or {}
+            if e.get("kind") == "lens_skipped":
+                sk = lens_entry(d.get("reviewer") or "perri:%s" % d.get("lens"))["skips"]
+                sk[d.get("reason") or "unknown"] = sk.get(d.get("reason") or "unknown", 0) + 1
+            elif e.get("kind") == "review_cycle_completed" and d.get("wave") is True:
+                decisions[d.get("decision")] = decisions.get(d.get("decision"), 0) + 1
+        for r in rows:
+            stage = r.get("stage") or ""
+            if stage.startswith("review-perri:"):
+                ent = lens_entry(stage[len("review-"):])
+                ent["runs"] += 1
+                if r.get("outcome") == "error":
+                    ent["errors"] += 1
+                ent["costs"].append(r.get("cost_usd") or 0)
+            elif stage == "adherence" and r.get("pre_ready") is True:
+                adh_costs.append(r.get("cost_usd") or 0)
+            elif r.get("run_kind") == "review_rework":
+                refuted_sent += r.get("refuted_sent") or 0
+        wave_root = os.path.join(root, "crew", jid or "", "wave")
+        try:
+            cycle_dirs = sorted(os.listdir(wave_root))
+        except OSError:
+            cycle_dirs = []
+        for c in cycle_dirs:
+            cdir = os.path.join(wave_root, c)
+            try:
+                names = os.listdir(cdir)
+            except OSError:
+                continue
+            for name in names:
+                if not name.endswith(".json") or name.startswith("."):
+                    continue
+                try:
+                    with open(os.path.join(cdir, name)) as fh:
+                        doc = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(doc, dict):
+                    continue
+                if name == "merged.json":
+                    for f in doc.get("refuted") or []:
+                        for lens in f.get("lenses") or []:
+                            refuted_by_lens[lens] = refuted_by_lens.get(lens, 0) + 1
+                elif name != "summary.json":
+                    fd = lens_entry("perri:" + name[:-5])["findings"]
+                    for f in doc.get("findings") or []:
+                        sev = f.get("severity") if isinstance(f, dict) else None
+                        if sev in fd:
+                            fd[sev] += 1
+
+    total = sum(sum(v["costs"]) for v in lenses.values()) + sum(adh_costs)
+    wave_table = {}
+    if jobs:
+        per_lens = {}
+        for reviewer in sorted(lenses):
+            v = lenses[reviewer]
+            spent = sum(v["costs"])
+            per_lens[reviewer] = {
+                "runs": v["runs"], "errors": v["errors"], "skips": v["skips"],
+                "findings": v["findings"],
+                "median_cost_usd": _median(v["costs"]),
+                "spend_share_pct": round(100.0 * spent / total, 1) if total else None,
+            }
+        wave_table = {
+            "jobs": jobs, "cycles": cycles, "decisions": decisions,
+            "lenses": per_lens,
+            "adherence": {"runs": len(adh_costs), "median_cost_usd": _median(adh_costs),
+                          "spend_share_pct": round(100.0 * sum(adh_costs) / total, 1) if total else None},
+            "review_cost_usd": round(total, 4),
+        }
+    refuted_table = {}
+    if jobs:
+        refuted_table = {"by_lens": refuted_by_lens, "total": sum(refuted_by_lens.values()),
+                         "refuted_sent_to_worker": refuted_sent}
+    return wave_table, refuted_table
+
+
 def build_retro(root, since_dt, jobs_meta, backfilled_count=None, backfill=False):
     """Build the retro report as a dict keyed by table name. Pure function
     over already-loaded job metadata — no filesystem writes."""
@@ -1656,6 +1761,9 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None, backfill=False
     tables["stage_calibration"] = sc
     tables["progress_accuracy"] = pa
     tables["progress_flags"] = pf
+    rw, rc = _retro_review_wave_tables(root, in_window, rows_by_job)
+    tables["review_wave"] = rw
+    tables["refuted_claims"] = rc
 
     if backfilled_count is not None:
         tables["_meta"] = {"backfilled_rows": backfilled_count, "since": since_dt.isoformat(),
@@ -1683,6 +1791,8 @@ _RETRO_TITLES = [
     ("stage_calibration", "Stage calibration"),
     ("progress_accuracy", "Progress accuracy (≈50% moment)"),
     ("progress_flags", "Progress flags"),
+    ("review_wave", "Review wave"),
+    ("refuted_claims", "Refuted claims"),
 ]
 
 
@@ -1778,6 +1888,11 @@ def _coverage_line(key, data, tables):
         return f"jobs with a ≈50% moment that finished: {(data.get('overall') or {}).get('n', 0)}"
     if key == "progress_flags":
         return f"flags raised: {data.get('raised', 0)}"
+    if key == "review_wave":
+        return f"{data.get('cycles', 0)} wave cycle(s) across {data.get('jobs', 0)} job(s)"
+    if key == "refuted_claims":
+        return (f"{data.get('total', 0)} refuted finding(s); refuted findings sent to a worker: "
+                f"{data.get('refuted_sent_to_worker', 0)} (must be 0)")
     return None
 
 
@@ -2047,7 +2162,10 @@ def segment_events(events, now_s=None):
             state["pending_rework"] = False
             activate(t, "review")
         elif kind == "adherence_reviewed":
-            deactivate(t)
+            # A wave's pre-ready adherence finishes alongside running lenses;
+            # review_cycle_completed closes that stage instead.
+            if not detail.get("pre_ready"):
+                deactivate(t)
         elif kind in ("adherence_rework_kicked", "pipeline_cycle_continued"):
             deactivate(t)
             state["pending_rework"] = True
@@ -2075,7 +2193,7 @@ def segment_events(events, now_s=None):
             activate(t, "gates")
         elif kind == "gates_completed":
             deactivate(t)
-        elif kind == "gate_fix_started":
+        elif kind in ("gate_fix_started", "review_rework_started"):
             state["pending_rework"] = True
             seg.trigger = kind
             activate(t, "rework")
