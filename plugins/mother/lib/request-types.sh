@@ -24,7 +24,7 @@ rt_exists() {
     case "${agent}:${rtype}" in
         ada:prd|ada:plan_feedback|ada:review|\
         archie:plan|archie:review|\
-        perri:review|\
+        perri:review|perri-lens:review|\
         redd:test|cody:implement|marty:refactor)
             return 0 ;;
         *) return 1 ;;
@@ -50,6 +50,8 @@ rt_inputs() {
             printf "plan\ndiff\npr_comments" ;;
         perri:review)
             printf "diff\npr_comments\ntests" ;;
+        perri-lens:review)
+            printf "patch\ntests\nplan" ;;
         redd:test)
             printf "prd\nplan\ntests" ;;
         cody:implement)
@@ -79,6 +81,8 @@ rt_contract() {
             echo "Structured findings on plan adherence and scope compliance" ;;
         perri:review)
             echo "Structured findings on code quality and PR-level concerns" ;;
+        perri-lens:review)
+            echo "Structured findings and an examined-files list for one review lens" ;;
         redd:test)
             echo "Behavioral test suite covering the plan's acceptance criteria" ;;
         cody:implement)

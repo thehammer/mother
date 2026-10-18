@@ -479,6 +479,33 @@ review process time only (no queue waits, no `awaiting`). `progress_fraction` (p
 most once per job per 60s (the terminal 100% write bypasses the gap); `progress_half` once at the first ≥ 50%.
 `mother list`/`status` and the broker merge the file/latest event in as `.progress` — job files stay identical.
 
+### Reviewer lenses (HC-12)
+
+`.mother/crew.yml` `lenses:` declares the focused reviewer set: `mode` observe|enforce,
+`default` and `mandatory` (subsets of `correctness`, `phi-security`, `tests`, `ops-infra`),
+`scopes` (lens -> glob list), `budget_usd` (>0, <=20, default 3), `cycle_cap` (1..3,
+default 2). Mandatory lenses are folded into `default`. In a PHI repo `phi-security` is
+injected into both and any scope on it is dropped.
+
+- **`crew_config.select(crew, plan_lenses, changed_files, posture)`** returns
+  `[{reviewer: "perri:<lens>", lens, run, skip_reason}]`. Skip reasons: `removed_by_plan`,
+  `path_scope`, `posture` (non-mandatory under `conservative`). Mandatory lenses, and
+  `phi-security` whenever `crew.phi_sensitive`, always run: no plan removal, scope or
+  posture skips them (R11).
+- **`mother add`** reads the plan's `lenses: {add, remove}` (next to `suggested_config`).
+  Unknown lens names fail; removing a mandatory lens fails with
+  `add: lens '<lens>' is mandatory in <repo> and cannot be removed by a plan`, even when
+  the repo has no `crew.yml` (PHI repos). Stored as `.crew.lenses.plan` (only when the repo
+  has a `crew.yml`).
+- **`mother review-lens <id> --lens <name> [--budget-usd N]`** (`cmd_review_lens`, separate
+  from `cmd_review_phase`) spawns `claude --agent perri-lens --max-budget-usd N`, default
+  sonnet/medium (`suggested_config.perri` overrides; `conservative` clamps the model to
+  sonnet). Findings and the `examined` list go to
+  `$MOTHER_ROOT/crew/<id>/wave/c<cycle>/<lens>.json` only. Usage stage `review-perri:<lens>`.
+  Exit 0 ok, 2 invalid findings, 1 usage error.
+- Findings gain optional `claims[{path,line,quote<=200}]` and `asserts_existing_code`;
+  lens reviewers also emit an `examined` block (`findings_extract_examined`).
+
 ## Internals reference (lazy-loaded)
 
 Resource teardown (worktrees/containers), PR detection (`lib/prdetect.sh`,

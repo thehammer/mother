@@ -11,7 +11,8 @@
 #         {version, source_ref, source_sha, phi_sensitive,
 #          gates:{mode, max_attempts, budget_minutes,
 #                 checks:[{name, run, when, blocking, where, timeout_s, hint}]},
-#          lenses: <raw section or null>}
+#          lenses: {mode, default, mandatory, scopes, budget_usd, cycle_cap}
+#                  (HC-12: validated, defaults applied) or null}
 #     - invalid          -> exit 1, stdout {"errors":[{"path","message"}...]}
 #       reporting ALL errors.
 #     - MOTHER_PHI_REPOS (space separated; default "admin-portal
@@ -182,20 +183,238 @@ gates:
     [ "$output" = "null" ]
 }
 
-@test "lenses section is accepted and returned untouched" {
-    _commit_crew 'version: 1
-gates:
-  checks:
-    - name: pint
-      run: "true"
-lenses:
-  security:
-    anything: [1, 2, {deep: true}]
-  whatever: "not validated"'
+# --- lenses (HC-12): validated and resolved with defaults applied ----------
+
+# _yaml_lenses <lenses-body (indented 2 spaces)> — gates-only config + lenses.
+_yaml_lenses() {
+    printf 'version: 1\ngates:\n  checks:\n    - name: pint\n      run: "true"\nlenses:\n%s\n' "$1"
+}
+
+@test "a valid lenses section is resolved with every field present" {
+    _commit_crew "$(_yaml_lenses '  mode: enforce
+  default: [correctness, tests]
+  mandatory: [correctness]
+  scopes:
+    ops-infra: ["infrastructure/**", "**/*.tf"]
+  budget_usd: 5
+  cycle_cap: 3')"
     _resolve main
     [ "$status" -eq 0 ]
     printf '%s' "$output" | jq -e '
-        .lenses == {"security": {"anything": [1, 2, {"deep": true}]}, "whatever": "not validated"}' >/dev/null
+        .lenses.mode == "enforce"
+        and (.lenses.default | sort) == ["correctness", "tests"]
+        and .lenses.mandatory == ["correctness"]
+        and .lenses.scopes == {"ops-infra": ["infrastructure/**", "**/*.tf"]}
+        and .lenses.budget_usd == 5
+        and .lenses.cycle_cap == 3' >/dev/null
+}
+
+@test "lenses defaults: observe mode, budget 3, cycle cap 2, no scopes, no mandatory lenses" {
+    _commit_crew "$(_yaml_lenses '  default: [correctness]')"
+    _resolve main
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e '
+        .lenses.mode == "observe"
+        and .lenses.budget_usd == 3
+        and .lenses.cycle_cap == 2
+        and .lenses.scopes == {}
+        and .lenses.mandatory == []
+        and .lenses.default == ["correctness"]' >/dev/null
+}
+
+@test "mandatory lenses are also included in default" {
+    _commit_crew "$(_yaml_lenses '  default: [tests]
+  mandatory: [correctness]')"
+    _resolve main
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e '
+        (.lenses.default | index("correctness")) != null
+        and (.lenses.default | index("tests")) != null' >/dev/null
+}
+
+@test "lenses stays null when there is no lenses section and the repo is not PHI" {
+    _commit_crew "$(_yaml_one_check)"
+    _resolve main somerepo
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '.lenses')" = "null" ]
+}
+
+@test "PHI repos get phi-security injected into default and mandatory even with no lenses section" {
+    _commit_crew "$(_yaml_one_check)"
+    local r
+    for r in admin-portal referral-monitor; do
+        _resolve main "$r"
+        [ "$status" -eq 0 ]
+        printf '%s' "$output" | jq -e '
+            (.lenses.default | index("phi-security")) != null
+            and (.lenses.mandatory | index("phi-security")) != null' >/dev/null
+    done
+}
+
+@test "phi_sensitive: true in the file injects phi-security for a non-listed repo" {
+    _commit_crew 'version: 1
+phi_sensitive: true
+gates:
+  checks:
+    - name: pint
+      run: "true"'
+    _resolve main somerepo
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e '
+        (.lenses.default | index("phi-security")) != null
+        and (.lenses.mandatory | index("phi-security")) != null' >/dev/null
+}
+
+@test "MOTHER_PHI_REPOS makes a custom repo PHI for lenses" {
+    export MOTHER_PHI_REPOS="somerepo"
+    _commit_crew "$(_yaml_one_check)"
+    _resolve main somerepo
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e '(.lenses.mandatory | index("phi-security")) != null' >/dev/null
+}
+
+@test "PHI repos drop any scope configured on phi-security but keep other scopes" {
+    _commit_crew "$(_yaml_lenses '  default: [correctness, ops-infra]
+  scopes:
+    phi-security: ["docs/**"]
+    ops-infra: ["**/*.tf"]')"
+    _resolve main admin-portal
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e '
+        (.lenses.scopes | has("phi-security") | not)
+        and .lenses.scopes["ops-infra"] == ["**/*.tf"]' >/dev/null
+}
+
+@test "PHI injection keeps an author's other mandatory lenses" {
+    _commit_crew "$(_yaml_lenses '  default: [correctness]
+  mandatory: [tests]')"
+    _resolve main admin-portal
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e '
+        (.lenses.mandatory | sort) == ["phi-security", "tests"]' >/dev/null
+}
+
+# --- lenses validation -------------------------------------------------------
+
+@test "invalid lenses: not a mapping is reported at lenses" {
+    _commit_crew 'version: 1
+gates:
+  checks: []
+lenses: [correctness]'
+    _resolve main
+    _assert_error_at "lenses"
+}
+
+@test "invalid lenses: mode must be observe or enforce" {
+    _commit_crew "$(_yaml_lenses '  mode: yolo')"
+    _resolve main
+    _assert_error_at "lenses.mode"
+}
+
+@test "invalid lenses: an unknown lens in default is reported at its index" {
+    _commit_crew "$(_yaml_lenses '  default: [correctness, bogus]')"
+    _resolve main
+    _assert_error_at "lenses.default[1]"
+}
+
+@test "invalid lenses: default must be a list" {
+    _commit_crew "$(_yaml_lenses '  default: correctness')"
+    _resolve main
+    _assert_error_at "lenses.default"
+}
+
+@test "invalid lenses: mandatory must be a list, reported at lenses.mandatory" {
+    _commit_crew "$(_yaml_lenses '  mandatory: correctness')"
+    _resolve main
+    _assert_error_at "lenses.mandatory"
+}
+
+@test "invalid lenses: an unknown lens in mandatory is reported at or beneath lenses.mandatory" {
+    _commit_crew "$(_yaml_lenses '  mandatory: [bogus]')"
+    _resolve main
+    [ "$status" -eq 1 ]
+    printf '%s' "$output" | jq -e '
+        .errors | map(select((.path | startswith("lenses.mandatory"))
+                             and ((.path + " " + .message) | contains("bogus")))) | length >= 1' >/dev/null
+}
+
+@test "invalid lenses: an empty scope list is reported at lenses.scopes.<lens>" {
+    _commit_crew "$(_yaml_lenses '  scopes:
+    ops-infra: []')"
+    _resolve main
+    _assert_error_at "lenses.scopes.ops-infra"
+}
+
+@test "invalid lenses: a non-string glob is reported at lenses.scopes.<lens>" {
+    _commit_crew "$(_yaml_lenses '  scopes:
+    ops-infra: [1]')"
+    _resolve main
+    _assert_error_at "lenses.scopes.ops-infra"
+}
+
+@test "invalid lenses: a scope keyed by an unknown lens is rejected and names it" {
+    _commit_crew "$(_yaml_lenses '  scopes:
+    bogus: ["**/*.tf"]')"
+    _resolve main
+    [ "$status" -eq 1 ]
+    printf '%s' "$output" | jq -e '
+        .errors | map(select((.path | startswith("lenses.scopes"))
+                             and ((.path + " " + .message) | contains("bogus")))) | length >= 1' >/dev/null
+}
+
+@test "invalid lenses: budget_usd must be above 0 and at most 20" {
+    local v
+    for v in 0 -1 21 '"x"'; do
+        _commit_crew "$(_yaml_lenses "  budget_usd: $v")"
+        _resolve main
+        _assert_error_at "lenses.budget_usd"
+    done
+    for v in 0.5 20 3; do
+        _commit_crew "$(_yaml_lenses "  budget_usd: $v")"
+        _resolve main
+        [ "$status" -eq 0 ]
+    done
+}
+
+@test "invalid lenses: cycle_cap must be an integer from 1 to 3" {
+    local v
+    for v in 0 4 1.5 '"x"'; do
+        _commit_crew "$(_yaml_lenses "  cycle_cap: $v")"
+        _resolve main
+        _assert_error_at "lenses.cycle_cap"
+    done
+    for v in 1 3; do
+        _commit_crew "$(_yaml_lenses "  cycle_cap: $v")"
+        _resolve main
+        [ "$status" -eq 0 ]
+        [ "$(printf '%s' "$output" | jq -r '.lenses.cycle_cap')" = "$v" ]
+    done
+}
+
+@test "invalid lenses: an unknown key is reported at lenses.<key>" {
+    _commit_crew "$(_yaml_lenses '  bogus_key: 1')"
+    _resolve main
+    _assert_error_at "lenses.bogus_key"
+}
+
+@test "lenses errors are reported alongside gates errors in one pass" {
+    _commit_crew 'version: 1
+gates:
+  mode: yolo
+  checks: []
+lenses:
+  mode: yolo
+  budget_usd: 99
+  cycle_cap: 0
+  default: [bogus]
+  bogus_key: 1'
+    _resolve main
+    _assert_error_at "gates.mode"
+    _assert_error_at "lenses.mode"
+    _assert_error_at "lenses.budget_usd"
+    _assert_error_at "lenses.cycle_cap"
+    _assert_error_at "lenses.default[0]"
+    _assert_error_at "lenses.bogus_key"
 }
 
 # ---------------------------------------------------------------------------

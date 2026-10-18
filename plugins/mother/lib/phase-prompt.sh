@@ -113,6 +113,33 @@ phase_render_input() {
             printf '\n'
             ;;
 
+        patch)
+            # Full patch (git diff base...HEAD) for lens reviewers, capped so a
+            # huge diff can't blow the prompt. Best-effort, never hard-fails.
+            printf '## Patch\n\n'
+            local _patch="" _cap=122880 _patch_len=0
+            if [ -n "$work_dir" ] && [ -d "$work_dir" ] && [ -n "$base_ref" ]; then
+                (cd "$work_dir" && git fetch --quiet origin 2>/dev/null || true)
+                _patch=$(cd "$work_dir" && git diff "${base_ref}...HEAD" 2>/dev/null || true)
+            fi
+            if [ -n "$_patch" ]; then
+                _patch_len=$(printf '%s' "$_patch" | wc -c | tr -d ' ')
+                printf '```diff\n'
+                if [ "$_patch_len" -gt "$_cap" ]; then
+                    printf '%s' "$_patch" | head -c "$_cap"
+                    printf '\n```\n\n_(patch truncated: showing the first %s of %s bytes; read the rest with `git diff %s...HEAD -- <path>`)_\n' \
+                        "$_cap" "$_patch_len" "$base_ref"
+                else
+                    printf '%s\n```\n' "$_patch"
+                fi
+            elif [ -n "$work_dir" ] && [ ! -d "$work_dir" ]; then
+                printf '_(work dir missing: %s)_\n' "$work_dir"
+            else
+                printf '_(branch has no changes against %s)_\n' "${base_ref:-<unknown>}"
+            fi
+            printf '\n'
+            ;;
+
         findings)
             # Only rendered when rt_inputs declares 'findings' for the phase.
             # Filter .pipeline.findings by target == target_agent; omit section if none.

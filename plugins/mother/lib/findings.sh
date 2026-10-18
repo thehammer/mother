@@ -30,12 +30,35 @@ if blocks:
 PYEOF
 }
 
+# ---------- findings_extract_examined ----------
+
+# findings_extract_examined <file>
+# Prints the JSON array from the LAST ```examined fenced block in <file>:
+# the changed files a lens reviewer says it looked at. Prints [] when the
+# block is absent or the file is unreadable.
+findings_extract_examined() {
+    local file="$1"
+    if [ ! -r "$file" ]; then echo "[]"; return 0; fi
+    python3 - "$file" <<'PYEOF'
+import sys, re
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    content = f.read()
+
+blocks = re.findall(r'```examined\n(.*?)```', content, re.DOTALL)
+print(blocks[-1].strip() if blocks else "[]")
+PYEOF
+}
+
 # ---------- findings_validate ----------
 
 # findings_validate <json>
 # Returns 0 if <json> is a valid findings array: each element must have
 #   target   ∈ {redd, cody, marty, human}
 #   severity ∈ {blocking, advisory}
+# Optional fields, type-checked only when present:
+#   claims                [{path: non-empty string, line: integer, quote: string <= 200 chars}]
+#   asserts_existing_code boolean
 # An empty array [] is valid.
 # Returns non-zero and prints a diagnostic to stderr on failure.
 findings_validate() {
@@ -50,6 +73,17 @@ findings_validate() {
                 error("invalid target: \(.target // "null") (must be one of: redd cody marty human)")
             elif (.severity != "blocking" and .severity != "advisory") then
                 error("invalid severity: \(.severity // "null") (must be one of: blocking advisory)")
+            elif (has("asserts_existing_code") and (.asserts_existing_code | type) != "boolean") then
+                error("invalid asserts_existing_code: must be a boolean")
+            elif (has("claims") and (
+                    (.claims | type) != "array"
+                    or (.claims | any(
+                        (type != "object")
+                        or ((.path | type) != "string") or (.path == "")
+                        or ((.line | type) != "number") or (.line != (.line | floor))
+                        or ((.quote | type) != "string") or ((.quote | length) > 200)
+                    )))) then
+                error("invalid claims: must be an array of {path: string, line: integer, quote: string of at most 200 chars}")
             else
                 empty
             end

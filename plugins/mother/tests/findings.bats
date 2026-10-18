@@ -227,3 +227,158 @@ TEXT
     [ "$status" -eq 0 ]
     [ "$output" = "continue" ]
 }
+
+# ---------------------------------------------------------------------------
+# HC-12: findings_extract_examined — the optional ```examined block
+
+@test "findings_extract_examined: returns the JSON array from an examined block" {
+    local f="$FINDINGS_TMP/in.txt"
+    printf 'ok\n\n```findings\n[]\n```\n\n```examined\n["a.php", "b/c.tf"]\n```\n' > "$f"
+    run bash -c "source '$_LIB' && findings_extract_examined '$f'"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c .)" = '["a.php","b/c.tf"]' ]
+}
+
+@test "findings_extract_examined: returns the LAST examined block when several are present" {
+    local f="$FINDINGS_TMP/in.txt"
+    printf '```examined\n["quoted-schema.txt"]\n```\n\nreal:\n\n```examined\n["real.php"]\n```\n' > "$f"
+    run bash -c "source '$_LIB' && findings_extract_examined '$f'"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c .)" = '["real.php"]' ]
+}
+
+@test "findings_extract_examined: prints [] when there is no examined block" {
+    local f="$FINDINGS_TMP/in.txt"
+    _valid_findings_block > "$f"
+    run bash -c "source '$_LIB' && findings_extract_examined '$f'"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c .)" = '[]' ]
+}
+
+@test "findings_extract_examined: prints [] for an unreadable or missing file" {
+    run bash -c "source '$_LIB' && findings_extract_examined '$FINDINGS_TMP/does-not-exist'"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c .)" = '[]' ]
+}
+
+@test "findings_extract_examined: a findings block is not mistaken for an examined block" {
+    local f="$FINDINGS_TMP/in.txt"
+    printf '```findings\n[{"target":"cody","severity":"advisory"}]\n```\n' > "$f"
+    run bash -c "source '$_LIB' && findings_extract_examined '$f'"
+    [ "$(printf '%s' "$output" | jq -c .)" = '[]' ]
+}
+
+@test "findings_extract still returns the findings block when an examined block follows it" {
+    local f="$FINDINGS_TMP/in.txt"
+    printf '```findings\n[{"target":"human","severity":"advisory","note":"x"}]\n```\n\n```examined\n["a"]\n```\n' > "$f"
+    run bash -c "source '$_LIB' && findings_extract '$f'"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.[0].target')" = "human" ]
+}
+
+# ---------------------------------------------------------------------------
+# HC-12: findings_validate — optional claims / asserts_existing_code
+
+_validate() { bash -c "source '$_LIB' && findings_validate \"\$1\"" _ "$1"; }
+
+_with_field() { # <jq-object-fragment> — one valid finding plus extra fields
+    jq -nc "[{target:\"cody\", severity:\"blocking\", summary:\"s\"} + $1]"
+}
+
+@test "findings_validate: a finding with no claims stays valid" {
+    run _validate '[{"target":"cody","severity":"blocking","summary":"s"}]'
+    [ "$status" -eq 0 ]
+}
+
+@test "findings_validate: accepts a well-formed claims array" {
+    run _validate "$(_with_field '{claims:[{path:"app/Foo.php", line:3, quote:"if ($x) {"}]}')"
+    [ "$status" -eq 0 ]
+}
+
+@test "findings_validate: accepts an empty claims array" {
+    run _validate "$(_with_field '{claims:[]}')"
+    [ "$status" -eq 0 ]
+}
+
+@test "findings_validate: accepts a quote of exactly 200 characters" {
+    local q; q=$(head -c 200 /dev/zero | tr '\0' q)
+    run _validate "$(_with_field "{claims:[{path:\"a\", line:1, quote:\"$q\"}]}")"
+    [ "$status" -eq 0 ]
+}
+
+@test "findings_validate: rejects a quote longer than 200 characters" {
+    local q; q=$(head -c 201 /dev/zero | tr '\0' q)
+    run _validate "$(_with_field "{claims:[{path:\"a\", line:1, quote:\"$q\"}]}")"
+    [ "$status" -ne 0 ]
+}
+
+@test "findings_validate: rejects claims that is not an array" {
+    run _validate "$(_with_field '{claims:{path:"a", line:1, quote:"q"}}')"
+    [ "$status" -ne 0 ]
+}
+
+@test "findings_validate: rejects a claim that is not an object" {
+    run _validate "$(_with_field '{claims:["app/Foo.php:3"]}')"
+    [ "$status" -ne 0 ]
+}
+
+@test "findings_validate: rejects a claim with an empty or missing path" {
+    run _validate "$(_with_field '{claims:[{path:"", line:1, quote:"q"}]}')"
+    [ "$status" -ne 0 ]
+    run _validate "$(_with_field '{claims:[{line:1, quote:"q"}]}')"
+    [ "$status" -ne 0 ]
+}
+
+@test "findings_validate: rejects a claim with a non-integer or missing line" {
+    run _validate "$(_with_field '{claims:[{path:"a", line:"3", quote:"q"}]}')"
+    [ "$status" -ne 0 ]
+    run _validate "$(_with_field '{claims:[{path:"a", line:1.5, quote:"q"}]}')"
+    [ "$status" -ne 0 ]
+    run _validate "$(_with_field '{claims:[{path:"a", quote:"q"}]}')"
+    [ "$status" -ne 0 ]
+}
+
+@test "findings_validate: rejects a claim with a non-string or missing quote" {
+    run _validate "$(_with_field '{claims:[{path:"a", line:1, quote:7}]}')"
+    [ "$status" -ne 0 ]
+    run _validate "$(_with_field '{claims:[{path:"a", line:1}]}')"
+    [ "$status" -ne 0 ]
+}
+
+@test "findings_validate: one malformed claim among valid findings fails the whole array" {
+    local good bad
+    good='{"target":"redd","severity":"advisory","summary":"ok"}'
+    bad='{"target":"cody","severity":"blocking","summary":"s","claims":[{"path":"","line":1,"quote":"q"}]}'
+    run _validate "[$good, $bad]"
+    [ "$status" -ne 0 ]
+}
+
+@test "findings_validate: asserts_existing_code accepts true and false" {
+    run _validate "$(_with_field '{asserts_existing_code:true}')"
+    [ "$status" -eq 0 ]
+    run _validate "$(_with_field '{asserts_existing_code:false}')"
+    [ "$status" -eq 0 ]
+}
+
+@test "findings_validate: asserts_existing_code must be boolean" {
+    run _validate "$(_with_field '{asserts_existing_code:"yes"}')"
+    [ "$status" -ne 0 ]
+    run _validate "$(_with_field '{asserts_existing_code:1}')"
+    [ "$status" -ne 0 ]
+}
+
+@test "findings_validate: pre-existing rejections are unchanged when claims are present" {
+    run _validate "$(jq -nc '[{target:"foo", severity:"blocking", claims:[{path:"a", line:1, quote:"q"}]}]')"
+    [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# HC-12: the reviewer prompt documents the optional fields
+
+@test "findings-prompt documents claims, asserts_existing_code and the examined block as optional" {
+    local f="$_PLUGIN_DIR/templates/findings-prompt.md"
+    grep -q 'claims' "$f"
+    grep -q 'asserts_existing_code' "$f"
+    grep -q 'examined' "$f"
+    grep -qi 'optional' "$f"
+}

@@ -477,6 +477,77 @@ print("null")
 PYEOF
 }
 
+# _parse_plan_lenses <plan_file>
+# Prints the plan's `lenses: {add: [...], remove: [...]}` as normalised JSON
+# {add, remove}, or the literal `null` when the key is absent. A malformed
+# block prints `invalid:<message>` so the caller can fail the add.
+_parse_plan_lenses() {
+    python3 - "$1" <<'PYEOF' 2>/dev/null || echo "null"
+import sys, re, json
+try:
+    import yaml
+except ImportError:
+    print("null"); sys.exit(0)
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    content = f.read()
+
+for block in re.findall(r'```yaml\n(.*?)```', content, re.DOTALL):
+    if 'suggested_config' not in block:
+        continue
+    data = yaml.safe_load(block.strip()) or {}
+    lenses = data.get("lenses")
+    if lenses is None:
+        print("null"); sys.exit(0)
+    if not isinstance(lenses, dict) or set(lenses) - {"add", "remove"}:
+        print("invalid:lenses must be a mapping with only 'add' and 'remove' keys"); sys.exit(0)
+    out = {}
+    for key in ("add", "remove"):
+        v = lenses.get(key) or []
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            print("invalid:lenses.%s must be a list of lens names" % key); sys.exit(0)
+        out[key] = v
+    print(json.dumps(out)); sys.exit(0)
+print("null")
+PYEOF
+}
+
+# _is_phi_repo <repo_name> — true when named in MOTHER_PHI_REPOS (env, then config.env, then default).
+_is_phi_repo() {
+    local list="${MOTHER_PHI_REPOS:-}"
+    if [ -z "${MOTHER_PHI_REPOS+x}" ]; then
+        list=$(mother_config_get MOTHER_PHI_REPOS 2>/dev/null)
+    fi
+    [ -z "$list" ] && list="admin-portal referral-monitor"
+    local r
+    for r in $list; do [ "$r" = "$1" ] && return 0; done
+    return 1
+}
+
+# _validate_plan_lenses <repo> <plan_lenses_json> <crew_json|"">
+# Dies when the plan names an unknown lens or removes a mandatory one.
+_validate_plan_lenses() {
+    local repo="$1" plan_lenses="$2" crew="$3"
+    local known="correctness phi-security tests ops-infra" lens
+    for lens in $(printf '%s' "$plan_lenses" | jq -r '(.add + .remove)[]'); do
+        case " $known " in
+            *" $lens "*) ;;
+            *) _die "add: unknown lens '$lens' in plan lenses (known: $known)" ;;
+        esac
+    done
+    local mandatory="" phi=0
+    [ -n "$crew" ] && mandatory=$(printf '%s' "$crew" | jq -r '(.lenses.mandatory // [])[]')
+    _is_phi_repo "$repo" && phi=1
+    [ -n "$crew" ] && [ "$(printf '%s' "$crew" | jq -r '.phi_sensitive // false')" = "true" ] && phi=1
+    [ "$phi" -eq 1 ] && mandatory="$mandatory
+phi-security"
+    for lens in $(printf '%s' "$plan_lenses" | jq -r '.remove[]'); do
+        if printf '%s\n' "$mandatory" | grep -qx -- "$lens"; then
+            _die "add: lens '$lens' is mandatory in $repo and cannot be removed by a plan"
+        fi
+    done
+}
+
 # ---------- tier ladder ----------
 
 # Tier definitions (sourced by both mother and mother-run-job via lib/state.sh
@@ -614,6 +685,16 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         esac
     fi
 
+    # Plan lens add/remove. Validated even with no crew.yml: a PHI repo's
+    # phi-security lens is mandatory regardless of config.
+    local plan_lenses_json
+    plan_lenses_json=$(_parse_plan_lenses "$plan_file")
+    case "$plan_lenses_json" in
+        invalid:*) _die "add: ${plan_lenses_json#invalid:}" ;;
+        null|"")   plan_lenses_json="" ;;
+        *)         _validate_plan_lenses "$repo" "$plan_lenses_json" "$crew_json" ;;
+    esac
+
     # Parse the no_pr flag (opt-out of the no_pr_no_push failure check).
     local no_pr_flag
     no_pr_flag=$(_parse_no_pr "$plan_file")
@@ -722,6 +803,10 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         job_json=$(printf '%s' "$job_json" | jq \
             --argjson crew "$crew_json" --arg ma "$plan_max_attempts" \
             '. + {crew: (if $ma != "" then ($crew | .gates.max_attempts = ($ma | tonumber)) else $crew end)}')
+        if [ -n "$plan_lenses_json" ]; then
+            job_json=$(printf '%s' "$job_json" | jq --argjson pl "$plan_lenses_json" \
+                '.crew.lenses = ((.crew.lenses // {}) + {plan: $pl})')
+        fi
     fi
     # For pipeline jobs, merge the pipeline object onto the base job JSON.
     # Non-pipeline plans get today's exact shape (no kind, no pipeline key).
@@ -2688,6 +2773,182 @@ EOF
     return 0
 }
 
+# ---------- review-lens ----------
+#
+# Run ONE review lens (a lean `perri-lens` agent with a lens checklist) against
+# a job's branch. Parses the lens's ```findings and ```examined blocks, tags
+# each finding {reviewer: "perri:<lens>", lens}, and writes
+#   $MOTHER_ROOT/crew/<id>/wave/c<cycle>/<lens>.json = {findings, examined, cost_usd, decision}
+# Finding text is never written to the job JSON or events. Does not touch
+# cmd_review_phase; merging and running a wave of lenses is a later layer.
+#
+# Returns 0 on success, 2 on invalid findings output; 1 on usage errors.
+# Usage: cmd_review_lens <id> --lens <name> [--budget-usd N]
+
+cmd_review_lens() {
+    local id="" lens="" budget=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --lens)         lens="${2:-}"; shift 2 ;;
+            --lens=*)       lens="${1#*=}"; shift ;;
+            --budget-usd)   budget="${2:-}"; shift 2 ;;
+            --budget-usd=*) budget="${1#*=}"; shift ;;
+            --) shift; break ;;
+            -*) _die "review-lens: unknown flag: $1" ;;
+            *)
+                if [ -z "$id" ]; then id="$1"; shift
+                else _die "review-lens: unexpected argument: $1"
+                fi ;;
+        esac
+    done
+    [ -n "$id" ]   || _die "review-lens: <id> required"
+    [ -n "$lens" ] || _die "review-lens: --lens required"
+    case "$lens" in
+        correctness|phi-security|tests|ops-infra) ;;
+        *) _die "review-lens: --lens must be one of: correctness phi-security tests ops-infra" ;;
+    esac
+    _job_exists "$id" || _die "no such job: $id"
+    local job_file; job_file=$(_job_path "$id")
+
+    if [ -z "$budget" ]; then
+        budget=$(jq -r '.crew.lenses.budget_usd // 3' "$job_file")
+    fi
+    _is_positive_number "$budget" \
+        && awk -v b="$budget" 'BEGIN { exit !(b > 0 && b <= 20) }' \
+        || _die "review-lens: --budget-usd must be greater than 0 and at most 20 (got: $budget)"
+
+    local plan_file
+    plan_file=$(jq -r '.plan_path // empty' "$job_file")
+    if [ -z "$plan_file" ] || [ ! -f "$plan_file" ]; then
+        plan_file=$(_plan_path "$id")
+    fi
+    [ -f "$plan_file" ] || _die "review-lens: plan file not found for $id"
+
+    local tmpl_dir="$MOTHER_BIN_DIR/../templates"
+    local review_prompt_tmpl="$tmpl_dir/review-prompt.md"
+    local checklist_tmpl="$tmpl_dir/lens-checklists/${lens}.md"
+    local findings_tmpl="$tmpl_dir/findings-prompt.md"
+    local t
+    for t in "$review_prompt_tmpl" "$checklist_tmpl" "$findings_tmpl"; do
+        [ -f "$t" ] || _die "review-lens: template not found: $t"
+    done
+    rt_exists perri-lens review \
+        || _die "review-lens: (perri-lens, review) is not a registered request type"
+
+    # Lens tier: sonnet/medium unless suggested_config.perri says otherwise.
+    local model effort posture
+    model=$(jq -r '.suggested_config.perri.model // empty' "$job_file" 2>/dev/null)
+    effort=$(jq -r '.suggested_config.perri.effort // empty' "$job_file" 2>/dev/null)
+    [ -n "$model" ]  || model="sonnet"
+    [ -n "$effort" ] || effort="medium"
+    posture=$(_resolve_posture)
+    [ "$posture" = "conservative" ] && model="sonnet"
+
+    local work_dir base_ref prd_path pr_url cycle
+    work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
+    base_ref=$(jq -r '.base_ref // empty' "$job_file")
+    prd_path=$(jq -r '.prd_path // empty' "$job_file")
+    pr_url=$(jq -r '.pr_url // empty' "$job_file")
+    cycle=$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null)
+    if [ -z "$work_dir" ] || [ ! -d "$work_dir" ]; then
+        _append_event "$id" "review_workdir_missing" \
+            "$(jq -nc --arg wd "$work_dir" --arg jb "$(jq -r '.branch // empty' "$job_file")" --arg pr "${pr_url:-}" \
+                '{work_dir: $wd, job_branch: $jb, pr_url: $pr}')"
+        _die "review-lens: work_dir is missing ($work_dir) — restore the worktree before a review can run"
+    fi
+
+    local artifacts="" key rendered
+    while IFS= read -r key; do
+        [ -z "$key" ] && continue
+        rendered=$(phase_render_input "$key" "$work_dir" "$plan_file" "${prd_path:-}" \
+            "${base_ref:-}" "$job_file" "perri:$lens" 2>/dev/null || true)
+        artifacts=$(printf '%s\n%s\n' "$artifacts" "$rendered")
+    done <<EOF
+$(rt_inputs perri-lens review)
+EOF
+
+    local prompt
+    prompt=$(printf '%s\n\n%s\n\n%s\n\n%s\n' \
+        "$(cat "$checklist_tmpl")" \
+        "$(cat "$review_prompt_tmpl")" \
+        "$artifacts" \
+        "$(cat "$findings_tmpl")")
+
+    _append_event "$id" "review_spawned" \
+        "$(jq -nc --arg r "perri:$lens" --arg m "$model" --arg p "$posture" \
+            '{reviewer: $r, model: $m, posture: $p}')"
+
+    type mother_claude_extra_args >/dev/null 2>&1 || mother_claude_extra_args() { MOTHER_CLAUDE_ARGS=(); }
+    mother_claude_extra_args "$effort" review
+
+    local lens_log="$LOGS_DIR/$id.lens-${lens}-c${cycle}.log"
+    ( cd "$work_dir" && claude --dangerously-skip-permissions --agent perri-lens --model "$model" \
+        --max-budget-usd "$budget" "${MOTHER_CLAUDE_ARGS[@]}" \
+        -p --output-format stream-json --verbose <<< "$prompt" ) \
+        > "$lens_log" 2>/dev/null || true
+
+    local tmpfile; tmpfile=$(mktemp)
+    _extract_transcript_result_text "$lens_log" > "$tmpfile" 2>/dev/null \
+        || cp "$lens_log" "$tmpfile" 2>/dev/null
+    local raw_findings raw_examined
+    raw_findings=$(findings_extract "$tmpfile" 2>/dev/null || true)
+    raw_examined=$(findings_extract_examined "$tmpfile" 2>/dev/null || true)
+    rm -f "$tmpfile"
+
+    if [ -z "$raw_findings" ]; then
+        raw_findings="[]"
+        _append_event "$id" "review_no_findings_block" \
+            "$(jq -nc --arg r "perri:$lens" '{reviewer: $r}')"
+    fi
+    # examined: an array of strings, else [] (a malformed list must not fail the lens).
+    raw_examined=$(printf '%s' "${raw_examined:-[]}" \
+        | jq -c 'if type == "array" and all(.[]; type == "string") then . else [] end' 2>/dev/null || echo "[]")
+
+    local usage_extra
+    usage_extra=$(jq -nc --arg lens "$lens" --arg model "$model" --arg effort "$effort" --argjson budget "$budget" \
+        '{lens: $lens, model: $model, effort: $effort, budget_usd: $budget}')
+
+    local validate_err
+    if ! validate_err=$(findings_validate "$raw_findings" 2>&1); then
+        _append_event "$id" "review_parse_error" \
+            "$(jq -nc --arg r "perri:$lens" --arg d "$validate_err" '{reviewer: $r, diagnostic: $d}')"
+        type mother_record_run_usage >/dev/null 2>&1 && mother_record_run_usage "$id" "error" "$lens_log" 0 "" \
+            "review-perri:${lens}" "perri:${lens}" "review" \
+            "$(printf '%s' "$usage_extra" | jq -c '. + {decision: null, finding_count: null}')"
+        echo "mother: review-lens: perri:$lens emitted invalid findings: $validate_err" >&2
+        return 2
+    fi
+
+    local tagged decision finding_count
+    tagged=$(printf '%s' "$raw_findings" \
+        | jq -c --arg r "perri:$lens" --arg l "$lens" 'map(. + {reviewer: $r, lens: $l})')
+    decision=$(findings_exit_decision "$tagged" 2>/dev/null || echo "ship")
+    finding_count=$(printf '%s' "$tagged" | jq 'length')
+
+    type mother_record_run_usage >/dev/null 2>&1 && mother_record_run_usage "$id" "succeeded" "$lens_log" 0 "" \
+        "review-perri:${lens}" "perri:${lens}" "review" \
+        "$(printf '%s' "$usage_extra" | jq -c --arg d "$decision" --argjson fc "$finding_count" \
+            '. + {decision: $d, finding_count: $fc}')"
+
+    local cost_usd
+    cost_usd=$(grep -F "\"job_id\":\"$id\"" "$MOTHER_ROOT/metrics/runs.jsonl" 2>/dev/null \
+        | grep -F "\"stage\":\"review-perri:${lens}\"" | tail -n 1 | jq -c '.cost_usd // null' 2>/dev/null)
+    [ -n "$cost_usd" ] || cost_usd="null"
+
+    local wave_dir="$MOTHER_ROOT/crew/$id/wave/c${cycle}"
+    mkdir -p "$wave_dir" || _die "review-lens: cannot create $wave_dir"
+    _atomic_write "$wave_dir/$lens.json" "$(jq -n \
+        --argjson f "$tagged" --argjson e "$raw_examined" --argjson c "$cost_usd" --arg d "$decision" \
+        '{findings: $f, examined: $e, cost_usd: $c, decision: $d}')"
+
+    _append_event "$id" "reviewed" \
+        "$(jq -nc --arg r "perri:$lens" --argjson fc "$finding_count" --arg d "$decision" \
+            '{reviewer: $r, finding_count: $fc, decision: $d}')"
+
+    echo "$id: perri:$lens review: $finding_count findings ($decision)"
+    return 0
+}
+
 # ---------- _merge_reviewer_findings ----------
 #
 # Pure helper: reads .pipeline.reviewer_findings (an object keyed by reviewer
@@ -4270,6 +4531,8 @@ Usage:
   mother gates check [--repo PATH] [--ref REF]  (validate .mother/crew.yml at a ref)
   mother doctor                              (dependency checks + crew config check)
   mother review-phase ID --reviewer AGENT    (run one pipeline reviewer: ada|archie|perri)
+  mother review-lens ID --lens NAME [--budget-usd N]
+                                             (run one review lens: correctness|phi-security|tests|ops-infra)
   mother merge-findings ID                   (merge per-reviewer findings into one array; stdout only)
   mother await [ID] --question TEXT          (worker-side: pause for operator input)
   mother preview up|wait|info|verify|call|fake|down   (worker-side: per-job preview stack;
@@ -4580,6 +4843,7 @@ main() {
         route-failure)     cmd_route_failure "$@" ;;
         adherence-review)  cmd_adherence_review "$@" ;;
         review-phase)      cmd_review_phase "$@" ;;
+        review-lens)       cmd_review_lens "$@" ;;
         merge-findings)    _merge_reviewer_findings "${1:-}" ;;
         await)             cmd_await "$@" ;;
         preview)           cmd_preview "$@" ;;

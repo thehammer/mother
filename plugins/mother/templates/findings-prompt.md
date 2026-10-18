@@ -34,6 +34,24 @@ JSON array. If you have no issues to report, emit an empty array.
 | `summary`  | yes      | One line. Shown in `mother status` and the PR comment. |
 | `detail`   | yes      | Enough context for the target agent to act. Include the expected behavior and why the current code diverges. |
 | `location` | no       | `path/to/file.ext:LINE` or `path/to/file.ext:START-END`. Best-effort. |
+| `claims`   | no       | `[{"path": "...", "line": 42, "quote": "..."}]` — evidence for any assertion about existing code. `quote` is a verbatim excerpt of at most 200 characters. |
+| `asserts_existing_code` | no | `true` when the finding's reasoning depends on how existing (unchanged) code behaves. Such a finding without `claims` is treated as unverified. |
+
+`claims` and `asserts_existing_code` are optional; findings without them stay valid.
+
+## Lens reviewers: the `examined` block
+
+A reviewer that owns a single review lens must also end its response with a
+second fenced block, after the `findings` block, listing the changed files it
+actually reviewed (a JSON array of paths; `[]` if none):
+
+````
+```examined
+["src/Foo.php", "tests/FooTest.php"]
+```
+````
+
+Other reviewers do not emit this block.
 
 ## Target semantics
 
