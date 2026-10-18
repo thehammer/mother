@@ -461,3 +461,171 @@ _retro_json() { mother-usage retro --root "$MOTHER_ROOT" --since 3w --format jso
     [ "$(echo "$output" | jq -r '.red_at_presentation.rr["2026-W40"].any_red')" = "1" ]
     [ "$(echo "$output" | jq -r '.red_at_presentation.rr["2026-W40"].red_on_gate_check')" = "1" ]
 }
+
+# ===========================================================================
+# HC-11: stage_calibration, progress_accuracy, progress_flags
+#
+# JSON shapes assumed (retro tables are keyed like the other retro tables):
+#   stage_calibration : { fleet: {n, stages:{<stage>:{n, median_s, p90_s}}}, "<repo>": {...} }
+#                       (repo entries only for repos with n >= 20)
+#   progress_accuracy : { overall: {n, coverage_pct, coverage_result, width_ratio,
+#                         width_target, width_result}, "<repo>": {...} (n >= 20 only) }
+#   progress_flags    : { raised, real, real_pct, target_pct, result, by_reason }
+# ===========================================================================
+
+_epoch_iso() {  # <epoch>
+    date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
+_HC11_BASE=""
+_hc11_base() { [ -n "$_HC11_BASE" ] || _HC11_BASE=$(( $(date +%s) - 172800 )); echo "$_HC11_BASE"; }
+
+# _evat <job> <offset-s> <kind> [detail-json]   (offset from two days ago)
+_evat() {
+    _ev "$1" "$3" "${4:-{\}}" "$(_epoch_iso $(( $(_hc11_base) + $2 )))"
+}
+
+# _stage_job <id> <repo> <build-seconds>   finished job with one build interval
+_stage_job() {
+    local recent; recent=$(_days_ago 1)
+    make_job "$1" succeeded '.repo = "'"$2"'" | .created_at = "'"$recent"'" | .finished_at = "'"$recent"'"'
+    _evat "$1" -100 queued
+    _evat "$1" 0 worker_spawned
+    _evat "$1" "$3" final_result_observed
+    _evat "$1" "$(( $3 + 1 ))" succeeded
+}
+
+# _acc_job <id> <repo> <remaining-s> <eta_lo> <eta_hi> [state]
+# A job whose ≈50% moment came after 600 active seconds, then ran <remaining-s> more.
+_acc_job() {
+    local recent state="${6:-succeeded}"; recent=$(_days_ago 1)
+    make_job "$1" "$state" '.repo = "'"$2"'" | .created_at = "'"$recent"'" | .finished_at = "'"$recent"'"'
+    _evat "$1" -100 queued
+    _evat "$1" 0 worker_spawned
+    _evat "$1" 600 progress_half '{"eta_lo_s":'"$4"',"eta_hi_s":'"$5"',"elapsed_active_s":600}'
+    _evat "$1" "$(( 600 + $3 ))" final_result_observed
+    case "$state" in
+        succeeded|failed|cancelled) _evat "$1" "$(( 601 + $3 ))" "$state" ;;
+    esac
+}
+
+@test "HC11-1: retro prints and json-keys the three progress tables" {
+    run mother-usage retro --root "$MOTHER_ROOT" --since 3w
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "## "[^$'\n']*"Stage calibration" ]]
+    [[ "$output" =~ "## "[^$'\n']*"Progress accuracy" ]]
+    [[ "$output" =~ "## "[^$'\n']*"Progress flags" ]]
+    run _retro_json
+    for k in stage_calibration progress_accuracy progress_flags; do
+        echo "$output" | jq -e --arg k "$k" 'has($k)' >/dev/null
+    done
+}
+
+@test "HC11-2: stage_calibration reports fleet n and per-stage median/p90, and a repo entry only at n >= 20" {
+    local i
+    for i in $(seq 0 19); do _stage_job "big-$i" bigrepo "$(( 600 + 30 * i ))"; done
+    for i in $(seq 1 5); do _stage_job "small-$i" smallrepo 600; done
+    run _retro_json
+    [ "$status" -eq 0 ]
+    sc=$(echo "$output" | jq -c .stage_calibration)
+    [ "$(echo "$sc" | jq '.fleet.n')" = "25" ]
+    [ "$(echo "$sc" | jq '.bigrepo.n')" = "20" ]
+    [ "$(echo "$sc" | jq 'has("smallrepo")')" = "false" ]
+    [ "$(echo "$sc" | jq '.bigrepo.stages.build.n')" = "20" ]
+    echo "$sc" | jq -e '(.bigrepo.stages.build.median_s - 885) | fabs < 2' >/dev/null
+    echo "$sc" | jq -e '.bigrepo.stages.build.p90_s >= 1100 and .bigrepo.stages.build.p90_s <= 1170' >/dev/null
+    echo "$sc" | jq -e '.fleet.stages.build.median_s >= 600 and .fleet.stages.build.median_s <= 1170' >/dev/null
+}
+
+# 10 jobs: 8 remaining times inside the 300..1000 s band, 2 outside (100, 2000).
+# coverage 80%; median(band width 700) / median(remaining 575) = 1.217.
+_ten_accuracy_jobs() {
+    local r i=0
+    for r in 400 450 500 550 600 650 700 750 100 2000; do
+        i=$((i + 1)); _acc_job "acc-$i" solo "$r" 300 1000
+    done
+}
+
+@test "HC11-3: progress_accuracy coverage is the share of actual remaining times inside the band" {
+    _ten_accuracy_jobs
+    run _retro_json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq '.progress_accuracy.overall.n')" = "10" ]
+    echo "$output" | jq -e '(.progress_accuracy.overall.coverage_pct - 80) | fabs < 0.1' >/dev/null
+    [ "$(echo "$output" | jq -r '.progress_accuracy.overall.coverage_result')" = "PASS" ]
+}
+
+@test "HC11-3: width ratio over the target FAILs, and PASSes once MOTHER_I13_WIDTH_TARGET allows it" {
+    _ten_accuracy_jobs
+    run _retro_json
+    echo "$output" | jq -e '(.progress_accuracy.overall.width_ratio - 1.22) | fabs < 0.03' >/dev/null
+    [ "$(echo "$output" | jq -r '.progress_accuracy.overall.width_result')" = "FAIL" ]
+    MOTHER_I13_WIDTH_TARGET=5 run _retro_json
+    [ "$(echo "$output" | jq -r '.progress_accuracy.overall.width_result')" = "PASS" ]
+}
+
+@test "HC11-3: coverage under 70% FAILs" {
+    local i
+    for i in 1 2 3 4 5 6; do _acc_job "in-$i" solo 500 300 1000; done
+    for i in 1 2 3 4; do _acc_job "out-$i" solo 3000 300 1000; done   # 60% coverage
+    run _retro_json
+    echo "$output" | jq -e '(.progress_accuracy.overall.coverage_pct - 60) | fabs < 0.1' >/dev/null
+    [ "$(echo "$output" | jq -r '.progress_accuracy.overall.coverage_result')" = "FAIL" ]
+}
+
+@test "HC11-3: only finished jobs that reached the half mark are sampled; repos need n >= 20" {
+    local i
+    for i in $(seq 1 20); do _acc_job "a-$i" arepo 500 300 1000; done
+    for i in $(seq 1 5); do _acc_job "b-$i" brepo 500 300 1000; done
+    _acc_job still-running brepo 500 300 1000 running      # no terminal state: excluded
+    _stage_job no-half arepo 900                           # finished but never had a half event
+    run _retro_json
+    [ "$(echo "$output" | jq '.progress_accuracy.overall.n')" = "25" ]
+    [ "$(echo "$output" | jq '.progress_accuracy.arepo.n')" = "20" ]
+    [ "$(echo "$output" | jq '.progress_accuracy | has("brepo")')" = "false" ]
+}
+
+# _flag_job <id> <state> <reason> then optional extra events given as "kind" args,
+# each placed after the raise; "CLEARED" inserts attention_cleared.
+_flag_job() {
+    local id="$1" state="$2" reason="$3" off=100 k; shift 3
+    local recent; recent=$(_days_ago 1)
+    make_job "$id" "$state" '.repo = "fr" | .created_at = "'"$recent"'" | .finished_at = "'"$recent"'"'
+    _evat "$id" 0 worker_spawned
+    _evat "$id" 50 attention_raised '{"reason":"'"$reason"'"}'
+    for k in "$@"; do
+        off=$((off + 10))
+        if [ "$k" = CLEARED ]; then _evat "$id" "$off" attention_cleared '{"reason":"'"$reason"'"}'
+        else _evat "$id" "$off" "$k"; fi
+    done
+}
+
+@test "HC11-4: a flag is real when the operator acted while it was raised or the job later failed or was cancelled" {
+    _flag_job f1 succeeded progress_stalled resumed CLEARED          # real: resumed while flagged
+    _flag_job f2 succeeded burn_ahead cancel_requested CLEARED       # real
+    _flag_job f3 failed progress_stalled CLEARED                     # real: job later failed
+    _flag_job f4 succeeded progress_stalled CLEARED                  # not real
+    _flag_job f5 succeeded progress_stalled CLEARED resumed          # not real: acted after it cleared
+    _flag_job f6 succeeded gates_incomplete resumed                  # other reason: not counted at all
+    run _retro_json
+    [ "$status" -eq 0 ]
+    pf=$(echo "$output" | jq -c .progress_flags)
+    [ "$(echo "$pf" | jq .raised)" = "5" ]
+    [ "$(echo "$pf" | jq .real)" = "3" ]
+    echo "$pf" | jq -e '(.real_pct - 60) | fabs < 0.1' >/dev/null
+    echo "$pf" | jq -e '.target_pct == 50' >/dev/null
+    [ "$(echo "$pf" | jq -r .result)" = "PASS" ]
+}
+
+@test "HC11-4: retried and escalated count as operator action; under 50% real FAILs" {
+    _flag_job g1 succeeded progress_stalled retried CLEARED
+    _flag_job g2 succeeded burn_ahead escalated CLEARED
+    _flag_job g3 succeeded progress_stalled CLEARED
+    _flag_job g4 succeeded progress_stalled CLEARED
+    _flag_job g5 succeeded burn_ahead CLEARED
+    run _retro_json
+    pf=$(echo "$output" | jq -c .progress_flags)
+    [ "$(echo "$pf" | jq .raised)" = "5" ]
+    [ "$(echo "$pf" | jq .real)" = "2" ]
+    [ "$(echo "$pf" | jq -r .result)" = "FAIL" ]
+}

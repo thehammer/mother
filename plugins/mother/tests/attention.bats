@@ -25,6 +25,8 @@ setup() {
     export HOME="$MOTHER_ROOT/home"
     mkdir -p "$HOME"
     export MOTHER_NOTIFY_TRANSPORT=none
+    # These tests exercise progress flags as needs-attention items (HC-11 gates that behind this switch).
+    export MOTHER_PROGRESS_FLAGS_ATTENTION=1
     # `mother ack` refuses workers; the harness may export a job id.
     unset MOTHER_JOB_ID
 

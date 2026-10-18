@@ -93,10 +93,18 @@ _format_rows() {
                   | (if $f == null then now else ($f | parse_ts) end) as $fe
                   | fmt_dur(($fe - $se) | floor)
               end;
+        # Figure for running and awaiting jobs: pct plus the ETA (or pause) label.
+        def progress_col:
+            if (.state == "running" or .state == "awaiting") and (.progress.label // "") != "" then
+                (.progress.label | split(" · ")) as $parts
+                | $parts[0] + (($parts | map(select(startswith("ETA ") or startswith("paused")))
+                                | if length > 0 then " " + (.[0] | sub("^ETA "; "")) else "" end))
+            else "" end;
         .[] | [
             .id,
             color_state(.state),
             rpad(duration; 6),
+            rpad(progress_col; 14),
             .repo,
             .title
         ] | @tsv

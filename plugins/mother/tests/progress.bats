@@ -1178,7 +1178,7 @@ jobs_sum() { (cd "$JOBS_DIR" && cksum ./*.json); }
 # (j) observer only
 # =============================================================================
 
-@test "ticks never touch job files, never create files under jobs/, and append only progress_updated / progress_half" {
+@test "ticks never touch job files, never create files under jobs/, and append only progress_* / attention_* events" {
     write_std_cal
     build_job r1 "$G_ALL_PASS"
     mkjob a1 awaiting '.paused_reason = "gate_hold"'; ev a1 -600 worker_spawned
@@ -1202,8 +1202,8 @@ jobs_sum() { (cd "$JOBS_DIR" && cksum ./*.json); }
     for f in "$MOTHER_ROOT"/orig-events/*.jsonl; do
         id=$(basename "$f" .jsonl)
         # every line that is not a progress event is exactly the original, in order
-        [ "$(jq -c 'select(.kind | startswith("progress_") | not)' "$EVENTS_DIR/$id.jsonl")" \
-          = "$(jq -c 'select(.kind | startswith("progress_") | not)' "$f")" ]
+        [ "$(jq -c 'select(.kind | (startswith("progress_") or startswith("attention_")) | not)' "$EVENTS_DIR/$id.jsonl")" \
+          = "$(jq -c 'select(.kind | (startswith("progress_") or startswith("attention_")) | not)' "$f")" ]
     done
     kinds=$(cat "$EVENTS_DIR"/*.jsonl | jq -r 'select(.kind | startswith("progress")) | .kind' | sort -u | tr '\n' ' ')
     [ "$kinds" = "progress_half progress_updated " ] || [ "$kinds" = "progress_updated " ]

@@ -1652,6 +1652,11 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None, backfill=False
     tables["red_at_presentation"] = rd
     tables["interruptions"] = it
 
+    sc, pa, pf = _retro_progress_tables(root, in_window)
+    tables["stage_calibration"] = sc
+    tables["progress_accuracy"] = pa
+    tables["progress_flags"] = pf
+
     if backfilled_count is not None:
         tables["_meta"] = {"backfilled_rows": backfilled_count, "since": since_dt.isoformat(),
                             "jobs_in_window": len(in_window)}
@@ -1675,6 +1680,9 @@ _RETRO_TITLES = [
     ("gates_ci_agreement", "Gates vs CI agreement"),
     ("red_at_presentation", "Red PRs at presentation"),
     ("interruptions", "Operator interruptions"),
+    ("stage_calibration", "Stage calibration"),
+    ("progress_accuracy", "Progress accuracy (≈50% moment)"),
+    ("progress_flags", "Progress flags"),
 ]
 
 
@@ -1762,6 +1770,12 @@ def _coverage_line(key, data, tables):
         return f"PRs evaluated: {prs} across {len(data)} repo(s)"
     if key == "interruptions":
         return f"{data.get('interruptions', 0)} interruption(s) across {data.get('jobs', 0)} jobs"
+    if key == "stage_calibration":
+        return f"scopes: {len(data)} (fleet + repos with n >= {PROGRESS_MIN_N})"
+    if key == "progress_accuracy":
+        return f"jobs with a ≈50% moment that finished: {(data.get('overall') or {}).get('n', 0)}"
+    if key == "progress_flags":
+        return f"flags raised: {data.get('raised', 0)}"
     return None
 
 
@@ -1803,6 +1817,121 @@ def cmd_retro(args):
     else:
         print(render_retro_table(tables))
     return 0
+
+
+# --- progress retro tables (HC-11) ------------------------------------------
+
+I13_COVERAGE_TARGET_PCT = 70.0
+PROGRESS_FLAG_REASONS = ("progress_stalled", "burn_ahead")
+PROGRESS_FLAG_REAL_TARGET_PCT = 50.0
+_FLAG_OPERATOR_ACTIONS = ("resumed", "cancel_requested", "retried", "escalated")
+
+
+def _i13_width_target():
+    try:
+        return float(os.environ.get("MOTHER_I13_WIDTH_TARGET", "1.0"))
+    except ValueError:
+        return 1.0
+
+
+def _accuracy_row(samples):
+    """samples: [(lo_s, hi_s, actual_remaining_s)] -> coverage / width verdicts."""
+    n = len(samples)
+    target = _i13_width_target()
+    out = {"n": n}
+    if n == 0:
+        return out
+    inside = sum(1 for lo, hi, a in samples if lo <= a <= hi)
+    coverage = 100.0 * inside / n
+    med_width = statistics.median([hi - lo for lo, hi, _ in samples])
+    med_remaining = statistics.median([a for _, _, a in samples])
+    ratio = (med_width / med_remaining) if med_remaining > 0 else None
+    out.update({
+        "coverage_pct": round(coverage, 1),
+        "coverage_target_pct": I13_COVERAGE_TARGET_PCT,
+        "coverage_result": "PASS" if coverage >= I13_COVERAGE_TARGET_PCT else "FAIL",
+        "median_band_width_s": round(med_width, 1),
+        "median_remaining_s": round(med_remaining, 1),
+        "width_ratio": round(ratio, 2) if ratio is not None else None,
+        "width_target": target,
+        "width_result": "PASS" if ratio is not None and ratio <= target else "FAIL",
+    })
+    return out
+
+
+def _stage_cal_scope(scope):
+    return {"n": scope.get("n", 0),
+            "stages": {st: {"n": v.get("n"), "median_s": v.get("median_s"), "p90_s": v.get("p90_s")}
+                       for st, v in (scope.get("stages") or {}).items()}}
+
+
+def _retro_progress_tables(root, in_window):
+    """stage_calibration, progress_accuracy and progress_flags."""
+    calib = _read_json(_calibration_path(root))
+    if not calib:
+        rows = _finished_rows(root)
+        by_repo = {}
+        for r in rows:
+            by_repo.setdefault(r["repo"], []).append(r)
+        calib = {"fleet": _fit_scope(rows),
+                 "repos": {k: _fit_scope(v) for k, v in by_repo.items() if len(v) >= PROGRESS_MIN_N}}
+    stage_cal = {}
+    if (calib.get("fleet") or {}).get("n"):
+        stage_cal["fleet"] = _stage_cal_scope(calib["fleet"])
+        for repo, scope in sorted((calib.get("repos") or {}).items()):
+            stage_cal[repo] = _stage_cal_scope(scope)
+
+    overall, by_repo_samples = [], {}
+    raised, real = 0, 0
+    by_reason = {}
+    for job, _path, archived in in_window:
+        terminal = job.get("state") in PROGRESS_TERMINAL
+        events = _load_events(_events_path_for(root, job, archived))
+        repo = job.get("repo") or "unknown"
+        half = next((e for e in events if e.get("kind") == "progress_half"), None)
+        if half and terminal:
+            d = half.get("detail") or {}
+            total = segment_events(events).elapsed
+            at = d.get("elapsed_active_s")
+            if at is not None and d.get("eta_lo_s") is not None and d.get("eta_hi_s") is not None:
+                sample = (d["eta_lo_s"], d["eta_hi_s"], max(0.0, total - at))
+                overall.append(sample)
+                by_repo_samples.setdefault(repo, []).append(sample)
+        # flags: one episode per raise; real when the operator acted while it
+        # was raised, or the job later failed / was cancelled.
+        episodes, open_eps = [], {}
+        for e in events:
+            kind, d = e.get("kind"), e.get("detail") or {}
+            reason = d.get("reason")
+            if kind == "attention_raised" and reason in PROGRESS_FLAG_REASONS:
+                open_eps[reason] = {"reason": reason, "acted": False}
+                episodes.append(open_eps[reason])
+            elif kind == "attention_cleared":
+                open_eps.pop(reason, None)
+            elif kind in _FLAG_OPERATOR_ACTIONS:
+                for ep in open_eps.values():
+                    ep["acted"] = True
+        for ep in episodes:
+            is_real = ep["acted"] or job.get("state") in ("failed", "cancelled")
+            st = by_reason.setdefault(ep["reason"], {"raised": 0, "real": 0})
+            st["raised"] += 1
+            st["real"] += 1 if is_real else 0
+            raised += 1
+            real += 1 if is_real else 0
+    accuracy = {}
+    if overall:
+        accuracy["overall"] = _accuracy_row(overall)
+        for repo, samples in sorted(by_repo_samples.items()):
+            if len(samples) >= PROGRESS_MIN_N:
+                accuracy[repo] = _accuracy_row(samples)
+    flags = {}
+    if raised:
+        share = 100.0 * real / raised
+        flags = {"raised": raised, "real": real, "not_real": raised - real,
+                 "real_pct": round(share, 1), "target_pct": PROGRESS_FLAG_REAL_TARGET_PCT,
+                 "result": "PASS" if share >= PROGRESS_FLAG_REAL_TARGET_PCT else "FAIL",
+                 "by_reason": by_reason}
+    return stage_cal, accuracy, flags
 
 
 # ---------------------------------------------------------------------------
@@ -2223,14 +2352,57 @@ def compute_progress(job, events, now_s, calib, prev, root=None):
     }
     if moved_back:
         obj["moved_back"] = moved_back
+    obj["flags"], obj["signals"]["pct_moved_at_active_s"] = _progress_flags(obj, prev, scope, now_s)
     return obj
+
+
+PROGRESS_STALL_MIN_S = 600          # never call a stall under 10 active minutes
+PROGRESS_BURN_MIN_COST_FRAC = 0.5
+PROGRESS_BURN_RATIO = 2.0
+
+
+def _stall_threshold_s(stage, scope):
+    """The stage's calibrated normal: p90 active duration, floored at 10 min."""
+    st = ((scope or {}).get("stages") or {}).get(stage) or {}
+    p90 = st.get("p90_s")
+    if p90 is None:
+        p90 = PROGRESS_DEFAULT_MEDIANS.get(stage, 0)
+    return max(PROGRESS_STALL_MIN_S, float(p90))
+
+
+def _progress_flags(obj, prev, scope, now_s):
+    """Observe-only flags for the progress object. Pure: returns (flags, moved_at)
+    where moved_at is the active-elapsed second at which pct last increased.
+    Flags clear on their own because they are recomputed every tick."""
+    sig = obj["signals"]
+    elapsed = sig["elapsed_active_s"]
+    prev_sig = (prev or {}).get("signals") or {}
+    moved_at = prev_sig.get("pct_moved_at_active_s")
+    if moved_at is None or not prev or obj["pct"] > (prev.get("pct") or 0):
+        moved_at = elapsed
+    old = {f.get("reason"): f for f in (prev or {}).get("flags") or []}
+    since = lambda r: (old.get(r) or {}).get("since") or _iso_ms(now_s)
+    flags = []
+    if obj["stage"] == "done" or obj["pct"] >= 100:
+        return flags, moved_at
+    if not obj["paused"]:
+        stuck = elapsed - moved_at
+        if stuck > _stall_threshold_s(obj["stage"], scope):
+            flags.append({"reason": "progress_stalled", "since": since("progress_stalled"),
+                          "detail": {"stage": obj["stage"], "stuck_s": int(stuck)}})
+    frac = (sig.get("cost") or {}).get("fraction")
+    if frac is not None and frac >= PROGRESS_BURN_MIN_COST_FRAC \
+            and frac >= PROGRESS_BURN_RATIO * obj["pct"] / 100.0:
+        flags.append({"reason": "burn_ahead", "since": since("burn_ahead"),
+                      "detail": {"cost_frac": frac, "progress_frac": round(obj["pct"] / 100.0, 2)}})
+    return flags, moved_at
 
 
 def _visible_tuple(obj):
     g = obj["signals"].get("gates")
     gt = [g.get(k) for k in ("passed", "failed", "total", "attempt")] if g else None
     return [obj["pct"], obj["stage"], gt, obj["eta"]["label"], obj["paused"],
-            "moved_back" in obj, obj.get("flags", [])]
+            "moved_back" in obj, [f["reason"] for f in obj.get("flags", [])]]
 
 
 # --- files and events ---------------------------------------------------------
@@ -2321,6 +2493,7 @@ def _tick_job(root, job, now_s, calib):
         return False
     events = _load_events(os.path.join(root, "events", jid + ".jsonl"))
     obj = compute_progress(job, events, now_s, calib, prev, root)
+    _emit_flag_events(root, jid, prev, obj, now_s)
 
     # updated_at only moves when something else changed, so idle ticks are no-ops.
     stable = lambda o: {k: v for k, v in (o or {}).items() if k != "updated_at"}
@@ -2332,6 +2505,15 @@ def _tick_job(root, job, now_s, calib):
 
     _emit_progress_events(root, jid, obj, now_s, os.path.join(pdir, "meta", jid + ".json"))
     return True
+
+
+def _emit_flag_events(root, jid, prev, obj, now_s):
+    before = set(f.get("reason") for f in (prev or {}).get("flags") or [])
+    after = set(f["reason"] for f in obj.get("flags") or [])
+    for reason in sorted(after - before):
+        _append_event_locked(root, jid, "attention_raised", {"reason": reason}, now_s)
+    for reason in sorted(before - after):
+        _append_event_locked(root, jid, "attention_cleared", {"reason": reason}, now_s)
 
 
 def _emit_progress_events(root, jid, obj, now_s, mpath):

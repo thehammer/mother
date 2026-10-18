@@ -903,6 +903,10 @@ _status_progress_section() {
                        + (if .eta.n != null then " (n=\(.eta.n))" else "" end) + ")" end) end),
           (if .moved_back then "  Moved back: \(.moved_back.reason) at \(.moved_back.at) (was \(.moved_back.from_pct)%)" else empty end),
           (if .paused then "  Paused: yes (figure and ETA frozen; paused time not counted)" else empty end),
+          ((.flags // [])[]? | "  Flag: \(.reason) since \(.since) — " + (
+              if .reason == "progress_stalled" then "no progress for \(.detail.stuck_s / 60 | floor)m in \(.detail.stage)"
+              elif .reason == "burn_ahead" then "cost \(.detail.cost_frac * 100 | round)% vs progress \(.detail.progress_frac * 100 | round)%"
+              else "" end)),
           ""'
 }
 
@@ -993,9 +997,10 @@ cmd_list() {
                 .title,
                 (.kind // ""),
                 (.adherence_status // ""),
-                (if (.state == "running" or .state == "awaiting") then ($pm[.id].label // "") else "" end)
+                (if (.state == "running" or .state == "awaiting") then ($pm[.id].label // "") else "" end),
+                (if (.state == "running" or .state == "awaiting") then ([($pm[.id].flags // [])[]?.reason] | join(",")) else "" end)
             ] | map((. // "") | tostring | gsub("[\n\r\t]"; " ")) | join($us)' | \
-            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel; do
+            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel pflags; do
                 cost_display="-"
                 if [ -n "$max_cost" ]; then
                     if [ "$st" = "running" ] && [ -n "$live_cost" ]; then
@@ -1037,6 +1042,21 @@ cmd_list() {
                     tier_3) state_display="$state_display tier:3" ;;
                 esac
                 [ -n "${plabel:-}" ] && state_display="$state_display $plabel"
+                if [ -n "${pflags:-}" ]; then
+                    # Flag markers show even when acked (an ack hides the
+                    # needs-attention item, not the fact).
+                    local _fr _fm _acked
+                    _acked=$(mother_attention_reasons_json "$id" | jq -r '[.[] | select(.acked == true) | .reason] | join(",")')
+                    for _fr in ${pflags//,/ }; do
+                        case "$_fr" in
+                            progress_stalled) _fm="⚠stalled" ;;
+                            burn_ahead) _fm="⚠burn" ;;
+                            *) continue ;;
+                        esac
+                        case ",${_acked}," in *",$_fr,"*) _fm="$_fm(acked)" ;; esac
+                        state_display="$state_display $_fm"
+                    done
+                fi
                 printf "%-28s  %-16s  %-18s  %-12s  %-16s  %8s  %s\n" "$id" "$state_display" "$repo" "$iso" "$origin" "$cost_display" "$title"
             done
         # Attention footer: reads the cached list only (never recomputes, never gh).

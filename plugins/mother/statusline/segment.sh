@@ -105,6 +105,30 @@ mother_statusline_refresh() {
     case "${attention_count:-}" in ''|*[!0-9]*) attention_count=0 ;; esac
 
     printf '%s:%s:%s\n' "$counts" "$alert_count" "$attention_count" > "$tmp" && mv "$tmp" "$cache"
+    _mother_statusline_progress_refresh "$cache"
+}
+
+# Sibling file `${cache}.progress`: one line "<id>\t<label>" for the running
+# job with the soonest ETA hi (empty when none). Kept out of the 6-field cache,
+# whose format external consumers depend on. Not written when
+# MOTHER_PROGRESS_ENABLED=0.
+_mother_statusline_progress_refresh() {
+    local cache="$1" side="${1}.progress"
+    [ "${MOTHER_PROGRESS_ENABLED:-1}" != "0" ] || return 0
+    local line="" f id
+    local rows=""
+    for f in "$MOTHER_ROOT"/jobs/*.json; do
+        [ -f "$f" ] || continue
+        [ "$(jq -r '.state' "$f" 2>/dev/null)" = "running" ] || continue
+        id=$(basename "$f" .json)
+        [ -f "$MOTHER_ROOT/progress/$id.json" ] || continue
+        rows="${rows}$(jq -r --arg id "$id" 'select((.paused // false) | not) | select(.label != null and .label != "")
+            | [(.eta.hi_s // 999999999), $id, (.label | gsub("[\t\n]"; " "))] | @tsv' \
+            "$MOTHER_ROOT/progress/$id.json" 2>/dev/null)
+"
+    done
+    line=$(printf '%s' "$rows" | sed '/^$/d' | sort -n -k1,1 | head -1 | cut -f2-)
+    printf '%s\n' "$line" | sed '/^$/d' > "${side}.tmp.$$" && mv "${side}.tmp.$$" "$side"
 }
 
 # Render the statusline segment. Trailing space, no separator — callers add
@@ -145,7 +169,24 @@ mother_segment() {
 
     local reset='\033[38;5;245m'
     local out=" ${reset}Q"
-    [ "$_mr" -gt 0 ] && out="${out} \033[38;5;220m▶${_mr}${reset}"  # yellow — running
+    if [ "$_mr" -gt 0 ]; then
+        out="${out} \033[38;5;220m▶${_mr}"  # yellow — running
+        # Soonest-ETA running job's figure, from the sibling file (absent
+        # when progress is off or nothing is running).
+        local _mp_id _mp_label=""
+        if [ "${MOTHER_PROGRESS_ENABLED:-1}" != "0" ] && [ -r "${cache}.progress" ]; then
+            IFS=$'\t' read -r _mp_id _mp_label < "${cache}.progress" || true
+        fi
+        if [ -n "$_mp_label" ]; then
+            # "≈60% · gates 2/3 · ETA ~25m" -> "≈60% ~25m"
+            local _mp_pct _mp_eta
+            _mp_pct=${_mp_label%% *}
+            _mp_eta=$(printf '%s' "$_mp_label" | grep -o '~[^ ]*' | tail -1)
+            _mp_label="$_mp_pct${_mp_eta:+ $_mp_eta}"
+            out="${out} (${_mp_label:0:24})"
+        fi
+        out="${out}${reset}"
+    fi
     [ "$_mq" -gt 0 ] && out="${out} \033[38;5;75m⏸${_mq}${reset}"   # blue — queued/ready
     # Awaiting jobs come BEFORE failures because they need operator action
     # to make progress — surfacing them with a question-mark glyph in

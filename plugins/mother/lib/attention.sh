@@ -174,10 +174,14 @@ _attention_reason_items() {
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         id=$(basename "$f" .json)
+        # Progress-owned flags stay out of the needs-attention list unless
+        # MOTHER_PROGRESS_FLAGS_ATTENTION=1 (they remain in status/list/JSON).
         mother_attention_reasons_json "$id" | jq -c --arg id "$id" \
+            --arg pf "${MOTHER_PROGRESS_FLAGS_ATTENTION:-0}" \
             --arg repo "$(jq -r '.repo // ""' "$f" 2>/dev/null)" \
             --arg branch "$(jq -r '.branch // ""' "$f" 2>/dev/null)" '
-            .[] | {kind: "job_attention", job_id: $id, repo: $repo, branch: $branch,
+            .[] | select($pf == "1" or (.reason != "progress_stalled" and .reason != "burn_ahead"))
+            | {kind: "job_attention", job_id: $id, repo: $repo, branch: $branch,
                    reason: .reason, since: .since,
                    detail: {acked: .acked, since: .since},
                    hint: ("mother status " + $id)}' 2>/dev/null

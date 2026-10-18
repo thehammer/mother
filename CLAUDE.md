@@ -577,6 +577,19 @@ review process time only (no queue waits, no `awaiting`). `progress_fraction` (p
 most once per job per 60s (the terminal 100% write bypasses the gap); `progress_half` once at the first ≥ 50%.
 `mother list`/`status` and the broker merge the file/latest event in as `.progress` — job files stay identical.
 
+**Flags (HC-11).** `progress-tick` writes observe-only `flags[]` entries (`{reason, since, detail}`): `progress_stalled`
+(`{stage, stuck_s}`; no pct increase for > the stage's p90 active duration, floor 10 min, paused time excluded; the last
+increase is tracked in `signals.pct_moved_at_active_s`) and `burn_ahead` (`{cost_frac, progress_frac}`; cost fraction >= 0.5
+and >= 2x pct/100). Raise/clear append `attention_raised` / `attention_cleared {reason}`; a flag change counts as a visible
+change for `progress_updated`. Flags never change state or act on anything. They always show in `mother status`, `mother list`
+(`⚠stalled`/`⚠burn`, `(acked)`) and JSON `attention_reasons`, but enter the `job_attention` needs-attention list only when
+`MOTHER_PROGRESS_FLAGS_ATTENTION=1` (default `0`; job-owned reasons are always included).
+The statusline writes a sibling `${MOTHER_STATUSLINE_CACHE}.progress` (`<id>\t<label>` of the running job with the soonest
+ETA hi; empty if none) next to the **unchanged 6-field cache**; `MOTHER_PROGRESS_ENABLED=0` skips it. `mother retro` reports
+`stage_calibration`, `progress_accuracy` (I13: coverage and median band width / median remaining at the `progress_half` event;
+PASS/FAIL vs 70% and `MOTHER_I13_WIDTH_TARGET`, default `1.0`) and `progress_flags` (real = operator acted while raised, or job
+failed/cancelled; target >= 50%).
+
 ## Internals reference (lazy-loaded)
 
 Resource teardown (worktrees/containers), PR detection (`lib/prdetect.sh`,
