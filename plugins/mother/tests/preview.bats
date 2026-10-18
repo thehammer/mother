@@ -60,6 +60,8 @@ setup() {
     # `up` JSON includes owner_secrets whenever the component list has rm.
     cat > "$_MOCK_BIN/fake-preview-stack" <<'FAKEPS'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 sub="${1:-}"
 printf '%s|%s\n' "$(pwd -P)" "$*" >> "$MOTHER_ROOT/preview-cli.log"
 upper=$(printf '%s' "$sub" | tr 'a-z' 'A-Z')
@@ -149,6 +151,8 @@ FAKEPS
     # logs argv and stdin per call; answers from canned files keyed by URL.
     cat > "$_MOCK_BIN/fake-http" <<'FAKEHTTP'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 base="$MOTHER_ROOT/http"
 mkdir -p "$base/calls"
 n=$(ls "$base/calls" | wc -l | tr -d ' ')
@@ -216,6 +220,8 @@ FAKEHTTP
     # ---- fake rwx (only `results` is meaningful) --------------------------
     cat > "$_MOCK_BIN/rwx" <<'FAKERWX'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 printf '%s|%s\n' "$(pwd -P)" "$*" >> "$MOTHER_ROOT/rwx-calls.log"
 case "${1:-}" in
   results)
@@ -245,6 +251,8 @@ FAKERWX
 
     cat > "$_MOCK_BIN/gh" <<'GH'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 exit 0
 GH
     chmod +x "$_MOCK_BIN/gh"
@@ -1215,6 +1223,8 @@ _plant_secrets() { # <id>
 _install_claude_ok() {
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/preview-cli.log"
 [ -f "$MOTHER_ROOT/plant.sh" ] && . "$MOTHER_ROOT/plant.sh"
 cat <<'EOF'
@@ -1227,6 +1237,8 @@ CLAUDE
 _install_claude_fail() {
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/preview-cli.log"
 [ -f "$MOTHER_ROOT/plant.sh" ] && . "$MOTHER_ROOT/plant.sh"
 exit 1
@@ -1236,6 +1248,8 @@ CLAUDE
 _install_claude_await() {
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/preview-cli.log"
 [ -f "$MOTHER_ROOT/plant.sh" ] && . "$MOTHER_ROOT/plant.sh"
 mother await --question "need clarification before continuing" >/dev/null 2>&1
@@ -1247,6 +1261,8 @@ CLAUDE
 _install_claude_hang() {
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/preview-cli.log"
 [ -f "$MOTHER_ROOT/plant.sh" ] && . "$MOTHER_ROOT/plant.sh"
 echo "$$" > "$MOTHER_ROOT/claude.pid"
@@ -1356,6 +1372,8 @@ _assert_stopped_once() { # <id> <reason>
     _arm_preview "$id" ready
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/preview-cli.log"
 [ -f "$MOTHER_ROOT/plant.sh" ] && . "$MOTHER_ROOT/plant.sh"
 jf="$MOTHER_ROOT/jobs/$MOTHER_JOB_ID.json"
@@ -1427,6 +1445,8 @@ CLAUDE
     _lc_job "$id" '.repo = "mother"'
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/preview-cli.log"
 mother preview up --components rm --no-wait >/dev/null 2>&1
 [ -f "$MOTHER_ROOT/runner/$MOTHER_JOB_ID.preview-secrets.json" ] && echo present > "$MOTHER_ROOT/e2e-secrets"

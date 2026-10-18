@@ -50,6 +50,8 @@ setup() {
 
     cat > "$_MOCK_BIN/gh" <<'GH'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 exit 0
 GH
     chmod +x "$_MOCK_BIN/gh"
@@ -61,6 +63,8 @@ GH
     #   MOCK_RWX_OUTPUT  text printed to stdout
     cat > "$_MOCK_BIN/rwx" <<'RWX'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 action="${2:-}"
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 printf '%s|%s|%s\n' "$(pwd -P)" "$*" "$branch" >> "$MOTHER_ROOT/rwx-calls.log"
@@ -159,6 +163,8 @@ _drop_sandbox_config() {
 _install_claude_ok() {
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/rwx-calls.log"
 cat <<'EOF'
 {"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.01,"modelUsage":{}}
@@ -173,6 +179,8 @@ CLAUDE
 _install_claude_await() {
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/rwx-calls.log"
 mother await --question "need clarification before continuing" >/dev/null 2>&1
 echo "claude-end" >> "$MOTHER_ROOT/rwx-calls.log"
@@ -541,6 +549,8 @@ _hide_rwx() {
     # rewriting the job's worker_pid before it exits.
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/rwx-calls.log"
 jf="$MOTHER_ROOT/jobs/$MOTHER_JOB_ID.json"
 tmp=$(jq '.worker_pid = 999999' "$jf") && printf '%s' "$tmp" > "$jf"
