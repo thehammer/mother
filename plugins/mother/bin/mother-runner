@@ -929,7 +929,7 @@ _notify_event() {
 # broker pid, or zero await subscribers all mean "no client" -> push as usual,
 # so a crashed broker can never silence notifications.
 _notify_client_connected() {
-    [ "${MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT:-1}" = "1" ] || return 1
+    [ "${MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT:-0}" = "1" ] || return 1
     local f="$RUNNER_DIR/broker-clients.json" pid updated subs
     [ -f "$f" ] || return 1
     read -r pid updated subs < <(jq -r '[(.pid // 0), (.updated_at // ""), (.await_subscribers // 0)]

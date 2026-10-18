@@ -206,7 +206,7 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_AWAITING_REMIND_HOURS=N` — reminder cadence for a job left `awaiting` (default: 24; open-ended).
 - `MOTHER_PROGRESS_ENABLED=0` — disable the progress indicator entirely (default: `1`): `mother-usage progress-tick`/`calibrate` do nothing, and `mother list`/`status` ignore progress files, so displays look as before. See "Progress indicator" below. `MOTHER_PROGRESS_INTERVAL=N` (default 30) is the tick cadence; `MOTHER_PROGRESS_CALIBRATE_INTERVAL=N` (default: `MOTHER_ARCHIVE_INTERVAL`, 3600) the calibration cadence; `MOTHER_PROGRESS_TIMEOUT=N` (default 60) the watchdog on each.
 
-- `MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT=0` — send awaiting pushes even while a broker client subscribed to `await` (Nostromo) is connected (default: `1`, suppress; see "Operator attention and notifications").
+- `MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT=1` — opt in to skipping awaiting pushes while a broker client subscribed to `await` (Nostromo) is connected (default: `0`, always push). Opt-in because an `await` subscription doesn't mean the client shows notifications: Nostromo subscribes but shows none today, so suppressing by default silenced Mother whenever Nostromo was open. To be replaced by an explicit `notify` surface registration (see "Operator attention and notifications").
 - `MOTHER_SHARED_RATES_PATH=PATH` — destination `mother-usage publish-rates` writes the rate table to (default: `~/.claude/model-rates.json`), for Bishop or other tools to read the same per-model pricing Mother uses.
 
 ### Durable daemon config (`config.env`)
@@ -444,7 +444,7 @@ reasons yet (HC-08/HC-11/HC-14).
 `$RUNNER_DIR/broker-clients.json` = `{pid, updated_at, clients,
 await_subscribers}` on subscribe/unsubscribe/connect/drop and every ping tick.
 `_notify_awaiting` skips the transport when `MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT`
-(default `1`) is on and the file is fresh (`updated_at` within 3 x
+(default `0`, opt-in) is on and the file is fresh (`updated_at` within 3 x
 `MOTHER_BROKER_PING_SEC`, default 15), its `pid` is alive and
 `await_subscribers > 0`. A suppressed push is bookkept exactly like a delivered
 one (so the 24h cadence continues) and recorded as `awaiting_notified` with

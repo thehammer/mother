@@ -637,8 +637,11 @@ _iso_ms_ago() {
 
 # Write $RUNNER_DIR/broker-clients.json.
 # Usage: _registry [pid] [age_seconds] [await_subscribers]
+# Suppression is opt-in (MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT=1), so the tests in
+# this section that write a registry opt in; the default is tested separately.
 _registry() {
     local pid="${1:-$$}" age="${2:-0}" subs="${3:-1}"
+    export MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT="${MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT:-1}"
     mkdir -p "$RUNNER_DIR"
     jq -n --argjson pid "$pid" --arg at "$(_iso_ms_ago "$age")" --argjson s "$subs" \
         '{pid: $pid, updated_at: $at, clients: 1, await_subscribers: $s}' > "$RUNNER_DIR/broker-clients.json"
@@ -738,6 +741,14 @@ _assert_sent_as_usual() {
     _make_awaiting "job-a"
     mkdir -p "$RUNNER_DIR"
     echo "not json" > "$RUNNER_DIR/broker-clients.json"
+    _tick
+    _assert_sent_as_usual
+}
+
+@test "by default an await subscriber does not suppress the push (suppression is opt-in)" {
+    _make_awaiting "job-a"
+    _registry
+    unset MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT
     _tick
     _assert_sent_as_usual
 }

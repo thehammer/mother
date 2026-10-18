@@ -6,6 +6,8 @@ All notable changes to Mother are documented here. Format based on
 
 ## [Unreleased]
 
+- Notifications: suppressing awaiting pushes while an `await` subscriber is connected is now opt-in (`MOTHER_NOTIFY_SUPPRESS_WHEN_CLIENT=1`). An `await` subscription does not mean the client shows notifications (Nostromo subscribes but shows none), so the old default silenced Mother whenever Nostromo was open.
+
 - Gates (observe): only `no_pr` jobs skip the `pushed` pre-check; a PR job is gated on its pushed head. The whole gate run is bounded by `crew.gates.budget_minutes` (override `MOTHER_GATES_TOTAL_TIMEOUT_S`); overrunning it records the run as `incomplete`, never passed.
 
 ### Added
