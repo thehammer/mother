@@ -645,7 +645,8 @@ _flag_job() {
     [ "$(echo "$pf" | jq .raised)" = "5" ]
     [ "$(echo "$pf" | jq .real)" = "2" ]
     [ "$(echo "$pf" | jq -r .result)" = "FAIL" ]
-=======
+}
+
 # ---------------------------------------------------------------------------
 # HC-14 (HC14-5): review wave spend per lens, refuted claims
 
