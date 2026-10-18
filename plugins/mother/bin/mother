@@ -2882,7 +2882,11 @@ EOF
     mother_claude_extra_args "$effort" review
 
     local lens_log="$LOGS_DIR/$id.lens-${lens}-c${cycle}.log"
-    ( cd "$work_dir" && claude --dangerously-skip-permissions --agent perri-lens --model "$model" \
+    # Read-only by construction: no --dangerously-skip-permissions. Headless runs
+    # can't prompt, so anything outside the allowlist is denied.
+    ( cd "$work_dir" && claude --agent perri-lens --model "$model" \
+        --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(cat:*),Bash(rg:*),Bash(grep:*)" \
+        --disallowedTools "Write,Edit,NotebookEdit,WebFetch,WebSearch" \
         --max-budget-usd "$budget" "${MOTHER_CLAUDE_ARGS[@]}" \
         -p --output-format stream-json --verbose <<< "$prompt" ) \
         > "$lens_log" 2>/dev/null || true
