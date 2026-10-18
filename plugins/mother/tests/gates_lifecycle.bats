@@ -44,6 +44,8 @@ setup() {
 
     cat > "$_MOCK_BIN/gh" <<'GH'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 exit 0
 GH
     chmod +x "$_MOCK_BIN/gh"
@@ -84,6 +86,8 @@ teardown() {
 _gl_install_claude_ok() {
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 # A real worker pushes its branch before it finishes; GL_NO_PUSH=1 is one that didn't.
 [ "${GL_NO_PUSH:-0}" = "1" ] || git push -q -u origin HEAD >/dev/null 2>&1 || true
 cat <<'EOF'
@@ -474,6 +478,8 @@ gates:
     _gl_job g-f1 ".crew = $(_gl_crew "$(_gl_check ok 'true')")"
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 exit 1
 CLAUDE
     chmod +x "$_MOCK_BIN/claude"
@@ -487,6 +493,8 @@ CLAUDE
     _gl_job g-f2 ".crew = $(_gl_crew "$(_gl_check ok 'true')")"
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 mother await --question "need clarification before continuing" >/dev/null 2>&1
 exit 0
 CLAUDE
@@ -501,6 +509,8 @@ CLAUDE
     _gl_job g-f3 ".cancel_requested = true | .crew = $(_gl_crew "$(_gl_check ok 'true')")"
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 sleep 5
 exit 0
 CLAUDE
@@ -514,6 +524,8 @@ CLAUDE
     _gl_job g-f4 ".crew = $(_gl_crew "$(_gl_check ok 'true')")"
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 # Simulate a resume cycle having handed the job to a newer supervisor.
 sleep 1
 f="$MOTHER_ROOT/jobs/${MOTHER_JOB_ID}.json"
@@ -534,6 +546,8 @@ CLAUDE
     # A worker that reports its result and then refuses to exit.
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.01,"modelUsage":{}}'
 sleep 30
 CLAUDE
@@ -665,6 +679,8 @@ gates:
     # The fake worker does real work in its worktree: commit and push the branch.
     cat > "$_MOCK_BIN/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
+MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 mkdir -p app
 echo '<?php' > app/Foo.php
 git add app/Foo.php
