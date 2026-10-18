@@ -1301,7 +1301,8 @@ _row() { mother list | grep -E "^$1 "; }
     aw_label=$(pj aw-1 .label)
     [ -n "$run_label" ] && [ -n "$aw_label" ]
     [[ "$(_row run-1)" == *"running [gating] $run_label"* ]]
-    [[ "$(_row aw-1)" == *"awaiting [gate_hold] $aw_label"* ]]
+    # HC-08 renders a gate hold as the uppercase [GATES-HELD] marker (HC08-10).
+    [[ "$(_row aw-1)" == *"awaiting [GATES-HELD] $aw_label"* ]]
     [[ "$aw_label" == *"paused · gate_hold" ]]
 }
 
