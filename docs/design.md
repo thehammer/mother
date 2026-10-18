@@ -819,6 +819,10 @@ Notes:
   `perri:tests`, `perri:ops-infra`).
 - New `runs.jsonl` run kinds are `gate_fix` and `review_rework`; lens stages are `review-perri:<lens>`.
 - The job key `criteria_source` is `checklist` or `ledger`; `criterion_checked` events come from HC-10.
+  A job's `criteria_source` is set once at `mother add` (`checklist`) and never changed. All criteria reads go
+  through `mother_criteria_view <id>` (`{source, items:[{id,status,evidence}]|null}`, no text). `checklist` reads
+  `$MOTHER_ROOT/checklists/<id>.json`; `ledger` is the Phase 3 source behind the same view (until then
+  `items: null`, i.e. unavailable), so the indicator switches over with no display change and no migration.
 
 ### Broker additions
 

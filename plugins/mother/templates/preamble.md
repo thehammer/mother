@@ -191,6 +191,13 @@ show, or when the plan asks for it.
   result, or "not verified on a stack: <error>".
 - **Exit codes:** 0 ok, 1 failure, 2 usage/validation, 3 refused (disabled/backend), 4 still starting.
 
+## Acceptance criteria checklist
+
+As you complete each acceptance criterion in the plan, run `mother check <ID> --done --evidence <sha>`
+(a commit sha or test name). Ids are the bold tokens in the plan's "Acceptance criteria" section (e.g.
+`HC05-3`, `G5`). Mother uses the share done to refine its progress estimate; it does not replace
+finishing the work.
+
 ---
 
 The rest of this prompt is your actual plan. Read on.

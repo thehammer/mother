@@ -49,6 +49,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/request-types.sh" ] && source "$MOTHER_LIB_DIR/request-types.sh"
 # shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/criteria.sh" ] && source "$MOTHER_LIB_DIR/criteria.sh"
+# shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/findings.sh" ]      && source "$MOTHER_LIB_DIR/findings.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ]  && source "$MOTHER_LIB_DIR/phase-prompt.sh"
@@ -798,6 +800,9 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
             escalation_count: 0,
             adherence_attempts: 0
         }')
+    # Acceptance-criteria checklist (HC-10). The source is fixed here for life.
+    mother_criteria_seed "$id" "$plan_file" || _die "could not seed checklist for $id"
+    job_json=$(printf '%s' "$job_json" | jq '. + {criteria_source: "checklist"}')
     # Gates snapshot (G2): absent crew.yml => no `crew` key at all (G1).
     if [ -n "$crew_json" ]; then
         job_json=$(printf '%s' "$job_json" | jq \
@@ -897,6 +902,17 @@ _status_progress_section() {
           (if .moved_back then "  Moved back: \(.moved_back.reason) at \(.moved_back.at) (was \(.moved_back.from_pct)%)" else empty end),
           (if .paused then "  Paused: yes (figure and ETA frozen; paused time not counted)" else empty end),
           ""'
+}
+
+# Local-only: criterion text is read straight from the checklist file.
+_status_checklist_section() {
+    local f; f=$(mother_criteria_path "$1")
+    [ -r "$f" ] || return 0
+    jq -e '(.items | type) == "array" and (.items | length) > 0' "$f" >/dev/null 2>&1 || return 0
+    echo "=== checklist ==="
+    jq -r '.items[] | "  [" + (if .status == "done" then "x" else " " end) + "] \(.id) \(.text)"
+        + (if .evidence then " (\(.evidence))" else "" end)' "$f"
+    echo ""
 }
 
 cmd_list() {
@@ -1254,6 +1270,7 @@ cmd_status() {
         fi
 
         _status_progress_section "$id"
+        _status_checklist_section "$id"
 
         # Pipeline section — only for pipeline jobs.
         if [ "${kind:-}" = "pipeline" ]; then
@@ -4360,6 +4377,44 @@ _gates_check_one() {
     esac
 }
 
+# mother check <criterion-id> [--done|--open] [--evidence X] [--job ID]
+cmd_check() {
+    local cid="" job="${MOTHER_JOB_ID:-}" st="done" evidence=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --done)     st="done"; shift ;;
+            --open)     st="open"; shift ;;
+            --evidence) [ $# -ge 2 ] || _die "--evidence needs a value"; evidence="$2"; shift 2 ;;
+            --job)      [ $# -ge 2 ] || _die "--job needs a value"; job="$2"; shift 2 ;;
+            -*)         _die "unknown flag for check: $1" ;;
+            *)          [ -z "$cid" ] || _die "check: one criterion id only"; cid="$1"; shift ;;
+        esac
+    done
+    [ -n "$cid" ] || _die "usage: mother check <criterion-id> [--done|--open] [--evidence <sha|test>] [--job ID]"
+    [ -n "$job" ] || _die "check: no job (pass --job or run inside a worker with MOTHER_JOB_ID)"
+    _job_exists "$job" || _die "no such job: $job"
+    local f; f=$(mother_criteria_path "$job")
+    [ -r "$f" ] || _die "no checklist for job $job"
+    if ! jq -e --arg id "$cid" '.items | any(.id == $id)' "$f" >/dev/null 2>&1; then
+        echo "mother: unknown criterion '$cid' for job $job; valid ids: $(jq -r '[.items[]?.id] | join(", ")' "$f" 2>/dev/null)" >&2
+        return 1
+    fi
+    _check_apply() {
+        local new
+        new=$(jq -c --arg id "$cid" --arg st "$st" --arg ev "$evidence" \
+            '.items |= map(if .id == $id then .status = $st | (if $ev != "" then .evidence = $ev else . end) else . end)' "$f") \
+            || return 1
+        _atomic_write "$f" "$new"
+    }
+    _with_lock "$f" _check_apply || _die "could not update checklist for $job"
+    unset -f _check_apply
+    local has_ev=false
+    jq -e --arg id "$cid" '.items[] | select(.id == $id) | .evidence != null' "$f" >/dev/null 2>&1 && has_ev=true
+    _append_event "$job" "criterion_checked" \
+        "$(jq -nc --arg id "$cid" --arg s "$st" --argjson e "$has_ev" '{id: $id, status: $s, has_evidence: $e}')"
+    echo "$cid: $st"
+}
+
 cmd_gates() {
     local sub="${1:-}"
     [ $# -gt 0 ] && shift
@@ -4547,6 +4602,8 @@ Usage:
   mother adherence-review ID                 (check PR diff against original plan)
   mother gates run [--job ID] [--repo PATH] [--base REF] [--format text|json]
                                               (run the repo's .mother/crew.yml quality gates)
+  mother check CRITERION-ID [--done|--open] [--evidence SHA|TEST] [--job ID]
+                                              (tick an acceptance criterion; job defaults to $MOTHER_JOB_ID)
   mother gates check [--repo PATH] [--ref REF]  (validate .mother/crew.yml at a ref)
   mother doctor                              (dependency checks + crew config check)
   mother review-phase ID --reviewer AGENT    (run one pipeline reviewer: ada|archie|perri)
@@ -4867,6 +4924,7 @@ main() {
         await)             cmd_await "$@" ;;
         preview)           cmd_preview "$@" ;;
         gates)             cmd_gates "$@" ;;
+        check)             cmd_check "$@" ;;
         doctor)            cmd_doctor "$@" ;;
         resume)            cmd_resume "$@" ;;
         events)            cmd_events "$@" ;;

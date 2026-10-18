@@ -1780,6 +1780,31 @@ def _gates_fraction(stage, gates):
     return None
 
 
+def _checklist_signal(root, job):
+    """Same rules as lib/criteria.sh `mother_criteria_view` (the shell seam):
+    source from job.criteria_source (absent = checklist); only a readable
+    checklist with at least one item is available. Never reads criterion text."""
+    source = job.get("criteria_source") or "checklist"
+    if source != "checklist" or not root:
+        return {"status": "unavailable", "source": source}
+    data = _read_json(os.path.join(root, "checklists", str(job.get("id")) + ".json"))
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items:
+        return {"status": "unavailable", "source": source}
+    items = [i for i in items if isinstance(i, dict)]
+    if not items:
+        return {"status": "unavailable", "source": source}
+    done = sum(1 for i in items if i.get("status") == "done")
+    return {"status": "available", "done": done, "total": len(items), "source": source}
+
+
+def _checklist_fraction(stage, checklist):
+    """Within-stage signal for build: done/total (None outside build or when unavailable)."""
+    if stage == "build" and checklist["status"] == "available":
+        return checklist["done"] / float(checklist["total"])
+    return None
+
+
 def _eta_object(final, band, basis, scope_n):
     if final:
         return {"lo_s": 0, "hi_s": 0, "label": "", "basis": "none", "n": None}
@@ -1833,7 +1858,7 @@ def _progress_label(pct, gates_out, eta_label_text, final, paused):
     return " · ".join(parts)
 
 
-def compute_progress(job, events, now_s, calib, prev):
+def compute_progress(job, events, now_s, calib, prev, root=None):
     """Build the progress object for one job (no I/O)."""
     state = job.get("state")
     nonfinal = _nonfinal(job)
@@ -1848,8 +1873,18 @@ def compute_progress(job, events, now_s, calib, prev):
     gates_out = {k: v for k, v in gates.items() if not k.startswith("_")} if gates else None
     stage = _current_stage(seg, nonfinal, gates, gates_failed)
 
+    checklist = _checklist_signal(root, job)
+    within = _gates_fraction(stage, gates)
+    if within is None:
+        done_frac = _checklist_fraction(stage, checklist)
+        if done_frac is not None:
+            # Refines position within build only: never below the elapsed
+            # figure, never past the stage cap.
+            median = medians.get(stage) or PROGRESS_DEFAULT_MEDIANS.get(stage) or 1
+            elapsed_frac = seg.stage_totals.get(stage, 0.0) / float(median)
+            within = min(max(elapsed_frac, done_frac), PROGRESS_STAGE_CAP)
     fraction, stage_frac = progress_fraction(
-        stage, seg.stage_totals.get(stage, 0.0), shares, medians, _gates_fraction(stage, gates))
+        stage, seg.stage_totals.get(stage, 0.0), shares, medians, within)
     pct = _shown_pct(fraction, final)
     elapsed = int(round(seg.elapsed))
     band = None if final else eta_band(elapsed, stage, scope)
@@ -1868,7 +1903,7 @@ def compute_progress(job, events, now_s, calib, prev):
             "stage_frac": round(stage_frac, 3),
             "elapsed_active_s": elapsed,
             "gates": gates_out,
-            "checklist": {"status": "unavailable"},
+            "checklist": checklist,
             "cost": _cost_signal(job),
         },
         "eta": eta, "paused": paused, "flags": [],
@@ -1972,7 +2007,7 @@ def _tick_job(root, job, now_s, calib):
     if not (live or final_write):
         return False
     events = _load_events(os.path.join(root, "events", jid + ".jsonl"))
-    obj = compute_progress(job, events, now_s, calib, prev)
+    obj = compute_progress(job, events, now_s, calib, prev, root)
 
     # updated_at only moves when something else changed, so idle ticks are no-ops.
     stable = lambda o: {k: v for k, v in (o or {}).items() if k != "updated_at"}
