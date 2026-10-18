@@ -3133,8 +3133,9 @@ _render_review_findings() {
             + (if .conflict then "  CONFLICT (with \(.conflicts_with | join(",")))" else "" end)
             + "\n      \(.id) \(.location // "-"): \(.summary // .detail // "")"
             + ([claimline] | map("\n      " + .) | join(""));
-        ([.findings[] | select(.kind != "coverage_gap" and .verification != "refuted")]) as $main
-        | (if ($main | length) == 0 then "  (no findings)" else ($main[] | line) end),
+        ([.findings[] | select(.kind != "coverage_gap" and .kind != "lens_error" and .verification != "refuted")]) as $main
+        | (if ((.lens_errors // []) | length) > 0 then "  Lenses that did not complete (not a clean pass):", ((.lens_errors // [])[] | "    \(.lens): \(.reason)") else empty end),
+          (if ($main | length) == 0 then "  (no findings)" else ($main[] | line) end),
           (if (.refuted | length) > 0 then "  Refuted (not sent to worker):", (.refuted[] | line) else empty end),
           (if (.coverage_gaps | length) > 0 then "  Coverage gaps (no lens examined):", (.coverage_gaps[] | "    \(.location)") else empty end)
     ' "$merged"

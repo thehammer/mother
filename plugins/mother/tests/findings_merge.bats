@@ -223,3 +223,32 @@ _set_findings() { # <lens> <findings-json> [examined-json]
     [ "$(_m '.refuted | length')" = "0" ]
     [ "$(_m '.actionable | map(select(.kind != "coverage_gap")) | .[0].severity')" = "blocking" ]
 }
+
+@test "lens errors: an errored lens is surfaced even when other lenses covered its files" {
+    _only_lens correctness
+    printf '{"findings":[],"examined":[],"cost_usd":null,"decision":"error","state":"error","error_reason":"exit_nonzero"}' > "$WAVE/phi-security.json"
+    run _merge; [ "$status" -eq 0 ]
+    [ "$(_m '[.findings[] | select(.kind == "lens_error")] | length')" = "1" ]
+    [ "$(_m '.findings[] | select(.kind == "lens_error") | .lenses[0]')" = "phi-security" ]
+    [ "$(_m '.findings[] | select(.kind == "lens_error") | .severity')" = "blocking" ]
+    [ "$(_m '.findings[] | select(.kind == "lens_error") | .target')" = "human" ]
+    [ "$(_m '.lens_errors | length')" = "1" ]
+    [ "$(jq -r '.lens_errors' "$WAVE/summary.json")" = "1" ]
+    run mother status "$ID"
+    [[ "$output" == *"phi-security"* ]]
+    [[ "$output" == *"did not complete"* ]]
+}
+
+@test "lens errors: an unreadable side file is surfaced, not silently skipped" {
+    _only_lens correctness
+    printf '{not json' > "$WAVE/tests.json"
+    run _merge; [ "$status" -eq 0 ]
+    [ "$(_m '.lens_errors | map(.lens) | index("tests") != null')" = "true" ]
+    [ "$(_m '.lens_errors[] | select(.lens == "tests") | .reason')" = "unreadable" ]
+}
+
+@test "lens errors: a clean wave reports zero lens errors" {
+    run _merge; [ "$status" -eq 0 ]
+    [ "$(_m '.lens_errors | length')" = "0" ]
+    [ "$(jq -r '.lens_errors' "$WAVE/summary.json")" = "0" ]
+}

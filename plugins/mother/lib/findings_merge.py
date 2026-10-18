@@ -119,18 +119,25 @@ def overlaps(a, b, slack):
 
 
 def load_lenses(wave_dir):
-    out = []
+    """(lenses, errors): readable side files, and the lenses whose side file
+    could not be read. An unreadable side file is a lens that did not report,
+    never a lens with nothing to say."""
+    out, errors = [], []
     for name in sorted(os.listdir(wave_dir)):
-        if not name.endswith(".json") or name in ("merged.json", "summary.json"):
+        # Dotfiles are Mother's own scratch (e.g. .changed.<pid>.json), not lens side files.
+        if not name.endswith(".json") or name.startswith(".") or name in ("merged.json", "summary.json"):
             continue
         try:
             with open(os.path.join(wave_dir, name)) as f:
                 data = json.load(f)
         except (OSError, ValueError):
+            errors.append({"lens": name[:-5], "reason": "unreadable"})
             continue
         if isinstance(data, dict):
             out.append((name[:-5], data))
-    return out
+        else:
+            errors.append({"lens": name[:-5], "reason": "unreadable"})
+    return out, errors
 
 
 def dedup(raw):
@@ -193,7 +200,13 @@ def mark_conflicts(items):
 def merge(wave_dir, work_dir, sha, changed):
     verifier = Verifier(work_dir, sha, os.environ.get("MOTHER_CLAIM_VERIFY_ENABLED", "1") != "0")
     raw, examined = [], set()
-    for lens, data in load_lenses(wave_dir):
+    lenses, lens_errors = load_lenses(wave_dir)
+    for lens, data in lenses:
+        # A lens that errored (HC-12 writes state/decision "error") did not
+        # review: surface it on its own, never infer it from coverage gaps.
+        if data.get("state") == "error" or data.get("decision") == "error":
+            lens_errors.append({"lens": lens, "reason": str(data.get("error_reason") or "error")})
+            continue
         examined.update(e for e in data.get("examined") or [] if isinstance(e, str))
         for i, f in enumerate(data.get("findings") or []):
             if not isinstance(f, dict):
@@ -214,6 +227,15 @@ def merge(wave_dir, work_dir, sha, changed):
                      "claims": [], "verification": "none", "conflict": False, "conflicts_with": []})
     findings += gaps
 
+    lens_errors.sort(key=lambda e: e["lens"])
+    errs = []
+    for n, e in enumerate(lens_errors):
+        errs.append({"id": "lens-err-%d" % (n + 1), "target": "human", "severity": "blocking",
+                     "kind": "lens_error", "location": e["lens"], "reason": e["reason"],
+                     "lenses": [e["lens"]], "merged_from": [], "claims": [], "verification": "none",
+                     "conflict": False, "conflicts_with": []})
+    findings += errs
+
     refuted = [f for f in findings if f["verification"] == "refuted"]
     actionable = []
     for f in findings:
@@ -228,12 +250,12 @@ def merge(wave_dir, work_dir, sha, changed):
     counts = {k: sum(1 for f in findings if f["verification"] == k)
               for k in ("verified", "refuted", "unverified")}
     merged = {"findings": findings, "actionable": actionable, "refuted": refuted,
-              "coverage_gaps": gaps, "claims": counts}
+              "coverage_gaps": gaps, "lens_errors": lens_errors, "claims": counts}
     summary = {"findings": len(findings),
                "blocking": sum(1 for f in actionable if f["severity"] == "blocking"),
                "advisory": sum(1 for f in actionable if f["severity"] == "advisory"),
                "conflicts": sum(1 for f in findings if f["conflict"]),
-               "coverage_gaps": len(gaps), "claims": counts}
+               "coverage_gaps": len(gaps), "lens_errors": len(lens_errors), "claims": counts}
     for name, doc in (("merged.json", merged), ("summary.json", summary)):
         tmp = os.path.join(wave_dir, "%s.tmp.%d" % (name, os.getpid()))
         with open(tmp, "w") as fh:
