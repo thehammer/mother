@@ -2699,13 +2699,32 @@ EOF
     review_log="$LOGS_DIR/$id.review-${reviewer}-c$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null).log"
     ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" \
         "${MOTHER_CLAUDE_ARGS[@]}" -p --output-format stream-json --verbose <<< "$review_prompt" ) \
-        > "$review_log" 2>/dev/null || true
+        > "$review_log" 2>/dev/null
+    local review_rc=$?
     # findings_extract/verdict text want the reviewer's plain-text response;
     # extract it from the last result event when the stream is stream-json,
     # falling back to the raw file itself (a plaintext mock in tests, or a
     # stream that never produced a result event).
     _extract_transcript_result_text "$review_log" > "$tmpfile" 2>/dev/null \
         || cp "$review_log" "$tmpfile" 2>/dev/null
+
+    # A reviewer that crashed (non-zero exit) or produced no output did not
+    # review anything. Fail like an unparseable review (exit 2, nothing
+    # recorded) instead of falling through to "no findings block" = clean pass.
+    if [ "$review_rc" -ne 0 ] || ! grep -q '[^[:space:]]' "$tmpfile" 2>/dev/null; then
+        local fail_reason="empty_output"
+        [ "$review_rc" -ne 0 ] && fail_reason="exit_nonzero"
+        rm -f "$tmpfile"
+        _append_event "$id" "review_failed" \
+            "$(jq -nc --arg r "$reviewer" --arg why "$fail_reason" --argjson rc "$review_rc" \
+                '{reviewer: $r, reason: $why, exit_code: $rc}')"
+        type mother_record_run_usage >/dev/null 2>&1 && mother_record_run_usage "$id" "error" "$review_log" 0 "" \
+            "review-${reviewer}" "review-${reviewer}" "review" \
+            "$(jq -nc --arg model "$reviewer_model" --arg effort "$reviewer_effort" \
+                '{model: $model, effort: (($effort | select(length>0)) // null), decision: null, finding_count: null}')"
+        echo "mother: review-phase: $reviewer produced no review ($fail_reason); nothing recorded" >&2
+        return 2
+    fi
     # Extract findings block.
     local raw_findings
     raw_findings=$(findings_extract "$tmpfile" 2>/dev/null || true)

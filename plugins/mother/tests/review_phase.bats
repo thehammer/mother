@@ -211,6 +211,35 @@ _make_pipeline_succeeded_job() {
 }
 
 # ---------------------------------------------------------------------------
+# A reviewer that crashed or produced nothing did not review: never a clean pass
+
+@test "review-phase: a crashed reviewer (non-zero exit) returns 2, emits review_failed, and records no findings" {
+    _make_pipeline_succeeded_job "job-crash1"
+    export MOCK_CLAUDE_STDOUT=""
+    export MOCK_CLAUDE_EXIT=1
+
+    run mother review-phase "job-crash1" --reviewer perri
+    [ "$status" -eq 2 ]
+
+    run jq -r '.pipeline.reviewer_findings.perri // "null"' "$JOBS_DIR/job-crash1.json"
+    [ "$output" = "null" ]
+    assert_event_kind "job-crash1" "review_failed"
+    ! grep -q '"decision":"ship"' "$EVENTS_DIR/job-crash1.jsonl"
+}
+
+@test "review-phase: a reviewer with empty output (exit 0) returns 2 and records no findings" {
+    _make_pipeline_succeeded_job "job-empty-out1"
+    export MOCK_CLAUDE_STDOUT=""
+
+    run mother review-phase "job-empty-out1" --reviewer archie
+    [ "$status" -eq 2 ]
+
+    run jq -r '.pipeline.reviewer_findings.archie // "null"' "$JOBS_DIR/job-empty-out1.json"
+    [ "$output" = "null" ]
+    assert_event_kind "job-empty-out1" "review_failed"
+}
+
+# ---------------------------------------------------------------------------
 # Invalid findings block
 
 @test "review-phase: invalid findings block returns 2 and does not mutate reviewer_findings" {
