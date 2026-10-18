@@ -462,7 +462,8 @@ _retro_json() { mother-usage retro --root "$MOTHER_ROOT" --since 3w --format jso
     [ "$(echo "$output" | jq -r '.red_at_presentation.rr["2026-W40"].red_on_gate_check')" = "1" ]
 }
 
-# ===========================================================================
+# ====================================================================
+
 # HC-11: stage_calibration, progress_accuracy, progress_flags
 #
 # JSON shapes assumed (retro tables are keyed like the other retro tables):
@@ -644,4 +645,61 @@ _flag_job() {
     [ "$(echo "$pf" | jq .raised)" = "5" ]
     [ "$(echo "$pf" | jq .real)" = "2" ]
     [ "$(echo "$pf" | jq -r .result)" = "FAIL" ]
+=======
+# ---------------------------------------------------------------------------
+# HC-14 (HC14-5): review wave spend per lens, refuted claims
+
+# _wave_job <id> — a succeeded job with one review wave cycle.
+_wave_job() {
+    local id="$1" recent; recent=$(_days_ago 1)
+    make_job "$id" "succeeded" '.repo = "waverepo" | .created_at = "'"$recent"'" | .finished_at = "'"$recent"'"
+        | .review_wave = {cycle: 0, status: "done"}'
+    _ev "$id" review_cycle_started '{"cycle":0,"wave":true,"reviewers":["archie:adherence","perri:correctness","perri:phi-security"]}'
+    _ev "$id" review_cycle_completed '{"cycle":0,"wave":true,"decision":"ship"}'
+}
+
+@test "HC14-5: review_wave reports runs, median cost and spend share per lens, and adherence separately" {
+    _wave_job w1
+    _append_metrics_line '{"schema":2,"job_id":"w1","stage":"review-perri:correctness","cost_usd":0.30,"outcome":"succeeded"}'
+    _append_metrics_line '{"schema":2,"job_id":"w1","stage":"review-perri:phi-security","cost_usd":0.50,"outcome":"succeeded"}'
+    _append_metrics_line '{"schema":2,"job_id":"w1","stage":"adherence","pre_ready":true,"cost_usd":1.20,"outcome":"succeeded"}'
+    run _retro_json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r '.review_wave.jobs')" = "1" ]
+    [ "$(echo "$output" | jq -r '.review_wave.lenses["perri:correctness"].runs')" = "1" ]
+    echo "$output" | jq -e '(.review_wave.lenses["perri:phi-security"].median_cost_usd - 0.5) | fabs < 0.001' >/dev/null
+    echo "$output" | jq -e '(.review_wave.lenses["perri:correctness"].spend_share_pct - 15.0) | fabs < 0.1' >/dev/null
+    echo "$output" | jq -e '(.review_wave.adherence.spend_share_pct - 60.0) | fabs < 0.1' >/dev/null
+    echo "$output" | jq -e '(.review_wave.review_cost_usd - 2.0) | fabs < 0.001' >/dev/null
+}
+
+@test "HC14-5: an errored lens run is counted as an error, and lens skips are counted by reason" {
+    _wave_job w2
+    _append_metrics_line '{"schema":2,"job_id":"w2","stage":"review-perri:correctness","cost_usd":0.10,"outcome":"error"}'
+    _ev w2 lens_skipped '{"reviewer":"perri:ops-infra","lens":"ops-infra","reason":"path_scope"}'
+    run _retro_json
+    [ "$(echo "$output" | jq -r '.review_wave.lenses["perri:correctness"].errors')" = "1" ]
+    [ "$(echo "$output" | jq -r '.review_wave.lenses["perri:ops-infra"].skips.path_scope')" = "1" ]
+}
+
+@test "HC14-5: refuted claims are counted per lens from merged.json, and refuted findings sent to a worker are reported" {
+    _wave_job w3
+    mkdir -p "$MOTHER_ROOT/crew/w3/wave/c0"
+    printf '%s' '{"findings":[],"actionable":[],"refuted":[{"id":"f1","lenses":["correctness","tests"]},{"id":"f2","lenses":["correctness"]}],"coverage_gaps":[],"lens_errors":[],"claims":{"verified":0,"refuted":2,"unverified":0}}' \
+        > "$MOTHER_ROOT/crew/w3/wave/c0/merged.json"
+    _append_metrics_line '{"schema":2,"job_id":"w3","stage":"cody","run_kind":"review_rework","refuted_sent":0,"cost_usd":1.0}'
+    run _retro_json
+    [ "$(echo "$output" | jq -r '.refuted_claims.by_lens.correctness')" = "2" ]
+    [ "$(echo "$output" | jq -r '.refuted_claims.by_lens.tests')" = "1" ]
+    [ "$(echo "$output" | jq -r '.refuted_claims.total')" = "3" ]
+    [ "$(echo "$output" | jq -r '.refuted_claims.refuted_sent_to_worker')" = "0" ]
+}
+
+@test "HC14-5: with no review-wave jobs both tables are empty, and the text report never prints None" {
+    run _retro_json
+    [ "$(echo "$output" | jq -c '.review_wave')" = "{}" ]
+    [ "$(echo "$output" | jq -c '.refuted_claims')" = "{}" ]
+    run mother-usage retro --root "$MOTHER_ROOT" --since 3w
+    [ "$status" -eq 0 ]
+    [[ "$output" != *": None"* ]]
 }
