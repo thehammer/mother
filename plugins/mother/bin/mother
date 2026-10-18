@@ -1382,6 +1382,10 @@ cmd_status() {
         fi
 
         _status_gates_section "$id" "$job_file"
+        local _wd
+        for _wd in $(ls -d "$MOTHER_ROOT/crew/$id/wave"/c* 2>/dev/null | sort -V | tail -n 1); do
+            _render_review_findings "$_wd"
+        done
 
         echo "=== origin ==="
         jq -r '
@@ -3060,6 +3064,83 @@ _merge_reviewer_findings() {
     '
 }
 
+# ---------- merge-findings (dispatcher) + wave merge (HC-13) ----------
+#
+# `mother merge-findings ID` (no --wave) is the pipeline merge above, unchanged.
+# `mother merge-findings [ID] --wave WAVE_ID [--cycle N]` merges the lens files in
+# $MOTHER_ROOT/crew/WAVE_ID/wave/c<N>/ through lib/findings_merge.py, verifies cited
+# claims at the job's HEAD, writes merged.json + summary.json there, emits a
+# counts-only claims_verified event and prints the worker-facing `actionable` list.
+# ID (the job whose work_dir/base_ref to use) defaults to WAVE_ID.
+
+cmd_merge_findings() {
+    local id="" wave="" cycle=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --wave)  [ $# -ge 2 ] || _die "merge-findings: --wave needs a value"; wave="$2"; shift 2 ;;
+            --cycle) [ $# -ge 2 ] || _die "merge-findings: --cycle needs a value"; cycle="$2"; shift 2 ;;
+            -*)      _die "merge-findings: unknown flag: $1" ;;
+            *)       id="$1"; shift ;;
+        esac
+    done
+    if [ -z "$wave" ]; then
+        _merge_reviewer_findings "$id"
+        return
+    fi
+    case "$cycle" in ''|*[!0-9]*) _die "merge-findings: --cycle must be a non-negative integer" ;; esac
+    [ -n "$id" ] || id="$wave"
+    _job_exists "$id" || _die "no such job: $id"
+    local job_file; job_file=$(_job_path "$id")
+    local work_dir base_ref
+    work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
+    base_ref=$(jq -r '.base_ref // empty' "$job_file")
+    [ -n "$work_dir" ] && [ -d "$work_dir" ] || _die "merge-findings: work_dir is missing ($work_dir)"
+    local wave_dir="$MOTHER_ROOT/crew/$wave/wave/c${cycle}"
+    [ -d "$wave_dir" ] || _die "merge-findings: no wave directory: $wave_dir"
+
+    local sha; sha=$(git -C "$work_dir" rev-parse HEAD 2>/dev/null) || _die "merge-findings: cannot resolve HEAD in $work_dir"
+    local base="" changed_file="$wave_dir/.changed.$$.json"
+    [ -n "$base_ref" ] && base=$(git -C "$work_dir" merge-base "$base_ref" "$sha" 2>/dev/null || true)
+    if [ -n "$base" ]; then
+        git -C "$work_dir" diff --name-only "$base" "$sha" 2>/dev/null
+    fi | jq -R . | jq -s . > "$changed_file"
+
+    local summary
+    summary=$(python3 "$MOTHER_LIB_DIR/findings_merge.py" merge "$wave_dir" "$work_dir" "$sha" "$changed_file")
+    local rc=$?
+    rm -f "$changed_file"
+    [ $rc -eq 0 ] || _die "merge-findings: merge failed"
+
+    _append_event "$id" "claims_verified" "$(printf '%s' "$summary" | jq -c '.claims')"
+    jq '.actionable' "$wave_dir/merged.json"
+}
+
+# _render_review_findings <wave_dir>
+# Text renderer for merged.json (local files only). "citation found" means the
+# quote was located at the cited place -- never that the finding is correct.
+_render_review_findings() {
+    local merged="$1/merged.json"
+    [ -f "$merged" ] || return 0
+    echo "=== review findings ==="
+    jq -r '
+        def claimline:
+            if .verification == "verified" then "citation found"
+            elif .verification == "refuted" then "citation REFUTED (not in file)"
+            elif .verification == "unverified" then "citation not verified"
+            else empty end;
+        def line:
+            "  [\((.lenses // []) | join(","))] \(.severity) -> \(.target)"
+            + (if .conflict then "  CONFLICT (with \(.conflicts_with | join(",")))" else "" end)
+            + "\n      \(.id) \(.location // "-"): \(.summary // .detail // "")"
+            + ([claimline] | map("\n      " + .) | join(""));
+        ([.findings[] | select(.kind != "coverage_gap" and .verification != "refuted")]) as $main
+        | (if ($main | length) == 0 then "  (no findings)" else ($main[] | line) end),
+          (if (.refuted | length) > 0 then "  Refuted (not sent to worker):", (.refuted[] | line) else empty end),
+          (if (.coverage_gaps | length) > 0 then "  Coverage gaps (no lens examined):", (.coverage_gaps[] | "    \(.location)") else empty end)
+    ' "$merged"
+    echo
+}
+
 # ---------- adherence-review ----------
 #
 # Spawn Archie to review whether a job's PR diff matches the original plan.
@@ -4662,6 +4743,7 @@ Usage:
   mother review-lens ID --lens NAME [--budget-usd N]
                                              (run one review lens: correctness|phi-security|tests|ops-infra)
   mother merge-findings ID                   (merge per-reviewer findings into one array; stdout only)
+  mother merge-findings [ID] --wave WAVE_ID [--cycle N]  (merge a lens wave; prints the actionable list)
   mother await [ID] --question TEXT          (worker-side: pause for operator input)
   mother preview up|wait|info|verify|call|fake|down   (worker-side: per-job preview stack;
                                               see "Preview stacks" below)
@@ -5024,7 +5106,7 @@ main() {
         adherence-review)  cmd_adherence_review "$@" ;;
         review-phase)      cmd_review_phase "$@" ;;
         review-lens)       cmd_review_lens "$@" ;;
-        merge-findings)    _merge_reviewer_findings "${1:-}" ;;
+        merge-findings)    cmd_merge_findings "$@" ;;
         await)             cmd_await "$@" ;;
         preview)           cmd_preview "$@" ;;
         gates)             cmd_gates "$@" ;;

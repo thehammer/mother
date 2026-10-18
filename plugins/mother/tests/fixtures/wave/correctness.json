@@ -1,0 +1,7 @@
+{"findings":[
+ {"id":"f1","target":"cody","severity":"advisory","summary":"off by one","location":"src/A.php:10-12","reviewer":"perri:correctness","lens":"correctness"},
+ {"id":"f2","target":"cody","severity":"blocking","summary":"catch is too narrow","location":"src/C.php:5","reviewer":"perri:correctness","lens":"correctness",
+  "claims":[{"path":"src/C.php","line":5,"quote":"catch (\\Throwable $e)"}]},
+ {"id":"f3","target":"cody","severity":"blocking","summary":"missing file claim","location":"src/Gone.php:1","reviewer":"perri:correctness","lens":"correctness",
+  "claims":[{"path":"src/Gone.php","line":1,"quote":"anything"}]}
+],"examined":["src/A.php","src/C.php"],"cost_usd":0.1,"decision":"continue"}

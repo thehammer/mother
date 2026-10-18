@@ -1,0 +1,3 @@
+{"findings":[
+ {"id":"f1","target":"cody","severity":"blocking","summary":"no test for loop","location":"src/A.php:11-13","reviewer":"perri:tests","lens":"tests"}
+],"examined":["src/A.php"],"cost_usd":0.1,"decision":"continue"}

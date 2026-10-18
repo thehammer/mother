@@ -1,0 +1,4 @@
+{"findings":[
+ {"id":"f1","target":"human","severity":"blocking","summary":"needs a decision","location":"src/A.php:10-12","reviewer":"perri:ops-infra","lens":"ops-infra"},
+ {"id":"f2","target":"cody","severity":"blocking","summary":"no claim given","reviewer":"perri:ops-infra","lens":"ops-infra","asserts_existing_code":true}
+],"examined":["src/A.php"],"cost_usd":0.1,"decision":"block_human"}
