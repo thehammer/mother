@@ -907,7 +907,8 @@ _gates_start_attempt() {
 }
 
 # Draft discipline (B3): an enforce-mode PR stays a draft until Mother marks it
-# ready. Converts a non-draft PR back to draft; checked once per URL per run.
+# ready. Converts a non-draft PR back to draft; checked once per URL per worker
+# turn (_gates_fix clears the memo after every fix turn).
 _pr_draft_ok_url=""
 _gates_ensure_draft() {
     local url is_draft
@@ -1029,6 +1030,8 @@ _gates_fix() {
         next_session_id=""
     fi
     rm -f "$fixfile"
+    # The fix turn could have marked the PR ready itself: re-check draft state.
+    _pr_draft_ok_url=""
 
     # A superseded supervisor must not touch the job again.
     if [ -n "${worker_pid:-}" ] && \
