@@ -18,11 +18,17 @@
 #       Prints the JSON array registered with gh_mock_set_branch_pr, else [].
 #   gh api repos/<o>/<r>/commits/<sha>/pulls
 #       Prints the JSON array registered with gh_mock_set_commit_pulls, else [].
+#   gh api repos/<o>/<r>/commits/<sha>/check-runs
+#       Prints the {"check_runs": [...]} registered with gh_mock_set_check_runs,
+#       else {"check_runs": []}.
+#   gh pr checks <url> --json name,state,bucket
+#       Prints the JSON array registered with gh_mock_set_pr_checks, else [].
 #
 # Every invocation's argv is appended (space-joined) to $MOTHER_ROOT/mock-gh-calls.
 
 gh_mock_install() {
-    mkdir -p "$MOTHER_ROOT/gh/pr" "$MOTHER_ROOT/gh/pr-list" "$MOTHER_ROOT/gh/commit-pulls"
+    mkdir -p "$MOTHER_ROOT/gh/pr" "$MOTHER_ROOT/gh/pr-list" "$MOTHER_ROOT/gh/commit-pulls" \
+        "$MOTHER_ROOT/gh/check-runs" "$MOTHER_ROOT/gh/pr-checks"
     : > "$MOTHER_ROOT/mock-gh-calls"
     cat > "$_MOCK_BIN/gh" <<'GHEOF'
 #!/usr/bin/env bash
@@ -44,6 +50,10 @@ case "${1:-} ${2:-}" in
         [ -f "$f" ] || exit 1
         if [ -n "$expr" ]; then jq -r "$expr" "$f"; else cat "$f"; fi
         ;;
+    "pr checks")
+        f="$root/pr-checks/$(_key "${3:-}").json"
+        if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi
+        ;;
     "pr list")
         head=""
         shift 2
@@ -57,6 +67,11 @@ case "${1:-} ${2:-}" in
         if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi
         ;;
     "api "*)
+        csha=$(printf '%s' "${2:-}" | sed -n 's|.*/commits/\([^/]*\)/check-runs.*|\1|p')
+        if [ -n "$csha" ]; then
+            if [ -f "$root/check-runs/$csha.json" ]; then cat "$root/check-runs/$csha.json"; else echo '{"check_runs":[]}'; fi
+            exit 0
+        fi
         sha=$(printf '%s' "${2:-}" | sed -n 's|.*/commits/\([^/]*\)/pulls.*|\1|p')
         if [ -n "$sha" ] && [ -f "$root/commit-pulls/$sha.json" ]; then
             cat "$root/commit-pulls/$sha.json"
@@ -102,3 +117,27 @@ gh_mock_set_commit_pulls() {
 
 # gh_mock_calls — print the recorded call log.
 gh_mock_calls() { cat "$MOTHER_ROOT/mock-gh-calls" 2>/dev/null || true; }
+
+# gh_mock_set_check_runs <sha> <name:conclusion> ...
+#   conclusion "pending" registers an in-progress run (no conclusion yet).
+gh_mock_set_check_runs() {
+    local sha="$1"; shift
+    local runs='[]' spec
+    for spec in "$@"; do
+        runs=$(printf '%s' "$runs" | jq -c --arg n "${spec%%:*}" --arg c "${spec#*:}" '
+            . + [if $c == "pending" then {name: $n, status: "in_progress", conclusion: null}
+                 else {name: $n, status: "completed", conclusion: $c} end]')
+    done
+    jq -nc --argjson r "$runs" '{check_runs: $r}' > "$MOTHER_ROOT/gh/check-runs/$sha.json"
+}
+
+# gh_mock_set_pr_checks <url> <name:bucket> ...   (`gh pr checks --json name,state,bucket`)
+gh_mock_set_pr_checks() {
+    local url="$1"; shift
+    local out='[]' spec
+    for spec in "$@"; do
+        out=$(printf '%s' "$out" | jq -c --arg n "${spec%%:*}" --arg b "${spec#*:}" \
+            '. + [{name: $n, state: ($b | ascii_upcase), bucket: $b}]')
+    done
+    printf '%s' "$out" > "$MOTHER_ROOT/gh/pr-checks/$(_gh_mock_key "$url").json"
+}

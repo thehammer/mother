@@ -19,6 +19,7 @@
 # retro` (not `mother-usage retro`) assertions below would need adjusting.
 
 load 'test_helper'
+load 'gh_mock'
 
 setup() {
     setup_mother_env
@@ -268,4 +269,195 @@ EOF
     _build_fleet
     run mother retro --since 30d
     [ "$status" -eq 0 ]
+}
+
+# ===========================================================================
+# HC-07: gates, gates_ci_agreement, red_at_presentation, interruptions
+# ===========================================================================
+
+_ev() {  # _ev <job> <kind> <detail-json> [ts]
+    jq -nc --arg ts "${4:-$(_now_iso)}" --arg k "$2" --argjson d "$3" \
+        '{ts: $ts, kind: $k, detail: $d}' >> "$EVENTS_DIR/$1.jsonl"
+}
+
+# _gated_job <id> <repo> <sha> <status> <pr#> [gate-duration-s] [budget-min]
+_gated_job() {
+    local id="$1" repo="$2" sha="$3" status="$4" pr="$5" dur="${6:-60}" budget="${7:-15}" recent
+    recent=$(_days_ago 1)
+    local res="passed"; [ "$status" = "failed" ] && res="failed"; [ "$status" = "incomplete" ] && res="unavailable"
+    make_job "$id" "succeeded" '.repo = "'"$repo"'" | .created_at = "'"$recent"'" | .finished_at = "'"$recent"'"
+        | .pr_url = "https://github.com/x/'"$repo"'/pull/'"$pr"'"
+        | .crew = {gates: {budget_minutes: '"$budget"', checks: [{name: "unit"}]}}
+        | .gates = {status: "'"$status"'", head_sha: "'"$sha"'",
+                    results: [{name: "unit", result: "'"$res"'", duration_s: '"$dur"'}]}'
+    _ev "$id" gates_started '{"attempt":1,"head_sha":"'"$sha"'","gates":["unit"]}'
+    _ev "$id" gate_result '{"attempt":1,"name":"unit","result":"'"$res"'","duration_s":'"$dur"'}'
+    _ev "$id" gates_completed '{"attempt":1,"status":"'"$status"'"}'
+}
+
+_retro_json() { mother-usage retro --root "$MOTHER_ROOT" --since 3w --format json "$@"; }
+
+@test "HC07-1: retro prints and json-keys the four new tables" {
+    run mother-usage retro --root "$MOTHER_ROOT" --since 3w
+    [ "$status" -eq 0 ]
+    for t in "Quality gates" "Gates vs CI agreement" "Red PRs at presentation" "Operator interruptions"; do
+        [[ "$output" == *"## $t"* ]]
+    done
+    run _retro_json
+    for k in gates gates_ci_agreement red_at_presentation interruptions; do
+        echo "$output" | jq -e --arg k "$k" 'has($k)' >/dev/null
+    done
+}
+
+@test "HC07-2: 20 gated jobs with 19 agreeing is enforce-ready; 5 jobs is not" {
+    gh_mock_install
+    local i
+    for i in $(seq 1 20); do
+        _gated_job "big-$i" bigrepo "sha-big-$i" passed "$i" 60 15
+        if [ "$i" -le 19 ]; then gh_mock_set_check_runs "sha-big-$i" unit:success lint:success
+        else gh_mock_set_check_runs "sha-big-$i" unit:success lint:failure; fi
+    done
+    for i in $(seq 1 5); do
+        _gated_job "small-$i" smallrepo "sha-small-$i" passed "$((100+i))" 60 15
+        gh_mock_set_check_runs "sha-small-$i" unit:success
+    done
+    run _retro_json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.bigrepo.n')" = "20" ]
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.bigrepo.agreement_pct')" = "95.0" ]
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.bigrepo.enforce_ready')" = "yes" ]
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.smallrepo.enforce_ready')" = "no" ]
+}
+
+@test "HC07-2: gate time over budget blocks enforce-ready" {
+    gh_mock_install
+    local i
+    for i in $(seq 1 20); do
+        _gated_job "slow-$i" slowrepo "sha-slow-$i" passed "$i" 1200 15
+        gh_mock_set_check_runs "sha-slow-$i" unit:success
+    done
+    run _retro_json
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.slowrepo.agreement_pct')" = "100.0" ]
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.slowrepo.enforce_ready')" = "no" ]
+}
+
+@test "HC07-2/3: incomplete gates and pending CI are excluded from the ratio, never passed" {
+    gh_mock_install
+    _gated_job inc-1 r1 sha-inc incomplete 1
+    gh_mock_set_check_runs sha-inc unit:success
+    _gated_job pend-1 r1 sha-pend passed 2
+    gh_mock_set_check_runs sha-pend unit:pending
+    _gated_job ok-1 r1 sha-ok failed 3
+    gh_mock_set_check_runs sha-ok unit:failure
+    run _retro_json
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.r1.n')" = "1" ]
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.r1.incomplete')" = "1" ]
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.r1.ci_pending')" = "1" ]
+    [ "$(echo "$output" | jq -r '.gates_ci_agreement.r1.agreement_pct')" = "100.0" ]
+    # unavailable counted as unavailable in the per-gate table, never passed
+    [ "$(echo "$output" | jq -r '.gates.r1.gates.unit.unavailable')" = "1" ]
+    [ "$(echo "$output" | jq -r '.gates.r1.gates.unit.passed')" = "1" ]
+}
+
+@test "HC07-4: fix-loop job counts as fixed within budget and G5 ratio comes from rows" {
+    local recent; recent=$(_days_ago 1)
+    make_job fix-1 succeeded '.repo = "fr" | .created_at = "'"$recent"'"
+        | .gates = {status: "passed", head_sha: "s2", results: [{name: "unit", result: "passed", duration_s: 30}]}'
+    _ev fix-1 gates_started '{"attempt":1,"head_sha":"s1"}' 2026-10-01T10:00:00Z
+    _ev fix-1 gate_result '{"attempt":1,"name":"unit","result":"failed","duration_s":30}'
+    _ev fix-1 gates_completed '{"attempt":1,"status":"failed"}'
+    _ev fix-1 gate_fix_started '{"attempt":1}'
+    _ev fix-1 gates_started '{"attempt":2,"head_sha":"s2"}'
+    _ev fix-1 gate_result '{"attempt":2,"name":"unit","result":"passed","duration_s":30}'
+    _ev fix-1 gates_completed '{"attempt":2,"status":"passed"}'
+    _append_metrics_line '{"schema":2,"job_id":"fix-1","stage":"cody","run_kind":"worker","cost_usd":4.0}'
+    _append_metrics_line '{"schema":2,"job_id":"fix-1","stage":"cody","run_kind":"gate_fix","cost_usd":0.5}'
+    _append_metrics_line '{"schema":2,"job_id":"fix-1","stage":"cody","run_kind":"gate_fix","cost_usd":0.5}'
+    run _retro_json
+    [ "$(echo "$output" | jq -r '.gates.fr.jobs_with_gate_failure')" = "1" ]
+    [ "$(echo "$output" | jq -r '.gates.fr.fixed_within_budget')" = "1" ]
+    [ "$(echo "$output" | jq -r '.gates.fr.exhausted')" = "0" ]
+    [ "$(echo "$output" | jq -r '.gates.fr.g5_fix_cost_ratio_median')" = "0.25" ]
+}
+
+@test "HC07-4: a pass after gates_exhausted is not fixed within budget; overrides counted" {
+    local recent; recent=$(_days_ago 1)
+    make_job ex-1 succeeded '.repo = "er" | .created_at = "'"$recent"'" | .gates = {status: "passed", results: []}'
+    _ev ex-1 gates_completed '{"attempt":1,"status":"failed"}'
+    _ev ex-1 gates_exhausted '{}'
+    _ev ex-1 gates_overridden '{}'
+    _ev ex-1 gates_completed '{"attempt":2,"status":"passed"}'
+    run _retro_json
+    [ "$(echo "$output" | jq -r '.gates.er.fixed_within_budget')" = "0" ]
+    [ "$(echo "$output" | jq -r '.gates.er.exhausted')" = "1" ]
+    [ "$(echo "$output" | jq -r '.gates.er.overridden')" = "1" ]
+}
+
+@test "HC07-1: interruptions are counted per the PRD definition" {
+    local recent; recent=$(_days_ago 1)
+    make_job int-1 succeeded '.repo = "ir" | .created_at = "'"$recent"'"'
+    make_job int-2 succeeded '.repo = "ir" | .created_at = "'"$recent"'"'
+    _ev int-1 awaiting_input '{"question":"q","paused_reason":"gate_hold"}'
+    _ev int-1 awaiting_input '{"question":"q"}'
+    _ev int-1 awaiting_input '{"paused_reason":"adherence_blocked"}'
+    _ev int-1 awaiting_input '{"paused_reason":"operator_hold"}'
+    _ev int-1 awaiting_input '{"paused_reason":"review_hold"}'
+    _ev int-1 awaiting_input '{"paused_reason":"cost_cap"}'
+    _ev int-1 paused_for_quota '{}'
+    run _retro_json
+    [ "$(echo "$output" | jq -r '.interruptions.interruptions')" = "5" ]
+    [ "$(echo "$output" | jq -r '.interruptions.per_job_counts["int-1"]')" = "5" ]
+    [ "$(echo "$output" | jq -r '.interruptions.by_repo.ir.jobs')" = "2" ]
+    [ "$(echo "$output" | jq -r '.interruptions.by_repo.ir.per_job')" = "2.5" ]
+}
+
+@test "HC07-5: --backfill uses stubbed gh, writes the sha cache, and a rerun makes no gh calls" {
+    gh_mock_install
+    local recent; recent=$(_days_ago 1)
+    make_job bf-1 succeeded '.repo = "bf" | .created_at = "'"$recent"'" | .finished_at = "'"$recent"'"
+        | .pr_url = "https://github.com/x/bf/pull/9"'
+    make_job bf-2 succeeded '.repo = "bf" | .created_at = "'"$recent"'" | .finished_at = "'"$recent"'"
+        | .pr_url = "https://github.com/x/bf/pull/10"'
+    gh_mock_set_pr "https://github.com/x/bf/pull/9" OPEN feature/a sha-bf1
+    gh_mock_set_pr "https://github.com/x/bf/pull/10" OPEN feature/b sha-bf2
+    gh_mock_set_check_runs sha-bf1 unit:failure
+    gh_mock_set_check_runs sha-bf2 unit:success
+
+    run _retro_json --backfill
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r '[.red_at_presentation.bf[].prs] | add')" = "2" ]
+    [ "$(echo "$output" | jq -r '[.red_at_presentation.bf[].any_red] | add')" = "1" ]
+    [ "$(echo "$output" | jq -r '[.red_at_presentation.bf[].backfilled] | add')" = "2" ]
+    [ -s "$METRICS_DIR/ci-cache.jsonl" ]
+    [ "$(wc -l < "$METRICS_DIR/ci-cache.jsonl" | tr -d ' ')" = "2" ]
+
+    : > "$MOTHER_ROOT/mock-gh-calls"
+    run _retro_json --backfill
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r '[.red_at_presentation.bf[].any_red] | add')" = "1" ]
+    # pr view (sha lookup) may repeat; CI lookups for completed shas may not.
+    run grep -c "check-runs" "$MOTHER_ROOT/mock-gh-calls"
+    [ "$output" = "0" ]
+}
+
+@test "HC07-5: without --backfill, PRs lacking gate data are not evaluated" {
+    gh_mock_install
+    make_job nb-1 succeeded '.repo = "nb" | .pr_url = "https://github.com/x/nb/pull/1"'
+    run _retro_json
+    [ "$(echo "$output" | jq -r '.red_at_presentation | length')" = "0" ]
+    [ ! -s "$MOTHER_ROOT/mock-gh-calls" ]
+}
+
+@test "HC07: red_at_presentation flags a red check named like a gate; pr_marked_ready picks the sha" {
+    gh_mock_install
+    _gated_job rd-1 rr sha-final passed 1
+    _ev rd-1 gates_started '{"attempt":2,"head_sha":"sha-early"}' 2026-10-01T09:00:00Z
+    _ev rd-1 gates_started '{"attempt":3,"head_sha":"sha-late"}' 2026-10-01T11:00:00Z
+    _ev rd-1 pr_marked_ready '{}' 2026-10-01T10:00:00Z
+    gh_mock_set_check_runs sha-early unit:failure
+    gh_mock_set_check_runs sha-late unit:success
+    gh_mock_set_check_runs sha-final unit:success
+    run mother-usage retro --root "$MOTHER_ROOT" --since 2026-09-01 --format json
+    [ "$(echo "$output" | jq -r '.red_at_presentation.rr["2026-W40"].any_red')" = "1" ]
+    [ "$(echo "$output" | jq -r '.red_at_presentation.rr["2026-W40"].red_on_gate_check')" = "1" ]
 }

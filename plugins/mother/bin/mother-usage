@@ -935,7 +935,300 @@ def _fmt_tokens(v):
     return str(v)
 
 
-def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
+# ---------------------------------------------------------------------------
+# retro: CI lookup (shared by gates_ci_agreement and red_at_presentation)
+# ---------------------------------------------------------------------------
+
+_CI_RED = ("failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale")
+_CI_GREEN = ("success", "neutral", "skipped")
+_PR_URL_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/\d+")
+
+
+def _ci_cache_path(root):
+    return os.path.join(root, "metrics", "ci-cache.jsonl")
+
+
+def _load_ci_cache(root):
+    cache = {}
+    path = _ci_cache_path(root)
+    if os.path.isfile(path):
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    cache[rec["sha"]] = rec
+                except Exception:
+                    continue
+    return cache
+
+
+def _gh_json(args, timeout=30):
+    """Run gh, return parsed JSON or None on any failure."""
+    try:
+        out = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=timeout)
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout)
+    except Exception:
+        return None
+
+
+def _classify_check_runs(runs):
+    """-> (conclusion, red_names). conclusion: green | red | pending | unknown."""
+    if not runs:
+        return "unknown", []
+    red = [r.get("name") for r in runs if r.get("conclusion") in _CI_RED]
+    if red:
+        return "red", red
+    if any(r.get("status") != "completed" for r in runs):
+        return "pending", []
+    if all(r.get("conclusion") in _CI_GREEN for r in runs):
+        return "green", []
+    return "unknown", []
+
+
+def _ci_lookup(root, cache, pr_url, sha):
+    """CI conclusion for <sha> of the PR at <pr_url>: {conclusion, red}.
+    Completed results (green/red) are cached by sha in metrics/ci-cache.jsonl
+    so a rerun makes no gh call; pending/unknown are re-queried every time."""
+    hit = cache.get(sha)
+    if hit:
+        return {"conclusion": hit["conclusion"], "red": hit.get("red", [])}
+    m = _PR_URL_RE.search(pr_url or "")
+    if not m or not sha:
+        return {"conclusion": "unknown", "red": []}
+    data = _gh_json(["api", f"repos/{m.group(1)}/{m.group(2)}/commits/{sha}/check-runs"])
+    runs = data.get("check_runs") if isinstance(data, dict) else None
+    conclusion, red = _classify_check_runs(runs)
+    if conclusion in ("green", "red"):
+        rec = {"sha": sha, "conclusion": conclusion, "red": red}
+        cache[sha] = rec
+        try:
+            os.makedirs(os.path.dirname(_ci_cache_path(root)), exist_ok=True)
+            with open(_ci_cache_path(root), "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
+    return {"conclusion": conclusion, "red": red}
+
+
+def _backfill_head_sha(pr_url, ready_dt):
+    """Head sha of a PR when it was presented, via gh: the latest commit not
+    after ready_dt (default: the PR's creation); undated commits fall back to
+    the last one."""
+    data = _gh_json(["pr", "view", pr_url, "--json", "commits,createdAt"])
+    if not isinstance(data, dict):
+        return None
+    ready = ready_dt or _parse_iso(data.get("createdAt"))
+    commits = data.get("commits") or []
+    chosen = None
+    for c in commits:
+        d = _parse_iso(c.get("committedDate"))
+        if d is None or ready is None or d <= ready:
+            chosen = c
+    if chosen is None and commits:
+        chosen = commits[0]
+    return (chosen or {}).get("oid")
+
+
+def _median(vals):
+    return statistics.median(vals) if vals else None
+
+
+_INTERRUPTION_REASONS = ("user", "gate_hold", "review_hold", "adherence_blocked", "operator_hold")
+
+
+def _job_has_event(events, kind):
+    return any(e.get("kind") == kind for e in events)
+
+
+def _gate_fix_loop(events, gates):
+    """-> (failed, fixed_within_budget, exhausted) for one job's event stream."""
+    failed = fixed = exhausted = False
+    completed_seen = False
+    for e in events:
+        k = e.get("kind")
+        status = (e.get("detail") or {}).get("status")
+        if k == "gates_completed":
+            completed_seen = True
+            if status == "failed":
+                failed = True
+            elif status == "passed" and failed and not exhausted:
+                fixed = True
+        elif k == "gates_exhausted":
+            exhausted = True
+    if not completed_seen and gates.get("status") == "failed":
+        failed = True
+    return failed, fixed, exhausted
+
+
+def _retro_gates_tables(root, in_window, rows_by_job, backfill):
+    """Build the gates, gates_ci_agreement, red_at_presentation and
+    interruptions tables from in-window jobs, their events and runs rows."""
+    cache = _load_ci_cache(root)
+    gate_stats = {}      # repo -> gate name -> counters
+    repo_fix = {}        # repo -> counters
+    repo_jobtimes = {}   # repo -> total gate seconds per job
+    repo_budget = {}     # repo -> budget_minutes
+    gate_names = {}      # repo -> {gate names}
+    gated = []           # (job, head_sha, gates.status)
+    prs = []             # (job, events)
+    interruptions = {}   # job id -> (repo, count)
+
+    for job, path, archived in in_window:
+        events = _load_events(_events_path_for(root, job, archived))
+        repo = job.get("repo") or "unknown"
+        jid = job.get("id")
+
+        interruptions[jid] = (repo, sum(
+            1 for e in events if e.get("kind") == "awaiting_input"
+            and ((e.get("detail") or {}).get("paused_reason") or "user") in _INTERRUPTION_REASONS))
+
+        if job.get("pr_url"):
+            prs.append((job, events))
+
+        gates = job.get("gates") or {}
+        crew_gates = (job.get("crew") or {}).get("gates") or {}
+        for c in crew_gates.get("checks") or []:
+            gate_names.setdefault(repo, set()).add(c.get("name"))
+        if not gates and not any(e.get("kind") in ("gates_started", "gate_result") for e in events):
+            continue
+        if crew_gates.get("budget_minutes") is not None:
+            repo_budget[repo] = crew_gates["budget_minutes"]
+
+        # per-gate counts: every gate_result event, else the final .gates.results
+        results = [e.get("detail") or {} for e in events if e.get("kind") == "gate_result"]
+        results = results or gates.get("results") or []
+        stats = gate_stats.setdefault(repo, {})
+        for r in results:
+            st = stats.setdefault(r.get("name"), {"runs": 0, "passed": 0, "failed": 0,
+                                                  "unavailable": 0, "skipped": 0, "durs": []})
+            st["runs"] += 1
+            res = r.get("result")
+            if res in ("passed", "failed", "unavailable", "skipped"):
+                st[res] += 1
+            if res in ("passed", "failed") and isinstance(r.get("duration_s"), (int, float)):
+                st["durs"].append(r["duration_s"])
+        final_results = gates.get("results") or []
+        if final_results:
+            repo_jobtimes.setdefault(repo, []).append(sum(r.get("duration_s") or 0 for r in final_results))
+
+        fx = repo_fix.setdefault(repo, {"jobs_gated": 0, "failed": 0, "fixed": 0,
+                                        "exhausted": 0, "overridden": 0, "g5": []})
+        failed, fixed, exhausted = _gate_fix_loop(events, gates)
+        fx["jobs_gated"] += 1
+        fx["failed"] += failed
+        fx["fixed"] += fixed
+        fx["exhausted"] += exhausted
+        fx["overridden"] += _job_has_event(events, "gates_overridden")
+        rows = rows_by_job.get(jid, [])
+        fix_cost = sum(r.get("cost_usd") or 0 for r in rows if r.get("run_kind") == "gate_fix")
+        first = next((r for r in rows if (r.get("run_kind") or "worker") == "worker"), None)
+        if fix_cost > 0 and first and (first.get("cost_usd") or 0) > 0:
+            fx["g5"].append(fix_cost / first["cost_usd"])
+
+        if job.get("pr_url") and gates.get("head_sha"):
+            gated.append((job, gates["head_sha"], gates.get("status")))
+
+    gates_table = {}
+    for repo in sorted(set(gate_stats) | set(repo_fix)):
+        fx = repo_fix.get(repo, {})
+        gates_table[repo] = {
+            "jobs_gated": fx.get("jobs_gated", 0),
+            "gates": {
+                str(name): {"runs": st["runs"], "passed": st["passed"], "failed": st["failed"],
+                            "unavailable": st["unavailable"], "skipped": st["skipped"],
+                            "duration_s_median": _median(st["durs"]),
+                            "duration_s_p90": _percentile(st["durs"], 90)}
+                for name, st in sorted(gate_stats.get(repo, {}).items(), key=lambda kv: str(kv[0]))
+            },
+            "total_gate_time_s_median": _median(repo_jobtimes.get(repo, [])),
+            "budget_minutes": repo_budget.get(repo),
+            "jobs_with_gate_failure": fx.get("failed", 0),
+            "fixed_within_budget": fx.get("fixed", 0),
+            "exhausted": fx.get("exhausted", 0),
+            "overridden": fx.get("overridden", 0),
+            "g5_fix_cost_ratio_median": _median(fx.get("g5", [])),
+        }
+
+    # gates vs CI on the same head sha
+    agree = {}
+    for job, sha, status in gated:
+        a = agree.setdefault(job.get("repo") or "unknown", {"n": 0, "agree": 0, "incomplete": 0, "ci_pending": 0})
+        if status not in ("passed", "failed"):
+            a["incomplete"] += 1      # incomplete/unavailable: never counted as passed
+            continue
+        ci = _ci_lookup(root, cache, job.get("pr_url"), sha)
+        if ci["conclusion"] not in ("green", "red"):
+            a["ci_pending"] += 1
+            continue
+        a["n"] += 1
+        a["agree"] += (status == "passed") == (ci["conclusion"] == "green")
+    agreement_table = {}
+    for repo, a in sorted(agree.items()):
+        pct = round(100.0 * a["agree"] / a["n"], 1) if a["n"] else None
+        med = _median(repo_jobtimes.get(repo, []))
+        budget = repo_budget.get(repo)
+        ready = (a["n"] >= 20 and pct is not None and pct >= 90
+                 and med is not None and budget is not None and med <= budget * 60)
+        agreement_table[repo] = {"n": a["n"], "agreement_pct": pct, "incomplete": a["incomplete"],
+                                 "ci_pending": a["ci_pending"], "median_gate_time_s": med,
+                                 "budget_minutes": budget, "enforce_ready": "yes" if ready else "no"}
+
+    # red at presentation, per repo per ISO week
+    red = {}
+    for job, events in prs:
+        repo = job.get("repo") or "unknown"
+        gates = job.get("gates") or {}
+        ready_ev = next((e for e in events if e.get("kind") == "pr_marked_ready"), None)
+        ready_dt = _parse_iso(ready_ev.get("ts")) if ready_ev else None
+        from_backfill = False
+        if gates.get("head_sha"):
+            sha = gates["head_sha"]
+            if ready_dt:
+                before = [(e.get("detail") or {}).get("head_sha") for e in events
+                          if e.get("kind") == "gates_started" and (e.get("detail") or {}).get("head_sha")
+                          and (_parse_iso(e.get("ts")) or ready_dt) <= ready_dt]
+                sha = before[-1] if before else sha
+        elif backfill:
+            sha = _backfill_head_sha(job.get("pr_url"), ready_dt)
+            from_backfill = True
+        else:
+            continue
+        when = ready_dt or _parse_iso(job.get("finished_at")) or _parse_iso(job.get("created_at"))
+        iso = when.isocalendar() if when else None
+        week = f"{iso[0]}-W{iso[1]:02d}" if iso else "unknown"
+        row = red.setdefault(repo, {}).setdefault(week, {"prs": 0, "any_red": 0, "red_on_gate_check": 0,
+                                                         "unknown": 0, "backfilled": 0, "overridden": 0})
+        row["prs"] += 1
+        row["backfilled"] += from_backfill
+        row["overridden"] += _job_has_event(events, "gates_overridden")
+        ci = _ci_lookup(root, cache, job.get("pr_url"), sha) if sha else {"conclusion": "unknown", "red": []}
+        if ci["conclusion"] == "red":
+            row["any_red"] += 1
+            row["red_on_gate_check"] += bool(set(ci["red"]) & gate_names.get(repo, set()))
+        elif ci["conclusion"] != "green":
+            row["unknown"] += 1
+
+    by_repo = {}
+    for repo, n in interruptions.values():
+        b = by_repo.setdefault(repo, {"jobs": 0, "interruptions": 0})
+        b["jobs"] += 1
+        b["interruptions"] += n
+    for b in by_repo.values():
+        b["per_job"] = round(b["interruptions"] / b["jobs"], 3)
+    total_int = sum(n for _r, n in interruptions.values())
+    interruptions_table = {}
+    if interruptions:
+        interruptions_table = {"jobs": len(interruptions), "interruptions": total_int,
+                               "per_job": round(total_int / len(interruptions), 3),
+                               "by_repo": by_repo,
+                               "per_job_counts": {j: n for j, (_r, n) in interruptions.items() if n}}
+
+    return gates_table, agreement_table, red, interruptions_table
+
+
+def build_retro(root, since_dt, jobs_meta, backfilled_count=None, backfill=False):
     """Build the retro report as a dict keyed by table name. Pure function
     over already-loaded job metadata — no filesystem writes."""
 
@@ -1353,6 +1646,12 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None):
         "perri_subagent_spawns_non_pipeline": perri_subagent_spawns,
     }
 
+    g, ag, rd, it = _retro_gates_tables(root, in_window, rows_by_job, backfill)
+    tables["gates"] = g
+    tables["gates_ci_agreement"] = ag
+    tables["red_at_presentation"] = rd
+    tables["interruptions"] = it
+
     if backfilled_count is not None:
         tables["_meta"] = {"backfilled_rows": backfilled_count, "since": since_dt.isoformat(),
                             "jobs_in_window": len(in_window)}
@@ -1372,6 +1671,10 @@ _RETRO_TITLES = [
     ("repos", "Repos served"),
     ("teardown", "Teardown backlog"),
     ("perri_decisions", "Perri decision mix"),
+    ("gates", "Quality gates"),
+    ("gates_ci_agreement", "Gates vs CI agreement"),
+    ("red_at_presentation", "Red PRs at presentation"),
+    ("interruptions", "Operator interruptions"),
 ]
 
 
@@ -1449,6 +1752,16 @@ def _coverage_line(key, data, tables):
         reviews = sum(data.get("decision_mix", {}).values())
         spawns = data.get("perri_subagent_spawns_non_pipeline", 0)
         return f"pipeline perri reviews: {reviews}; subagent spawns (non-pipeline): {spawns}"
+    if key == "gates":
+        return f"gated jobs: {sum(v.get('jobs_gated', 0) for v in data.values())} across {len(data)} repo(s)"
+    if key == "gates_ci_agreement":
+        return (f"compared: {sum(v.get('n', 0) for v in data.values())}; excluded (incomplete/CI pending): "
+                f"{sum(v.get('incomplete', 0) + v.get('ci_pending', 0) for v in data.values())}")
+    if key == "red_at_presentation":
+        prs = sum(w.get("prs", 0) for weeks in data.values() for w in weeks.values())
+        return f"PRs evaluated: {prs} across {len(data)} repo(s)"
+    if key == "interruptions":
+        return f"{data.get('interruptions', 0)} interruption(s) across {data.get('jobs', 0)} jobs"
     return None
 
 
@@ -1483,7 +1796,7 @@ def cmd_retro(args):
                            if (_parse_iso(j.get("created_at")) or since_dt) >= since_dt]
         backfilled_count = _do_backfill(root, in_window_meta, rates)
 
-    tables = build_retro(root, since_dt, jobs_meta, backfilled_count)
+    tables = build_retro(root, since_dt, jobs_meta, backfilled_count, backfill=bool(args.backfill))
 
     if args.format == "json":
         print(json.dumps(tables, default=str))
