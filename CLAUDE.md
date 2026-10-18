@@ -460,25 +460,6 @@ true), where: any|sandbox (default any), timeout_s 1..3600 (default 900), hint <
   skips the add-time snapshot. `MOTHER_PHI_REPOS` (default `admin-portal referral-monitor`, also
   settable in `config.env`) forces `phi_sensitive: true` for those repo names.
 
-## Progress indicator
-
-An observer-only estimate (`≈NN% · gates n/N · ETA ~band`) for running jobs. **It never writes job JSON** — job
-writes are unlocked read-modify-write, so a second writer would race the supervisor. State lives in:
-
-- `$MOTHER_ROOT/progress/<id>.json` — the `.progress` object (`docs/design.md`, "Headless crew contract"),
-  written atomically only by `mother-usage progress-tick` (run by the runner's `_maybe_progress_tick`).
-  `progress/meta/<id>.json` is rate-limit bookkeeping (last emitted tuple/time, `progress_half` done). Files
-  for jobs no longer in `jobs/` are removed by the tick.
-- `$RUNNER_DIR/progress-calibration.json` — `{fitted_at, min_repo_n, fleet, repos}` from `mother-usage calibrate`
-  (stage shares/medians/p90 and remaining/elapsed ratios; per-repo entries only at n ≥ 20).
-
-Stages in pct order: `build`, `rework`, `gates`, `review`, `present`. The active clock counts worker, gate and
-review process time only (no queue waits, no `awaiting`). `progress_fraction` (pct) and `eta_band` (ETA) in
-`bin/mother-usage` are the single tunable functions (HC-11). pct is a multiple of 5, ≤ 95 until terminal.
-`progress_updated` events (broker category `progress`) are emitted only when the visible tuple changes and at
-most once per job per 60s (the terminal 100% write bypasses the gap); `progress_half` once at the first ≥ 50%.
-`mother list`/`status` and the broker merge the file/latest event in as `.progress` — job files stay identical.
-
 ### Reviewer lenses (HC-12)
 
 `.mother/crew.yml` `lenses:` declares the focused reviewer set: `mode` observe|enforce,
@@ -505,6 +486,25 @@ injected into both and any scope on it is dropped.
   Exit 0 ok, 2 invalid findings, 1 usage error.
 - Findings gain optional `claims[{path,line,quote<=200}]` and `asserts_existing_code`;
   lens reviewers also emit an `examined` block (`findings_extract_examined`).
+
+## Progress indicator
+
+An observer-only estimate (`≈NN% · gates n/N · ETA ~band`) for running jobs. **It never writes job JSON** — job
+writes are unlocked read-modify-write, so a second writer would race the supervisor. State lives in:
+
+- `$MOTHER_ROOT/progress/<id>.json` — the `.progress` object (`docs/design.md`, "Headless crew contract"),
+  written atomically only by `mother-usage progress-tick` (run by the runner's `_maybe_progress_tick`).
+  `progress/meta/<id>.json` is rate-limit bookkeeping (last emitted tuple/time, `progress_half` done). Files
+  for jobs no longer in `jobs/` are removed by the tick.
+- `$RUNNER_DIR/progress-calibration.json` — `{fitted_at, min_repo_n, fleet, repos}` from `mother-usage calibrate`
+  (stage shares/medians/p90 and remaining/elapsed ratios; per-repo entries only at n ≥ 20).
+
+Stages in pct order: `build`, `rework`, `gates`, `review`, `present`. The active clock counts worker, gate and
+review process time only (no queue waits, no `awaiting`). `progress_fraction` (pct) and `eta_band` (ETA) in
+`bin/mother-usage` are the single tunable functions (HC-11). pct is a multiple of 5, ≤ 95 until terminal.
+`progress_updated` events (broker category `progress`) are emitted only when the visible tuple changes and at
+most once per job per 60s (the terminal 100% write bypasses the gap); `progress_half` once at the first ≥ 50%.
+`mother list`/`status` and the broker merge the file/latest event in as `.progress` — job files stay identical.
 
 ## Internals reference (lazy-loaded)
 
