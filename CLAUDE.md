@@ -119,6 +119,7 @@ for display and routing.
 | `running` | `continuation` | Cody re-running after idle_timeout (auto-continuation) |
 | `awaiting` | (none) | Cody asked a question; answer with `mother resume` |
 | `awaiting` | `adherence_blocked` | Archie failed twice; human must review PR, then `resume` or `cancel` |
+| `running` | `gating` | Mother is running the repo's quality gates on the head commit (observe mode); the previous `activity` is restored afterwards |
 | `awaiting` | `operator_hold` | Mother held a failed job instead of escalating it (see "Failure routing"); `.question` names the next commands. Act with `resume`, `retry`, `reconcile`, or `cancel` |
 | `running` | `pipeline_phase` | pipeline job: a build agent (redd/cody/marty) is actively running |
 | `ready` | `pipeline_phase` | pipeline job: next build agent queued (driver just advanced the phase) |
@@ -157,6 +158,8 @@ Escalation bumps the job up this ladder (cap: 2 escalations):
 | `needs_attention` | object | Producer-agnostic flag `{reason, note, since}`. Anything that holds a job for the operator sets it; Mother renders it as a `job_flagged` needs-attention item. This repo adds no producer. |
 | `origin` | object | Provenance captured at `mother add` time: `{project, cwd, session, enqueued_by, label}`. `project` = basename of the enqueuing cwd's git toplevel, or the `--origin-project` override; `session` = `--origin-session` → `$MOTHER_ORIGIN_SESSION` → `$CLAUDE_SESSION_ID` → `""`. Surfaced as `mother list`'s ORIGIN column, filtered by `mother list --project`/`--label`, and rendered by `mother status`'s `=== origin ===` block. |
 | `decision` | object | Structured hold: `{id, kind, options[{id,label,consequence,takes_text}], opened_at, resolved_at, resolution{option,source,session,agent}}` (`lib/decision.sh`; option ids `resume_with_guidance`, `escalate`, `override_open`, `cancel`). Opened by a hold producer via `mother_decision_open`; resolved only by an explicit answer — Mother never selects an option (no timeout, no default). A resolved decision blocks answers only while `paused_reason == decision.kind`. |
+| `crew` | object | Resolved `.mother/crew.yml` snapshot taken at `mother add` (see "Quality gates"). Absent when the repo has no crew.yml: such a job, and any job enqueued before the snapshot existed, never runs gates. |
+| `gates` | object | Observe-mode gate outcome written by `mother-run-job`'s `_run_gates_observe`: `{mode, effective_mode, posture, status, attempt, max_attempts, head_sha, started_at, finished_at, results[{name, result, blocking, duration_s, exit_code, unavailable_reason, skip_reason}], not_run[]}`. Ids, enums, counts and durations only (no output text); `effective_mode` is always `observe` until HC-08. |
 | `last_answer` | object | `{source, session, agent, option, at}` of the most recent `mother resume` / broker `answer`. `source` is `nostromo_app`, `cli` or `broker_client`; `option` is null for a plain-text answer to a decision-less job. |
 
 ### Kill switches
@@ -440,7 +443,7 @@ true), where: any|sandbox (default any), timeout_s 1..3600 (default 900), hint <
 - **`mother add`** resolves it from `--base` (skipped when `MOTHER_GATES_ENABLED=0` or the ref doesn't
   resolve locally): an invalid file fails the add; a valid one is stored as `.crew`
   `{version, source_ref, source_sha, phi_sensitive, gates, lenses}`, with the plan's optional
-  `gates: {max_attempts: N}` applied. No file means no `crew` key. Nothing reads `.crew` yet (HC-06).
+  `gates: {max_attempts: N}` applied. No file means no `crew` key. A job's `.crew` snapshot (never the repo) is what drives the in-lifecycle gates below.
 - **`mother gates run`** (worker-callable; `--job`/`MOTHER_JOB_ID` use the job's work dir, base and
   `.crew`) always passes `--allow-unpushed` to `mother_gates_run` (`lib/gates.sh`). Exit 0 passed,
   1 failed, 2 incomplete. Logs/excerpts land in `$MOTHER_ROOT/gates/<job-or-adhoc>/`. `mother gates
@@ -456,6 +459,17 @@ true), where: any|sandbox (default any), timeout_s 1..3600 (default 900), hint <
   `<name>.excerpt`. Every check sees `MOTHER_GATE_BASE` (merge-base sha) and
   `MOTHER_GATE_CHANGED_FILES` (newline-separated, <= 64 KB); sandbox checks get them prepended to the
   `bash -c` string because local env doesn't reach the sandbox.
+- **Observe mode in the job lifecycle (HC-06).** `_run_gates_observe` (`mother-run-job`) runs right after
+  `_finalize_pr_url`, before `_rwx_post_exit` and the main-dir restore/lock release (HEAD must still be
+  the job branch). It runs only when the job has `.crew.gates`, `MOTHER_GATES_ENABLED` is not `0`, the run
+  is heading for success (exit 0, or reaped after a final result), the job isn't cancelled or `awaiting`,
+  and this supervisor still owns `worker_pid`. It sets `activity=gating`, emits `gates_started`, runs
+  `mother_gates_run … --attempt 1 --allow-unpushed` (logs in `$MOTHER_ROOT/crew/<id>/gates/1/`), emits one
+  `gate_result` per result and `gates_completed`, writes `.gates` and restores the previous `activity`.
+  It never changes `state`, `failure_reason`, the PR or a prompt; `mode: enforce` is recorded as
+  `.gates.mode = "enforce"`, `.gates.effective_mode = "observe"`. A gate run that produces no result is
+  recorded `incomplete`, never `passed`. `mother status <id>` renders a `=== gates ===` section (the only
+  place excerpts appear, read from the side files); `mother list` shows `[gating]`.
 - **Settings:** `MOTHER_GATES_ENABLED=0` makes `gates run` a no-op (`{"status":"disabled"}`) and
   skips the add-time snapshot. `MOTHER_PHI_REPOS` (default `admin-portal referral-monitor`, also
   settable in `config.env`) forces `phi_sensitive: true` for those repo names.

@@ -79,6 +79,11 @@ type mother_autostash_event_detail >/dev/null 2>&1 || mother_autostash_event_det
 type mother_rwx_gate    >/dev/null 2>&1 || mother_rwx_gate()    { echo disabled; return 1; }
 type mother_rwx_sandbox >/dev/null 2>&1 || mother_rwx_sandbox() { echo '{"outcome":"skipped","reason":"no_lib"}'; return 0; }
 
+# Quality gates (mother_gates_run). Sourced pre-SOURCE_ONLY-guard so
+# _run_gates_observe is bats-callable. A missing lib degrades to "no gates run".
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/gates.sh" ] && source "$MOTHER_LIB_DIR/gates.sh"
+
 # Best-effort preview-stack teardown (mother_preview_stop). Sourced
 # pre-SOURCE_ONLY-guard so _preview_pre_spawn / _preview_post_exit are
 # bats-callable. A missing lib degrades to "nothing to stop".
@@ -704,6 +709,99 @@ _preview_post_exit() {
         return 0
     fi
     mother_preview_stop "$id" worker_exit 2>/dev/null || true
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Quality gates, observe mode (HC-06). After the worker exits and the PR url is
+# settled, run the job's `.crew` gates against the head commit and record the
+# outcome as `.gates` plus gates_started / gate_result / gates_completed events.
+# Observe never changes state, failure_reason, the PR or any prompt: every
+# failure path here degrades to "recorded as incomplete" or "not run".
+# Must run before the main-dir restore / lock release (HEAD must still be the
+# job branch). Runs only for a run heading for success, never for a cancelled,
+# paused or superseded one. `.gates` carries ids, enums, counts and durations
+# only: gate output stays in $MOTHER_ROOT/crew/<id>/gates/<attempt>/.
+# ---------------------------------------------------------------------------
+_gates_observe_applicable() {
+    [ "${MOTHER_GATES_ENABLED:-1}" != "0" ] || return 1
+    type mother_gates_run >/dev/null 2>&1 || return 1
+    jq -e '(.crew.gates.checks // []) | length > 0' "$job_file" >/dev/null 2>&1 || return 1
+    [ "${cancel_requested:-0}" -eq 0 ] || return 1
+    if [ -n "${reaped_reason:-}" ]; then
+        [ "${final_result_epoch:-0}" -gt 0 ] || return 1
+    else
+        [ "${exit_code:-1}" = "0" ] || return 1
+    fi
+    [ "$(jq -r '.state // ""' "$job_file" 2>/dev/null)" != "awaiting" ] || return 1
+    # Stale-supervisor guard: a newer worker owns the worktree.
+    if [ -n "${worker_pid:-}" ] && \
+       [ "$(jq -r '.worker_pid // 0' "$job_file" 2>/dev/null)" != "$worker_pid" ]; then
+        return 1
+    fi
+    return 0
+}
+
+_run_gates_observe() {
+    _gates_observe_applicable || return 0
+
+    local attempt=1 mode max_attempts posture started_at prev_activity
+    mode=$(jq -r '.crew.gates.mode // "observe"' "$job_file" 2>/dev/null) || mode=observe
+    max_attempts=$(jq -r '.crew.gates.max_attempts // 3' "$job_file" 2>/dev/null) || max_attempts=3
+    prev_activity=$(jq -c '.activity // null' "$job_file" 2>/dev/null) || prev_activity=null
+    posture=$(_resolve_posture 2>/dev/null) || posture=normal
+    [ -n "$posture" ] || posture=normal
+    started_at=$(iso_now)
+
+    local head_sha
+    head_sha=$(git -C "${work_dir:-.}" rev-parse HEAD 2>/dev/null) || head_sha=""
+
+    local crew_file out_dir
+    crew_file=$(mktemp "${TMPDIR:-/tmp}/mother-crew.XXXXXX" 2>/dev/null) || return 0
+    jq -c '.crew' "$job_file" >"$crew_file" 2>/dev/null || { rm -f "$crew_file"; return 0; }
+    out_dir="$MOTHER_ROOT/crew/$id/gates/$attempt"
+    mkdir -p "$out_dir" 2>/dev/null && rm -f "${out_dir:?}"/*.log "${out_dir:?}"/*.excerpt
+
+    _job_update ".activity = \"gating\"" 2>/dev/null || true
+    _append_event "gates_started" "$(jq -nc \
+        --argjson attempt "$attempt" --argjson max "$max_attempts" --arg head "$head_sha" \
+        --arg mode "$mode" --arg posture "$posture" --slurpfile crew "$crew_file" \
+        '{attempt: $attempt, max_attempts: $max, head_sha: $head, mode: $mode, posture: $posture,
+          gates: [$crew[0].gates.checks[].name]}')" 2>/dev/null || true
+
+    local result
+    result=$(mother_gates_run "${work_dir:-}" "$crew_file" "$base_ref" "$out_dir" \
+        --posture "$posture" --attempt "$attempt" --allow-unpushed 2>/dev/null) || result=""
+    printf '%s' "$result" | jq -e 'type == "object" and (.results | type == "array")' >/dev/null 2>&1 \
+        || result=$(jq -nc --arg head "$head_sha" --arg posture "$posture" --argjson attempt "$attempt" \
+            '{status: "incomplete", head_sha: $head, posture: $posture, results: [], not_run: [], attempt: $attempt}')
+    rm -f "$crew_file"
+
+    local finished_at gates_json
+    finished_at=$(iso_now)
+    gates_json=$(printf '%s' "$result" | jq -c \
+        --arg mode "$mode" --argjson max "$max_attempts" --argjson attempt "$attempt" \
+        --arg started "$started_at" --arg finished "$finished_at" '
+        {mode: $mode, effective_mode: "observe", posture: .posture, status: .status,
+         attempt: $attempt, max_attempts: $max, head_sha: .head_sha,
+         started_at: $started, finished_at: $finished,
+         results: [.results[] | {name, result, blocking, duration_s, exit_code, unavailable_reason, skip_reason}],
+         not_run: .not_run}')
+
+    local ev
+    while IFS= read -r ev; do
+        [ -n "$ev" ] || continue
+        _append_event "gate_result" "$ev" 2>/dev/null || true
+    done < <(printf '%s' "$gates_json" | jq -c --argjson attempt "$attempt" \
+        '.results[] | {attempt: $attempt, name, result, blocking, duration_s, exit_code}')
+    _append_event "gates_completed" "$(printf '%s' "$gates_json" | jq -c '
+        {attempt, status,
+         passed: ([.results[] | select(.result == "passed")] | length),
+         failed: ([.results[] | select(.result == "failed")] | length),
+         unavailable: ([.results[] | select(.result == "unavailable")] | length),
+         not_run}')" 2>/dev/null || true
+
+    _job_update ".gates = $gates_json | .activity = $prev_activity" 2>/dev/null || true
     return 0
 }
 
@@ -1834,6 +1932,8 @@ _runner_died_trap() {
     if [ "$cur" = "running" ]; then
         _transition failed "$(jq -nc --argjson rc "$rc" \
             '{reason: "runner_died_early", exit_code: $rc}')" 2>/dev/null || true
+        # Died mid-gating: don't leave a terminal job looking like it is gating.
+        _job_update 'if .activity == "gating" then .activity = null else . end' 2>/dev/null || true
     fi
     # Stop the RWX sandbox first (idempotent; best-effort) — before the
     # main-dir restore switches the checkout away from the job branch.
@@ -2216,6 +2316,11 @@ _spawn_and_wait fresh
 # See _finalize_pr_url's definition (above the SOURCE_ONLY guard) for the
 # full contract. Sets the global `pr_url`.
 _finalize_pr_url
+
+# Quality gates in observe mode: record-only, never changes state or the PR.
+# Before the sandbox stop (sandbox gates reuse the sandbox) and before the
+# main-dir restore (HEAD must still be the job branch).
+_run_gates_observe
 
 # Stop the RWX sandbox now: before the main-dir stash-restore below switches the
 # checkout back to the operator's branch, and before the lock release lets

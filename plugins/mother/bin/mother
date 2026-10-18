@@ -1145,6 +1145,44 @@ _status_overview() {
     mother_attention_render_text "$items"
 }
 
+# _status_gates_section <id> <job_file> — the `=== gates ===` block of `mother
+# status`. Nothing for a job without `.gates`. Failing-gate excerpts are read
+# from the side files under $MOTHER_ROOT/crew/<id>/gates/<attempt>/ (local
+# only: they never go into job JSON or events).
+_status_gates_section() {
+    local id="$1" job_file="$2"
+    jq -e '.gates != null' "$job_file" >/dev/null 2>&1 || return 0
+
+    echo "=== gates ==="
+    jq -r '
+        .gates as $g
+        | (.crew.gates.budget_minutes // null) as $b
+        | (($g.results // []) | map(.duration_s // 0) | add // 0) as $actual
+        | "  Mode:      \($g.mode // "observe") (effective: \($g.effective_mode // $g.mode // "observe"))",
+          "  Posture:   \($g.posture // "normal")",
+          "  Attempt:   \($g.attempt // 1)/\($g.max_attempts // "?")",
+          "  Head:      \(($g.head_sha // "") | .[0:7] | if . == "" then "-" else . end)",
+          "  Status:    \($g.status // "unknown")",
+          (($g.results // [])[] |
+              "  \(if .result == "passed" then "✓" elif .result == "failed" then "✗" elif .result == "skipped" then "–" else "?" end) \(.name)  \(.result)  \(.duration_s // 0)s"
+              + (if .result == "failed" and .exit_code != null then "  (exit \(.exit_code))" else "" end)
+              + (if .result == "unavailable" then "  (\(.unavailable_reason // "unavailable"))" else "" end)
+              + (if .result == "skipped" and .skip_reason != null then "  (\(.skip_reason))" else "" end)),
+          (if (($g.not_run // []) | length) > 0 then "  gates incomplete: \(($g.not_run | join(", ")))" else empty end),
+          "  Budget:    \(if $b == null then "-" else "\($b)m" end) (actual \($actual)s)"
+    ' "$job_file"
+    local attempt name excerpt_file
+    attempt=$(jq -r '.gates.attempt // 1' "$job_file")
+    for name in $(jq -r '.gates.results[]? | select(.result == "failed") | .name' "$job_file"); do
+        excerpt_file="$MOTHER_ROOT/crew/$id/gates/$attempt/$name.excerpt"
+        [ -s "$excerpt_file" ] || continue
+        echo
+        echo "  --- $name ---"
+        sed 's/^/    /' "$excerpt_file"
+    done
+    echo
+}
+
 cmd_status() {
     local id="" format="text"
     case "${1:-}" in ""|-*) ;; *) id="$1"; shift ;; esac
@@ -1353,6 +1391,8 @@ cmd_status() {
             fi
             echo ""
         fi
+
+        _status_gates_section "$id" "$job_file"
 
         echo "=== origin ==="
         jq -r '
