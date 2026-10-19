@@ -80,6 +80,7 @@ read -r -d '' CONTRACT_TABLE <<'JSON'
     "option":        ["resume_with_guidance", "escalate", "override_open", "cancel"],
     "source":        ["nostromo_app", "cli", "broker_client"],
     "criteria_source": ["checklist", "ledger"],
+    "progress_stage": ["build", "rework", "gates", "review", "present", "done"],
     "crew_activity_running":  ["gating", "gate_fix", "review_wave", "review_rework"],
     "crew_activity_awaiting": ["gate_hold", "review_hold"]
   },
@@ -88,7 +89,8 @@ read -r -d '' CONTRACT_TABLE <<'JSON'
   "new_job_keys": {
     "crew": [], "gates": ["mode", "status", "attempt", "max_attempts"],
     "review_wave": ["mode", "cycle", "status"], "decision": ["id", "kind", "options", "opened_at"],
-    "attention": [], "last_answer": ["source", "at"], "progress": ["v", "pct", "stage"], "criteria_source": []
+    "attention": [], "attention_reasons": [], "last_answer": ["source", "at"],
+    "progress": ["v", "pct", "label", "stage", "signals", "eta", "paused", "flags", "updated_at"], "criteria_source": []
   },
   "forbidden_keys": ["excerpt", "output", "detail_text", "summary", "quote", "text", "criterion_text"]
 }
@@ -112,6 +114,12 @@ def in_enum($v; $name): $tbl.enums[$name] | any(. == $v);
   def enum($o; $key; $name; $what):
       if ($o | type) == "object" and ($o | has($key)) and ($o[$key] != null) and (in_enum($o[$key]; $name) | not)
       then err("\($what): \($key)=\($o[$key] | tojson) is not one of \($tbl.enums[$name] | join("|"))") else empty end;
+  def prog($p; $w): if ($p | type) != "object" then empty else
+        enum($p; "stage"; "progress_stage"; $w),
+        (if ($p.label | type) == "string" and ($p.pct | type) == "number"
+            and (($p.label | test("^≈[0-9]+%( · .+)?$") | not) or ($p.label | startswith("≈\($p.pct)%") | not) or ($p.label | test("ETA ~?under")))
+         then err("\($w): label \($p.label | tojson) is not the Mother-rendered line (≈<pct>% [· gates ..] [· ETA <band>|paused · <reason>])") else empty end)
+      end;
   def leak($v; $allow; $what): ($v | forbidden_found($allow)) as $f
       | if ($f | length) > 0 then err("\($what): forbidden free-text key(s): \($f | join(","))") else empty end;
 
@@ -137,7 +145,14 @@ def in_enum($v; $name): $tbl.enums[$name] | any(. == $v);
                               then err("\($w): \($k) is not ISO-8601 millisecond Z") else empty end),
                          ($tbl.new_job_keys | to_entries[] | select(.key as $k | $j | has($k)) | .key as $k
                             | need($j[$k]; .value; "\($w).\($k)"), leak($j[$k]; []; "\($w).\($k)")),
-                         (if ($j | has("progress")) then leak($j.progress; []; "\($w).progress") else empty end),
+                         (if ($j | has("progress")) then leak($j.progress; []; "\($w).progress"), prog($j.progress; "\($w).progress") else empty end),
+                         (if ($j | has("attention_reasons")) then
+                             (if ($j.attention_reasons | type) != "array" then err("\($w): attention_reasons must be an array")
+                              else ($j.attention_reasons[] | need(.; ["reason", "since", "acked"]; "\($w).attention_reasons[]"),
+                                    enum(.; "reason"; "attention"; "\($w).attention_reasons[]"),
+                                    (if (.acked | type) != "boolean" then err("\($w).attention_reasons[]: acked must be a boolean") else empty end))
+                              end)
+                          else empty end),
                          enum($j; "criteria_source"; "criteria_source"; $w),
                          ((($j.attention // [])[]?) as $a | enum($a; "reason"; "attention"; "\($w).attention")),
                          enum($j.last_answer; "source"; "source"; "\($w).last_answer"),
@@ -163,6 +178,7 @@ def in_enum($v; $name): $tbl.enums[$name] | any(. == $v);
                     (if $tbl.category_of | has($t) then
                         (if $d.category != $tbl.category_of[$t] then err("\($t): category must be \($tbl.category_of[$t])") else empty end)
                      else empty end),
+                    (if $t == "progress_updated" then prog($d; $t) else empty end),
                     (if $t == "gate_result" then enum($d; "result"; "gate_result"; $t) else empty end),
                     (if $t == "lens_skipped" then enum($d; "reason"; "skip_reason"; $t) else empty end),
                     (if $t == "attention_raised" or $t == "attention_cleared" or $t == "attention_acked"

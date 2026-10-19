@@ -63,7 +63,10 @@ setup() {
     # Convenience: Python helper function for one-shot IPC conversations.
     # Usage: broker_cmd <python-script-body>
     # The script has access to 'sock' (a connected socket), send(msg), recv().
-    _BROKER_HELPER=/tmp/broker-helper-$$.py
+    # The helper lives in the test's own MOTHER_ROOT (not /tmp) and clients run
+    # it from a file: endpoint security flags Python fed on stdin that opens a
+    # socket ("Reverse Shell Via Python"), even for a local AF_UNIX socket.
+    _BROKER_HELPER="$MOTHER_ROOT/broker-helper.py"
     cat > "$_BROKER_HELPER" <<'PYEOF'
 #!/usr/bin/env python3
 """Minimal NDJSON client for mother-broker bats tests."""
@@ -132,12 +135,13 @@ teardown() {
 # The body has access to everything defined in _BROKER_HELPER (connect, send,
 # recv_next, cmd, SOCK).
 run_broker_client() {
-    local body="$1"
-    python3 - <<PYEOF
-$(cat "$_BROKER_HELPER")
-
-${body}
-PYEOF
+    local body="$1" script
+    script=$(mktemp "$MOTHER_ROOT/broker-client.XXXXXX")
+    { cat "$_BROKER_HELPER"; printf '\n%s\n' "$body"; } > "$script"
+    python3 -I "$script"
+    local rc=$?
+    rm -f "$script"
+    return $rc
 }
 
 # ---------- helper: seed a job and events ----------
@@ -268,9 +272,9 @@ s.close()
     done
 
     # Use a single Python script that subscribes, then appends the event
-    # to the file via subprocess, then reads the live event.
+    # to the file directly, then reads the live event.
     result=$(run_broker_client "
-import time, subprocess, os
+import time, os
 
 s = connect()
 recv_next(s)   # hello

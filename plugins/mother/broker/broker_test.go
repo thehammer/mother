@@ -2633,3 +2633,27 @@ func TestAttentionReasons_withoutAcksDirEverythingIsUnacked(t *testing.T) {
 		t.Errorf("got %+v, want one unacked reason", got)
 	}
 }
+
+// C3: the broker's attention_reasons is the same union as `mother list --format json`
+// (lib/attention.sh): job-owned `attention[]` plus the progress overlay's `flags[]`.
+func TestAttentionReasons_unionsProgressFlagsWithJobAttention(t *testing.T) {
+	raw := json.RawMessage(`{"id":"j1",
+		"attention":[{"reason":"decision_awaiting","since":"2026-10-18T10:00:00.000Z"}],
+		"progress":{"flags":[
+			{"reason":"progress_stalled","since":"2026-10-18T10:05:00.000Z","detail":{"stage":"build","stuck_s":900}},
+			{"reason":"decision_awaiting","since":"2026-10-18T10:06:00.000Z"},
+			{"reason":"not_a_reason","since":"2026-10-18T10:07:00.000Z"}]}}`)
+	got := attentionReasons(raw, "")
+	want := []attentionReason{
+		{Reason: "decision_awaiting", Since: "2026-10-18T10:00:00.000Z"},
+		{Reason: "progress_stalled", Since: "2026-10-18T10:05:00.000Z"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("reason %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}

@@ -3,8 +3,8 @@ package main
 // attention.go — typed attention reasons (HC-03), computed as a pure read.
 //
 // attentionReasons mirrors lib/attention.sh's mother_attention_reasons_json:
-// the closed-list union of the job's own `.attention[]` and (later, via the
-// progress_updated overlay) progress flags, with `acked` resolved from
+// the closed-list union of the job's own `.attention[]` and the progress
+// flags (via the progress_updated overlay), with `acked` resolved from
 // $MOTHER_ROOT/acks/<id>.json. An ack applies only while its `since` equals
 // the condition's current `since`. The broker never writes the acks file and
 // never shells out for this.
@@ -39,6 +39,14 @@ func attentionReasons(jobRaw json.RawMessage, acksDir string) []attentionReason 
 			Reason string `json:"reason"`
 			Since  string `json:"since"`
 		} `json:"attention"`
+		// The progress_updated overlay (jobStore.withProgressLocked) carries the
+		// progress-owned flags; they are part of the same union as the shell side.
+		Progress struct {
+			Flags []struct {
+				Reason string `json:"reason"`
+				Since  string `json:"since"`
+			} `json:"flags"`
+		} `json:"progress"`
 	}
 	if json.Unmarshal(jobRaw, &job) != nil {
 		return out
@@ -53,8 +61,18 @@ func attentionReasons(jobRaw json.RawMessage, acksDir string) []attentionReason 
 		}
 	}
 
-	seen := map[string]bool{}
+	// Job-owned reasons win over progress-owned flags with the same reason.
+	type raised struct{ Reason, Since string }
+	var all []raised
 	for _, a := range job.Attention {
+		all = append(all, raised{a.Reason, a.Since})
+	}
+	for _, f := range job.Progress.Flags {
+		all = append(all, raised{f.Reason, f.Since})
+	}
+
+	seen := map[string]bool{}
+	for _, a := range all {
 		if !attentionReasonList[a.Reason] || seen[a.Reason] {
 			continue
 		}
