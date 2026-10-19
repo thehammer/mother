@@ -16,3 +16,5 @@
 
 # Local runtime state (should never live in the repo)
 .mother/
+__pycache__/
+*.pyc
