@@ -1278,6 +1278,15 @@ _set_job() { # <id> <jq filter>
 
 # After a worker exit: the stack was stopped exactly once, for <reason>.
 _assert_stopped_once() { # <id> <reason>
+    local id="$1"
+    # A subshell with its own errexit: inside `&&`/`if` the checks would not abort on the first failure.
+    ( set -e; _stopped_once_checks "$@" ) && return 0
+    echo "--- preview-cli.log"; cat "$PV_LOG" 2>/dev/null
+    echo "--- events"; cat "$EVENTS_DIR/$id.jsonl" 2>/dev/null
+    echo "--- .preview"; jq -c '.preview' "$JOBS_DIR/$id.json" 2>/dev/null
+    return 1
+}
+_stopped_once_checks() { # <id> <reason>
     local id="$1" sid; sid=$(_stack_id "$1")
     [ "$(_down_calls "$sid")" = "1" ]
     [ "$(_event_count "$id" preview_stop)" = "1" ]
