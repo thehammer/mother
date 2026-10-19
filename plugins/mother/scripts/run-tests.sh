@@ -85,7 +85,7 @@ _tap_count() { grep -cE '^(not )?ok [0-9]+ ' "$1"; }
 _bats() { # <tap out> <args...> : bats --tap, never reading our stdin
     local tap="$1"
     shift
-    bats --tap ${BATS_EXTRA[@]+"${BATS_EXTRA[@]}"} "$@" < /dev/null > "$tap" 2>&1
+    bats --tap --print-output-on-failure ${BATS_EXTRA[@]+"${BATS_EXTRA[@]}"} "$@" < /dev/null > "$tap" 2>&1
 }
 
 _build_broker() {

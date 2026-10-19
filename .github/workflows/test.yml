@@ -39,12 +39,14 @@ concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# BATS_TEST_TIMEOUT is deliberately NOT set: bats implements it with a background countdown process that
+# a bare `wait` in a test (preview.bats, others) then waits for, so those tests hang to the ceiling and fail;
+# it also makes a nested `bats` hang (ci_shards.bats). Hangs are bounded by timeout-minutes instead.
 env:
   SHARDS: 5
   MOTHER_ROOT: /nonexistent-guard
   MOTHER_TEST_STRICT_SKIPS: "1"
   MOTHER_TEST_LANES: "1"
-  BATS_TEST_TIMEOUT: "300"
   GIT_AUTHOR_NAME: mother-ci
   GIT_AUTHOR_EMAIL: ci@invalid
   GIT_COMMITTER_NAME: mother-ci

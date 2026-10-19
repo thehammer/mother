@@ -14,6 +14,9 @@ setup() {
     # The suite may itself run in GitHub Actions; nested runs must never write
     # into the real step summary.
     unset GITHUB_STEP_SUMMARY GITHUB_ACTIONS
+    # A nested bats that inherits BATS_TEST_TIMEOUT hangs until the countdown fires whenever a nested test
+    # fails (CI doesn't set it; a developer might), so the fixture runs never get it.
+    unset BATS_TEST_TIMEOUT
 
     SCRIPTS="$_PLUGIN_DIR/scripts"
     TS="$SCRIPTS/test-shards.sh"

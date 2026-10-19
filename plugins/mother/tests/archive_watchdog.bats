@@ -25,6 +25,9 @@ setup() {
     _FAKE_BIN="$MOTHER_ROOT/fake-bin"
     mkdir -p "$_FAKE_BIN"
     export MOTHER_BIN_DIR="$_FAKE_BIN"
+    # The gc watchdog leaves an orphaned `sleep $MOTHER_GC_TIMEOUT` holding `run`'s pipe open (default
+    # 300s), so a completed sweep followed by gc would make the test take 300s.
+    export MOTHER_GC_TIMEOUT=5
 }
 
 teardown() {

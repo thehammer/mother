@@ -511,6 +511,9 @@ exit 0
 EOF
     chmod +x "$_FAKE_BIN/mother"
     export MOTHER_BIN_DIR="$_FAKE_BIN"
+    # The runner's gc watchdog leaves an orphaned `sleep $MOTHER_GC_TIMEOUT` holding `run`'s pipe open,
+    # so a default 300s timeout makes each of these tests take 300s.
+    export MOTHER_GC_TIMEOUT=5
 }
 
 @test "the hourly archive sweep also runs mother gc, after mother archive" {
