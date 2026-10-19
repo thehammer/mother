@@ -95,6 +95,9 @@ _preview_bounded() {
     local pid=$!
     (
         sleep "$timeout"
+        # A command that already finished is not timed out (killing this
+        # subshell's sleep first lets it fall through to here after a normal exit).
+        [ -e "$rcf" ] && exit 0
         : >"$flag"
         mother_kill_tree "$pid"
     ) >/dev/null 2>&1 </dev/null &
