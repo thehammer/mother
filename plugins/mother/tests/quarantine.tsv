@@ -10,19 +10,9 @@
 #     Remove the row when the issue's exit criterion (20 consecutive main runs without a retry warning) is met.
 #   - scripts/test-shards.sh check rejects a row with no issue URL, an unknown test name, or a duplicate.
 pipeline_driver.bats	concurrent review: multiple reviewers each write to their own slot	https://github.com/thehammer/mother/issues/77	load-sensitive
-preview.bats	supervisor killed mid-run (EXIT-trap path, runner_died_early): the stack is still stopped once (worker_exit)	https://github.com/thehammer/mother/issues/78	load-sensitive
 preview.bats	call --token with an unknown token name exits 2 and makes no request	https://github.com/thehammer/mother/issues/79	load-sensitive
 rwx_sandbox.bats	hung rwx reset times out, the worker still spawns, and the run is not held hostage	https://github.com/thehammer/mother/issues/80	short watchdog timeout
-gates_lifecycle.bats	a stale supervisor (job's worker_pid moved on) runs no gates	https://github.com/thehammer/mother/issues/81	supervisor handoff timing
 gates_runner.bats	any-checks run in the work dir with MOTHER_GATE_BASE set to the merge-base sha	https://github.com/thehammer/mother/issues/82	1s watchdog timeout boundary
 go	TestOutputBackpressure_hardDropCeiling_exceededGapCountDropsClient	https://github.com/thehammer/mother/issues/83	registration deadline under load
 preview.bats	wait: an 'App Starting' page keeps polling until the timeout, then exits 4 and stays launching	https://github.com/thehammer/mother/issues/86	flaked in PR #84 CI
-preview.bats	worker exits cancelled: the stack is stopped once (worker_exit)	https://github.com/thehammer/mother/issues/87	flaked in PR #84 CI
-preview.bats	stale supervisor (a newer worker owns the job): preview_stop is skipped as newer_worker and nothing is stopped	https://github.com/thehammer/mother/issues/88	flaked in PR #84 CI
-preview.bats	kill switch MOTHER_PREVIEW_ENABLED=0: hooks still stop an existing stack	https://github.com/thehammer/mother/issues/89	flaked in PR #84 CI
-preview.bats	stop failure (CLI down exits 1): recorded as error/stop_failed, secrets removed, job still succeeded	https://github.com/thehammer/mother/issues/90	flaked in PR #84 CI
-preview.bats	stop output_tail is capped at 300 characters	https://github.com/thehammer/mother/issues/91	flaked in PR #84 CI
-preview.bats	stop that hangs past MOTHER_PREVIEW_STOP_TIMEOUT is recorded as timeout/stop_failed and the job still succeeds	https://github.com/thehammer/mother/issues/92	flaked in PR #84 CI
-preview.bats	CLI down exiting 2 (stack already gone) counts as a successful stop	https://github.com/thehammer/mother/issues/93	flaked in PR #84 CI
-rwx_sandbox.bats	stale supervisor: stop is skipped as newer_worker when the job's worker_pid changed	https://github.com/thehammer/mother/issues/94	flaked in PR #84 CI
 review_wave.bats	wave: reviewers run in parallel, an out-of-scope lens is skipped, and the PR is marked ready only after the wave ships	https://github.com/thehammer/mother/issues/95	flaked in PR #84 CI

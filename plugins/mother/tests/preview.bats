@@ -1197,6 +1197,13 @@ _arm_preview() { # <id> [status] [backend]
     _preview_obj "$@" > "$MOTHER_ROOT/plant-rec.json"
     cat > "$MOTHER_ROOT/plant.sh" <<'PLANT'
 jf="$MOTHER_ROOT/jobs/$MOTHER_JOB_ID.json"
+# The supervisor's post-spawn job updates (worker_pid, current_run) are unlocked
+# read-modify-writes that finish before it appends worker_spawned. Planting
+# before then lets one of them overwrite the record on a slow machine.
+for _i in $(seq 1 200); do
+    grep -q '"worker_spawned"' "$MOTHER_ROOT/events/$MOTHER_JOB_ID.jsonl" 2>/dev/null && break
+    sleep 0.1
+done
 tmp=$(jq --slurpfile r "$MOTHER_ROOT/plant-rec.json" '.preview = $r[0]' "$jf") && printf '%s' "$tmp" > "$jf"
 printf '{"seed":"planted","tokens":{"ADMIN_API_TOKEN":"planted"}}' > "$MOTHER_ROOT/runner/$MOTHER_JOB_ID.preview-secrets.json"
 chmod 600 "$MOTHER_ROOT/runner/$MOTHER_JOB_ID.preview-secrets.json"

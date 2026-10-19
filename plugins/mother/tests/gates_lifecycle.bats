@@ -526,8 +526,13 @@ CLAUDE
 #!/usr/bin/env bash
 # Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
 MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
-# Simulate a resume cycle having handed the job to a newer supervisor.
-sleep 1
+# Simulate a resume cycle having handed the job to a newer supervisor. Wait for
+# the supervisor's post-spawn updates (they finish before worker_spawned) first,
+# or one of them can overwrite this write on a slow machine.
+for _i in $(seq 1 200); do
+    grep -q '"worker_spawned"' "$MOTHER_ROOT/events/$MOTHER_JOB_ID.jsonl" 2>/dev/null && break
+    sleep 0.1
+done
 f="${MOTHER_LIVE_ROOT:-$MOTHER_ROOT}/jobs/${MOTHER_JOB_ID}.json"
 merged=$(jq '.worker_pid = 99999' "$f") && printf '%s' "$merged" > "$f"
 exit 0

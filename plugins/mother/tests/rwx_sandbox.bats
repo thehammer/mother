@@ -552,6 +552,12 @@ _hide_rwx() {
 # Workers get MOTHER_LIVE_ROOT, not MOTHER_ROOT (resolve like the real CLI does).
 MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
 echo "claude-start" >> "$MOTHER_ROOT/rwx-calls.log"
+# Wait for the supervisor's post-spawn updates (they finish before worker_spawned);
+# otherwise one of them can overwrite this write on a slow machine.
+for _i in $(seq 1 200); do
+    grep -q '"worker_spawned"' "$MOTHER_ROOT/events/$MOTHER_JOB_ID.jsonl" 2>/dev/null && break
+    sleep 0.1
+done
 jf="$MOTHER_ROOT/jobs/$MOTHER_JOB_ID.json"
 tmp=$(jq '.worker_pid = 999999' "$jf") && printf '%s' "$tmp" > "$jf"
 cat <<'EOF'
