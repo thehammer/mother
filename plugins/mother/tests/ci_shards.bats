@@ -154,7 +154,7 @@ assert_partition() {
     assert_partition 5
     assert_partition 8
     # list matches the actual top-level bats files
-    expected="$(cd "$_PLUGIN_DIR/tests" && ls -1 ./*.bats | sed 's|^\./||' | sort)"
+    expected="$(cd "$_PLUGIN_DIR/tests" && ls -1 ./*.bats | sed 's|^\./||' | LC_ALL=C sort)"
     [ "$("$TS" list)" = "$expected" ]
 }
 
