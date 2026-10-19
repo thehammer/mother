@@ -56,9 +56,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      # setup-go can't parse `.tool-versions` ("golang 1.26.0"): read the version ourselves.
+      - name: Go version from .tool-versions
+        id: gover
+        run: echo "version=$(awk '$1 == "golang" { print $2 }' plugins/mother/broker/.tool-versions)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v5
         with:
-          go-version-file: plugins/mother/broker/.tool-versions
+          go-version: ${{ steps.gover.outputs.version }}
           cache-dependency-path: plugins/mother/broker/go.sum
       - name: Broker checks (gofmt, vet, build, test)
         run: ./plugins/mother/scripts/run-tests.sh --go-only
@@ -91,9 +95,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shard output dir
         run: echo "MOTHER_TEST_OUT=$RUNNER_TEMP/bats-out" >> "$GITHUB_ENV"
+      # setup-go can't parse `.tool-versions` ("golang 1.26.0"): read the version ourselves.
+      - name: Go version from .tool-versions
+        id: gover
+        run: echo "version=$(awk '$1 == "golang" { print $2 }' plugins/mother/broker/.tool-versions)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v5
         with:
-          go-version-file: plugins/mother/broker/.tool-versions
+          go-version: ${{ steps.gover.outputs.version }}
           cache-dependency-path: plugins/mother/broker/go.sum
       - uses: actions/setup-python@v5
         with:
