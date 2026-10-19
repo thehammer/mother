@@ -153,9 +153,24 @@ _go_half() {
 
 # --- bats per-file loop -----------------------------------------------------------------------------
 
+# Re-run one quarantined test alone. Prints message lines; returns 1 when it still fails (or breaks strict skips).
+_retry_quarantined() { # <file> <name> <url> <retry tap>
+    local file="$1" name="$2" url="$3" rtap="$4" base skipmsg rc
+    base="$(basename "$file")"
+    _bats "$rtap" --filter "^$(_re_escape "$name")\$" "$file"; rc=$?
+    if [ "$rc" -ne 0 ] || [ "$(_tap_count "$rtap")" -lt 1 ] || [ -n "$(_tap_failed "$rtap")" ]; then
+        echo "  quarantined test failed twice: \"$name\" ($url)"
+        return 1
+    fi
+    echo "::warning title=Quarantined test retried::$base: \"$name\" passed only on retry ($url)"
+    _summary "- :warning: \`$base\` \"$name\" passed only on retry — $url"
+    skipmsg="$(_strict_skips "$base" "$rtap")"
+    [ -z "$skipmsg" ] || { echo "$skipmsg"; return 1; }
+}
+
 # Run one bats file with quarantine retry and strict skips; write $OUT/results/<file>.tsv and print the outcome.
 _run_one_file() { # <path>
-    local file="$1" base tap start secs result=PASS retries=0 failed name url msg="" rtap rn tests rc skipmsg
+    local file="$1" base tap start secs result=PASS retries=0 failed name url msg="" out tests rc
     base="$(basename "$file")"
     tap="$OUT/tap/$base.tap"
     start="$(date +%s)"
@@ -167,42 +182,26 @@ _run_one_file() { # <path>
         msg="${msg}  bats exited $rc without a failing test (load/syntax error?)
 "
     fi
-    if [ -n "$failed" ]; then
-        while IFS= read -r name; do
-            if url="$(_quarantine_url "$base" "$name")"; then
-                retries=$((retries + 1))
-                rtap="$OUT/tap/$base.retry$retries.tap"
-                _bats "$rtap" --filter "^$(_re_escape "$name")\$" "$file"; rc=$?
-                rn="$(_tap_count "$rtap")"
-                if [ "$rc" -eq 0 ] && [ "$rn" -ge 1 ] && [ -z "$(_tap_failed "$rtap")" ]; then
-                    msg="${msg}::warning title=Quarantined test retried::$base: \"$name\" passed only on retry ($url)
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if url="$(_quarantine_url "$base" "$name")"; then
+            retries=$((retries + 1))
+            out="$(_retry_quarantined "$file" "$name" "$url" "$OUT/tap/$base.retry$retries.tap")" || result=FAIL
+            msg="${msg}${out}
 "
-                    _summary "- :warning: \`$base\` \"$name\" passed only on retry — $url"
-                    skipmsg="$(_strict_skips "$base" "$rtap")"
-                    if [ -n "$skipmsg" ]; then
-                        result=FAIL
-                        msg="${msg}${skipmsg}
+        else
+            result=FAIL
+            msg="${msg}  FAILED: $base: \"$name\"
 "
-                    fi
-                else
-                    result=FAIL
-                    msg="${msg}  quarantined test failed twice: \"$name\" ($url)
-"
-                fi
-            else
-                result=FAIL
-                msg="${msg}  FAILED: $base: \"$name\"
-"
-            fi
-        done <<EOF2
+        fi
+    done <<EOF2
 $failed
 EOF2
-    fi
 
-    skipmsg="$(_strict_skips "$base" "$tap")"
-    if [ -n "$skipmsg" ]; then
+    out="$(_strict_skips "$base" "$tap")"
+    if [ -n "$out" ]; then
         result=FAIL
-        msg="${msg}${skipmsg}
+        msg="${msg}${out}
 "
     fi
 
@@ -238,9 +237,43 @@ _run_lane() { # <file>... (sequential)
     for f in "$@"; do _run_one_file "$f"; done
 }
 
+# Run the files (full paths) in K concurrent LPT lanes (test-shards.sh lanes), waiting for all of them.
+_run_in_lanes() {
+    local f base lane lane_files pid pids="" names=""
+    for f in "$@"; do names="$names $(basename "$f")"; done
+    lane=1
+    while [ "$lane" -le "$LANES" ]; do
+        lane_files=""
+        # shellcheck disable=SC2086
+        for base in $("$SHARDS_SH" lanes "$LANES" $names | awk -F'\t' -v l="$lane" '$1 == l { print $2 }'); do
+            for f in "$@"; do
+                [ "$(basename "$f")" = "$base" ] && lane_files="$lane_files $f"
+            done
+        done
+        # shellcheck disable=SC2086
+        [ -z "$lane_files" ] || { _run_lane $lane_files & pids="$pids $!"; }
+        lane=$((lane + 1))
+    done
+    for pid in $pids; do wait "$pid"; done
+}
+
+# Every file we were asked to run must have a result, and nothing else.
+_verify_all_ran() { # <path>...
+    local f expected="" ran
+    for f in "$@"; do expected="$expected$(basename "$f")
+"; done
+    ran="$(for f in "$OUT"/results/*.tsv; do [ -f "$f" ] && basename "$f" .tsv; done | LC_ALL=C sort)"
+    expected="$(printf '%s' "$expected" | LC_ALL=C sort)"
+    [ "$ran" != "$expected" ] || return 0
+    echo "run-tests: files run differ from files assigned" >&2
+    echo "  assigned: $(echo "$expected" | tr '\n' ' ')" >&2
+    echo "  ran:      $(echo "$ran" | tr '\n' ' ')" >&2
+    return 1
+}
+
 # Run the given files (full paths), honouring MOTHER_TEST_LANES; verify and summarise. Returns 0 if all passed.
 _run_files() {
-    local f base lane pids="" pid rc=0 expected ran lane_files
+    local rc=0
     rm -rf "$OUT/results" "$OUT/tap" "$OUT/timings.tsv"
     mkdir -p "$OUT/results" "$OUT/tap"
 
@@ -248,36 +281,10 @@ _run_files() {
     if [ "$LANES" -le 1 ] || [ "$#" -le 1 ]; then
         _run_lane "$@"
     else
-        local names=""
-        for f in "$@"; do names="$names $(basename "$f")"; done
-        lane=1
-        while [ "$lane" -le "$LANES" ]; do
-            lane_files=""
-            # shellcheck disable=SC2086
-            for base in $("$SHARDS_SH" lanes "$LANES" $names | awk -F'\t' -v l="$lane" '$1 == l { print $2 }'); do
-                for f in "$@"; do
-                    [ "$(basename "$f")" = "$base" ] && lane_files="$lane_files $f"
-                done
-            done
-            # shellcheck disable=SC2086
-            [ -z "$lane_files" ] || { _run_lane $lane_files & pids="$pids $!"; }
-            lane=$((lane + 1))
-        done
-        for pid in $pids; do wait "$pid"; done
+        _run_in_lanes "$@"
     fi
 
-    # Every file we were asked to run must have a result, and nothing else.
-    expected=""; for f in "$@"; do expected="$expected$(basename "$f")
-"; done
-    ran="$(for f in "$OUT"/results/*.tsv; do [ -f "$f" ] && basename "$f" .tsv; done | LC_ALL=C sort)"
-    expected="$(printf '%s' "$expected" | LC_ALL=C sort)"
-    if [ "$ran" != "$expected" ]; then
-        echo "run-tests: files run differ from files assigned" >&2
-        echo "  assigned: $(echo "$expected" | tr '\n' ' ')" >&2
-        echo "  ran:      $(echo "$ran" | tr '\n' ' ')" >&2
-        rc=1
-    fi
-
+    _verify_all_ran "$@" || rc=1
     _write_reports || rc=1
     return "$rc"
 }
@@ -311,12 +318,7 @@ _summary_halves() { # <go rc> <bats rc>
 }
 
 _need_bats() {
-    command -v bats >/dev/null 2>&1 || { echo "error: bats not found. Install with: brew install bats-core" >&2; exit 1; }
-}
-
-_all_files() {
-    local f
-    for f in $("$SHARDS_SH" list); do echo "$TESTS_DIR/$f"; done
+    command -v bats >/dev/null 2>&1 || { echo "error: bats not found. Install with: brew install bats-core" >&2; return 1; }
 }
 
 mode_go_only() {
@@ -332,7 +334,7 @@ mode_shard() { # <N/M>
     n="${spec%%/*}"; m="${spec#*/}"
     case "$n$m" in *[!0-9]*) die "--shard wants N/M (e.g. 2/5), got '$spec'" ;; esac
     { [ "$n" -ge 1 ] && [ "$n" -le "$m" ]; } || die "--shard $spec is out of range (need 1 <= N <= M)"
-    _need_bats
+    _need_bats || exit 1
     files="$("$SHARDS_SH" pick "$n" "$m")" || exit 2
     if ! _build_broker; then
         echo "run-tests: broker build failed; failing shard $spec (never skipping)" >&2
@@ -349,7 +351,7 @@ mode_shard() { # <N/M>
 }
 
 mode_targeted() { # <files...> (BATS_EXTRA already filled)
-    _need_bats
+    _need_bats || exit 1
     if ! _build_broker; then
         echo "run-tests: broker build failed" >&2
         exit 1
@@ -358,35 +360,32 @@ mode_targeted() { # <files...> (BATS_EXTRA already filled)
     _run_files "$@"
 }
 
-mode_all() {
-    local grc=0 brc=0 paths=() f
-    _build_broker || grc=1
-    _go_half || grc=1
-    if _need_bats_soft; then
-        echo "== bats =="
-        for f in $("$SHARDS_SH" list); do paths+=("$TESTS_DIR/$f"); done
-        _run_files "${paths[@]}" || brc=1
-    else
-        brc=1
-    fi
-    _summary_halves "$grc" "$brc"
+_run_all_files() {
+    local f paths=()
+    for f in $("$SHARDS_SH" list); do paths+=("$TESTS_DIR/$f"); done
+    _run_files "${paths[@]}"
 }
 
-_need_bats_soft() {
-    command -v bats >/dev/null 2>&1 || { echo "error: bats not found. Install with: brew install bats-core" >&2; return 1; }
-}
-
-mode_passthrough() {
+# Broker build, Go half, then the given bats command; reports both halves.
+_both_halves() { # <bats command...>
     local grc=0 brc=0
     _build_broker || grc=1
     _go_half || grc=1
-    if _need_bats_soft; then
+    if _need_bats; then
         echo "== bats =="
-        bats "$TESTS_DIR" "$@" || brc=1
+        "$@" || brc=1
     else
         brc=1
     fi
     _summary_halves "$grc" "$brc"
+}
+
+mode_all() {
+    _both_halves _run_all_files
+}
+
+mode_passthrough() {
+    _both_halves bats "$TESTS_DIR" "$@"
 }
 
 usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }

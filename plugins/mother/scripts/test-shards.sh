@@ -221,43 +221,38 @@ _check_allowed_skips() {
     done < "$ALLOWED_SKIPS"
 }
 
+_check_no_subdir_tests() {
+    local sub
+    sub="$(find "$TESTS_DIR" -mindepth 2 -name '*.bats' | LC_ALL=C sort)"
+    [ -z "$sub" ] || printf 'bats files in a subdirectory (bats and the shard lister would silently skip them):\n%s\n' "$sub"
+}
+
+_check_each_file_assigned_once() { # <assigned plan> <files>
+    local f c
+    for f in $2; do
+        c="$(printf '%s\n' "$1" | awk -F'\t' -v f="$f" '$2 == f { n++ } END { print n + 0 }')"
+        [ "$c" -eq 1 ] || echo "$f is assigned to $c shards (want exactly 1)"
+    done
+}
+
 cmd_check() {
     _need_pos_int "M" "${1:-}"
-    local m="$1" errors="" files assigned f c sub i matrix=""
+    local m="$1" errors files assigned i matrix=""
     files="$(cmd_list)"
     [ -n "$files" ] || die "no top-level *.bats files in $TESTS_DIR"
 
-    sub="$(find "$TESTS_DIR" -mindepth 2 -name '*.bats' | LC_ALL=C sort)"
-    if [ -n "$sub" ]; then
-        errors="${errors}bats files in a subdirectory (bats and the shard lister would silently skip them):
-$sub
-"
-    fi
-
     assigned="$(cmd_assign "$m")"
-    for f in $files; do
-        c="$(printf '%s\n' "$assigned" | awk -F'\t' -v f="$f" '$2 == f { n++ } END { print n + 0 }')"
-        [ "$c" -eq 1 ] || errors="${errors}$f is assigned to $c shards (want exactly 1)
-"
-    done
-
-    c="$(_check_quarantine)"; [ -z "$c" ] || errors="${errors}$c
-"
-    c="$(_check_allowed_skips)"; [ -z "$c" ] || errors="${errors}$c
-"
-
+    errors="$(_check_no_subdir_tests; _check_each_file_assigned_once "$assigned" "$files"; _check_quarantine; _check_allowed_skips)"
     if [ -n "$errors" ]; then
-        printf 'test-shards: check failed:\n%s' "$errors" >&2
+        printf 'test-shards: check failed:\n%s\n' "$errors" >&2
         exit 1
     fi
 
     printf '%s\n' "$assigned" | awk -F'\t' -v m="$m" '
         { n[$1]++; w[$1] += $3 }
         END { for (s = 1; s <= m; s++) printf "shard %d/%d: %d files, weight %g\n", s, m, n[s], w[s] }' >&2
-    i=1
-    while [ "$i" -le "$m" ]; do
+    for i in $(seq 1 "$m"); do
         matrix="$matrix${matrix:+,}$i"
-        i=$((i + 1))
     done
     echo "[$matrix]"
 }
