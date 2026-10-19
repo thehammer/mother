@@ -694,9 +694,10 @@ are read-only diagnostics.
 
 The headless-crew work adds quality gates, a parallel reviewer "lens wave", decisions, attention
 flags and a progress indicator. This section is the **client contract** for all of it, published
-before any producer lands so that Nostromo can build against fixtures
-(`plugins/mother/tests/fixtures/contract/*.ndjson`, provisional until re-recorded from real runs)
-while Mother builds the producers. Every later PR emits exactly these names.
+before any producer landed so that Nostromo could build against fixtures. The fixtures are now
+**recorded from real runs** (recorded fixtures: `plugins/mother/tests/fixtures/contract/*.ndjson`,
+written by `plugins/mother/scripts/record-contract-fixtures.sh`; re-run it after any contract change,
+`tests/contract.bats` fails when the committed files are stale). Every PR emits exactly these names.
 `plugins/mother/scripts/contract-check.sh` validates NDJSON streams against this section; its
 table at the top of the script must match the tables below exactly.
 
@@ -742,11 +743,12 @@ All optional; absent until the producing feature runs. Existing keys keep their 
 
 | Key | Fields |
 |---|---|
-| `crew` | resolved crew snapshot (opaque to clients; presence means the repo opted in) |
+| `crew` | resolved crew snapshot `{version, source_ref, source_sha, phi_sensitive, gates{mode, max_attempts, budget_minutes, checks[]}, lenses{mode, default, mandatory, scopes, budget_usd, cycle_cap, plan?}\|null}`: **configuration**, opaque to clients; presence means the repo opted in. Clients read the mode from `gates.mode` and `review_wave.mode` (authoritative: they reflect what the job actually ran, e.g. `gates.effective_mode`), never from `crew.gates.mode` |
 | `gates` | `{mode, posture, status, attempt, max_attempts, head_sha, started_at, finished_at, results[{name, result: passed\|failed\|skipped\|unavailable, blocking, duration_s, exit_code, unavailable_reason}], not_run[], override}` |
 | `review_wave` | `{mode, cycle, cycle_cap, status, budget_usd, spent_usd, lenses[{reviewer, lens, state: pending\|running\|done\|skipped\|error, skip_reason, findings{blocking, advisory}, cost_usd, examined_files}], adherence{state, verdict}, coverage_gaps, claims{verified, refuted, unverified}}` |
-| `decision` | `{id, kind, options[{id, label, consequence, takes_text}], opened_at, resolved_at, resolution}` |
-| `attention` | `[{reason, since}]` |
+| `decision` | `{id, kind, options[{id, label, consequence, takes_text}], opened_at, resolved_at, resolution}`. `decision.options` are objects; the `decision_opened` event's `options` are bare option ids |
+| `attention` | `[{reason, since}]` (job-owned raised reasons only; no `acked`) |
+| `attention_reasons` | `[{reason, since, acked}]`, derived (never stored), on every job object in `mother list/status --format json` and on broker snapshot / `query.list` / `query.get` records: the union of `attention` and the progress `flags[]`, one entry per reason, `acked` resolved from `$MOTHER_ROOT/acks/<id>.json`. `reason` is one of the closed list below. **Clients should prefer `attention_reasons` over `attention`**: only it carries `acked` and the progress-owned reasons |
 | `last_answer` | `{source, session, agent, option, at}` |
 | `criteria_source` | `checklist` or `ledger` (the checklist/ledger seam) |
 
@@ -754,6 +756,9 @@ All optional; absent until the producing feature runs. Existing keys keep their 
 off). `mother list/status --format json` merge `$MOTHER_ROOT/progress/<id>.json` in as `.progress`,
 and the broker overlays the latest `progress_updated` detail as `.progress`:
 `{v, pct, label, stage, signals{stage, checklist, gates, elapsed_active_s, cost}, eta{lo_s, hi_s, label, basis: repo|fleet|none}, paused, moved_back{reason, at}, flags[], updated_at}`.
+Where the overlay is applied: the snapshot, `query.list` and `query.get` all carry `.progress` (from the latest
+`progress_updated`) and `attention_reasons`, so a client may refresh a job with `query.get` after any crew event.
+`updated_at` strictly increases per job (ISO-8601 millisecond `Z`): the newest `progress_updated` wins.
 
 As produced by HC-09 (additive detail on the shape above): `stage` is one of `build|rework|gates|review|present|done`;
 `signals` also carries `stage_share` and `stage_frac`, `gates` is `null` or `{passed, failed, total, attempt, max_attempts}`,
@@ -762,8 +767,25 @@ As produced by HC-09 (additive detail on the shape above): `stage` is one of `bu
 `paused · <reason>`; `moved_back` also carries `from_pct` (`reason`: `gate_failed|adherence_rework|review_rework`).
 `pct` is a multiple of 5, at most 95 until the job is terminal. `progress_updated` is emitted only on a visible change
 and at most once per job per 60s; the broker keeps the latest one per job (snapshot, `query.list`, `query.get`).
-The provisional fixtures under `tests/fixtures/contract/` use older illustrative stage names and scalar `cost`; they
-are replaced when re-recorded from real runs.
+
+Inner shapes (as recorded):
+
+- `signals.gates` is `null` (no gates configured) or `{passed, failed, total, attempt, max_attempts}`; the counts include
+  Mother's built-in `clean_tree` and `pushed` pre-checks. `signals.checklist` is `{status: "unavailable"}` or
+  `{status: "available", done, total, source}` (counts only; criterion text never leaves the host).
+- `flags[]` elements are `{reason, since, detail}` with `reason` one of `progress_stalled` (`detail {stage, stuck_s}`) or
+  `burn_ahead` (`detail {cost_frac, progress_frac}`); `[]` when none. Flags are also reported in `attention_reasons`.
+- **`label` is the Mother-rendered display line, not a stage name.** It is the one string every surface shows, e.g.
+  `≈5% · ETA ?`, `≈80% · gates ✗ attempt 1/3 · ETA ?`, `≈60% · gates 2/3 · ETA ~25m`, `≈100% · gates 5/5`,
+  `≈5% · gates ✗ attempt 2/2 · paused · gate_hold`. Clients render `label` verbatim and must not recompose it;
+  the stage is `stage` (a closed enum, `build|rework|gates|review|present|done`) and a client wanting its own wording maps
+  that enum. Composition rule (`mother-usage` `_progress_label`): `≈<pct>%`, then `gates <passed>/<total>` or, when a gate
+  is red, `gates ✗ attempt <n>/<max>` (omitted when `signals.gates` is `null`), then, unless the job is terminal, the ETA
+  part: `ETA <eta.label>` while running, or `eta.label` unchanged (`paused · <paused_reason>`) while awaiting; parts are
+  joined with ` · `. `eta.label` is `~25m`, `~1–2h`, `?` (no usable calibration) or `paused · <reason>`, and is `""` once
+  terminal. The words "ETA ~under 2 min" never occur. The statusline's compact form (`≈60% ~25m`) is derived from the same
+  line; there is no separate `line` or accessibility field, so an accessibility string should be built from `pct`, `stage`,
+  `signals.gates` and `eta` (the structured fields), not by parsing `label`.
 
 ### Attention reasons
 
