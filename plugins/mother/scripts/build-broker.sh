@@ -9,12 +9,14 @@
 #
 # Usage:
 #   scripts/build-broker.sh
+#
+# MOTHER_BROKER_DIR overrides the module directory (tests/ci_shards.bats uses a fixture).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-BROKER_DIR="$PLUGIN_DIR/broker"
+BROKER_DIR="${MOTHER_BROKER_DIR:-$PLUGIN_DIR/broker}"
 OUT_DIR="$BROKER_DIR/bin"
 OUT="$OUT_DIR/mother-broker"
 
