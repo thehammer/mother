@@ -193,9 +193,21 @@ record_once() {
     : > "$REC/.done"
 }
 
+# _pyfile <code> — write Python code to a file in this test's tmpdir and echo
+# its path. Clients run from a file, never `python3 -c` or stdin: endpoint
+# security flags inline/stdin Python that opens a socket ("Reverse Shell Via
+# Python"), even for a local AF_UNIX socket.
+_pyfile() {
+    local f
+    f=$(mktemp "$BATS_TEST_TMPDIR/py.XXXXXX")
+    printf '%s\n' "$1" > "$f"
+    echo "$f"
+}
+
 # Run python3 reading fixtures; show its output on failure.
 pyrun() {
-    run python3 -I -c "$1" "${@:2}"
+    local f; f=$(_pyfile "$1")
+    run python3 -I "$f" "${@:2}"
     if [ "$status" -ne 0 ]; then echo "$output" >&2; fi
     [ "$status" -eq 0 ]
 }
@@ -386,7 +398,7 @@ assert "decision_awaiting" in [r["reason"] for r in j["attention_reasons"]]
     seed_live_job flags
     start_test_broker
     # Broker side: append progress_updated after connecting, then query.get / query.list.
-    LIVE_ID="$LIVE_ID" run python3 -I -c "$PY_CLIENT"'
+    _live_py=$(_pyfile "$PY_CLIENT"'
 c = C()
 c.subscribe()
 detail = json.load(open(os.path.join(os.environ["MOTHER_ROOT"], "live-progress.json")))
@@ -398,7 +410,8 @@ l = c.request("query.list", {})
 assert l["data"]["ok"], l
 lj = [x for x in l["data"]["jobs"] if x["id"] == os.environ["LIVE_ID"]][0]
 json.dump({"get": g["data"]["job"], "list": lj}, open(os.path.join(os.environ["MOTHER_ROOT"], "broker-out.json"), "w"))
-'
+')
+    LIVE_ID="$LIVE_ID" run python3 -I "$_live_py"
     [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
 
     mother list --format json > "$MOTHER_ROOT/cli-list.json"
