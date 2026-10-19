@@ -39,6 +39,9 @@ mother_watchdog_run() {
     # $(...) capture open for the full timeout after it is reaped below.
     (
         sleep "$timeout"
+        # A command that already finished is not timed out: only declare (and
+        # enforce) a timeout when no .rc exists yet.
+        [ -e "$prefix.rc" ] && exit 0
         : >"$prefix.timeout"
         mother_kill_tree "$probe_pid"
     ) >/dev/null 2>&1 </dev/null &
@@ -48,6 +51,12 @@ mother_watchdog_run() {
     mother_kill_tree "$watchdog_pid"
     wait "$watchdog_pid" 2>/dev/null
 
+    # .timeout wins: the watchdog only writes it when no .rc existed, i.e. the
+    # command had not finished, and then kills the tree. A shell killed in that
+    # tree can still write .rc on its way down (its child died first), so a
+    # .rc next to a .timeout is never the command's real result. The rare
+    # boundary case (finished between the check and the kill) resolves to
+    # timeout, which callers treat as unavailable: fail-safe, never "passed".
     if [ -f "$prefix.timeout" ]; then
         MOTHER_WD_OUTCOME=timeout; MOTHER_WD_RC=124
     elif [ -f "$prefix.rc" ]; then
