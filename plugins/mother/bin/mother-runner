@@ -1408,9 +1408,11 @@ _run_adherence_pending() {
             # relying on the pipeline's own exit status (bash 3.2-compatible;
             # macOS ships 3.2.57 per repo convention).
             "$MOTHER_BIN_DIR/mother" adherence-review "$id" 2>&1 | while read -r line; do _log "adherence: $line"; done
-            if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+            local review_rc=${PIPESTATUS[0]}
+            if [ "$review_rc" -eq 0 ]; then
                 _log "adherence review passed for $id"
-            else
+            elif [ "$review_rc" -eq 1 ]; then
+                # Only rc 1 is a recorded fail; after rc 2 adherence_status may be stale from a prior review.
                 local post_status; post_status=$(jq -r '.adherence_status // ""' "$JOBS_DIR/$id.json" 2>/dev/null)
                 case "$post_status" in
                     failed_first)
@@ -1443,6 +1445,8 @@ _run_adherence_pending() {
                         _log "adherence failed for $id (second attempt) — job is now awaiting (adherence_blocked)"
                         ;;
                 esac
+            else
+                _log "adherence review errored for $id (rc=$review_rc) — leaving it pending for a later tick"
             fi
             break  # one review per tick
         done

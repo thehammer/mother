@@ -1205,6 +1205,26 @@ _rw_pre_unchanged() {
     _rw_pre_unchanged "$id"
 }
 
+@test "adherence-review --pre-ready: a verdict that cannot be recorded exits 2 and claims no verdict" {
+    local id="w-p4"
+    _rw_pre_job "$id"
+    _rw_adh_reply pass "$RW_NOTES looks right"
+    # A string sha_runs on a matching head makes the verdict filter's `+ 1` error, so the write fails.
+    local head merged
+    head=$(git -C "$REPO" rev-parse HEAD)
+    merged=$(jq --arg h "$head" '.adherence_reviewed_sha = $h | .adherence_sha_runs = "x"' "$JOBS_DIR/$id.json") \
+        && printf '%s' "$merged" > "$JOBS_DIR/$id.json"
+
+    run mother adherence-review "$id" --pre-ready
+    echo "$output"
+    [ "$status" -eq 2 ]
+    [[ "$output" != *"(pre-ready): PASS"* ]]
+    run grep -q '"kind":"adherence_reviewed"' "$EVENTS_DIR/$id.jsonl"
+    [ "$status" -ne 0 ]
+    [ "$(_rw_job_json "$id" '.adherence_status')" = "null" ]
+    _rw_pre_unchanged "$id"
+}
+
 # ---------------------------------------------------------------------------
 # (j) the runner's post-PR adherence loop and the wave
 

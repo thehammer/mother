@@ -3268,6 +3268,7 @@ _adherence_pre_ready_side_file() {
 # _adherence_record_pre_ready <id> <verdict> <notes> <attempts> <cycle> <head>
 # Records a pre-ready verdict (see cmd_adherence_review). The job write takes
 # the job file's lock: the wave updates the same file while reviewers run.
+# Returns 2, with no event or verdict line, if the job write fails.
 _adherence_record_pre_ready() {
     local id="$1" verdict="$2" notes="$3" attempts="$4" cycle="$5" head="$6"
     local job_file prev status rc
@@ -3282,7 +3283,7 @@ _adherence_record_pre_ready() {
     fi
     _adherence_pre_ready_side_file "$id" "$cycle" "$verdict" "$status" "$notes" "$head" \
         || echo "mother: adherence-review: could not write the side file for $id" >&2
-    _with_lock "$job_file" mother_job_update "$id" '
+    if ! _with_lock "$job_file" mother_job_update "$id" '
         .adherence_status = $status
         | .adherence_attempts = $attempts
         | .adherence_pending = false
@@ -3290,8 +3291,10 @@ _adherence_record_pre_ready() {
         | .adherence_sha_runs = (if $sha != "" and .adherence_reviewed_sha == $sha
                                  then (.adherence_sha_runs // 0) + 1 else 1 end)
         | .adherence_reviewed_sha = (if $sha == "" then "unknown" else $sha end)' \
-        --arg status "$status" --argjson attempts "$attempts" --arg sha "$head" \
-        || echo "mother: adherence-review: failed to record the verdict for $id" >&2
+        --arg status "$status" --argjson attempts "$attempts" --arg sha "$head"; then
+        echo "mother: adherence-review: failed to record the verdict for $id" >&2
+        return 2
+    fi
     _append_event "$id" "adherence_reviewed" \
         "$(jq -nc --arg v "$verdict" --argjson a "$attempts" --arg s "$status" --argjson c "$cycle" \
             '{verdict: $v, attempts: $a, status: $s, pre_ready: true, cycle: $c}')"
@@ -3305,7 +3308,8 @@ _adherence_record_pre_ready() {
 # Reads the plan from events/<id>-plan.md, fetches the PR diff and CI summary,
 # constructs a structured prompt, and calls claude --agent archie in headless mode.
 # Parses the verdict (pass/fail) and stores it on the job JSON.
-# Returns 0 on pass, 1 on fail, 2 on error.
+# Returns 0 on pass, 1 on fail, 2 on error (including a failed job write:
+# then no event and no verdict line).
 #
 # --pre-ready (HC-14): one reviewer of a review wave, run by mother-run-job on
 # the gated commit before the PR is marked ready. The job is still `running`
@@ -3314,7 +3318,8 @@ _adherence_record_pre_ready() {
 # re-reviews a head the wave passed) but never touches state, activity or
 # pending_answer: the wave reworks in-session or holds. Notes text goes to
 # $MOTHER_ROOT/crew/<id>/adherence/c<cycle>.json only, never job JSON or events.
-# Returns 0 pass, 1 fail, 3 fail again (previous status failed_first), 2 error.
+# Returns 0 pass, 1 fail, 3 fail again (previous status failed_first), 2 error
+# (including a failed job write).
 
 cmd_adherence_review() {
     local id="" pre_ready=0
@@ -3510,10 +3515,12 @@ cmd_adherence_review() {
         # Notes are free-form text (backslashes, quotes, newlines) — pass them
         # as jq --arg, never interpolated into the filter. A filter-syntax
         # failure here used to leave the job "pending" forever (1532 reviews).
-        _job_update "$id" \
+        if ! _job_update "$id" \
             '.adherence_status = $status | .adherence_notes = $notes | .adherence_pending = false | .adherence_attempts = $attempts' \
-            --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts" \
-            || echo "mother: adherence-review: failed to record pass for $id" >&2
+            --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts"; then
+            echo "mother: adherence-review: failed to record pass for $id" >&2
+            return 2
+        fi
         _append_event "$id" "adherence_reviewed" \
             "$(jq -nc --arg verdict "pass" --arg notes "$notes" --argjson attempts "$new_attempts" \
                 '{verdict: $verdict, notes: $notes, attempts: $attempts}')"
@@ -3524,10 +3531,12 @@ cmd_adherence_review() {
         if [ "$esc_attempts" -eq 0 ]; then
             adherence_status="failed_first"
             # Store notes and pending_answer; runner re-queues with activity=cody_rework.
-            _job_update "$id" \
+            if ! _job_update "$id" \
                 '.adherence_status = $status | .adherence_notes = $notes | .adherence_attempts = $attempts | .pending_answer = $notes' \
-                --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts" \
-                || echo "mother: adherence-review: failed to record fail for $id" >&2
+                --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts"; then
+                echo "mother: adherence-review: failed to record fail for $id" >&2
+                return 2
+            fi
             _append_event "$id" "adherence_reviewed" \
                 "$(jq -nc --arg verdict "fail" --arg notes "$notes" --argjson attempts "$new_attempts" --arg status "$adherence_status" \
                     '{verdict: $verdict, notes: $notes, attempts: $attempts, status: $status}')"
@@ -3536,10 +3545,12 @@ cmd_adherence_review() {
         else
             adherence_status="blocked_for_human"
             # Transition to awaiting so the operator sees it in the statusline ?-count.
-            _job_update "$id" \
+            if ! _job_update "$id" \
                 '.adherence_status = $status | .adherence_notes = $notes | .adherence_attempts = $attempts | .adherence_pending = false | .activity = "adherence_blocked" | .state = "awaiting" | .paused_at = $now | .paused_reason = "adherence_blocked"' \
-                --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts" --arg now "$(_iso_now)" \
-                || echo "mother: adherence-review: failed to record block for $id" >&2
+                --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts" --arg now "$(_iso_now)"; then
+                echo "mother: adherence-review: failed to record block for $id" >&2
+                return 2
+            fi
             _append_event "$id" "adherence_reviewed" \
                 "$(jq -nc --arg verdict "fail" --arg notes "$notes" --argjson attempts "$new_attempts" --arg status "$adherence_status" \
                     '{verdict: $verdict, notes: $notes, attempts: $attempts, status: $status}')"

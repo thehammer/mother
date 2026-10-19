@@ -211,6 +211,73 @@ Still drifted. Please review manually."
 }
 
 # ---------------------------------------------------------------------------
+# Verdict that cannot be persisted: error (exit 2), no verdict claimed.
+# A read-only jobs dir makes the job write fail (_atomic_write can't create its temp file).
+
+@test "adherence-review: a pass that cannot be recorded exits 2 and claims no verdict" {
+    [ "$(id -u)" -ne 0 ] || skip "root ignores dir permissions"
+    _make_succeeded_job "job-persist-pass"
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: pass
+NOTES:
+All good."
+
+    chmod u-w "$JOBS_DIR"
+    run mother adherence-review "job-persist-pass"
+    chmod u+w "$JOBS_DIR"
+
+    [ "$status" -eq 2 ]
+    [[ "$output" != *"PASS"* ]]
+    [[ "$output" == *"failed to record"* ]]
+    run grep -q '"kind":"adherence_reviewed"' "$EVENTS_DIR/job-persist-pass.jsonl"
+    [ "$status" -ne 0 ]
+    [ "$(jq -r '.adherence_status' "$JOBS_DIR/job-persist-pass.json")" = "null" ]
+}
+
+@test "adherence-review: a first fail that cannot be recorded exits 2 and claims no verdict" {
+    [ "$(id -u)" -ne 0 ] || skip "root ignores dir permissions"
+    _make_succeeded_job "job-persist-fail1"
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
+NOTES:
+Drifted from the plan."
+
+    chmod u-w "$JOBS_DIR"
+    run mother adherence-review "job-persist-fail1"
+    chmod u+w "$JOBS_DIR"
+
+    [ "$status" -eq 2 ]
+    [[ "$output" != *"FAIL"* ]]
+    [[ "$output" == *"failed to record"* ]]
+    run grep -q '"kind":"adherence_reviewed"' "$EVENTS_DIR/job-persist-fail1.jsonl"
+    [ "$status" -ne 0 ]
+    [ "$(jq -r '.adherence_status' "$JOBS_DIR/job-persist-fail1.json")" = "null" ]
+    [ -z "$(jq -r '.pending_answer // ""' "$JOBS_DIR/job-persist-fail1.json")" ]
+}
+
+@test "adherence-review: a second fail that cannot be recorded exits 2, stays succeeded and emits no awaiting_input" {
+    [ "$(id -u)" -ne 0 ] || skip "root ignores dir permissions"
+    _make_succeeded_job "job-persist-fail2"
+    merged=$(jq '.adherence_attempts = 1 | .adherence_status = "failed_first"' "$JOBS_DIR/job-persist-fail2.json") \
+        && printf '%s' "$merged" > "$JOBS_DIR/job-persist-fail2.json"
+    export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
+NOTES:
+Still drifted."
+
+    chmod u-w "$JOBS_DIR"
+    run mother adherence-review "job-persist-fail2"
+    chmod u+w "$JOBS_DIR"
+
+    [ "$status" -eq 2 ]
+    [[ "$output" != *"FAIL"* ]]
+    [[ "$output" == *"failed to record"* ]]
+    run grep -q '"kind":"adherence_reviewed"' "$EVENTS_DIR/job-persist-fail2.jsonl"
+    [ "$status" -ne 0 ]
+    run grep -q '"kind":"awaiting_input"' "$EVENTS_DIR/job-persist-fail2.jsonl"
+    [ "$status" -ne 0 ]
+    [ "$(jq -r '.state' "$JOBS_DIR/job-persist-fail2.json")" = "succeeded" ]
+    [ "$(jq -r '.adherence_status' "$JOBS_DIR/job-persist-fail2.json")" = "failed_first" ]
+}
+
+# ---------------------------------------------------------------------------
 # cmd_list displays [ADHERENCE-BLOCKED] marker
 
 @test "cmd_list shows [ADHERENCE-BLOCKED] marker for blocked jobs" {
@@ -439,6 +506,23 @@ All good."
 
     local events_file="$EVENTS_DIR/job-loop-pass.jsonl"
     run grep '"adherence_rework_kicked"' "$events_file"
+    [ "$status" -ne 0 ]
+}
+
+@test "adherence loop: an errored review of a rework job does not requeue it again" {
+    _make_succeeded_job "job-loop-err"
+    # Second pass after a rework: the stale failed_first must not be read as this review's verdict.
+    merged=$(jq '.adherence_attempts = 1 | .adherence_status = "failed_first"' "$JOBS_DIR/job-loop-err.json") \
+        && printf '%s' "$merged" > "$JOBS_DIR/job-loop-err.json"
+    export MOCK_CLAUDE_STDOUT="I looked at it but have no verdict to give."
+
+    run mother-runner --adherence-tick
+    [ "$status" -eq 0 ]
+
+    [ "$(jq -r '.state' "$JOBS_DIR/job-loop-err.json")" = "succeeded" ]
+    [ "$(jq -r '.activity // ""' "$JOBS_DIR/job-loop-err.json")" != "cody_rework" ]
+    [ "$(jq -r '.adherence_pending' "$JOBS_DIR/job-loop-err.json")" = "true" ]
+    run grep -q '"kind":"adherence_rework_kicked"' "$EVENTS_DIR/job-loop-err.jsonl"
     [ "$status" -ne 0 ]
 }
 
