@@ -615,10 +615,12 @@ job_real = meta["JOB"]
 
 # --- key-based stable numbers / strings
 FIXED_NUM = {"duration_s": 1, "elapsed_active_s": 120, "worker_pid": 4242, "supervisor_pid": 4241,
-             "live_tokens": 0, "live_cost_usd": 0, "pid": 4242, "pct_moved_at_active_s": 60, "log_offset": 0}
+             "live_tokens": 0, "live_cost_usd": 0, "pid": 4242, "pct_moved_at_active_s": 60, "log_offset": 0,
+             "usd": 0, "actual_cost_usd": 0, "actual_tokens": 0}
 QUANTISE = {"stage_frac": 0.25}       # key -> step; the real value depends on a few seconds of wall clock
 FIXED_STR = {"cwd": "/tmp/work/admin-portal", "enqueued_by": "operator", "project": "admin-portal"}
-DROP_KEYS = set()
+# final_result_at is stamped by the supervisor poll loop, so whether a mid-scenario snapshot has it is a race.
+DROP_KEYS = {"final_result_at"}
 
 # --- pass 1: gather the data timestamps (everything except the envelope ts).
 # Ranking all of them together would make a placeholder depend on whether two unrelated real timestamps
