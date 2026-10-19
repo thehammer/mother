@@ -41,13 +41,14 @@ type rawEvent struct {
 //   - everything else                 → activity
 //
 // The "everything else" bucket includes (non-exhaustive):
-//   escalated, resumed, retried, cancel_requested, adherence_*,
-//   and the pipeline events emitted by W4/W5:
-//     pipeline_review_started, pipeline_shipped, pipeline_blocked,
-//     pipeline_cap_hit, pipeline_cycle_continued, pipeline_phase_advance,
-//     pipeline_error,
-//     phase_started, phase_completed,          (W5 additive)
-//     review_cycle_started, review_cycle_completed.  (W5 additive)
+//
+//	escalated, resumed, retried, cancel_requested, adherence_*,
+//	and the pipeline events emitted by W4/W5:
+//	  pipeline_review_started, pipeline_shipped, pipeline_blocked,
+//	  pipeline_cap_hit, pipeline_cycle_continued, pipeline_phase_advance,
+//	  pipeline_error,
+//	  phase_started, phase_completed,          (W5 additive)
+//	  review_cycle_started, review_cycle_completed.  (W5 additive)
 //
 // Pipeline-progress events are classified as activity, not state.  The job's
 // `state` field already drives CatState; these events are sub-state signals

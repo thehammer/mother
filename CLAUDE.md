@@ -36,6 +36,8 @@ Mother's state tree (`~/.mother`: jobs, events, archive) is irreplaceable; on 20
   `rm -rf <dir>` in `bin/` or `lib/`; file-level `rm -f` is fine.
 - **Workers get `MOTHER_LIVE_ROOT`, not `MOTHER_ROOT`.** Resolve the root as
   `${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}` in any new entry point.
+- **CI:** `.github/workflows/test.yml` runs with `MOTHER_ROOT=/nonexistent-guard` and fails if `~/.mother` or that
+  path ever exists (see "Tests").
 - **Backups:** the runner writes `mother-state-<UTC>.tar.gz` every `MOTHER_BACKUP_INTERVAL` (900s) outside
   the tree; `mother backup now|list|restore`. See `docs/design.md` "State safety".
 
@@ -274,13 +276,43 @@ Plans must include a `suggested_config:` YAML block (see `archie.md`). Without i
 
 ### Tests
 
-The bats test suite lives at `plugins/mother/tests/`. Run with:
+The suite is the Go broker tests plus the bats files in `plugins/mother/tests/`. **The full suite runs in
+CI** (`.github/workflows/test.yml`) on every PR and every push to `main`; `ci-ok` is the required check.
+Workers and reviewers do **not** run the full suite locally: run only the files covering your change, push,
+and don't wait for CI before your final result (the required check is the merge gate). Reviewers read
+`gh pr checks <pr>`. The operator may still run the whole thing.
 
 ```bash
-./plugins/mother/scripts/run-tests.sh
+# targeted local run (always rebuilds the broker first; no Go half)
+./plugins/mother/scripts/run-tests.sh plugins/mother/tests/<file>.bats [more.bats ...]
+./plugins/mother/scripts/run-tests.sh                  # everything: Go half + all bats; both always run
+./plugins/mother/scripts/run-tests.sh --go-only        # gofmt, go vet (native + GOOS=darwin), build, go test
+./plugins/mother/scripts/run-tests.sh --shard 2/5      # what a CI shard runs
 ```
 
-Requires `bats` (`brew install bats-core`).
+Requires `bats` (`brew install bats-core`) and Go (version in `plugins/mother/broker/.tool-versions`), plus
+`pip install -r plugins/mother/requirements-ci.txt` (PyYAML) if your Python lacks it. A Go failure no longer hides
+the bats result: with no args both halves run and the script prints `go: PASS|FAIL` / `bats: PASS|FAIL`.
+
+- **ThreatDown:** `broker.bats` and `contract.bats` run Python socket clients, which ThreatDown has flagged
+  ("Reverse Shell via Python", and the alert emails other people). Prefer CI for those two files.
+- **Sharding:** CI runs `SHARDS` (workflow env, currently 5 = the macOS concurrency cap on the Free plan)
+  `bats` shards on `macos-15`. `scripts/test-shards.sh` assigns each top-level `tests/*.bats` file to a shard by
+  greedy longest-processing-time over `tests/shard-weights.tsv` (per-file seconds); a file with no weight gets the
+  median, so new test files are picked up automatically. The `shard-plan` job fails if a file is in no shard or two
+  shards, or a `*.bats` file sits in a subdirectory (bats would silently skip it). Refresh weights from a CI run:
+  `gh run download <run-id> -p 'bats-timings-*' -D /tmp/t && plugins/mother/scripts/test-shards.sh weights /tmp/t`.
+  `MOTHER_TEST_LANES=2` runs two file lists concurrently inside a shard.
+- **Quarantine:** `tests/quarantine.tsv` lists known-flaky tests (`target<TAB>name<TAB>issue URL<TAB>note`; target is
+  a bats file or `go`). A quarantined test that fails is re-run once, alone; passing on retry keeps the shard
+  green but emits a `::warning::` and a step-summary line. Failing twice is red. Any non-quarantined failure is red
+  immediately. Quarantined tests are never skipped, and nothing retries a whole file or suite. Every row needs an
+  open `flaky-test` issue; remove the row when the issue is fixed (20 consecutive `main` runs with no warning).
+- **Strict skips:** CI sets `MOTHER_TEST_STRICT_SKIPS=1`: a TAP `# skip` fails the shard unless the test is listed in
+  `tests/ci-allowed-skips.tsv` (`file<TAB>name<TAB>reason`), so a missing tool or failed broker build can't hide as a
+  skip. Locally skips stay allowed.
+- **CI never touches `~/.mother`:** the workflow sets `MOTHER_ROOT=/nonexistent-guard`, never sets
+  `MOTHER_LIVE_ROOT`, and each shard fails if `~/.mother` or the guard path exists before or after the run.
 
 ## Bishop budget posture
 

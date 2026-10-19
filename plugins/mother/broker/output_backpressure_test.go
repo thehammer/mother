@@ -320,7 +320,7 @@ func TestOutputBackpressure_hardDropCeiling_exceededGapCountDropsClient(t *testi
 	// Wait for hub to register the client.
 	registered := pollCondition(func() bool {
 		return th.hub.clientCount() >= 1
-	}, 2*time.Second)
+	}, 10*time.Second)
 	if !registered {
 		t.Fatal("client did not register within deadline")
 	}
@@ -334,7 +334,7 @@ func TestOutputBackpressure_hardDropCeiling_exceededGapCountDropsClient(t *testi
 	// The client must eventually be hard-dropped once the gap ceiling is hit.
 	dropped := pollCondition(func() bool {
 		return th.hub.clientCount() == 0
-	}, 5*time.Second)
+	}, 15*time.Second)
 	if !dropped {
 		t.Errorf("client with outputMaxGap=%d was NOT hard-dropped after gap ceiling exceeded (clientCount=%d)", th.hub.outputMaxGap, th.hub.clientCount())
 	}

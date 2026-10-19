@@ -1,0 +1,3 @@
+# PyYAML is the only third-party Python package Mother uses
+# (lib/crew_config.py, and inline yaml in bin/mother). Everything else is stdlib.
+PyYAML==6.0.3

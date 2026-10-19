@@ -1,0 +1,18 @@
+# quarantine.tsv — known-flaky tests (policy: CLAUDE.md "Tests", scripts/run-tests.sh).
+# Columns (tab-separated): target<TAB>test name<TAB>issue URL<TAB>note
+#   target = a bats file basename in this directory, or `go` (broker Go test function name).
+#   name   = the @test name verbatim, or the Go func name.
+# Policy:
+#   - A quarantined test ALWAYS runs. If it fails it is re-run once, alone. Pass on retry: the shard stays green
+#     and emits a ::warning:: plus a step-summary line naming the test and its issue. Fail twice: red.
+#   - Any failure of a test NOT listed here is red immediately. Nothing is skipped; no file or suite is retried.
+#   - Every row needs an open issue (https://github.com/thehammer/mother/issues/<n>) with the `flaky-test` label.
+#     Remove the row when the issue's exit criterion (20 consecutive main runs without a retry warning) is met.
+#   - scripts/test-shards.sh check rejects a row with no issue URL, an unknown test name, or a duplicate.
+pipeline_driver.bats	concurrent review: multiple reviewers each write to their own slot	https://github.com/thehammer/mother/issues/77	load-sensitive
+preview.bats	supervisor killed mid-run (EXIT-trap path, runner_died_early): the stack is still stopped once (worker_exit)	https://github.com/thehammer/mother/issues/78	load-sensitive
+preview.bats	call --token with an unknown token name exits 2 and makes no request	https://github.com/thehammer/mother/issues/79	load-sensitive
+rwx_sandbox.bats	hung rwx reset times out, the worker still spawns, and the run is not held hostage	https://github.com/thehammer/mother/issues/80	short watchdog timeout
+gates_lifecycle.bats	a stale supervisor (job's worker_pid moved on) runs no gates	https://github.com/thehammer/mother/issues/81	supervisor handoff timing
+gates_runner.bats	any-checks run in the work dir with MOTHER_GATE_BASE set to the merge-base sha	https://github.com/thehammer/mother/issues/82	1s watchdog timeout boundary
+go	TestOutputBackpressure_hardDropCeiling_exceededGapCountDropsClient	https://github.com/thehammer/mother/issues/83	registration deadline under load

@@ -108,6 +108,13 @@ answer in your next prompt. Yielding without finishing is an accidental
   guard refuses to remove. Tests must build their own temp tree (`mktemp -d`, bats `setup_mother_env`)
   and delete only that. Never `rm -rf` a path derived from `MOTHER_LIVE_ROOT` or `$HOME/.mother`.
 
+## Test scope when the repo has CI
+
+If the repo's `CLAUDE.md` says its full test suite runs in CI, run locally only the tests that cover your change,
+using the command `CLAUDE.md` gives for targeted runs. Push, and don't wait for CI before your final result; the
+repo's required check is the merge gate. Never launch the repo's full suite "just to be safe" when CI covers it.
+Repos without such a note are unchanged (the RWX section still applies to them).
+
 ## Containers and test infrastructure
 
 `COMPOSE_PROJECT_NAME` is already exported into your environment, scoped to
