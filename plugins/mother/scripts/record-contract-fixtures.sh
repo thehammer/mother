@@ -214,6 +214,13 @@ new_scenario() {
     export MOTHER_NOTIFY_ENABLED=0 MOTHER_BACKUP_ENABLED=0
     export MOTHER_BROKER_SOCK="$MOTHER_ROOT/broker.sock" MOTHER_BROKER_ANSWER_GUARD=0
     export MOTHER_CLI="$_BIN_DIR/mother"
+    # Pin the host-derived cost model so recordings are identical everywhere:
+    # `mother add` asks `bishop` and then ~/.claude/budget-posture.json, which
+    # differ between a developer Mac ("metered") and a CI runner ("unknown").
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$_MOCK_BIN/bishop"
+    chmod +x "$_MOCK_BIN/bishop"
+    printf '{"billing_mode":"metered"}\n' > "$MOTHER_ROOT/budget-posture.json"
+    export BUDGET_POSTURE_FILE="$MOTHER_ROOT/budget-posture.json"
     gh_mock_install
     install_claude
     install_rwx
