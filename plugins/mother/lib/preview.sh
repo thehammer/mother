@@ -60,7 +60,9 @@ _preview_stack_bin() {
         if command -v preview-stack >/dev/null 2>&1; then
             bin=$(command -v preview-stack)
         else
-            bin="$HOME/Code/preview-stack/bin/preview-stack"
+            local root="$HOME/Code"
+            type mother_code_root >/dev/null 2>&1 && root=$(mother_code_root)
+            bin="$root/preview-stack/bin/preview-stack"
         fi
     fi
     [ -x "$bin" ] || return 1

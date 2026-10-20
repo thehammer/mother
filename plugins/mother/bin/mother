@@ -641,7 +641,7 @@ cmd_add() {
     case "$isolation" in worktree|main-dir) ;; *) _die "isolation must be worktree or main-dir" ;; esac
     case "$executor"  in local-tmux)        ;; *) _die "executor must be local-tmux (for now)" ;; esac
 
-    [ -z "$repo_path" ] && repo_path="$HOME/Code/$repo"
+    [ -z "$repo_path" ] && repo_path="$(mother_code_root)/$repo"
     # A git worktree's .git is a FILE (a gitdir pointer back to the main
     # repo's .git/worktrees/<name>), not a directory — `-d` alone rejects
     # every legitimate worktree path (e.g. --repo-path pointed at another
@@ -2762,7 +2762,7 @@ cmd_review_phase() {
     # Determine work_dir and base_ref from job.
     # NOTE: prefer the job's own .work_dir (the actual isolated worktree a
     # worktree-isolated job's Cody/Redd/Marty ran in) over .repo_path (the
-    # logical/main-checkout path, which is ALWAYS ~/Code/<repo> regardless of
+    # logical/main-checkout path, which is ALWAYS <code root>/<repo> regardless of
     # isolation mode). Reading .repo_path here was the root cause of every
     # reviewer (perri, archie via adherence-review) inspecting the wrong repo
     # state: phase_render_input's diff/tests sections AND the reviewer's own
@@ -5013,7 +5013,7 @@ Usage:
   mother run --once
 
 Add options:
-  --repo-path PATH     (default: ~/Code/<repo>)
+  --repo-path PATH     (default: <code root>/<repo>; code root is MOTHER_CODE_ROOT, default ~/Code)
   --base REF           (default: origin/main)
   --isolation worktree|main-dir   (default: worktree)
   --executor local-tmux           (only option in phase 2)

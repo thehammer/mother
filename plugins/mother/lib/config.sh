@@ -114,3 +114,19 @@ mother_config_migrate_plist() {
     esac
     mother_config_set MOTHER_CONCURRENCY "$val" && echo "$val"
 }
+
+# mother_code_root — the folder whose children are the code repos (<root>/<repo>).
+# Resolution: $MOTHER_CODE_ROOT (env) → MOTHER_CODE_ROOT in config.env → ~/Code.
+# A leading ~ is expanded. Empty values fall through to the next source.
+mother_code_root() {
+    local root="${MOTHER_CODE_ROOT:-}"
+    if [ -z "$root" ] && type mother_config_get >/dev/null 2>&1; then
+        root=$(mother_config_get MOTHER_CODE_ROOT 2>/dev/null) || root=""
+    fi
+    case "$root" in
+        "")     root="$HOME/Code" ;;
+        "~")    root="$HOME" ;;
+        "~/"*)  root="$HOME/${root#\~/}" ;;
+    esac
+    printf '%s' "$root"
+}

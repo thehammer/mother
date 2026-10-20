@@ -24,7 +24,7 @@
 #   MOTHER_GC_DERIVED_DATA_DIR   default ~/Library/Developer/Xcode/DerivedData
 #   MOTHER_GO_BIN                if SET (even empty) the only go binary considered
 #   MOTHER_GOCACHE_MAX_GB        default 10
-#   MOTHER_GC_CODE_DIR           default ~/Code (scanned for */target next to Cargo.toml)
+#   MOTHER_GC_CODE_DIR           default: the code root, MOTHER_CODE_ROOT or ~/Code (scanned for */target next to Cargo.toml)
 #   MOTHER_GC_TARGET_REPORT_GB   default 10
 #   MOTHER_CARGO_TARGET_PURGE    default 1; 0/false/no/off (any case) or an unrecognised value = only report
 #   MOTHER_CARGO_TARGET_IDLE_MINUTES  default 10; a target/ touched more recently is kept
@@ -531,7 +531,10 @@ _gc_write_cargo_cache() {
 # _gc_cargo_targets — informational only; nothing here is ever removed.
 # Job worktrees are skipped: _gc_cargo_job_targets owns those.
 _gc_cargo_targets() {
-    local code="${MOTHER_GC_CODE_DIR:-${HOME:-}/Code}"
+    local code="${MOTHER_GC_CODE_DIR:-}"
+    if [ -z "$code" ]; then
+        if type mother_code_root >/dev/null 2>&1; then code=$(mother_code_root); else code="${HOME:-}/Code"; fi
+    fi
     local report_gb="${MOTHER_GC_TARGET_REPORT_GB:-10}"
     case "$report_gb" in ''|*[!0-9]*) report_gb=10 ;; esac
     [ -d "$code" ] || return 0
