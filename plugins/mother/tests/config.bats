@@ -147,3 +147,24 @@ _runner_effective() {
     [ "$(printf '%s' "$output" | jq -r '.concurrency.value')" = "3" ]
     [ "$(printf '%s' "$output" | jq -r '.concurrency.source')" = "config file" ]
 }
+
+@test "mother_code_root defaults to ~/Code" {
+    unset MOTHER_CODE_ROOT
+    HOME=/h run mother_code_root
+    [ "$output" = "/h/Code" ]
+}
+
+@test "mother_code_root reads config.env, expands ~, and env wins" {
+    unset MOTHER_CODE_ROOT
+    printf 'MOTHER_CODE_ROOT=~/Software Development\n' > "$CONF"
+    HOME=/h run mother_code_root
+    [ "$output" = "/h/Software Development" ]
+    MOTHER_CODE_ROOT=/env HOME=/h run mother_code_root
+    [ "$output" = "/env" ]
+}
+
+@test "mother_code_root treats empty values as unset" {
+    printf 'MOTHER_CODE_ROOT=\n' > "$CONF"
+    MOTHER_CODE_ROOT= HOME=/h run mother_code_root
+    [ "$output" = "/h/Code" ]
+}
