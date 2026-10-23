@@ -44,9 +44,9 @@ code and decide" — that's your job, not the executor's.>
 3. <Step>
 
 ## Acceptance criteria
-- <Specific, checkable. The executor verifies these before opening a PR.>
-- <E.g. "Running the relevant test file passes.">
-- <E.g. "PR body references the ticket (e.g. 'Fixes TICKET-1234').">
+- **<ID>-1** <Specific, checkable. The executor verifies these before opening a PR. Bold IDs (letter first, digit last, unique) let Mother track progress per criterion.>
+- **<ID>-2** <E.g. "Running the relevant test file passes.">
+- **<ID>-3** <E.g. "PR body references the ticket (e.g. 'Fixes TICKET-1234').">
 
 ## Out of scope
 - <What NOT to do, even if tempted. Pin down the blast radius.>
@@ -110,6 +110,28 @@ deliberate cost-savings visible in the plan and in Mother's event log.
 **Default tier (no downgrade/upgrade needed):** `sonnet/medium`. Use higher
 tiers when the work is complex, touches fragile paths, or correctness is critical.
 Use lower tiers only for trivially small, well-scoped tasks.
+
+**Mother features the same YAML block can drive** (all optional; checked against `mother add`'s parser):
+- **`lenses: {add: [...], remove: [...]}`**: a top-level key beside `cody`/`redd`/`marty`/`perri`. Names:
+  `correctness`, `phi-security`, `tests`, `ops-infra`; an unknown name fails `mother add`, and `phi-security`
+  is forced on for PHI repos whatever the plan says. Lenses and gates only run in a repo whose base ref has a
+  `.mother/crew.yml` (check with `git show <base>:.mother/crew.yml`); without one these keys do nothing
+  useful, so don't promise a lens review in the plan. Security, wire and data-handling slices should add
+  `correctness` + `phi-security` (+ `tests`); small low-risk slices should not pay for lenses.
+- **`gates: {max_attempts: N}`** (integer 1-5): how many times the worker may fix failing gates before
+  Mother holds the job with options. The gates themselves are defined in `.mother/crew.yml`, never in the
+  plan. If the repo documents a toolchain guard or an offload route (a sandbox, `make ci-remote`), name it
+  in the plan, because a gate command has to use it.
+- **`expect_branch_mismatch: true`** when the job pushes more commits to an existing PR branch; **`no_pr: true`**
+  for a job that deliberately opens no PR.
+- **Acceptance criteria in bold-ID form.** Mother seeds a per-job checklist (progress %, ETA, and
+  `criterion_checked` events) from bullets under a heading that starts with "Acceptance criteria",
+  in the form `- **T0b-1** the criterion text`. The ID must start with a letter, end with a digit and be
+  unique in the plan. Plain bullets still work but give the job no checklist progress. Keep each criterion
+  atomic and checkable.
+- **Progress and ETA.** Mother shows a progress figure and an ETA band for running jobs and calibrates from
+  finished ones (`mother retro`). Use it as a sanity check on your estimate; keep stating estimates as ranges.
+- **`rationale` is at most 200 characters**; a longer one is rejected by `mother add`, so keep it to one line.
 
 **Dogfood example** (a complex multi-file shell feature):
 ```yaml
