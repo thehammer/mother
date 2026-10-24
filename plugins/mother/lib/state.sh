@@ -146,6 +146,21 @@ mother_event_append() {
 
 _job_exists() { [ -f "$(_job_path "$1")" ]; }
 
+# The ref every LOCAL diff consumer (changed files, patches, commits-ahead,
+# gate `when` scopes) compares HEAD against: the job's `.base_sha` snapshot,
+# else `.base_ref` (jobs enqueued before the snapshot existed), else the
+# optional fallback. `base_ref` is a moving remote-tracking ref (a fix-up job
+# pushes to the very branch it is based on), so a late evaluation of it sees an
+# empty diff. PR targeting and worktree creation keep using `.base_ref`.
+# Usage: mother_job_diff_base <job_file> [fallback]
+mother_job_diff_base() {
+    local job_file="${1:-}" fallback="${2:-}" v=""
+    if [ -n "$job_file" ] && [ -f "$job_file" ]; then
+        v=$(jq -r '.base_sha // .base_ref // empty' "$job_file" 2>/dev/null) || v=""
+    fi
+    printf '%s' "${v:-$fallback}"
+}
+
 # Merge a JSON patch into the job file (atomic read-modify-write).
 # Usage: _job_update <id> <jq-filter> [jq args...]
 _job_update() { mother_job_update "$@"; }
