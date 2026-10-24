@@ -3,7 +3,7 @@
 Broker transcripts that show Nostromo (and any other client) what the headless-crew producers put
 on the wire. The contract itself is documented in `docs/design.md`, "Headless crew contract (Phase 1)".
 
-**Recorded** by `plugins/mother/scripts/record-contract-fixtures.sh` at `8fd283d`; re-run it after any
+**Recorded** by `plugins/mother/scripts/record-contract-fixtures.sh` at `8fd283d`, re-recorded 2026-10-24 on `8d55c3b` for the new `base_sha` job key; re-run it after any
 contract change (`tests/contract.bats` fails when the committed files no longer match a fresh recording).
 
 The script runs each scenario through the real `mother add`, `mother-run-job`, `mother-usage progress-tick`
@@ -38,6 +38,7 @@ One broker message per line (NDJSON), in the exact envelope from `broker/envelop
 - Commands (`dir: cmd`) and their acks (`dir: ack`) share the command's `id`.
 - Snapshot jobs are the real job records the broker serves (existing keys with unchanged types, plus
   the new keys `crew`, `gates`, `review_wave`, `decision`, `attention`, `attention_reasons`, `progress`).
+- `base_sha` (string or null) is an additive job-record key: the commit SHA of `base_ref` at `mother add`. It appears in `queued` event data and snapshot jobs, normalised like any other sha. Clients must ignore unknown keys.
 - `crew.gates.mode` / `crew.lenses.mode` are configuration. Read `gates.mode` and `review_wave.mode`.
 - `progress.label` is the Mother-rendered display line (`≈80% · gates ✗ attempt 1/3 · ETA ?`); render it verbatim.
 
