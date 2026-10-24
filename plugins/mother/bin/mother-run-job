@@ -252,6 +252,21 @@ _reject_scraped_pr_url() {
         'if $transient then {url: $url, reason: $reason, transient: true} else {url: $url, reason: $reason} end')"
 }
 
+# _diff_base: the ref LOCAL diff consumers compare HEAD against (commits-ahead
+# counts, changed files, gate scopes, candidate-sha ranges): the job's
+# .base_sha snapshot, else .base_ref (jobs enqueued before the snapshot, or an
+# unresolvable base at add time). base_ref is a moving remote-tracking ref, so
+# for a fix-up job that pushes to its own base branch it would collapse the
+# diff to nothing. Same rule as lib/state.sh's mother_job_diff_base, re-stated
+# here because state.sh isn't sourced before the SOURCE_ONLY guard. Worktree
+# creation, branch creation and PR targeting keep using base_ref.
+_diff_base() {
+    local v=""
+    [ -n "${job_file:-}" ] && [ -f "$job_file" ] \
+        && v=$(jq -r '.base_sha // .base_ref // empty' "$job_file" 2>/dev/null)
+    printf '%s' "${v:-${base_ref:-}}"
+}
+
 # Gate for any PR URL scraped out of the worker transcript. Accepts the URL
 # only when GitHub-side evidence ties the PR to THIS job:
 #   - the PR's head branch is the job's branch, or expect_branch_mismatch is set
@@ -286,8 +301,9 @@ $pv
 GATE_PV_EOF
 
     ahead=""
-    if [ -n "${work_dir:-}" ] && [ -d "$work_dir" ] && [ -n "${base_ref:-}" ]; then
-        ahead=$(cd "$work_dir" && git rev-list --count "${base_ref}..HEAD" 2>/dev/null || true)
+    local diff_base; diff_base=$(_diff_base)
+    if [ -n "${work_dir:-}" ] && [ -d "$work_dir" ] && [ -n "$diff_base" ]; then
+        ahead=$(cd "$work_dir" && git rev-list --count "${diff_base}..HEAD" 2>/dev/null || true)
     fi
     case "$ahead" in ''|*[!0-9]*) ahead="" ;; esac
 
@@ -311,7 +327,7 @@ GATE_PV_EOF
         return 1
     fi
 
-    cands=$(prd_candidate_shas "${work_dir:-}" "${branch:-}" "${base_ref:-}" 2>/dev/null)
+    cands=$(prd_candidate_shas "${work_dir:-}" "${branch:-}" "$(_diff_base)" 2>/dev/null)
     indeterminate=0
     if [ -n "$cands" ]; then
         while IFS= read -r sha; do
@@ -499,7 +515,7 @@ _verify_no_pr_commits_or_fail() {
 
     local commits_ahead=""
     if [ -n "$tip_ref" ]; then
-        commits_ahead=$(cd "$work_dir" && git rev-list --count "$base_ref..$tip_ref" 2>/dev/null)
+        commits_ahead=$(cd "$work_dir" && git rev-list --count "$(_diff_base)..$tip_ref" 2>/dev/null)
         case "${commits_ahead:-}" in ''|*[!0-9]*) commits_ahead="" ;; esac
     fi
 
@@ -847,7 +863,7 @@ _gates_run_attempt() {
 
     local result=""
     mother_watchdog_run "$budget_s" "$out_dir/.total" "${work_dir:-.}" _gates_run_to_file \
-        "${work_dir:-}" "$crew_file" "$base_ref" "$out_dir" \
+        "${work_dir:-}" "$crew_file" "$(_diff_base)" "$out_dir" \
         --posture "$posture" --attempt "$attempt" ${unpushed_flag[@]+"${unpushed_flag[@]}"}
     if [ "${MOTHER_WD_OUTCOME:-}" = "done" ] && [ -s "$_GATES_RESULT_FILE" ]; then
         result=$(cat "$_GATES_RESULT_FILE" 2>/dev/null) || result=""
@@ -1325,7 +1341,7 @@ _wave_select() {
 # _wave_changed_files <out-file> — files changed on the branch (merge base..HEAD).
 _wave_changed_files() {
     local out="$1" mb
-    mb=$(git -C "${work_dir:-.}" merge-base "$base_ref" HEAD 2>/dev/null) || mb=""
+    mb=$(git -C "${work_dir:-.}" merge-base "$(_diff_base)" HEAD 2>/dev/null) || mb=""
     if [ -n "$mb" ]; then
         git -C "${work_dir:-.}" diff --name-only "$mb" HEAD 2>/dev/null >"$out" || : >"$out"
     else
@@ -1922,7 +1938,7 @@ _verify_artifact_or_fail() {
     # branch). That is still real, shipped work; only the branch-naming
     # contract was missed, not the actual delivery. See
     # .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md.
-    if prd_sha_on_origin "$work_dir" "$base_ref"; then
+    if prd_sha_on_origin "$work_dir" "$(_diff_base)"; then
         local origin_refs
         origin_refs=$(cd "$work_dir" && git branch -r --contains HEAD 2>/dev/null \
             | sed 's/^[* ]*//' | tr '\n' ',' | sed 's/,$//')
@@ -1936,7 +1952,7 @@ _verify_artifact_or_fail() {
     # regardless of what the result event claimed. Gather context that'll
     # help the operator decide whether to retry or hand-finish.
     local commits_ahead=0 uncommitted=0
-    commits_ahead=$(cd "$work_dir" && git rev-list --count "$base_ref..HEAD" 2>/dev/null || echo 0)
+    commits_ahead=$(cd "$work_dir" && git rev-list --count "$(_diff_base)..HEAD" 2>/dev/null || echo 0)
     uncommitted=$(cd "$work_dir" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
 
     _transition failed "$(jq -nc \
@@ -2036,7 +2052,7 @@ PV_EOF
         fi
 
         if [ -n "$pv_state" ] && [ "$pv_state" != "OPEN" ]; then
-            hit=$(prd_detect_pr "$work_dir" "$branch" "$base_ref" 2>/dev/null)
+            hit=$(prd_detect_pr "$work_dir" "$branch" "$(_diff_base)" 2>/dev/null)
             _split_pr_hit "$hit"
             if [ -n "$hit_url" ] && [ "$hit_url" != "$pr_url" ]; then
                 _append_event "pr_url_updated" "$(jq -nc \
@@ -2057,7 +2073,7 @@ PV_EOF
 
     # --- first capture (nothing usable was stored) ---
     if [ -z "$pr_url" ]; then
-        hit=$(prd_detect_pr "$work_dir" "$branch" "$base_ref" 2>/dev/null)
+        hit=$(prd_detect_pr "$work_dir" "$branch" "$(_diff_base)" 2>/dev/null)
         _split_pr_hit "$hit"
         if [ -z "$hit_url" ] && [ -f "$log_path" ]; then
             hit_url=$(_finalize_scrape_pr_url)
@@ -2110,7 +2126,7 @@ PV_EOF
         return 0
     fi
 
-    cands=$(prd_candidate_shas "$work_dir" "$branch" "$base_ref" 2>/dev/null)
+    cands=$(prd_candidate_shas "$work_dir" "$branch" "$(_diff_base)" 2>/dev/null)
     accepted=0; indeterminate=0; matched_sha=""
     if [ -n "$cands" ]; then
         while IFS= read -r sha; do
@@ -2435,11 +2451,11 @@ _spawn_and_wait() {
                 while IFS= read -r _input_key; do
                     [ -z "$_input_key" ] && continue
                     phase_render_input "$_input_key" "$work_dir" "$plan_path" \
-                        "${prd_path:-}" "${base_ref:-}" "$job_file" "$phase_agent"
+                        "${prd_path:-}" "$(_diff_base)" "$job_file" "$phase_agent"
                 done <<< "$_inputs_list"
                 if [ "${_declared_plan:-0}" -eq 0 ]; then
                     phase_render_input "plan" "$work_dir" "$plan_path" \
-                        "${prd_path:-}" "${base_ref:-}" "$job_file" "$phase_agent"
+                        "${prd_path:-}" "$(_diff_base)" "$job_file" "$phase_agent"
                 fi
             else
                 # ---- Legacy (non-pipeline) prompt: preamble + routing + plan ----
@@ -3046,6 +3062,23 @@ if [ "$kind" = "pipeline" ]; then
             '{phase: $ph, agent: $a, request_type: $rt}')"
 fi
 
+# _refresh_base_sha <dir>: a brand-new job branch was just created from base_ref
+# (after the fetch above), so its true branch point is <dir>'s HEAD, which may be
+# newer than the base_sha `mother add` snapshotted (a queued job can wait a long
+# time, and main moves). Re-snapshot so the diff doesn't include main's
+# intervening commits. Only called when the branch is created here: resumes,
+# rework and reruns on an existing branch keep the job's original base_sha.
+_refresh_base_sha() {
+    local sha cur
+    sha=$(git -C "$1" rev-parse --verify --quiet "HEAD^{commit}" 2>/dev/null) || sha=""
+    [ -n "$sha" ] || return 0
+    cur=$(jq -r '.base_sha // empty' "$job_file" 2>/dev/null)
+    if [ "$sha" != "$cur" ]; then
+        _job_update ".base_sha = \"$sha\""
+    fi
+    return 0
+}
+
 # Resolve working directory.
 work_dir=""
 _workspace_lock_held=0
@@ -3063,6 +3096,7 @@ if [ "$isolation" = "worktree" ]; then
         else
             (cd "$repo_path" && git worktree add -b "$branch" "$wt_path" "$base_ref") \
                 || { _transition failed "$(jq -nc --arg r "worktree_create_failed" '{reason: $r}')"; exit 1; }
+            _refresh_base_sha "$wt_path"
         fi
     fi
     work_dir="$wt_path"
@@ -3134,6 +3168,7 @@ else
             _workspace_lock_held=0
             exit 1
         fi
+        _refresh_base_sha "$work_dir"
         _append_event "branch_checked_out" "$(jq -nc --arg b "$branch" --arg base "$base_ref" '{branch: $b, created: true, base: $base}')"
     fi
 fi
@@ -3495,7 +3530,7 @@ _attempt_continuation() {
     # Summarise what's already committed so the resumed worker doesn't redo it.
     local git_log_summary=""
     if [ -d "${work_dir:-}" ]; then
-        git_log_summary=$(cd "$work_dir" && git log --oneline "${base_ref}..HEAD" 2>/dev/null || true)
+        git_log_summary=$(cd "$work_dir" && git log --oneline "$(_diff_base)..HEAD" 2>/dev/null || true)
     fi
     [ -z "$git_log_summary" ] && git_log_summary="(no commits ahead of base yet)"
 

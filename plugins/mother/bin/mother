@@ -689,6 +689,13 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         esac
     fi
 
+    # Snapshot the base as a commit SHA now. base_ref is a MOVING remote-tracking
+    # ref (a fix-up job pushes to the branch it is based on); every local diff
+    # consumer compares against base_sha instead (mother_job_diff_base). An
+    # unresolvable base leaves it empty and consumers fall back to base_ref.
+    local base_sha=""
+    base_sha=$(git -C "$repo_path" rev-parse --verify --quiet "${base_ref}^{commit}" 2>/dev/null) || base_sha=""
+
     # Plan lens add/remove. Validated even with no crew.yml: a PHI repo's
     # phi-security lens is mandatory regardless of config.
     local plan_lenses_json
@@ -767,6 +774,7 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         --arg repo_path "$repo_path" \
         --arg branch "$branch" \
         --arg base_ref "$base_ref" \
+        --arg base_sha "$base_sha" \
         --arg isolation "$isolation" \
         --arg executor "$executor" \
         --argjson deps "$deps_json" \
@@ -786,7 +794,9 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         --arg origin_label "$origin_label" \
         '{
             id: $id, title: $title, repo: $repo, repo_path: $repo_path,
-            branch: $branch, base_ref: $base_ref, isolation: $isolation,
+            branch: $branch, base_ref: $base_ref,
+            base_sha: (if $base_sha == "" then null else $base_sha end),
+            isolation: $isolation,
             executor: $executor, depends_on: $deps, max_cost_usd: $max_cost,
             plan_path: $plan_path, log_path: $log_path,
             plan_summary: $plan_summary,
@@ -1501,6 +1511,14 @@ cmd_status() {
         ' "$job_file"
         echo
 
+        local base_sha_short
+        base_sha_short=$(jq -r '(.base_sha // "")[0:7]' "$job_file")
+        if [ -n "$base_sha_short" ]; then
+            echo "=== base ==="
+            jq -r '"  Base ref:    \(.base_ref // "-")", "  Base sha:    \((.base_sha // "")[0:7]) (diff base; fixed at add time)"' "$job_file"
+            echo
+        fi
+
         echo "=== job ==="
         jq . "$job_file"
         echo
@@ -1607,6 +1625,8 @@ cmd_peek() {
     local question paused_at
     question=$(jq -r '.question // ""' "$job_json")
     paused_at=$(jq -r '.paused_at // ""' "$job_json")
+    local base_sha_short
+    base_sha_short=$(jq -r '(.base_sha // "")[0:7]' "$job_json")
 
     [ -n "$work_dir" ] || _die "peek: could not resolve work_dir for $id"
 
@@ -1642,6 +1662,7 @@ cmd_peek() {
         PEEK_WORK_DIR="$work_dir" PEEK_TRANSCRIPT="$transcript" \
         PEEK_FORMAT="$format" PEEK_TAIL="$tail_count" \
         PEEK_QUESTION="$question" PEEK_PAUSED_AT="$paused_at" \
+        PEEK_BASE_SHA="$base_sha_short" \
             python3 - <<'PYEOF'
 import json, os, sys, time
 from collections import Counter
@@ -1655,6 +1676,7 @@ fmt        = os.environ.get("PEEK_FORMAT", "text")
 tail_n     = int(os.environ.get("PEEK_TAIL", "8"))
 question   = os.environ.get("PEEK_QUESTION", "")
 paused_at  = os.environ.get("PEEK_PAUSED_AT", "")
+base_sha   = os.environ.get("PEEK_BASE_SHA", "")
 
 size_bytes = os.path.getsize(path)
 mtime      = os.path.getmtime(path)
@@ -1733,6 +1755,7 @@ if fmt == "json":
         "last_text":   last_text,
         "question":    question or None,
         "paused_at":   paused_at or None,
+        "base_sha":    base_sha or None,
     }
     print(json.dumps(out, indent=2))
 else:
@@ -1741,6 +1764,8 @@ else:
         print(f"Title:       {title}")
     print(f"State:       {state}")
     print(f"Work dir:    {work_dir}")
+    if base_sha:
+        print(f"Base sha:    {base_sha}")
     print(f"Transcript:  {path}")
     print(f"             {fmt_size(size_bytes)}, updated {fmt_age(age_s)}")
     print()
@@ -1886,7 +1911,7 @@ _guard_existing_pr() {
     local branch repo_path base_ref hit hit_url hit_kind hit_sha disp
     branch=$(jq -r '.branch // empty' "$job_file" 2>/dev/null)
     repo_path=$(jq -r '.work_dir // .repo_path // empty' "$job_file" 2>/dev/null)
-    base_ref=$(jq -r '.base_ref // empty' "$job_file" 2>/dev/null)
+    base_ref=$(mother_job_diff_base "$job_file")
     [ -n "$branch" ] && [ -n "$repo_path" ] || return 0
 
     hit=$(prd_detect_pr "$repo_path" "$branch" "$base_ref" 2>/dev/null)
@@ -2311,7 +2336,7 @@ cmd_reconcile() {
 
     local branch base_ref work_dir
     branch=$(jq -r '.branch // empty' "$job_file")
-    base_ref=$(jq -r '.base_ref // empty' "$job_file")
+    base_ref=$(mother_job_diff_base "$job_file")
     work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
 
     local url="" match_kind="" matched_sha="" pr_branch="" verified=0
@@ -2773,7 +2798,7 @@ cmd_review_phase() {
     # fallback.
     local work_dir base_ref prd_path
     work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
-    base_ref=$(jq -r '.base_ref // empty' "$job_file")
+    base_ref=$(mother_job_diff_base "$job_file")
     prd_path=$(jq -r '.prd_path // empty' "$job_file")
 
     # Hard-fail BEFORE any artifact rendering or reviewer spawn when the
@@ -3022,7 +3047,7 @@ cmd_review_lens() {
 
     local work_dir base_ref prd_path pr_url cycle
     work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
-    base_ref=$(jq -r '.base_ref // empty' "$job_file")
+    base_ref=$(mother_job_diff_base "$job_file")
     prd_path=$(jq -r '.prd_path // empty' "$job_file")
     pr_url=$(jq -r '.pr_url // empty' "$job_file")
     # A review wave (HC-14) numbers its own cycles; pipeline jobs use theirs.
@@ -3202,7 +3227,7 @@ cmd_merge_findings() {
     local job_file; job_file=$(_job_path "$id")
     local work_dir base_ref
     work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file")
-    base_ref=$(jq -r '.base_ref // empty' "$job_file")
+    base_ref=$(mother_job_diff_base "$job_file")
     [ -n "$work_dir" ] && [ -d "$work_dir" ] || _die "merge-findings: work_dir is missing ($work_dir)"
     local wave_dir="$MOTHER_ROOT/crew/$wave/wave/c${cycle}"
     [ -d "$wave_dir" ] || _die "merge-findings: no wave directory: $wave_dir"
@@ -3374,7 +3399,7 @@ cmd_adherence_review() {
         pre_head=$(git -C "${pre_work_dir:-.}" rev-parse HEAD 2>/dev/null) || pre_head=""
         pre_cycle=$(jq -r '.review_wave.cycle // 0' "$job_file")
         local pre_base pre_mb
-        pre_base=$(jq -r '.base_ref // empty' "$job_file")
+        pre_base=$(mother_job_diff_base "$job_file")
         pre_mb=$(git -C "${pre_work_dir:-.}" merge-base "$pre_base" HEAD 2>/dev/null) || pre_mb=""
         [ -n "$pre_mb" ] && pr_diff=$(git -C "$pre_work_dir" diff "$pre_mb" HEAD 2>/dev/null)
     fi
@@ -4832,7 +4857,7 @@ _gates_cmd_run() {
         job_file=$(_job_path "$job_id")
         repo_path=$(jq -r '.repo_path // empty' "$job_file")
         repo_name=$(jq -r '.repo // empty' "$job_file")
-        [ -n "$base" ] || base=$(jq -r '.base_ref // empty' "$job_file")
+        [ -n "$base" ] || base=$(mother_job_diff_base "$job_file")
         if [ -n "$repo" ]; then work_dir="$repo"; else work_dir=$(jq -r '.work_dir // .repo_path // empty' "$job_file"); fi
         out_name="$job_id"
     else
@@ -4917,7 +4942,7 @@ cmd_doctor() {
         case "$seen" in *$'\n'"$repo_path"$'\n'*) continue ;; esac
         seen="${seen}${repo_path}"$'\n'
         [ -d "$repo_path" ] && git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
-        base_ref=$(jq -r '.base_ref // empty' "$job_file")
+        base_ref=$(jq -r '.base_ref // empty' "$job_file" 2>/dev/null)
         label=$(jq -r '.repo // empty' "$job_file"); [ -n "$label" ] || label=$(basename "$repo_path")
         if [ -z "$base_ref" ] || ! git -C "$repo_path" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
             base_ref=$(_crew_default_ref "$repo_path")
