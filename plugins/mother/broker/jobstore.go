@@ -18,10 +18,16 @@ package main
 //     watch goroutine, dropping records whose file is gone and (re)loading
 //     files that are new or changed. It also runs on every watcher error.
 //   - if the watcher cannot be created/attached (or dies), watch falls back
-//     to calling reconcile() every pollEvery (5s) instead of freezing.
+//     to calling reconcile() every pollEvery (5s) instead of freezing. The
+//     broker then polls for the rest of its life: the watcher is never
+//     retried (restart the broker to get fsnotify back).
 //   - pruneMissing() stats each record's file; query.list, query.get and
 //     subscribe snapshots call it first, so a lost event never surfaces a
 //     job whose file is gone.
+//   - a record is dropped only when a fresh stat of its own file fails with
+//     ENOENT (never on the strength of a directory snapshot, which may
+//     predate the record), and never while the jobs directory itself is
+//     missing or unreadable (e.g. an unmounted volume).
 // No protocol event is published for a reconcile drop: the contract has no
 // removal/archived kind, so clients converge via query.list.
 
@@ -34,6 +40,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -75,6 +82,14 @@ type jobStore struct {
 	reconcileEvery time.Duration // directory reconcile while the watcher is healthy
 	pollEvery      time.Duration // reconcile cadence when the watcher is unavailable
 	openWatcher    func(dir string) (*fsnotify.Watcher, error)
+
+	// afterListHook, if non-nil, runs in reconcile() right after the directory
+	// snapshot is taken and before the store is examined. Tests use it to
+	// interleave a create+refresh at the worst moment; production leaves it nil.
+	afterListHook func()
+
+	// dirDownLogged makes the "jobs dir unavailable" log fire once per outage.
+	dirDownLogged atomic.Bool
 }
 
 func newJobStore(jobsDir string) *jobStore {
@@ -176,21 +191,28 @@ func (s *jobStore) reconcile() {
 		}
 		present[e.Name()] = sig
 	}
+	if s.afterListHook != nil {
+		s.afterListHook()
+	}
 
-	s.mu.Lock()
+	// Records whose file is absent from the snapshot are only candidates: the
+	// snapshot may predate the record (a refresh can land between ReadDir and
+	// here), so each candidate is re-stat'd before it is dropped.
+	s.mu.RLock()
 	fresh := make(map[string]bool, len(s.jobs))
-	for id, rec := range s.jobs {
+	var absent []*jobRecord
+	for _, rec := range s.jobs {
 		sig, ok := present[rec.file]
 		if !ok {
-			delete(s.jobs, id)
-			delete(s.progress, id)
+			absent = append(absent, rec)
 			continue
 		}
 		if sig == rec.sig {
 			fresh[rec.file] = true
 		}
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
+	s.dropGone(absent)
 
 	for name := range present {
 		if !fresh[name] {
@@ -208,14 +230,7 @@ func (s *jobStore) pruneMissing() {
 		recs = append(recs, rec)
 	}
 	s.mu.RUnlock()
-
-	var gone []*jobRecord
-	for _, rec := range recs {
-		if _, err := os.Stat(filepath.Join(s.dir, rec.file)); errors.Is(err, os.ErrNotExist) {
-			gone = append(gone, rec)
-		}
-	}
-	s.dropRecords(gone)
+	s.dropGone(recs)
 }
 
 // pruneMissingID is pruneMissing for a single job (query.get).
@@ -226,9 +241,47 @@ func (s *jobStore) pruneMissingID(id string) {
 	if rec == nil {
 		return
 	}
-	if _, err := os.Stat(filepath.Join(s.dir, rec.file)); errors.Is(err, os.ErrNotExist) {
-		s.dropRecords([]*jobRecord{rec})
+	s.dropGone([]*jobRecord{rec})
+}
+
+// dropGone drops the candidate records whose backing file is verifiably gone:
+// a stat of the file's real path that fails with os.ErrNotExist. Any other
+// stat error (permission, I/O) keeps the record, and so does a missing or
+// unreadable jobs directory (e.g. an unmounted volume), where every file
+// would look gone. Candidates are drawn from a snapshot that may be stale, so
+// the stat here is what decides, never the snapshot; dropRecords then guards
+// against a record replaced in the meantime.
+func (s *jobStore) dropGone(candidates []*jobRecord) {
+	var gone []*jobRecord
+	for _, rec := range candidates {
+		if _, err := os.Stat(filepath.Join(s.dir, rec.file)); errors.Is(err, os.ErrNotExist) {
+			gone = append(gone, rec)
+		}
 	}
+	if len(gone) == 0 {
+		return
+	}
+	if !s.jobsDirReadable() {
+		return
+	}
+	s.dropRecords(gone)
+}
+
+// jobsDirReadable reports whether the jobs directory exists and can be
+// opened. When it cannot, the failure is logged once per outage (the flag
+// resets when the directory is healthy again) so a polling broker doesn't
+// spam stderr.
+func (s *jobStore) jobsDirReadable() bool {
+	f, err := os.Open(s.dir)
+	if err == nil {
+		f.Close()
+		s.dirDownLogged.Store(false)
+		return true
+	}
+	if s.dirDownLogged.CompareAndSwap(false, true) {
+		fmt.Fprintf(os.Stderr, "mother-broker: jobs dir %s unavailable (%v); keeping job records until it returns\n", s.dir, err)
+	}
+	return false
 }
 
 // dropRecords deletes the given records unless a refresh has replaced them

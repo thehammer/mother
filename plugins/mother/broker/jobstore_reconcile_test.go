@@ -5,8 +5,15 @@ package main
 // watcher death), so a job file moved to archive/ must not linger in
 // query.list / query.get, and the store must self-heal without events.
 //
-// Requires: jobStore.reconcile, jobStore.pruneMissing, jobStore.reconcileEvery,
-// jobStore.pollEvery, jobStore.openWatcher (see jobstore.go).
+// Requires: jobStore.reconcile, jobStore.pruneMissing, jobStore.pruneMissingID,
+// jobStore.reconcileEvery, jobStore.pollEvery, jobStore.openWatcher, and the
+// test hook jobStore.afterListHook (runs inside reconcile() right after the
+// directory snapshot, before the store is examined; nil in production). See
+// jobstore.go.
+//
+// Invariant added alongside the hook: a record is dropped only on positive
+// evidence that its own file is gone (ENOENT on that file), never because a
+// snapshot, a listing, or a missing/unreadable jobs directory said so.
 
 import (
 	"encoding/json"
@@ -15,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -464,13 +472,18 @@ func TestJobStore_ConcurrentQueriesAndReconcileWhileFilesChurn(t *testing.T) {
 			}
 		}()
 	}
+	// Completed-iteration counters: the test waits for real progress from the
+	// churn writer and the reconcile spinner rather than sleeping.
+	var churnIters, reconcilePasses, pruneIters atomic.Int64
+	const minIters = 20
+
 	spin(func() { th.runner.queryList(listFilter{}) })
 	spin(func() { th.runner.queryList(listFilter{state: "ready"}) })
 	spin(func() { th.runner.queryGet("stable-3") })
 	spin(func() { th.store.get("churn-1"); th.store.allIDs() })
 	spin(func() { th.store.setProgress("churn-1", json.RawMessage(`{"pct":1}`)) })
-	spin(func() { th.store.reconcile() })
-	spin(func() { th.store.pruneMissing() })
+	spin(func() { th.store.reconcile(); reconcilePasses.Add(1) })
+	spin(func() { th.store.pruneMissing(); pruneIters.Add(1) })
 	spin(func() {
 		for i := 0; i < 5; i++ {
 			id := fmt.Sprintf("churn-%d", i)
@@ -478,11 +491,22 @@ func TestJobStore_ConcurrentQueriesAndReconcileWhileFilesChurn(t *testing.T) {
 			th.store.refresh(path)
 			_ = os.Remove(path)
 		}
+		churnIters.Add(1)
 	})
 
-	time.Sleep(300 * time.Millisecond) // let the goroutines interleave under -race
+	// Let the goroutines interleave under -race until each spinner has done a
+	// minimum amount of real work (bounded by a deadline, no fixed sleep).
+	interleaved := pollCondition(func() bool {
+		return churnIters.Load() >= minIters &&
+			reconcilePasses.Load() >= minIters &&
+			pruneIters.Load() >= minIters
+	}, reconcileDeadline)
 	close(stop)
 	wg.Wait()
+	if !interleaved {
+		t.Errorf("spinners made too little progress before the deadline: churn=%d reconcile=%d prune=%d (want >= %d each)",
+			churnIters.Load(), reconcilePasses.Load(), pruneIters.Load(), minIters)
+	}
 	stopWatch() // a late fs event must not re-add a churn file after the checks below
 
 	// Quiescent end state: stable jobs survive, churn files (all removed) don't.
@@ -498,6 +522,246 @@ func TestJobStore_ConcurrentQueriesAndReconcileWhileFilesChurn(t *testing.T) {
 			t.Errorf("removed job %s still listed", id)
 		}
 	}
+}
+
+// --- 10. Snapshot race: a file created after the listing must survive ------
+
+// reconcile lists the directory outside the store lock. A file created (and
+// picked up by the watcher's refresh) after that listing is absent from the
+// snapshot but its file exists, so reconcile must not drop its record.
+func TestReconcile_KeepsRecordCreatedAfterSnapshot(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.injectJob(t, "keep", nil)
+	th.injectJob(t, "gone", nil)
+	archiveJobFile(t, th.jobsDir, "gone") // genuinely gone before reconcile
+
+	var once sync.Once
+	th.store.afterListHook = func() {
+		once.Do(func() {
+			path := writeJobFile(t, th.jobsDir, "late.json", "late", "running")
+			th.store.refresh(path) // the watcher wins the race against reconcile
+		})
+	}
+
+	th.store.reconcile()
+	th.store.afterListHook = nil
+
+	if !th.store.exists("late") {
+		t.Errorf("reconcile dropped a record created after its snapshot although its file exists")
+	}
+	if _, ok := th.store.get("late"); !ok {
+		t.Errorf("get(late) not found after reconcile")
+	}
+	if !th.store.exists("keep") {
+		t.Errorf("reconcile dropped a pre-existing record whose file exists")
+	}
+	if th.store.exists("gone") {
+		t.Errorf("reconcile kept a record whose file is genuinely gone")
+	}
+	ids := listedIDs(t, th.runner)
+	if !contains(ids, "late") || !contains(ids, "keep") || contains(ids, "gone") {
+		t.Errorf("list = %v, want late and keep, not gone", ids)
+	}
+}
+
+// Same race under load: one goroutine creates files and refreshes them, as the
+// watcher does, while another reconciles continuously. No created file may
+// ever be missing afterwards. (Deliberately no final reconcile: that would
+// re-load a wrongly dropped file and mask the bug.)
+func TestReconcile_ConcurrentCreatesAreNeverDropped(t *testing.T) {
+	th := newTestHub(t, 1024)
+	total := 3000
+	if testing.Short() {
+		total = 500
+	}
+
+	stop := make(chan struct{})
+	var passes atomic.Int64
+	var rwg sync.WaitGroup
+	rwg.Add(1)
+	go func() {
+		defer rwg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				th.store.reconcile()
+				passes.Add(1)
+			}
+		}
+	}()
+
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("late-%04d", i)
+		path := filepath.Join(th.jobsDir, id+".json")
+		body := fmt.Sprintf(`{"id":%q,"state":"running","repo":"testrepo"}`, id)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+		th.store.refresh(path)
+	}
+	close(stop)
+	rwg.Wait()
+
+	var missing []string
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("late-%04d", i)
+		if !th.store.exists(id) {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		show := missing
+		if len(show) > 5 {
+			show = show[:5]
+		}
+		t.Errorf("%d of %d created jobs missing from the store after %d concurrent reconciles (first: %v)",
+			len(missing), total, passes.Load(), show)
+	}
+}
+
+// --- 11. Jobs directory missing or unreadable: never drop anything ---------
+
+// threeJobHub returns a hub holding jobs a, b and c, all with files.
+func threeJobHub(t *testing.T) *testHub {
+	t.Helper()
+	th := newTestHub(t, 1024)
+	for _, id := range []string{"a", "b", "c"} {
+		th.injectJob(t, id, nil)
+	}
+	return th
+}
+
+func assertAllThreePresent(t *testing.T, th *testHub, when string) {
+	t.Helper()
+	for _, id := range []string{"a", "b", "c"} {
+		if !th.store.exists(id) {
+			t.Errorf("%s: record %q was dropped", when, id)
+		}
+	}
+}
+
+// The real jobs directory vanishes (ENOENT on the directory itself): that is
+// an outage, not evidence that every job was archived.
+func TestReconcile_MissingJobsDirDropsNothing(t *testing.T) {
+	th := threeJobHub(t)
+	if err := os.RemoveAll(th.jobsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	th.store.reconcile()
+
+	assertAllThreePresent(t, th, "reconcile with jobs dir removed")
+}
+
+func TestPruneMissing_MissingJobsDirDropsNothing(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func(t *testing.T, th *testHub)
+	}{
+		{"pruneMissing", func(t *testing.T, th *testHub) { th.store.pruneMissing() }},
+		{"pruneMissingID", func(t *testing.T, th *testHub) {
+			for _, id := range []string{"a", "b", "c"} {
+				th.store.pruneMissingID(id)
+			}
+		}},
+		{"queryList", func(t *testing.T, th *testHub) {
+			if res := th.runner.queryList(listFilter{}); res.code != "" {
+				t.Errorf("queryList failed: %s %s", res.code, res.msg)
+			}
+		}},
+		{"queryGet", func(t *testing.T, th *testHub) {
+			for _, id := range []string{"a", "b", "c"} {
+				if res := th.runner.queryGet(id); res.code != "" {
+					t.Errorf("queryGet(%s) = %q while only the jobs dir is missing", id, res.code)
+				}
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			th := threeJobHub(t)
+			if err := os.RemoveAll(th.jobsDir); err != nil {
+				t.Fatal(err)
+			}
+			tc.run(t, th)
+			assertAllThreePresent(t, th, tc.name+" with jobs dir removed")
+		})
+	}
+}
+
+// After the outage ends and the files are back, the store serves the same
+// records, still tracks new files, and again drops genuinely archived ones.
+func TestJobStore_RecoversWhenJobsDirReappears(t *testing.T) {
+	th := threeJobHub(t)
+	if err := os.RemoveAll(th.jobsDir); err != nil {
+		t.Fatal(err)
+	}
+	th.store.reconcile()
+	th.store.pruneMissing()
+	_ = th.runner.queryList(listFilter{})
+
+	if err := os.MkdirAll(th.jobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		writeJobFile(t, th.jobsDir, id+".json", id, "ready")
+	}
+
+	ids := listedIDs(t, th.runner)
+	for _, id := range []string{"a", "b", "c"} {
+		if !contains(ids, id) {
+			t.Errorf("after recovery list = %v, missing %q", ids, id)
+		}
+		if res := th.runner.queryGet(id); res.code != "" {
+			t.Errorf("after recovery queryGet(%s) = %q", id, res.code)
+		}
+	}
+
+	writeJobFile(t, th.jobsDir, "d.json", "d", "ready")
+	th.store.reconcile()
+	if !th.store.exists("d") {
+		t.Errorf("reconcile did not pick up a new file after recovery")
+	}
+	archiveJobFile(t, th.jobsDir, "b")
+	if ids := listedIDs(t, th.runner); contains(ids, "b") {
+		t.Errorf("after recovery list = %v, still returns archived b", ids)
+	}
+}
+
+// chmod 000 on the jobs directory: listing and stat both fail with EACCES,
+// which is not "file gone". Nothing may be dropped.
+func TestJobStore_UnreadableJobsDirDropsNothing(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	th := threeJobHub(t)
+	// Registered before the chmod so TempDir cleanup can always remove the dir.
+	t.Cleanup(func() { _ = os.Chmod(th.jobsDir, 0o755) })
+	if err := os.Chmod(th.jobsDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadDir(th.jobsDir); err == nil {
+		t.Skip("chmod 000 did not make the jobs dir unreadable on this platform")
+	}
+
+	th.store.reconcile()
+	assertAllThreePresent(t, th, "reconcile with unreadable jobs dir")
+
+	th.store.pruneMissing()
+	assertAllThreePresent(t, th, "pruneMissing with unreadable jobs dir")
+
+	for _, id := range []string{"a", "b", "c"} {
+		th.store.pruneMissingID(id)
+	}
+	assertAllThreePresent(t, th, "pruneMissingID with unreadable jobs dir")
+
+	_ = th.runner.queryList(listFilter{})
+	for _, id := range []string{"a", "b", "c"} {
+		_ = th.runner.queryGet(id)
+	}
+	assertAllThreePresent(t, th, "queries with unreadable jobs dir")
 }
 
 // --- 9. Benchmark ----------------------------------------------------------

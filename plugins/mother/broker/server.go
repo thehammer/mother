@@ -315,6 +315,13 @@ func (h *hub) unsubscribe(cl *client, name string) {
 	h.mu.Unlock()
 }
 
+// snapshotJobsLocked builds a subscribe snapshot. For an all-jobs subscription
+// it calls store.pruneMissing(), which stats every job file (one stat per job)
+// while the caller holds h.mu. That is acceptable at this scale: a few hundred
+// jobs is a few hundred stats on a local filesystem (about 1 ms), it happens
+// once per subscribe rather than per event, and it keeps a lost fs event from
+// putting an archived job in the snapshot. Revisit if job counts reach the
+// tens of thousands or the jobs dir moves to a slow/network filesystem.
 func (h *hub) snapshotJobsLocked(sub *subscription) []json.RawMessage {
 	var ids []string
 	if sub.allJobs {
