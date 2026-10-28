@@ -91,6 +91,18 @@ don't use it to tidy your own jobs. `DAYS` must be an integer.
 session can find the jobs it queued with `mother list --project <p>` /
 `--label <l>`.
 
+**`$CLAUDE_SESSION_ID` is not always set in the Bash tool.** Claude Code hands
+the session id to hooks but does not export it to the shell your commands run
+in, so check before you enqueue (`echo "${CLAUDE_SESSION_ID:-}"`). If it is
+empty, the job is recorded with an empty `origin.session` unless you pass your
+own id with `--origin-session <id>`. Your session id is the UUID that names your
+transcript, `~/.claude/projects/<project>/<id>.jsonl`, and the directory your
+large tool results are saved in (`~/.claude/projects/<project>/<id>/tool-results/`).
+Read it from a path in your own output, and confirm that transcript exists. Do
+not take "the most recently modified transcript": it is the wrong session
+whenever two sessions are active in the same project. If you cannot establish
+the id, leave `--origin-session` off and tell the user, rather than inventing one.
+
 ## Typical invocation pattern
 
 After user agreement:
@@ -108,6 +120,7 @@ id=$(mother add --plan-file /tmp/plan-TICKET-1234.md \
                 --isolation worktree \
                 --max-cost 3 \
                 --label "short description of the requesting work")
+# If $CLAUDE_SESSION_ID is empty, also pass: --origin-session <your session id>
 echo "Queued: $id"
 ```
 
