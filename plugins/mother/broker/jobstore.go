@@ -9,22 +9,61 @@ package main
 // state/activity/await fields are overlaid from the event-derived mirror
 // (see hub.jobState) so the snapshot is consistent with the live event
 // stream — see subscriptions / hub for the no-gap/no-dup contract.
+//
+// INVARIANT: a record exists only while its job file does. fsnotify is a
+// hint, not a guarantee (kqueue drops/coalesces events under bursts, the
+// watcher can fail to start or report errors), so the invariant is enforced
+// by reconciling against the directory rather than trusting events alone:
+//   - reconcile() lists the directory every reconcileEvery (30s) from the
+//     watch goroutine, dropping records whose file is gone and (re)loading
+//     files that are new or changed. It also runs on every watcher error.
+//   - if the watcher cannot be created/attached (or dies), watch falls back
+//     to calling reconcile() every pollEvery (5s) instead of freezing. The
+//     broker then polls for the rest of its life: the watcher is never
+//     retried (restart the broker to get fsnotify back).
+//   - pruneMissing() stats each record's file; query.list, query.get and
+//     subscribe snapshots call it first, so a lost event never surfaces a
+//     job whose file is gone.
+//   - a record is dropped only when a fresh stat of its own file fails with
+//     ENOENT (never on the strength of a directory snapshot, which may
+//     predate the record), and never while the jobs directory itself is
+//     missing or unreadable (e.g. an unmounted volume).
+// No protocol event is published for a reconcile drop: the contract has no
+// removal/archived kind, so clients converge via query.list.
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
+
+const (
+	defaultReconcileEvery = 30 * time.Second
+	defaultPollEvery      = 5 * time.Second
+)
+
+// fileSig identifies a version of a job file, so reconcile can spot content
+// changes whose fs event was lost without re-reading every file each pass.
+type fileSig struct {
+	mtime time.Time
+	size  int64
+}
 
 // jobRecord holds a job's raw JSON plus the few fields the broker filters on.
 type jobRecord struct {
 	raw   json.RawMessage
 	id    string
+	file  string // base name of the backing file in the jobs dir
+	sig   fileSig
 	state string
 	repo  string
 }
@@ -38,10 +77,42 @@ type jobStore struct {
 	// progress is the latest progress_updated detail per job (HC-09), folded
 	// in from the event stream by the hub. Not job JSON: merged on read.
 	progress map[string]json.RawMessage
+
+	// Cadences and the watcher factory; set by newJobStore, overridable in tests.
+	reconcileEvery time.Duration // directory reconcile while the watcher is healthy
+	pollEvery      time.Duration // reconcile cadence when the watcher is unavailable
+	openWatcher    func(dir string) (*fsnotify.Watcher, error)
+
+	// afterListHook, if non-nil, runs in reconcile() right after the directory
+	// snapshot is taken and before the store is examined. Tests use it to
+	// interleave a create+refresh at the worst moment; production leaves it nil.
+	afterListHook func()
+
+	// dirDownLogged makes the "jobs dir unavailable" log fire once per outage.
+	dirDownLogged atomic.Bool
 }
 
 func newJobStore(jobsDir string) *jobStore {
-	return &jobStore{dir: jobsDir, jobs: map[string]*jobRecord{}, progress: map[string]json.RawMessage{}}
+	return &jobStore{
+		dir:            jobsDir,
+		jobs:           map[string]*jobRecord{},
+		progress:       map[string]json.RawMessage{},
+		reconcileEvery: defaultReconcileEvery,
+		pollEvery:      defaultPollEvery,
+		openWatcher:    openDirWatcher,
+	}
+}
+
+func openDirWatcher(dir string) (*fsnotify.Watcher, error) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+	if err := w.Add(dir); err != nil {
+		w.Close()
+		return nil, err
+	}
+	return w, nil
 }
 
 // load reads every jobs/*.json into memory. Called once at startup.
@@ -61,6 +132,12 @@ func (s *jobStore) load() {
 // refresh re-reads a single job file. A removed file drops the record.
 func (s *jobStore) refresh(path string) {
 	id := strings.TrimSuffix(filepath.Base(path), ".json")
+	// Stat before reading: a write landing in between leaves a stale sig, so
+	// the next reconcile re-reads rather than missing it.
+	var sig fileSig
+	if fi, err := os.Stat(path); err == nil {
+		sig = fileSig{mtime: fi.ModTime(), size: fi.Size()}
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		s.mu.Lock()
@@ -84,6 +161,8 @@ func (s *jobStore) refresh(path string) {
 	rec := &jobRecord{
 		raw:   append(json.RawMessage(nil), b...),
 		id:    light.ID,
+		file:  filepath.Base(path),
+		sig:   sig,
 		state: light.State,
 		repo:  light.Repo,
 	}
@@ -92,33 +171,192 @@ func (s *jobStore) refresh(path string) {
 	s.mu.Unlock()
 }
 
-// watch blocks, applying fsnotify changes to the store until ctx-style stop
-// via the done channel. Runs in its own goroutine.
-func (s *jobStore) watch(done <-chan struct{}) {
-	w, err := fsnotify.NewWatcher()
+// reconcile brings the store in line with the jobs directory: records whose
+// file is gone are dropped (with their progress entry), files present but
+// unknown are loaded, and files whose mtime/size changed are re-read (a lost
+// modify event). If the directory cannot be listed nothing is dropped.
+func (s *jobStore) reconcile() {
+	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return
 	}
-	defer w.Close()
-	if err := w.Add(s.dir); err != nil {
+	present := make(map[string]fileSig, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		var sig fileSig
+		if fi, err := e.Info(); err == nil {
+			sig = fileSig{mtime: fi.ModTime(), size: fi.Size()}
+		}
+		present[e.Name()] = sig
+	}
+	if s.afterListHook != nil {
+		s.afterListHook()
+	}
+
+	// Records whose file is absent from the snapshot are only candidates: the
+	// snapshot may predate the record (a refresh can land between ReadDir and
+	// here), so each candidate is re-stat'd before it is dropped.
+	s.mu.RLock()
+	fresh := make(map[string]bool, len(s.jobs))
+	var absent []*jobRecord
+	for _, rec := range s.jobs {
+		sig, ok := present[rec.file]
+		if !ok {
+			absent = append(absent, rec)
+			continue
+		}
+		if sig == rec.sig {
+			fresh[rec.file] = true
+		}
+	}
+	s.mu.RUnlock()
+	s.dropGone(absent)
+
+	for name := range present {
+		if !fresh[name] {
+			s.refresh(filepath.Join(s.dir, name))
+		}
+	}
+}
+
+// pruneMissing stats every record's file and drops those that are gone, so
+// callers never see a job whose file was archived behind a lost fs event.
+func (s *jobStore) pruneMissing() {
+	s.mu.RLock()
+	recs := make([]*jobRecord, 0, len(s.jobs))
+	for _, rec := range s.jobs {
+		recs = append(recs, rec)
+	}
+	s.mu.RUnlock()
+	s.dropGone(recs)
+}
+
+// pruneMissingID is pruneMissing for a single job (query.get).
+func (s *jobStore) pruneMissingID(id string) {
+	s.mu.RLock()
+	rec := s.jobs[id]
+	s.mu.RUnlock()
+	if rec == nil {
 		return
 	}
+	s.dropGone([]*jobRecord{rec})
+}
+
+// dropGone drops the candidate records whose backing file is verifiably gone:
+// a stat of the file's real path that fails with os.ErrNotExist. Any other
+// stat error (permission, I/O) keeps the record, and so does a missing or
+// unreadable jobs directory (e.g. an unmounted volume), where every file
+// would look gone. Candidates are drawn from a snapshot that may be stale, so
+// the stat here is what decides, never the snapshot; dropRecords then guards
+// against a record replaced in the meantime.
+func (s *jobStore) dropGone(candidates []*jobRecord) {
+	var gone []*jobRecord
+	for _, rec := range candidates {
+		if _, err := os.Stat(filepath.Join(s.dir, rec.file)); errors.Is(err, os.ErrNotExist) {
+			gone = append(gone, rec)
+		}
+	}
+	if len(gone) == 0 {
+		return
+	}
+	if !s.jobsDirReadable() {
+		return
+	}
+	s.dropRecords(gone)
+}
+
+// jobsDirReadable reports whether the jobs directory exists and can be
+// opened. When it cannot, the failure is logged once per outage (the flag
+// resets when the directory is healthy again) so a polling broker doesn't
+// spam stderr.
+func (s *jobStore) jobsDirReadable() bool {
+	f, err := os.Open(s.dir)
+	if err == nil {
+		f.Close()
+		s.dirDownLogged.Store(false)
+		return true
+	}
+	if s.dirDownLogged.CompareAndSwap(false, true) {
+		fmt.Fprintf(os.Stderr, "mother-broker: jobs dir %s unavailable (%v); keeping job records until it returns\n", s.dir, err)
+	}
+	return false
+}
+
+// dropRecords deletes the given records unless a refresh has replaced them
+// since they were observed (the file may have reappeared).
+func (s *jobStore) dropRecords(recs []*jobRecord) {
+	if len(recs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	for _, rec := range recs {
+		if s.jobs[rec.id] == rec {
+			delete(s.jobs, rec.id)
+			delete(s.progress, rec.id)
+		}
+	}
+	s.mu.Unlock()
+}
+
+// watch blocks, applying fsnotify changes to the store until the done channel
+// closes, and reconciling against the directory on a timer and on watcher
+// errors. If the watcher cannot start or dies, it polls instead. Runs in its
+// own goroutine.
+func (s *jobStore) watch(done <-chan struct{}) {
+	w, err := s.openWatcher(s.dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mother-broker: job watcher unavailable (%v); polling %s every %s\n", err, s.dir, s.pollEvery)
+		s.poll(done)
+		return
+	}
+	defer w.Close()
+	// Catch anything that changed between load() and the watcher attaching.
+	s.reconcile()
+	tick := time.NewTicker(s.reconcileEvery)
+	defer tick.Stop()
 	for {
 		select {
 		case <-done:
 			return
+		case <-tick.C:
+			s.reconcile()
 		case ev, ok := <-w.Events:
 			if !ok {
+				fmt.Fprintf(os.Stderr, "mother-broker: job watcher closed; polling %s every %s\n", s.dir, s.pollEvery)
+				s.poll(done)
 				return
 			}
 			if !strings.HasSuffix(ev.Name, ".json") {
 				continue
 			}
 			s.refresh(ev.Name)
-		case _, ok := <-w.Errors:
+		case err, ok := <-w.Errors:
 			if !ok {
+				fmt.Fprintf(os.Stderr, "mother-broker: job watcher closed; polling %s every %s\n", s.dir, s.pollEvery)
+				s.poll(done)
 				return
 			}
+			fmt.Fprintf(os.Stderr, "mother-broker: job watcher error: %v; reconciling\n", err)
+			s.reconcile()
+		}
+	}
+}
+
+// poll reconciles every pollEvery until done closes (fallback when there is
+// no working watcher). It reconciles once immediately to catch anything
+// missed while the watcher was failing.
+func (s *jobStore) poll(done <-chan struct{}) {
+	s.reconcile()
+	tick := time.NewTicker(s.pollEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-tick.C:
+			s.reconcile()
 		}
 	}
 }
