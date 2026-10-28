@@ -318,6 +318,7 @@ func (h *hub) unsubscribe(cl *client, name string) {
 func (h *hub) snapshotJobsLocked(sub *subscription) []json.RawMessage {
 	var ids []string
 	if sub.allJobs {
+		h.store.pruneMissing()
 		ids = h.store.allIDs()
 	} else {
 		ids = sub.selectedJobIDs()

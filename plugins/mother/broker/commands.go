@@ -165,6 +165,7 @@ func (c *commandRunner) ack(job, reason, source string) cmdResult {
 
 // queryList serves the `mother list --format json` equivalent from memory.
 func (c *commandRunner) queryList(f listFilter) cmdResult {
+	c.store.pruneMissing()
 	records := c.store.list(f)
 	jobs := make([]json.RawMessage, len(records))
 	for i, r := range records {
@@ -179,6 +180,7 @@ func (c *commandRunner) queryGet(job string) cmdResult {
 	if job == "" {
 		return fail(ErrMalformed, "query.get: job required")
 	}
+	c.store.pruneMissingID(job)
 	raw, found := c.store.get(job)
 	if !found {
 		return fail(ErrNoSuchJob, "no such job: "+job)
