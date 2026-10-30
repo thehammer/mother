@@ -253,3 +253,16 @@ write_event_ago() {
     [ "$status" -eq 0 ]
     [ "$(echo "$output" | jq 'length')" -eq 1 ]
 }
+
+@test "events carry origin_focus only for jobs whose record has a focus" {
+    jq -n '{id:"j-focus", title:"t1", origin:{focus:"f1"}}' > "$JOBS_DIR/j-focus.json"
+    jq -n '{id:"j-plain", title:"t2", origin:{}}' > "$JOBS_DIR/j-plain.json"
+    write_event_ago "j-focus" "succeeded" 1
+    write_event_ago "j-plain" "succeeded" 1
+    write_event_ago "j-gone" "succeeded" 1   # archived: no job file
+    run mother events --since "2020-01-01T00:00:00Z"
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r '[.[] | select(.job_id=="j-focus")][0].origin_focus')" = "f1" ]
+    [ "$(echo "$output" | jq '[.[] | select(.job_id=="j-plain")][0] | has("origin_focus")')" = "false" ]
+    [ "$(echo "$output" | jq '[.[] | select(.job_id=="j-gone")][0] | has("origin_focus")')" = "false" ]
+}

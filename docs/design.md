@@ -690,6 +690,22 @@ The broker is a single static binary built by `scripts/build-broker.sh` into
 it and runs `go test ./broker/...` alongside the bats suite. `mother broker status|path`
 are read-only diagnostics.
 
+### Origin focus (additive job keys)
+
+`mother add` records the originating Nostromo focus in the job's `origin` object as two additive,
+optional keys, present **only when non-empty** (a job queued with no focus has exactly the previous
+`origin` object, so recorded fixtures are unchanged):
+
+- `origin.focus`: the focus tag. Default order: `--origin-focus`, `$MOTHER_ORIGIN_FOCUS`,
+  `$NOSTROMO_FOCUS_TAG`, `$NOSTROMO_PTY_ID` (first non-empty). Must match `^[A-Za-z0-9._-]{1,128}$`;
+  anything else is dropped (a warning, not echoing the value, goes to stderr; the job still queues).
+- `origin.focus_name`: display name, explicit only (`--origin-focus-name`, `$MOTHER_ORIGIN_FOCUS_NAME`).
+  Control characters removed, whitespace collapsed and trimmed, capped at 120 characters.
+
+Mother only stores the claim; Nostromo verifies it. `mother events` adds `origin_focus` to an event
+when its job record has a focus (nothing for archived jobs). The `UserPromptSubmit` hook drops events
+whose `origin_focus` equals `$NOSTROMO_FOCUS_TAG`, since Nostromo notifies that focus directly.
+
 ## Headless crew contract (Phase 1)
 
 The headless-crew work adds quality gates, a parallel reviewer "lens wave", decisions, attention

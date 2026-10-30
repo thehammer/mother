@@ -309,3 +309,57 @@ _run_hook() {
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
+
+# --- NOSTROMO_FOCUS_TAG: the focus's own jobs are not announced back to it ---
+
+_seed_focus_jobs() {
+    local id focus
+    for pair in "jf1:f1" "jf2:f2" "jnone:"; do
+        id="${pair%%:*}"; focus="${pair#*:}"
+        jq -n --arg id "$id" --arg f "$focus" \
+            '{id:$id, title:("title-"+$id)} + (if $f != "" then {origin:{focus:$f}} else {} end)' \
+            > "$JOBS_DIR/$id.json"
+    done
+}
+
+_emit_succeeded() {
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    for id in "$@"; do
+        jq -nc --arg ts "$ts" '{ts:$ts, kind:"succeeded", detail:{}}' >> "$EVENTS_DIR/$id.jsonl"
+    done
+}
+
+_run_hook_focus() {
+    # bootstrap cursor, then emit after it
+    bash -c "printf '%s' '{\"session_id\":\"sess-focus\"}' | '$HOOK'" >/dev/null
+    sleep 1
+    _emit_succeeded "$@"
+}
+
+@test "hook drops the current focus's own jobs, keeps others and focusless" {
+    _seed_focus_jobs
+    _run_hook_focus jf1 jf2 jnone
+    NOSTROMO_FOCUS_TAG=f1 run bash -c "printf '%s' '{\"session_id\":\"sess-focus\"}' | '$HOOK'"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"title-jf1"* ]]
+    [[ "$output" == *"title-jf2"* ]]
+    [[ "$output" == *"title-jnone"* ]]
+}
+
+@test "hook shows all three when NOSTROMO_FOCUS_TAG is unset or empty" {
+    _seed_focus_jobs
+    _run_hook_focus jf1 jf2 jnone
+    NOSTROMO_FOCUS_TAG= run bash -c "printf '%s' '{\"session_id\":\"sess-focus\"}' | '$HOOK'"
+    [[ "$output" == *"title-jf1"* ]]
+    [[ "$output" == *"title-jf2"* ]]
+    [[ "$output" == *"title-jnone"* ]]
+}
+
+@test "hook prints nothing when only the current focus's events exist" {
+    _seed_focus_jobs
+    _run_hook_focus jf1
+    NOSTROMO_FOCUS_TAG=f1 run bash -c "printf '%s' '{\"session_id\":\"sess-focus\"}' | '$HOOK'"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
