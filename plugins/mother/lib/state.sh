@@ -370,6 +370,34 @@ _tier_from_index() {
     esac
 }
 
+# _normalize_posture <raw>: the single boundary between Bishop's vocabulary and
+# Mother's. Bishop (since 2026-05-16, bishop 508fe2a) prints one of five labels;
+# Mother's internals (_apply_posture_bias, gates, review) keep the four below:
+#   Pump the brakes      -> conservative
+#   Ease up              -> conservative  (both say "use cheaper models")
+#   Cruise               -> normal
+#   Push                 -> elevated
+#   Put the hammer down  -> flush
+#   conservative|normal|elevated|flush -> themselves (legacy labels)
+# Leading/trailing whitespace is trimmed (inner spaces are kept) and matching is
+# case-insensitive. Anything else -> normal, with one stderr line naming it.
+_normalize_posture() {
+    local raw="${1:-}" key
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    key=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$key" in
+        "pump the brakes"|"ease up"|conservative) echo conservative ;;
+        cruise|normal) echo normal ;;
+        push|elevated) echo elevated ;;
+        "put the hammer down"|flush) echo flush ;;
+        *)
+            echo "mother: unrecognized bishop posture \"$raw\"; treating as normal" >&2
+            echo normal
+            ;;
+    esac
+}
+
 # _resolve_posture: best-effort fetch of current Bishop posture.
 # Echoes one of: conservative | normal | elevated | flush.
 # Falls back to `normal` if bishop is not on PATH, the call fails, or output
@@ -383,11 +411,8 @@ _resolve_posture() {
     fi
     bishop --refresh >/dev/null 2>&1 || true
     local p
-    p=$(bishop get posture 2>/dev/null | tr -d '[:space:]')
-    case "$p" in
-        conservative|normal|elevated|flush) echo "$p" ;;
-        *) echo "normal" ;;
-    esac
+    p=$(bishop get posture 2>/dev/null) || p=""
+    _normalize_posture "$p"
 }
 
 # _resolve_cost_model: best-effort detection of the account's billing mode.
