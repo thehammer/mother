@@ -2728,6 +2728,19 @@ WRAP
                 _live_capture_pr_url
             fi
 
+            # A run that got past its first real assistant turn is not being
+            # rate limited any more: clear the backoff bookkeeping. (Claude
+            # emits a synthetic assistant message to report an API error; that
+            # one does not count.)
+            if [ -n "$(jq -r '.backoff_count // empty' "$job_file" 2>/dev/null)" ] \
+                && tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
+                    | jq -R -e 'fromjson? | select(.type == "assistant"
+                        and (.message.model // "") != "<synthetic>" and .isApiErrorMessage != true)' \
+                        >/dev/null 2>&1; then
+                _job_update '.not_before = null | .backoff_count = null | .backoff_first_at = null'
+                _append_event "backoff_cleared" '{}'
+            fi
+
             if [ "$final_result_epoch" -eq 0 ]; then
                 # stream-json emits one complete JSON event per line. The result
                 # event has top-level "type":"result". The whitespace tolerance
@@ -3615,6 +3628,26 @@ if [ "$_final_wpid" != "$worker_pid" ]; then
     exit 0
 fi
 
+# A run can exit 0 (or be reaped after its result) with a result event that is
+# really an API error: `api_error_status: 429` + `subtype: success`. That run
+# did no work, so it must never become `succeeded` (an existing PR on the
+# branch would otherwise get adopted as its artifact). Classify the run's own
+# result event; on an explicit API error, fail with the classified reason so
+# route-failure handles it (429/529 back off, billing/auth hold). Returns 0
+# when it failed the job, 1 when the result is not an API error.
+_fail_on_api_error_result() {
+    local c d
+    c=$(mother_classify_exit "$log_path" "$log_offset_at_spawn" 1 2>/dev/null) || return 1
+    printf '%s' "$c" | jq -e '
+        (.api_error_status != null)
+        and (.reason | IN("api_error","rate_limited","api_overloaded","billing","auth_error"))' \
+        >/dev/null 2>&1 || return 1
+    d=$(printf '%s' "$c" | jq -c --argjson code "${exit_code:-0}" '. + {exit_code: $code}')
+    _append_metrics "failed" "$d"
+    _transition failed "$d"
+    return 0
+}
+
 # Final transition. Usage rows are recorded BEFORE the terminal _transition
 # call so that _transition's cost recompute (see lib/usage.sh / _transition
 # below) includes this run's row.
@@ -3629,7 +3662,9 @@ elif [ -n "$reaped_reason" ]; then
     # ever seeing a result (idle timeout mid-work), attempt a continuation
     # first; fall back to failed if the continuation cap is reached.
     if [ "$final_result_epoch" -gt 0 ]; then
-        if _verify_artifact_or_fail; then
+        if _fail_on_api_error_result; then
+            :
+        elif _verify_artifact_or_fail; then
             _append_metrics "succeeded" "$(jq -nc --arg reason "$reaped_reason" '{reaped: $reason}')"
             _transition succeeded "$(jq -nc --arg pr "$pr_url" --arg reason "$reaped_reason" '{pr_url: $pr, reaped: $reason}')"
         else
@@ -3645,7 +3680,9 @@ elif [ -n "$reaped_reason" ]; then
         _transition failed "$_fail_detail"
     fi
 elif [ "$exit_code" = "0" ]; then
-    if _verify_artifact_or_fail; then
+    if _fail_on_api_error_result; then
+        :
+    elif _verify_artifact_or_fail; then
         _append_metrics "succeeded" '{}'
         _transition succeeded "$(jq -nc --arg pr "$pr_url" '{pr_url: $pr}')"
     else

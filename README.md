@@ -248,6 +248,8 @@ Manual escalation: `mother escalate <id>` (same as auto, but operator-initiated)
 
 Kill switch: `MOTHER_ESCALATION_ENABLED=0` (env var, e.g. in launchd plist).
 
+A rate limit is not a failed attempt. A worker that ends on HTTP 429 (`rate_limited`) or 529 / 503 / other 5xx (`api_overloaded`) is **not** escalated: Mother puts it back to `ready` at the same tier with a `not_before` delay (the API's `retry-after` if it gave one, else 30 s doubling to 300 s, plus up to 20% jitter), and a 429 also pauses every new worker and reviewer start until then (`$MOTHER_ROOT/ratelimit-until`; running jobs are unaffected). `mother list` shows `[BACKOFF 2m]` while a job waits. After `MOTHER_BACKOFF_MAX_S` (900 s) of backing off the job is held `awaiting` for you (`mother resume <id> go` retries now, `mother cancel <id>` gives up). Billing (402) and auth (401/403) errors are held at once. `MOTHER_BACKOFF_ENABLED=0` restores the old routing.
+
 ### Plan-adherence review
 
 After a job succeeds and opens a PR, the daemon schedules an adherence review.
@@ -408,6 +410,12 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_TEARDOWN_MAX_DEFERRALS` | `30` | Stalled deferrals (gh/docker unreachable, races, worktree errors — a still-open PR doesn't count) before a teardown is flagged for attention (never auto-deleted) |
 | `MOTHER_TEARDOWN_ALLOW_UNSAFE` | `0` | Restore unconditional force-removal, bypassing the unrecovered-work guard (uncommitted changes or commits on no remote) below |
 | `MOTHER_MIN_FREE_GB` | `20` | Pause dispatch (never running jobs) while the volume holding the next job's repo has less than this many GB free; shows as a `low_disk` needs-attention item and triggers one `mother gc` sweep (at most every `MOTHER_LOWDISK_GC_INTERVAL`, default 600s). `0` disables. Resumes automatically |
+| `MOTHER_BACKOFF_ENABLED` | `1` | Rate limits (429) and overloads (529/503/5xx) back off at the same tier instead of escalating; billing/auth errors hold. `0` restores the old routing (they escalate) |
+| `MOTHER_BACKOFF_BASE_S` / `MOTHER_BACKOFF_CAP_S` | `30` / `300` | First backoff delay (doubles each time) and its ceiling. A `retry-after` from the API wins |
+| `MOTHER_BACKOFF_JITTER_PCT` | `20` | Random extra delay, 0..N% of the base |
+| `MOTHER_BACKOFF_RETRY_AFTER_MAX_S` | `3600` | Ceiling on a `retry-after` the API gives, so a bogus value cannot stall the queue |
+| `MOTHER_BACKOFF_MAX_S` | `900` | Wall-clock a job may spend backing off (since `backoff_first_at`) before it is held for the operator; also the longest a reviewer waits on the shared pause |
+| `MOTHER_REVIEW_RATELIMIT_RETRIES` | `2` | Re-spawns of a rate-limited lens / pipeline reviewer (each after waiting on the pause) before it is recorded as an error |
 | `MOTHER_GOCACHE_MAX_GB` | `10` | `mother gc` runs `go clean -cache` when the Go build cache is larger than this and no job is running |
 | `MOTHER_GC_ENABLED` | `1` | Run `mother gc` in the hourly sweep and on low disk (`0` to disable) |
 | `MOTHER_CARGO_TARGET_PURGE` | `1` | `mother gc` deletes the `target/` of a Cargo job worktree once every job on it is `succeeded`/`failed`/`cancelled` (none adherence-pending or in pipeline review). `0`/`false`/`no`/`off` (or any unrecognised value) only reports |

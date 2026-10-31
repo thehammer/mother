@@ -49,10 +49,106 @@ _rates() { echo "$MOTHER_LIB_DIR/rates.json"; }
     [ "$reason" = "worker_signal_11" ]
 }
 
-@test "classify-exit rule: result is_error/api_error_status -> api_error" {
+@test "classify-exit rule: result is_error with a non-retryable api_error_status (400) -> api_error" {
     run mother-usage classify-exit --log "$FIXTURES/result_api_error.jsonl" --offset 0 --exit-code 1
     reason=$(printf '%s' "$output" | jq -r '.reason')
     [ "$reason" = "api_error" ]
+}
+
+# ---------------------------------------------------------------------------
+# The API status on a result event decides the reason. A 429/529 is "wait and
+# retry the same tier" (never a failed attempt that escalates), a 402/401/403 is
+# an account problem a bigger model cannot fix. Incident: three 429 results
+# (subtype "success", is_error true, $0) escalated a job tier_0 -> tier_2 in a
+# minute because every is_error result used to be a generic api_error.
+# ---------------------------------------------------------------------------
+
+# _status_log <status|null> [result-text] — a transcript whose result event is an
+# is_error "success" carrying that api_error_status. Echoes the log path.
+_status_log() {
+    local st="$1" text="${2:-API error}" f="$MOTHER_ROOT/status-$1.jsonl"
+    {
+        head -1 "$FIXTURES/result_rate_limited_429.jsonl"
+        jq -nc --argjson st "$st" --arg t "$text" \
+            '{type: "result", subtype: "success", is_error: true, total_cost_usd: 0, result: $t}
+             + (if $st == null then {} else {api_error_status: $st} end)'
+    } > "$f"
+    echo "$f"
+}
+
+_reason_for() {
+    mother-usage classify-exit --log "$1" --offset 0 --exit-code "${2:-1}" | jq -r '.reason'
+}
+
+@test "classify-exit rule: result api_error_status 429 -> rate_limited" {
+    run mother-usage classify-exit --log "$FIXTURES/result_rate_limited_429.jsonl" --offset 0 --exit-code 1
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+}
+
+@test "classify-exit rule: result api_error_status 529 -> api_overloaded" {
+    run mother-usage classify-exit --log "$FIXTURES/result_overloaded_529.jsonl" --offset 0 --exit-code 1
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "api_overloaded" ]
+}
+
+@test "classify-exit rule: result api_error_status 503 -> api_overloaded" {
+    [ "$(_reason_for "$(_status_log 503)")" = "api_overloaded" ]
+}
+
+@test "classify-exit rule: result api_error_status 500 (any other 5xx) -> api_overloaded" {
+    [ "$(_reason_for "$(_status_log 500)")" = "api_overloaded" ]
+    [ "$(_reason_for "$(_status_log 502)")" = "api_overloaded" ]
+}
+
+@test "classify-exit rule: result api_error_status 402 -> billing" {
+    run mother-usage classify-exit --log "$FIXTURES/result_billing_402.jsonl" --offset 0 --exit-code 1
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "billing" ]
+}
+
+@test "classify-exit rule: result api_error_status 401 -> auth_error" {
+    run mother-usage classify-exit --log "$FIXTURES/result_auth_401.jsonl" --offset 0 --exit-code 1
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "auth_error" ]
+}
+
+@test "classify-exit rule: result api_error_status 403 -> auth_error" {
+    [ "$(_reason_for "$(_status_log 403)")" = "auth_error" ]
+}
+
+@test "classify-exit rule: a non-null status that is none of the above (400, 404, 422) -> api_error" {
+    local st
+    for st in 400 404 422; do
+        [ "$(_reason_for "$(_status_log "$st")")" = "api_error" ] || { echo "status $st" >&2; return 1; }
+    done
+}
+
+@test "classify-exit rule: is_error result with no status and no recognizable text -> api_error" {
+    [ "$(_reason_for "$(_status_log null "something odd happened")")" = "api_error" ]
+}
+
+@test "classify-exit rule: is_error result with no status whose text mentions the credit balance or billing -> billing" {
+    [ "$(_reason_for "$(_status_log null "Your credit balance is too low to access the API")")" = "billing" ]
+    [ "$(_reason_for "$(_status_log null "Please go to Plans & Billing to upgrade")")" = "billing" ]
+}
+
+@test "classify-exit rule: a 429 result with a clean exit 0 is still rate_limited (a 429 is never a success)" {
+    run mother-usage classify-exit --log "$FIXTURES/result_rate_limited_429.jsonl" --offset 0 --exit-code 0
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+}
+
+@test "classify-exit rule: signal exits still win over a result's api status (143 with a 429 result -> worker_sigterm)" {
+    run mother-usage classify-exit --log "$FIXTURES/result_rate_limited_429.jsonl" --offset 0 --exit-code 143
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "worker_sigterm" ]
+}
+
+@test "classify-exit rule: the no-result-event text matches are unchanged (rate_limited, api_overloaded, billing, context_overflow) and report no retry hint" {
+    local pair f want
+    for pair in error_tail_rate_limit:rate_limited error_tail_overloaded:api_overloaded \
+                error_tail_billing:billing error_tail_context_overflow:context_overflow; do
+        f="${pair%%:*}"; want="${pair##*:}"
+        run mother-usage classify-exit --log "$FIXTURES/$f.jsonl" --offset 0 --exit-code 1
+        [ "$(printf '%s' "$output" | jq -r '.reason')" = "$want" ] || { echo "$f -> $output" >&2; return 1; }
+        [ "$(printf '%s' "$output" | jq -r '.result_is_error')" = "false" ]
+        printf '%s' "$output" | jq -e '.retry_after_s == null' >/dev/null
+    done
 }
 
 @test "classify-exit rule: result subtype error_max_turns -> max_turns" {
