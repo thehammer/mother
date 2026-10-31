@@ -1301,3 +1301,130 @@ All good."
     [ "$(_ev "bo-ra-huge" failure_routed | jq -r '.delay_s')" = "3600" ]
     [ "$(tr -d '[:space:]' < "$MOTHER_ROOT/ratelimit-until")" -le $(( $(_now) + 3600 )) ]
 }
+
+
+# ===========================================================================
+# Review fix-ups: lifetime cap, clearing rules, bounded waits
+# ===========================================================================
+
+@test "backoff: a lifetime cap on backoff_count (default 10) holds the job backoff_exhausted even inside the 15-minute window" {
+    _bo_job "bo-cap" "rate_limited" ".backoff_count = 10 | .backoff_first_at = $(( $(_now) - 60 ))" '{"api_error_status":429}'
+
+    run mother route-failure "bo-cap"
+    [ "$status" -eq 0 ]
+
+    assert_job_field "bo-cap" '.state' "awaiting"
+    assert_job_field "bo-cap" '.operator_hold.sub_reason' "backoff_exhausted"
+    [ "$(_ev_count bo-cap succeeded)" = "0" ]
+}
+
+@test "backoff: below the lifetime cap the job still backs off" {
+    _bo_job "bo-cap9" "rate_limited" ".backoff_count = 9 | .backoff_first_at = $(( $(_now) - 60 ))" '{"api_error_status":429}'
+
+    run mother route-failure "bo-cap9"
+    [ "$status" -eq 0 ]
+
+    assert_job_field "bo-cap9" '.state' "ready"
+    assert_job_field "bo-cap9" '.backoff_count' "10"
+}
+
+# A transcript of <n> real assistant turns followed by <result fixture line>.
+_bo_turns_log() {
+    local n="$1" result="$2" f="$MOTHER_ROOT/turns-$1.jsonl" i
+    : > "$f"
+    for i in $(seq 1 "$n"); do
+        printf '{"type":"assistant","message":{"id":"msg_t%s","model":"claude-sonnet-5","usage":{"input_tokens":10,"output_tokens":5}}}\n' "$i" >> "$f"
+    done
+    printf '%s\n' "$result" >> "$f"
+    echo "$f"
+}
+
+_bo_backed_off_run_job() {
+    local id="$1"
+    _bo_seed_branch "feature/test-$id"
+    _bo_run_job_fields "$id" ".no_pr = true | .backoff_count = 2 | .backoff_first_at = $(( $(_now) - 60 )) | .not_before = $(( $(_now) - 1 ))"
+}
+
+@test "run-job: ONE real assistant turn then another 429 does NOT clear the backoff bookkeeping" {
+    _bo_init_repo
+    _bo_backed_off_run_job "rj-clr1"
+    export MOCK_CLAUDE_STDOUT_FILE="$(_bo_turns_log 1 '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"total_cost_usd":0}')"
+    export MOCK_CLAUDE_EXIT=1 MOCK_CLAUDE_SLEEP=5
+
+    run mother-run-job "rj-clr1"
+
+    assert_job_field "rj-clr1" '.state' "failed"
+    assert_job_field "rj-clr1" '.backoff_count' "2"
+    [ "$(_jf rj-clr1 '.backoff_first_at')" != "null" ]
+    [ "$(_ev_count rj-clr1 backoff_cleared)" = "0" ]
+}
+
+@test "run-job: five real assistant turns clear the backoff bookkeeping and emit backoff_cleared" {
+    _bo_init_repo
+    _bo_backed_off_run_job "rj-clr5"
+    export MOCK_CLAUDE_STDOUT_FILE="$(_bo_turns_log 5 '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"total_cost_usd":0}')"
+    export MOCK_CLAUDE_EXIT=1 MOCK_CLAUDE_SLEEP=5
+
+    run mother-run-job "rj-clr5"
+
+    assert_job_field "rj-clr5" '.backoff_count' "null"
+    assert_job_field "rj-clr5" '.backoff_first_at' "null"
+    assert_job_field "rj-clr5" '.not_before' "null"
+    [ "$(_ev_count rj-clr5 backoff_cleared)" = "1" ]
+}
+
+@test "run-job: MOTHER_BACKOFF_CLEAR_TURNS lowers the turn threshold" {
+    _bo_init_repo
+    _bo_backed_off_run_job "rj-clr2"
+    export MOTHER_BACKOFF_CLEAR_TURNS=2
+    export MOCK_CLAUDE_STDOUT_FILE="$(_bo_turns_log 2 '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"total_cost_usd":0}')"
+    export MOCK_CLAUDE_EXIT=1 MOCK_CLAUDE_SLEEP=5
+
+    run mother-run-job "rj-clr2"
+
+    assert_job_field "rj-clr2" '.backoff_count' "null"
+    [ "$(_ev_count rj-clr2 backoff_cleared)" = "1" ]
+}
+
+@test "run-job: a successful end clears the backoff bookkeeping even after a single turn" {
+    _bo_init_repo
+    _bo_backed_off_run_job "rj-clrok"
+    export MOCK_CLAUDE_STDOUT_FILE="$(_bo_turns_log 1 '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.001}')"
+    export MOCK_CLAUDE_EXIT=0
+
+    run mother-run-job "rj-clrok"
+
+    assert_job_field "rj-clrok" '.state' "succeeded"
+    assert_job_field "rj-clrok" '.backoff_count' "null"
+    assert_job_field "rj-clrok" '.backoff_first_at' "null"
+    assert_job_field "rj-clrok" '.not_before' "null"
+}
+
+@test "ratelimit-until: a far-future value (9999999999) is treated as expired; a plausible one still pauses" {
+    source "$BATS_TEST_DIRNAME/../lib/backoff.sh"
+    echo 9999999999 > "$MOTHER_ROOT/ratelimit-until"
+    [ "$(mother_ratelimit_remaining)" = "0" ]
+    ! mother_ratelimit_active
+    echo $(( $(date +%s) + 120 )) > "$MOTHER_ROOT/ratelimit-until"
+    [ "$(mother_ratelimit_remaining)" -gt 0 ]
+    mother_ratelimit_active
+}
+
+@test "backoff label: a far-future not_before shows no BACKOFF label" {
+    source "$BATS_TEST_DIRNAME/../lib/backoff.sh"
+    [ -z "$(mother_backoff_label 9999999999)" ]
+    [ -n "$(mother_backoff_label $(( $(date +%s) + 120 )))" ]
+}
+
+@test "dispatch: a ready job with a far-future not_before (9999999999) is picked, a near-future one is not" {
+    make_job "bo-far" "ready" '.not_before = 9999999999'
+    make_job "bo-near" "ready" ".not_before = $(( $(date +%s) + 120 ))"
+    run bash -c "
+        set -u
+        source '$BATS_TEST_DIRNAME/../lib/backoff.sh'
+        eval \"\$(sed -n '/^_pick_next_ready()/,/^}/p' '$BATS_TEST_DIRNAME/../bin/mother-runner')\"
+        JOBS_DIR='$JOBS_DIR'
+        _pick_next_ready"
+    [ "$status" -eq 0 ]
+    [ "$output" = "bo-far" ]
+}

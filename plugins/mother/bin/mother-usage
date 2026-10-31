@@ -593,7 +593,7 @@ def _api_error_reason(status, result_text):
     """Map a result event's api_error_status (and, with no usable status, its
     result text) to a failure reason. 429 is a rate limit and 529/503/other
     5xx are overload: transient, never the worker's fault. 402 / a billing
-    body and 401/403 need an operator. Anything else stays `api_error`."""
+    body (with no status or a 400: "credit balance is too low" arrives as a 400) and 401/403 need an operator. Anything else stays `api_error`."""
     code = _api_status_int(status)
     if code == 429:
         return "rate_limited"
@@ -603,7 +603,7 @@ def _api_error_reason(status, result_text):
         return "billing"
     if code in (401, 403):
         return "auth_error"
-    if code is None and _BILLING_RE.search(result_text or ""):
+    if code in (None, 400) and _BILLING_RE.search(result_text or ""):
         return "billing"
     return "api_error"
 

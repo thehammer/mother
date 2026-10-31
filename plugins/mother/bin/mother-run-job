@@ -2252,7 +2252,7 @@ _install_core_job_helpers() {
                 _reason_lit=$(_failure_reason_literal "$detail") || _reason_lit='"unspecified"'
                 _job_update ".failure_reason = $_reason_lit | .failure_routed = null" ;;
             succeeded)
-                _job_update ".failure_reason = null" ;;
+                _job_update ".failure_reason = null | .not_before = null | .backoff_count = null | .backoff_first_at = null" ;;
         esac
         case "$new" in
             running)    _job_update ".started_at = \"$(iso_now)\"" ;;
@@ -2677,6 +2677,11 @@ WRAP
     RESULT_GRACE_SECONDS="${MOTHER_RESULT_GRACE_SECONDS:-300}"
     IDLE_REAP_SECONDS="${MOTHER_IDLE_REAP_SECONDS:-1800}"
 
+    case "${MOTHER_BACKOFF_CLEAR_TURNS:-}" in
+        ''|*[!0-9]*|0) MOTHER_BACKOFF_CLEAR_TURNS_N=5 ;;
+        *) MOTHER_BACKOFF_CLEAR_TURNS_N=$MOTHER_BACKOFF_CLEAR_TURNS ;;
+    esac
+
     # Poll for the marker file.
     cancel_requested=0
     final_result_epoch=0
@@ -2728,17 +2733,24 @@ WRAP
                 _live_capture_pr_url
             fi
 
-            # A run that got past its first real assistant turn is not being
-            # rate limited any more: clear the backoff bookkeeping. (Claude
-            # emits a synthetic assistant message to report an API error; that
-            # one does not count.)
-            if [ -n "$(jq -r '.backoff_count // empty' "$job_file" 2>/dev/null)" ] \
-                && tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
-                    | jq -R -e 'fromjson? | select(.type == "assistant"
-                        and (.message.model // "") != "<synthetic>" and .isApiErrorMessage != true)' \
-                        >/dev/null 2>&1; then
-                _job_update '.not_before = null | .backoff_count = null | .backoff_first_at = null'
-                _append_event "backoff_cleared" '{}'
+            # A run that got several real assistant turns through (default 5,
+            # MOTHER_BACKOFF_CLEAR_TURNS) is not being rate limited any more:
+            # clear the backoff bookkeeping. One turn is not enough: a job that
+            # squeezes one turn in and then hits a 429 again would otherwise
+            # restart at the 30 s base every cycle and never reach the give-up.
+            # A successful end clears it too (see _transition). Claude emits a
+            # synthetic assistant message to report an API error; that one does
+            # not count.
+            if [ -n "$(jq -r '.backoff_count // empty' "$job_file" 2>/dev/null)" ]; then
+                _clear_turns=$MOTHER_BACKOFF_CLEAR_TURNS_N
+                _real_turns=$(tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
+                    | jq -R -c 'fromjson? | select(.type == "assistant"
+                        and (.message.model // "") != "<synthetic>" and .isApiErrorMessage != true) | 1' \
+                        2>/dev/null | wc -l | tr -d ' ')
+                if [ "${_real_turns:-0}" -ge "$_clear_turns" ]; then
+                    _job_update '.not_before = null | .backoff_count = null | .backoff_first_at = null'
+                    _append_event "backoff_cleared" "$(jq -nc --argjson t "$_real_turns" '{turns: $t}')"
+                fi
             fi
 
             if [ "$final_result_epoch" -eq 0 ]; then

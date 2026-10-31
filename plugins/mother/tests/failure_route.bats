@@ -529,7 +529,12 @@ _fr_make_retryable() {
 # Usage: _fr_make_noop_job <id> <failure_reason> <mode> [extra-jq-filter]
 #   mode base_is_head   .base_ref = pr-head (HEAD == base; no .base_sha)
 #   mode sha_is_head    .base_ref = main (HEAD is ahead of it) but .base_sha = HEAD
-#   mode sha_is_main    .base_ref = main and .base_sha = main's sha (HEAD is a commit past base)
+#   mode sha_is_main    .base_ref = main and .base_sha = main's sha (HEAD is a commit past base; no
+#                       current_run, so the base-based fallback applies)
+#   mode start_is_head  base as sha_is_main, but current_run.head_sha_at_start = HEAD: the branch already
+#                       carries the PR and this run added nothing
+#   mode start_is_main  base as sha_is_main, current_run.head_sha_at_start = main's sha: this run
+#                       committed the PR's commit
 # Sets FR_PR_URL.
 _fr_make_noop_job() {
     local id="$1" reason="$2" mode="$3" extra="${4:-.}"
@@ -553,6 +558,8 @@ _fr_make_noop_job() {
         base_is_head) base_filter='.base_ref = "pr-head"' ;;
         sha_is_head)  base_filter='.base_ref = "main" | .base_sha = "'"$head"'"' ;;
         sha_is_main)  base_filter='.base_ref = "main" | .base_sha = "'"$main_sha"'"' ;;
+        start_is_head) base_filter='.base_ref = "main" | .base_sha = "'"$main_sha"'" | .current_run = {head_sha_at_start: "'"$head"'"}' ;;
+        start_is_main) base_filter='.base_ref = "main" | .base_sha = "'"$main_sha"'" | .current_run = {head_sha_at_start: "'"$main_sha"'"}' ;;
         *) echo "bad mode $mode" >&2; return 1 ;;
     esac
     _fr_make_job "$id" "$reason" \
@@ -600,8 +607,31 @@ _fr_make_noop_job() {
     assert_job_field "fr-noop-sha" '.pr_url' "null"
 }
 
-@test "reconcile guard control: one commit past .base_sha is real work, so the existing PR is adopted as before" {
-    _fr_make_noop_job "fr-noop-ctl" "max_turns" sha_is_main
+@test "reconcile guard: a rework run on a branch that already carries the PR, with no new commit since the run started, is NOT adopted (max_turns)" {
+    _fr_make_noop_job "fr-noop-start" "max_turns" start_is_head
+
+    run mother route-failure "fr-noop-start"
+    [ "$status" -eq 0 ]
+
+    [ "$(_fr_ev_count fr-noop-start succeeded)" = "0" ]
+    [ "$(_fr_ev_count fr-noop-start reconciled)" = "0" ]
+    [ "$(_fr_ev "fr-noop-start" reconcile_skipped | jq -r '.reason')" = "no_new_commit" ]
+    [ "$(jq -r .state "$JOBS_DIR/fr-noop-start.json")" != "succeeded" ]
+    assert_job_field "fr-noop-start" '.pr_url' "null"
+}
+
+@test "reconcile guard fallback: without head_sha_at_start, a commit past .base_sha counts as work" {
+    _fr_make_noop_job "fr-noop-fb" "max_turns" sha_is_main
+
+    run mother route-failure "fr-noop-fb"
+    [ "$status" -eq 0 ]
+
+    assert_job_field "fr-noop-fb" '.state' "succeeded"
+    [ "$(_fr_ev_count fr-noop-fb reconcile_skipped)" = "0" ]
+}
+
+@test "reconcile guard control: HEAD moved past the run's starting head is real work, so the PR is adopted" {
+    _fr_make_noop_job "fr-noop-ctl" "max_turns" start_is_main
 
     run mother route-failure "fr-noop-ctl"
     [ "$status" -eq 0 ]

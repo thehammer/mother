@@ -42,12 +42,23 @@ mother_ratelimit_until() {
     _backoff_int "$v" 0
 }
 
-# Seconds left on the shared pause (0 when none).
+# Longest wait Mother itself ever schedules (a server retry-after is clamped to
+# this when set). A stored `ratelimit-until` / `.not_before` further out than
+# this was not written by us (corrupt file, clock jump, hand edit) and is
+# treated as expired: nothing else would ever lift it, and it would block
+# dispatch without bound.
+mother_backoff_horizon_s() {
+    _backoff_int "${MOTHER_BACKOFF_RETRY_AFTER_MAX_S:-}" 3600
+}
+
+# Seconds left on the shared pause (0 when none, or when implausibly far out).
 mother_ratelimit_remaining() {
-    local until now
+    local until now left
     until=$(mother_ratelimit_until)
     now=$(date +%s)
-    if [ "$until" -gt "$now" ]; then echo $((until - now)); else echo 0; fi
+    [ "$until" -gt "$now" ] || { echo 0; return 0; }
+    left=$((until - now))
+    if [ "$left" -gt "$(mother_backoff_horizon_s)" ]; then echo 0; else echo "$left"; fi
 }
 
 # True while the shared pause is in force.
@@ -99,6 +110,7 @@ mother_backoff_label() {
     now=$(date +%s)
     [ "$nb" -gt "$now" ] || return 0
     left=$((nb - now))
+    [ "$left" -le "$(mother_backoff_horizon_s)" ] || return 0
     if [ "$left" -lt 60 ]; then echo "${left}s"; else echo "$(((left + 59) / 60))m"; fi
 }
 

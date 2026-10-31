@@ -303,19 +303,20 @@ _reap_broker() {
 
 # A `ready` job backed off for a rate limit carries `.not_before` (epoch
 # seconds); it is not eligible until that time has passed (lib/backoff.sh).
+# A not_before further out than the backoff horizon is bogus and ignored.
 _pick_next_ready() {
-    local now; now=$(date +%s)
+    local now hz; now=$(date +%s); hz=$(mother_backoff_horizon_s)
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | while read -r f; do
-        jq -r --argjson now "$now" \
-            'select(.state == "ready" and ((.not_before // 0) | tonumber? // 0) <= $now) | .created_at + "\t" + .id' "$f"
+        jq -r --argjson now "$now" --argjson hz "$hz" \
+            'select(.state == "ready" and (((.not_before // 0) | tonumber? // 0) as $nb | $nb <= $now or $nb > $now + $hz)) | .created_at + "\t" + .id' "$f"
     done | sort | head -1 | cut -f2
 }
 
 _pick_next_forced_ready() {
-    local now; now=$(date +%s)
+    local now hz; now=$(date +%s); hz=$(mother_backoff_horizon_s)
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | while read -r f; do
-        jq -r --argjson now "$now" \
-            'select(.state == "ready" and (.force_start == true) and ((.not_before // 0) | tonumber? // 0) <= $now) | .created_at + "\t" + .id' "$f"
+        jq -r --argjson now "$now" --argjson hz "$hz" \
+            'select(.state == "ready" and (.force_start == true) and (((.not_before // 0) | tonumber? // 0) as $nb | $nb <= $now or $nb > $now + $hz)) | .created_at + "\t" + .id' "$f"
     done | sort | head -1 | cut -f2
 }
 

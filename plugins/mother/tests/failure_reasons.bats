@@ -129,6 +129,15 @@ _reason_for() {
     [ "$(_reason_for "$(_status_log null "Please go to Plans & Billing to upgrade")")" = "billing" ]
 }
 
+@test "classify-exit rule: a 400 whose text says the credit balance is too low (or billing) -> billing; other statuses keep their reason" {
+    [ "$(_reason_for "$(_status_log 400 "Your credit balance is too low to access the API")")" = "billing" ]
+    [ "$(_reason_for "$(_status_log 400 "Please go to Plans & Billing to upgrade")")" = "billing" ]
+    # A 400 with no billing text, and a billing-looking body on a non-400 status, are unchanged.
+    [ "$(_reason_for "$(_status_log 400 "invalid request")")" = "api_error" ]
+    [ "$(_reason_for "$(_status_log 404 "credit balance is too low")")" = "api_error" ]
+    [ "$(_reason_for "$(_status_log 429 "credit balance is too low")")" = "rate_limited" ]
+}
+
 @test "classify-exit rule: a 429 result with a clean exit 0 is still rate_limited (a 429 is never a success)" {
     run mother-usage classify-exit --log "$FIXTURES/result_rate_limited_429.jsonl" --offset 0 --exit-code 0
     [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]

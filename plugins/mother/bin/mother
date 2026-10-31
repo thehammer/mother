@@ -2592,15 +2592,25 @@ _rf_try_reconcile() {
     ( cmd_reconcile "$id" --auto )
 }
 
-# True unless the job's work_dir is a git repo with no commit past the job's
-# base: a run that added nothing must not "adopt" a PR that was already there
-# (that is how a job that did no work became `succeeded`). A work_dir that is
-# gone or not a repo can't be checked, so it keeps the old behaviour.
+# True unless the failed run demonstrably added nothing: a run that added no
+# commit must not "adopt" a PR that was already there (that is how a job that
+# did no work became `succeeded`). "Added nothing" means HEAD is still the
+# commit the run started from (.current_run.head_sha_at_start): comparing with
+# the job's base would count the existing PR's own commits as this run's work.
+# Only when the starting head is missing/unresolvable does it fall back to
+# "no commit past the base". A work_dir that is gone or not a repo can't be
+# checked, so it keeps the old behaviour.
 _rf_run_made_commit() {
-    local job_file wd base
+    local job_file wd start base head
     job_file=$(_job_path "$1")
     wd=$(jq -r '.work_dir // empty' "$job_file")
     [ -n "$wd" ] && git -C "$wd" rev-parse --git-dir >/dev/null 2>&1 || return 0
+    start=$(jq -r '.current_run.head_sha_at_start // empty' "$job_file")
+    if [ -n "$start" ] && git -C "$wd" rev-parse --verify -q "$start^{commit}" >/dev/null 2>&1; then
+        head=$(git -C "$wd" rev-parse HEAD 2>/dev/null) || return 0
+        [ "$head" != "$(git -C "$wd" rev-parse "$start^{commit}")" ]
+        return
+    fi
     base=$(mother_job_diff_base "$job_file" 2>/dev/null)
     [ -n "$base" ] && git -C "$wd" rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1 || return 0
     [ "$(git -C "$wd" rev-list --count "$base..HEAD" 2>/dev/null || echo 1)" -gt 0 ]
@@ -2647,8 +2657,14 @@ _rf_backoff() {
     count=$(_backoff_int "$(jq -r '.backoff_count // 0' "$job_file")" 0)
     first=$(_backoff_int "$(jq -r '.backoff_first_at // 0' "$job_file")" 0)
     max=$(_backoff_int "${MOTHER_BACKOFF_MAX_S:-}" 900)
-    if [ "$first" -gt 0 ] && [ $((now - first)) -gt "$max" ]; then
-        detail=$(printf '%s' "$detail" | jq -c --argjson m "$(((now - first) / 60))" '. + {waited_minutes: $m}')
+    # Lifetime cap on consecutive backoffs (the counter only resets after a run
+    # that really got going), so a job that keeps hitting the limit can't loop.
+    local max_count; max_count=$(_backoff_int "${MOTHER_BACKOFF_MAX_COUNT:-}" 10)
+    if { [ "$first" -gt 0 ] && [ $((now - first)) -gt "$max" ]; } \
+        || { [ "$max_count" -gt 0 ] && [ "$count" -ge "$max_count" ]; }; then
+        local waited=0
+        [ "$first" -le 0 ] || waited=$(((now - first) / 60))
+        detail=$(printf '%s' "$detail" | jq -c --argjson m "$waited" '. + {waited_minutes: $m}')
         _rf_hold "$id" "$reason" "backoff_exhausted" "$detail"
         # Kind != paused_reason on purpose: a later, unrelated operator_hold
         # on this job must stay answerable with plain text.
