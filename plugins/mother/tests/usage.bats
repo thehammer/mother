@@ -475,7 +475,7 @@ _classify() { mother-usage classify-exit --log "$1" --offset 0 --exit-code "${2:
     [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "17" ]
 }
 
-@test "classify-exit: retry_after_s is parsed from the log tail when there is no result event" {
+@test "classify-exit: a retry-after in the log tail with no result event is ignored (free text never sets a wait); still rate_limited" {
     {
         head -1 "$FIXTURES/result_rate_limited_429.jsonl"
         echo "Error: 429 rate limit exceeded. Retry-After: 45"
@@ -483,9 +483,22 @@ _classify() { mother-usage classify-exit --log "$1" --offset 0 --exit-code "${2:
     run _classify "$MOTHER_ROOT/ra-tail.jsonl"
     [ "$status" -eq 0 ]
     [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
-    [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "45" ]
+    [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "null" ]
     # No result event at all -> result_is_error is false.
     [ "$(printf '%s' "$output" | jq -r '.result_is_error')" = "false" ]
+}
+
+@test "classify-exit: a 5000-digit retry-after and an infinite retry_after key cannot crash the classifier (reason still rate_limited)" {
+    local digits; digits=$(printf '9%.0s' $(seq 1 5000))
+    _result_log "$MOTHER_ROOT/ra-huge.jsonl" '{"api_error_status":429,"result":"retry-after: '"$digits"'"}'
+    run _classify "$MOTHER_ROOT/ra-huge.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+
+    _result_log "$MOTHER_ROOT/ra-inf.jsonl" '{"api_error_status":429,"retry_after":1e999}'
+    run _classify "$MOTHER_ROOT/ra-inf.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
 }
 
 @test "classify-exit: a result event's own retry_after_s key wins over a different number in its text" {

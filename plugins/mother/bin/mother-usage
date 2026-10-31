@@ -516,7 +516,7 @@ _CTX_OVERFLOW_RE = re.compile(r"prompt is too long|context (window|length)", re.
 _RATE_LIMIT_RE = re.compile(r"rate.?limit|429|usage limit", re.I)
 _OVERLOADED_RE = re.compile(r"overloaded|529", re.I)
 _BILLING_RE = re.compile(r"credit balance|billing", re.I)
-_RETRY_AFTER_RE = re.compile(r"retry[-_ ]after\D{0,4}(\d+)", re.I)
+_RETRY_AFTER_RE = re.compile(r"retry[-_ ]after\D{0,4}(\d{1,7})", re.I)
 _BANNER_RE = re.compile(r"^=== mother job \S+ starting at (.+?) ===\s*$")
 
 
@@ -608,19 +608,21 @@ def _api_error_reason(status, result_text):
     return "api_error"
 
 
-def _retry_after_seconds(result_event, text):
+def _retry_after_seconds(result_event):
     """Seconds the API asked us to wait, from the result event's own keys or a
-    `retry-after: N` in its text / the log tail. None when absent."""
-    if result_event:
-        for key in ("retry_after_s", "retry_after", "retry-after"):
-            val = result_event.get(key)
-            try:
-                n = int(float(val))
-            except (TypeError, ValueError):
-                continue
-            if n > 0:
-                return n
-    m = _RETRY_AFTER_RE.search(text or "")
+    `retry-after: N` in its result text. None when absent. Only an event that
+    carries an api_error_status is trusted: free text in a log tail (a worker's
+    own output) never sets a wait. Callers clamp the value."""
+    if not result_event or result_event.get("api_error_status") is None:
+        return None
+    for key in ("retry_after_s", "retry_after", "retry-after"):
+        try:
+            n = int(float(result_event.get(key)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if n > 0:
+            return n
+    m = _RETRY_AFTER_RE.search(str(result_event.get("result") or ""))
     if m and int(m.group(1)) > 0:
         return int(m.group(1))
     return None
@@ -695,8 +697,7 @@ def classify_exit(log_path, offset, exit_code, end=None):
         "retry_after_s": None,
     }
     if reason in ("rate_limited", "api_overloaded"):
-        retry_src = str(result_event.get("result") or "") if result_event else ""
-        out["retry_after_s"] = _retry_after_seconds(result_event, retry_src + "\n" + tail_text)
+        out["retry_after_s"] = _retry_after_seconds(result_event)
     return out
 
 

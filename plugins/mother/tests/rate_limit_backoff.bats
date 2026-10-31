@@ -366,7 +366,7 @@ _bo_assert_counters_untouched() {
 # ---------------------------------------------------------------------------
 
 @test "pause file: a rate_limited route-failure writes ratelimit-until = the job's not_before as one integer line" {
-    _bo_job "bo-p1" "rate_limited"
+    _bo_job "bo-p1" "rate_limited" . '{"api_error_status":429}'
 
     run mother route-failure "bo-p1"
     [ "$status" -eq 0 ]
@@ -381,7 +381,7 @@ _bo_assert_counters_untouched() {
 @test "pause file: an existing later pause is kept (max of existing and not_before)" {
     local later=$(( $(_now) + 5000 ))
     echo "$later" > "$MOTHER_ROOT/ratelimit-until"
-    _bo_job "bo-p2" "rate_limited"
+    _bo_job "bo-p2" "rate_limited" . '{"api_error_status":429}'
 
     run mother route-failure "bo-p2"
     [ "$status" -eq 0 ]
@@ -391,7 +391,7 @@ _bo_assert_counters_untouched() {
 
 @test "pause file: an existing earlier (stale) pause is extended to the job's not_before" {
     echo "$(( $(_now) - 500 ))" > "$MOTHER_ROOT/ratelimit-until"
-    _bo_job "bo-p3" "rate_limited"
+    _bo_job "bo-p3" "rate_limited" . '{"api_error_status":429}'
 
     run mother route-failure "bo-p3"
     [ "$status" -eq 0 ]
@@ -1283,6 +1283,15 @@ All good."
     run mother-usage retro --root "$MOTHER_ROOT" --since 7d --format json
     [ "$status" -eq 0 ]
     [ "$(printf '%s' "$output" | jq -c '.backoffs')" = '{"repo-x":{"jobs_backed_off":2,"backoffs":4,"median_wait_s":90.0,"give_ups":1}}' ]
+}
+
+@test "backoff: a text-only rate_limited failure (no api_error_status) backs off just that job: base delay, no retry_after_s, NO shared pause" {
+    _bo_job "bo-text" "rate_limited" . '{"retry_after_s":3000}'
+    run mother route-failure "bo-text"
+    [ "$status" -eq 0 ]
+    assert_job_field "bo-text" '.state' "ready"
+    [ "$(_ev "bo-text" failure_routed | jq -r '.delay_s')" = "30" ]
+    [ ! -e "$MOTHER_ROOT/ratelimit-until" ]
 }
 
 @test "backoff: an absurd retry_after_s (a day) is clamped to MOTHER_BACKOFF_RETRY_AFTER_MAX_S (default 3600) so it cannot stall the queue" {

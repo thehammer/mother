@@ -2656,8 +2656,12 @@ _rf_backoff() {
         return 0
     fi
 
-    local ra delay not_before new_state
-    ra=$(printf '%s' "$detail" | jq -r '.retry_after_s // 0' 2>/dev/null)
+    local delay not_before new_state
+    # Only a real API error result (it carries api_error_status) may set the
+    # wait or the shared pause; a text-only match backs off just this job.
+    local ra=0 api_status
+    api_status=$(printf '%s' "$detail" | jq -r '.api_error_status // empty' 2>/dev/null)
+    [ -z "$api_status" ] || ra=$(printf '%s' "$detail" | jq -r '.retry_after_s // 0' 2>/dev/null)
     delay=$(mother_backoff_delay "$count" "$ra")
     not_before=$((now + delay))
     new_state=$(_rf_ready_or_queued "$job_file")
@@ -2674,7 +2678,7 @@ _rf_backoff() {
         | .backoff_first_at = (.backoff_first_at // $now)
     ' "$job_file") || _die "route-failure: jq update failed"
     _atomic_write "$job_file" "$merged"
-    [ "$reason" != "rate_limited" ] || mother_ratelimit_extend "$not_before"
+    [ "$reason" != "rate_limited" ] || [ -z "$api_status" ] || mother_ratelimit_extend "$not_before"
     _append_event "$id" "failure_routed" \
         "$(jq -nc --arg r "$reason" --argjson d "$delay" --argjson n "$((count + 1))" \
             '{action: "backed_off", reason: $r, delay_s: $d, backoff_count: $n}')"
