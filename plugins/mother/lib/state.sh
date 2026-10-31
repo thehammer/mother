@@ -370,6 +370,46 @@ _tier_from_index() {
     esac
 }
 
+# _normalize_posture <raw>: the single boundary between Bishop's vocabulary and
+# Mother's. Bishop (since 2026-05-16, bishop 508fe2a) prints one of five labels;
+# Mother's internals (_apply_posture_bias, gates, review) keep the four below:
+#   Pump the brakes      -> conservative
+#   Ease up              -> normal        (deliberate: Bishop's own text for it is
+#                                          only "consider lighter model selection",
+#                                          while conservative also clamps to tier_0,
+#                                          skips non-mandatory lenses and limits
+#                                          enforce gates to one attempt; to reverse,
+#                                          move "ease up" into the conservative arm)
+#   Cruise               -> normal
+#   Push                 -> elevated
+#   Put the hammer down  -> flush
+#   conservative|normal|elevated|flush -> themselves (legacy labels)
+# Leading/trailing whitespace is trimmed, runs of whitespace are squashed, and
+# matching is case-insensitive. Empty/whitespace-only input -> normal, silently
+# (bishop failed or the file is missing). Any other unrecognized value -> normal
+# plus one stderr line naming it (control characters and ANSI escapes stripped,
+# truncated to 40 characters).
+_normalize_posture() {
+    local raw="${1:-}" key shown
+    key=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    case "$key" in
+        "")
+            echo normal
+            ;;
+        "pump the brakes"|conservative) echo conservative ;;
+        "ease up"|cruise|normal) echo normal ;;
+        push|elevated) echo elevated ;;
+        "put the hammer down"|flush) echo flush ;;
+        *)
+            shown=$(printf '%s' "$raw" | LC_ALL=C sed -e $'s/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' | LC_ALL=C tr -d '\000-\037\177' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | cut -c1-40)
+            echo "mother: unrecognized bishop posture \"$shown\"; treating as normal" >&2
+            echo normal
+            ;;
+    esac
+}
+
 # _resolve_posture: best-effort fetch of current Bishop posture.
 # Echoes one of: conservative | normal | elevated | flush.
 # Falls back to `normal` if bishop is not on PATH, the call fails, or output
@@ -383,11 +423,8 @@ _resolve_posture() {
     fi
     bishop --refresh >/dev/null 2>&1 || true
     local p
-    p=$(bishop get posture 2>/dev/null | tr -d '[:space:]')
-    case "$p" in
-        conservative|normal|elevated|flush) echo "$p" ;;
-        *) echo "normal" ;;
-    esac
+    p=$(bishop get posture 2>/dev/null) || p=""
+    _normalize_posture "$p"
 }
 
 # _resolve_cost_model: best-effort detection of the account's billing mode.

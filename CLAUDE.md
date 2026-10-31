@@ -329,6 +329,17 @@ adherence-review time to bias the model/effort tier.
 **Kill switch:** set `MOTHER_POSTURE_ENABLED=0` (in the launchd plist or shell
 environment) to disable posture bias entirely. The default is `1` (enabled).
 
+**Label mapping.** Bishop prints five labels (since bishop `508fe2a`, 2026-05-16); `_normalize_posture`
+(`lib/state.sh`) is the one boundary that maps them to Mother's internal four (case-insensitive, whitespace trimmed
+and squashed): `Pump the brakes` -> `conservative`, `Ease up` -> `normal`, `Cruise` -> `normal`, `Push` -> `elevated`,
+`Put the hammer down` -> `flush`; the four legacy labels map to themselves. `Ease up` is `normal` deliberately:
+Bishop's own text for it is only "consider lighter model selection", while `conservative` also clamps to tier_0,
+skips non-mandatory lenses and limits enforce gates to one attempt; to reverse, move `"ease up"` into the
+conservative arm of `_normalize_posture`. Empty input -> `normal` silently; any other unrecognized value -> `normal`
+plus one stderr line (`mother: unrecognized bishop posture "<label>"; treating as normal`, control characters and ANSI
+escapes stripped, 40 characters max). `tests/posture.bats` checks the vendored vocabulary
+(`tests/fixtures/bishop-posture-labels.txt`) in CI and has a local-only canary against the real `bishop`.
+
 **Posture levels and bias semantics:**
 
 | Posture | Effect on initial tier |
