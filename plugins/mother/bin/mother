@@ -607,6 +607,7 @@ cmd_add() {
     local isolation="worktree" executor="local-tmux" max_cost="" depends_on=""
     local format="text" title=""
     local origin_label="" origin_project_override="" origin_session=""
+    local origin_focus="" origin_focus_name=""
     local expect_branch_mismatch_flag=0
 
     while [ $# -gt 0 ]; do
@@ -625,6 +626,8 @@ cmd_add() {
             --label)            origin_label="$2"; shift 2 ;;
             --origin-project)   origin_project_override="$2"; shift 2 ;;
             --origin-session)   origin_session="$2"; shift 2 ;;
+            --origin-focus)     origin_focus="$2"; shift 2 ;;
+            --origin-focus-name) origin_focus_name="$2"; shift 2 ;;
             --expect-branch-mismatch) expect_branch_mismatch_flag=1; shift ;;
             *) _die "unknown flag for add: $1" ;;
         esac
@@ -748,6 +751,32 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
     fi
     [ -z "$origin_session" ] && origin_session="${MOTHER_ORIGIN_SESSION:-}"
     [ -z "$origin_session" ] && origin_session="${CLAUDE_SESSION_ID:-}"
+    # Nostromo focus: first non-empty of flag, MOTHER_ORIGIN_FOCUS,
+    # NOSTROMO_FOCUS_TAG, NOSTROMO_PTY_ID. Mother only stores the claim; an
+    # invalid tag is dropped (never refuses the job) without echoing the value.
+    [ -z "$origin_focus" ] && origin_focus="${MOTHER_ORIGIN_FOCUS:-}"
+    [ -z "$origin_focus" ] && origin_focus="${NOSTROMO_FOCUS_TAG:-}"
+    [ -z "$origin_focus" ] && origin_focus="${NOSTROMO_PTY_ID:-}"
+    if [ -n "$origin_focus" ]; then
+        if ! LC_ALL=C bash -c '[[ $1 =~ ^[A-Za-z0-9._-]{1,128}$ ]]' _ "$origin_focus"; then
+            echo "warning: ignoring invalid origin focus (must match [A-Za-z0-9._-]{1,128})" >&2
+            origin_focus=""
+        fi
+    fi
+    [ -z "$origin_focus_name" ] && origin_focus_name="${MOTHER_ORIGIN_FOCUS_NAME:-}"
+    [ -z "$origin_focus" ] && origin_focus_name=""
+    if [ -n "$origin_focus_name" ]; then
+        # Controls (C0/C1/DEL) removed (NUL cannot occur in an argv string, so
+        # the class starts at \u0001 and never puts a NUL in the regex), whitespace collapsed and trimmed,
+        # capped at 120 characters (jq slices by codepoint: UTF-8 safe).
+        origin_focus_name=$(jq -rn --arg n "$origin_focus_name" '
+            $n | gsub("[\t\n\r]"; " ")
+               | gsub("[\u0001-\u001f\u007f-\u009f]"; "")
+               | gsub("\\s+"; " ")
+               | gsub("^ | $"; "")
+               | .[0:120]
+               | gsub("^ | $"; "")') || origin_focus_name=""
+    fi
     enqueued_by=$(whoami)
 
     local id deps_json job_json max_cost_json
@@ -792,6 +821,8 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         --arg origin_session "$origin_session" \
         --arg enqueued_by "$enqueued_by" \
         --arg origin_label "$origin_label" \
+        --arg origin_focus "$origin_focus" \
+        --arg origin_focus_name "$origin_focus_name" \
         '{
             id: $id, title: $title, repo: $repo, repo_path: $repo_path,
             branch: $branch, base_ref: $base_ref,
@@ -801,7 +832,9 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
             plan_path: $plan_path, log_path: $log_path,
             plan_summary: $plan_summary,
             state: "queued", created_at: $created_at,
-            origin: {project: $origin_project, cwd: $origin_cwd, session: $origin_session, enqueued_by: $enqueued_by, label: $origin_label},
+            origin: ({project: $origin_project, cwd: $origin_cwd, session: $origin_session, enqueued_by: $enqueued_by, label: $origin_label}
+                      + (if $origin_focus != "" then {focus: $origin_focus} else {} end)
+                      + (if $origin_focus_name != "" then {focus_name: $origin_focus_name} else {} end)),
             started_at: null, finished_at: null,
             pr_url: null, tmux_window: null, worker_pid: null, actual_cost_usd: null,
             suggested_config: $suggested_config,
@@ -3928,13 +3961,21 @@ cmd_events() {
     # Aggregate all events across jobs, keeping job id and title alongside
     local all
     all=$(find "$EVENTS_DIR" -maxdepth 1 -name '*.jsonl' -type f 2>/dev/null | while read -r f; do
-        local jobid title
+        local jobid title focus meta
         jobid=$(basename "$f" .jsonl)
         # Skip derivative plan files (events ending in -plan are actually .md, not .jsonl — guard anyway)
         [[ "$jobid" == *-plan ]] && continue
         title=""
-        [ -f "$(_job_path "$jobid")" ] && title=$(jq -r '.title // ""' "$(_job_path "$jobid")" 2>/dev/null || echo "")
-        jq -c --arg jobid "$jobid" --arg title "$title" '. + {job_id: $jobid, title: $title}' "$f" 2>/dev/null
+        focus=""
+        if [ -f "$(_job_path "$jobid")" ]; then
+            # One jq for both fields: focus (a validated tag, one line) first,
+            # then the title raw, so a title containing tabs/newlines survives.
+            meta=$(jq -r '(.origin.focus // ""), (.title // "")' "$(_job_path "$jobid")" 2>/dev/null || echo "")
+            focus="${meta%%$'\n'*}"
+            [[ "$meta" == *$'\n'* ]] && title="${meta#*$'\n'}"
+        fi
+        jq -c --arg jobid "$jobid" --arg title "$title" --arg focus "$focus" \
+            '. + {job_id: $jobid, title: $title} + (if $focus != "" then {origin_focus: $focus} else {} end)' "$f" 2>/dev/null
     done | jq -cs --arg since "$since_ts" '
         map(select(($since | length == 0) or (.ts > $since)))
         | sort_by(.ts)
@@ -5056,6 +5097,11 @@ Add options:
   --origin-project NAME  override auto-detected originating project name
   --origin-session ID    originating session id
                           (default: \$MOTHER_ORIGIN_SESSION, then \$CLAUDE_SESSION_ID)
+  --origin-focus TAG     originating Nostromo focus tag, [A-Za-z0-9._-]{1,128}
+                          (default: \$MOTHER_ORIGIN_FOCUS, then \$NOSTROMO_FOCUS_TAG,
+                          then \$NOSTROMO_PTY_ID); invalid values are dropped
+  --origin-focus-name N  display name for the focus, cleaned and capped at 120 chars
+                          (default: \$MOTHER_ORIGIN_FOCUS_NAME)
   --expect-branch-mismatch  the worker is deliberately targeting a branch
                             other than --branch (e.g. landing on an existing
                             PR); also settable via the plan's suggested_config

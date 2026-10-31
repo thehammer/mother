@@ -1304,3 +1304,94 @@ PLAN
     [[ "$origin_block" == *"-"* ]]
     [[ "$origin_block" != *"null"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# origin.focus / origin.focus_name (Nostromo focus)
+
+_focus_add() {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+    unset MOTHER_ORIGIN_FOCUS MOTHER_ORIGIN_FOCUS_NAME NOSTROMO_FOCUS_TAG NOSTROMO_PTY_ID
+    for kv in ${FOCUS_ENV:-}; do export "$kv"; done
+    run mother add --plan-file "$plan" --repo testrepo --repo-path "$FAKE_REPO" \
+        --branch feature/test "$@"
+}
+
+@test "origin focus: NOSTROMO_FOCUS_TAG is recorded with no flags" {
+    FOCUS_ENV="NOSTROMO_FOCUS_TAG=claudia-C9D6B773" _focus_add
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.origin.focus' "$JOBS_DIR/$output.json")" = "claudia-C9D6B773" ]
+}
+
+@test "origin focus: env sources and precedence" {
+    FOCUS_ENV="NOSTROMO_PTY_ID=pty1" _focus_add
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.origin.focus' "$JOBS_DIR/$output.json")" = "pty1" ]
+
+    FOCUS_ENV="NOSTROMO_PTY_ID=pty1 NOSTROMO_FOCUS_TAG=tag1" _focus_add
+    [ "$(jq -r '.origin.focus' "$JOBS_DIR/$output.json")" = "tag1" ]
+
+    FOCUS_ENV="NOSTROMO_PTY_ID=pty1 NOSTROMO_FOCUS_TAG=tag1 MOTHER_ORIGIN_FOCUS=env1" _focus_add
+    [ "$(jq -r '.origin.focus' "$JOBS_DIR/$output.json")" = "env1" ]
+
+    FOCUS_ENV="NOSTROMO_PTY_ID=pty1 NOSTROMO_FOCUS_TAG=tag1 MOTHER_ORIGIN_FOCUS=env1" \
+        _focus_add --origin-focus flag1
+    [ "$(jq -r '.origin.focus' "$JOBS_DIR/$output.json")" = "flag1" ]
+}
+
+@test "origin focus: invalid tags are dropped, job still queues, value not echoed" {
+    local long
+    long=$(printf 'a%.0s' $(seq 1 129))
+    for bad in "a b" "x;rm" "$long" $'a\nb' $'abc\n' $'a\x01b'; do
+        _focus_add --origin-focus "$bad"
+        [ "$status" -eq 0 ]
+        local id
+        id=$(printf '%s\n' "$output" | grep -E '^[0-9]{8}T' | tail -1)
+        [ "$(jq '.origin | has("focus")' "$JOBS_DIR/$id.json")" = "false" ]
+        [[ "$output" != *"x;rm"* ]]
+        [[ "$output" != *"$long"* ]]
+    done
+}
+
+@test "origin focus: invalid NOSTROMO_FOCUS_TAG is dropped, not replaced by NOSTROMO_PTY_ID" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+    unset MOTHER_ORIGIN_FOCUS MOTHER_ORIGIN_FOCUS_NAME
+    NOSTROMO_FOCUS_TAG=$'bad\ntag' NOSTROMO_PTY_ID=pty1 run mother add --plan-file "$plan" \
+        --repo testrepo --repo-path "$FAKE_REPO" --branch feature/test
+    [ "$status" -eq 0 ]
+    local id
+    id=$(printf '%s\n' "$output" | grep -E '^[0-9]{8}T' | tail -1)
+    [ "$(jq '.origin | has("focus")' "$JOBS_DIR/$id.json")" = "false" ]
+}
+
+@test "origin focus: a name without a valid focus is not stored" {
+    _focus_add --origin-focus "a b" --origin-focus-name "Orphan"
+    [ "$status" -eq 0 ]
+    local id
+    id=$(printf '%s\n' "$output" | grep -E '^[0-9]{8}T' | tail -1)
+    [ "$(jq '.origin | has("focus_name")' "$JOBS_DIR/$id.json")" = "false" ]
+}
+
+@test "origin focus: name is cleaned and capped at 120 characters" {
+    _focus_add --origin-focus f1 --origin-focus-name $'  My\x01 focus\t name  '
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.origin.focus_name' "$JOBS_DIR/$output.json")" = "My focus name" ]
+
+    local big
+    big=$(printf 'é%.0s' $(seq 1 200))
+    _focus_add --origin-focus f1 --origin-focus-name "$big"
+    [ "$(jq -r '.origin.focus_name | length' "$JOBS_DIR/$output.json")" -eq 120 ]
+}
+
+@test "origin focus: hostile name is stored verbatim as safe JSON" {
+    _focus_add --origin-focus f1 --origin-focus-name 'a "q" </x> b'
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.origin.focus_name' "$JOBS_DIR/$output.json")" = 'a "q" </x> b' ]
+}
+
+@test "origin focus: no focus means no focus keys in origin" {
+    _focus_add
+    [ "$status" -eq 0 ]
+    [ "$(jq '.origin | has("focus") or has("focus_name")' "$JOBS_DIR/$output.json")" = "false" ]
+}

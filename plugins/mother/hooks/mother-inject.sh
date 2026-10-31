@@ -81,6 +81,16 @@ if [ "$max_age_hours" -gt 0 ]; then
     [ -z "$events" ] && exit 0
 fi
 
+# Nostromo notifies the focus that queued a job directly, so inside a focus
+# (NOSTROMO_FOCUS_TAG set) drop that focus's own jobs: no double-telling.
+# Events without origin_focus, and every event when the variable is unset or
+# empty, are kept.
+if [ -n "${NOSTROMO_FOCUS_TAG:-}" ]; then
+    events=$(printf '%s' "$events" | jq -c --arg f "$NOSTROMO_FOCUS_TAG" \
+        'map(select((.origin_focus // "") != $f))' 2>/dev/null)
+    [ -z "$events" ] && exit 0
+fi
+
 count=$(printf '%s' "$events" | jq 'length' 2>/dev/null || echo 0)
 [ -z "$count" ] || [ "$count" = "0" ] && exit 0
 

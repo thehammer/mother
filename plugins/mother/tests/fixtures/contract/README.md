@@ -39,6 +39,7 @@ One broker message per line (NDJSON), in the exact envelope from `broker/envelop
 - Snapshot jobs are the real job records the broker serves (existing keys with unchanged types, plus
   the new keys `crew`, `gates`, `review_wave`, `decision`, `attention`, `attention_reasons`, `progress`).
 - `base_sha` (string or null) is an additive job-record key: the commit SHA of `base_ref` at `mother add`. It appears in `queued` event data and snapshot jobs, normalised like any other sha. Clients must ignore unknown keys.
+- `origin.focus` / `origin.focus_name` (strings) are additive, optional job-record keys: the originating Nostromo focus tag and display name. They are present only when non-empty, so jobs queued without a focus (as in these fixtures) are unchanged. Clients must ignore unknown keys.
 - `crew.gates.mode` / `crew.lenses.mode` are configuration. Read `gates.mode` and `review_wave.mode`.
 - `progress.label` is the Mother-rendered display line (`≈80% · gates ✗ attempt 1/3 · ETA ?`); render it verbatim.
 

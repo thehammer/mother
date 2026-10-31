@@ -25,6 +25,8 @@ setup_mother_env() {
     # older workers as MOTHER_ROOT=~/.mother). Unsetting both means test code can
     # never resolve the live tree.
     unset MOTHER_ROOT MOTHER_LIVE_ROOT _MOTHER_TEST_ROOT
+    # A suite run from inside a Nostromo focus must not leak that focus into tests.
+    unset NOSTROMO_FOCUS_TAG NOSTROMO_PTY_ID MOTHER_ORIGIN_FOCUS MOTHER_ORIGIN_FOCUS_NAME
     # Test trees never get a .mother-live marker (see lib/safe-rm.sh).
     export MOTHER_TEST_ROOT=1
     export MOTHER_ROOT

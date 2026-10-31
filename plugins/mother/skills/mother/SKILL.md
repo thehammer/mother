@@ -103,6 +103,10 @@ not take "the most recently modified transcript": it is the wrong session
 whenever two sessions are active in the same project. If you cannot establish
 the id, leave `--origin-session` off and tell the user, rather than inventing one.
 
+Inside Nostromo, the focus (`origin.focus`, from `$NOSTROMO_FOCUS_TAG`) and
+the session are captured from the environment automatically. Do not pass
+`--origin-focus` by hand.
+
 ## Typical invocation pattern
 
 After user agreement:
