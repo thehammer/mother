@@ -978,7 +978,7 @@ BISHOP
     [ "$(_rw_job_json "$id" '.review_wave.status')" = "shipped" ]
 }
 
-@test "wave under Bishop's "Pump the brakes" runs only the phi-security lens (plus adherence) on a PHI repo and skips the rest as posture" {
+@test "wave under Bishop posture Pump the brakes runs only the phi-security lens (plus adherence) on a PHI repo and skips the rest as posture" {
     local id="w-e2"
     cat > "$_MOCK_BIN/bishop" <<'BISHOP'
 #!/usr/bin/env bash
@@ -1008,7 +1008,7 @@ BISHOP
     [ "$(_rw_job_json "$id" '.review_wave.status')" = "shipped" ]
 }
 
-@test "wave under Bishop's "Ease up" (= normal) runs every default lens and skips none the phi-security lens (plus adherence) on a PHI repo and skips the rest as posture" {
+@test "wave under Bishop posture Ease up (= normal) runs every default lens and skips none" {
     local id="w-e3"
     cat > "$_MOCK_BIN/bishop" <<'BISHOP'
 #!/usr/bin/env bash

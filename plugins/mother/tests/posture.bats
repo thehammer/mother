@@ -117,21 +117,55 @@ BISHOP
     [ "$(jq -r '.detail.posture' < <(grep force_start_requested "$EVENTS_DIR/job-pb.jsonl" | tail -1))" = "conservative" ]
 }
 
-@test "vocabulary canary: every label in the vendored Bishop fixture maps to a known class" {
+@test "vocabulary canary: every label in the vendored Bishop fixture maps to its expected class" {
     fixture="$BATS_TEST_DIRNAME/fixtures/bishop-posture-labels.txt"
     [ "$(grep -c . "$fixture")" -eq 5 ]
     while IFS= read -r label; do
         [ -n "$label" ] || continue
+        case "$label" in
+            "Pump the brakes")     want=conservative ;;
+            "Ease up"|"Cruise")    want=normal ;;
+            "Push")                want=elevated ;;
+            "Put the hammer down") want=flush ;;
+            *) echo "fixture label has no expected class in this test: $label" >&2; false ;;
+        esac
         err=$(bash -c 'set -u; source "$1/state.sh"; _normalize_posture "$2" 2>&1 >/dev/null' _ "$_LIB_DIR" "$label")
         [ -z "$err" ] || { echo "unmapped Bishop label: $label" >&2; false; }
+        got=$(bash -c 'set -u; source "$1/state.sh"; _normalize_posture "$2" 2>/dev/null' _ "$_LIB_DIR" "$label")
+        [ "$got" = "$want" ] || { echo "label '$label' maps to '$got', expected '$want'" >&2; false; }
     done < "$fixture"
+}
+
+# Finds the real bishop: drops $_MOCK_BIN wherever it sits on PATH, then refuses a result under it.
+_real_bishop() {
+    local clean="" dir old_ifs="$IFS"
+    IFS=:
+    for dir in $PATH; do
+        [ "$dir" = "$_MOCK_BIN" ] && continue
+        clean="${clean:+$clean:}$dir"
+    done
+    IFS="$old_ifs"
+    local found
+    found=$(PATH="$clean" command -v bishop || true)
+    case "$found" in "$_MOCK_BIN"/*) return 1 ;; esac
+    printf '%s' "$found"
 }
 
 @test "local drift canary: real bishop posture is a label Mother recognizes" {
     # Use the real bishop, not the stub. Listed in ci-allowed-skips.tsv.
-    real=$(PATH="${PATH#"$_MOCK_BIN":}" command -v bishop || true)
+    real=$(_real_bishop)
     [ -n "$real" ] || skip "bishop not installed"
     raw=$("$real" get posture 2>/dev/null) || skip "bishop get posture failed"
+    [ -n "$raw" ] || { echo "bishop printed an empty posture" >&2; false; }
     run bash -c 'set -u; source "$1/state.sh"; _normalize_posture "$2" 2>&1 >/dev/null' _ "$_LIB_DIR" "$raw"
     [ -z "$output" ] || { echo "bishop now prints an unmapped posture: $raw" >&2; false; }
+    # Every level Bishop documents must be in the vendored fixture, and vice versa, so a rename or an
+    # added level fails here instead of rotting the CI canary.
+    if help=$("$real" --help 2>/dev/null) && grep -q "POSTURE LEVELS" <<<"$help"; then
+        live=$(sed -n '/POSTURE LEVELS/,/^$/p' <<<"$help" \
+            | grep -o -E '^[[:space:]]+(Pump the brakes|Ease up|Cruise|Push|Put the hammer down)' \
+            | sed -E 's/^[[:space:]]+//' | sort)
+        fixture_sorted=$(grep . "$BATS_TEST_DIRNAME/fixtures/bishop-posture-labels.txt" | sort)
+        [ "$live" = "$fixture_sorted" ] || { printf 'bishop --help levels differ from the fixture\nlive:\n%s\nfixture:\n%s\n' "$live" "$fixture_sorted" >&2; false; }
+    fi
 }
