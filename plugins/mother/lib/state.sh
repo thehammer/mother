@@ -374,25 +374,37 @@ _tier_from_index() {
 # Mother's. Bishop (since 2026-05-16, bishop 508fe2a) prints one of five labels;
 # Mother's internals (_apply_posture_bias, gates, review) keep the four below:
 #   Pump the brakes      -> conservative
-#   Ease up              -> conservative  (both say "use cheaper models")
+#   Ease up              -> normal        (deliberate: Bishop's own text for it is
+#                                          only "consider lighter model selection",
+#                                          while conservative also clamps to tier_0,
+#                                          skips non-mandatory lenses and limits
+#                                          enforce gates to one attempt; to reverse,
+#                                          move "ease up" into the conservative arm)
 #   Cruise               -> normal
 #   Push                 -> elevated
 #   Put the hammer down  -> flush
 #   conservative|normal|elevated|flush -> themselves (legacy labels)
-# Leading/trailing whitespace is trimmed (inner spaces are kept) and matching is
-# case-insensitive. Anything else -> normal, with one stderr line naming it.
+# Leading/trailing whitespace is trimmed, runs of whitespace are squashed, and
+# matching is case-insensitive. Empty/whitespace-only input -> normal, silently
+# (bishop failed or the file is missing). Any other unrecognized value -> normal
+# plus one stderr line naming it (control characters and ANSI escapes stripped,
+# truncated to 40 characters).
 _normalize_posture() {
-    local raw="${1:-}" key
-    raw="${raw#"${raw%%[![:space:]]*}"}"
-    raw="${raw%"${raw##*[![:space:]]}"}"
-    key=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    local raw="${1:-}" key shown
+    key=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
     case "$key" in
-        "pump the brakes"|"ease up"|conservative) echo conservative ;;
-        cruise|normal) echo normal ;;
+        "")
+            echo normal
+            ;;
+        "pump the brakes"|conservative) echo conservative ;;
+        "ease up"|cruise|normal) echo normal ;;
         push|elevated) echo elevated ;;
         "put the hammer down"|flush) echo flush ;;
         *)
-            echo "mother: unrecognized bishop posture \"$raw\"; treating as normal" >&2
+            shown=$(printf '%s' "$raw" | LC_ALL=C sed -e $'s/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' | LC_ALL=C tr -d '\000-\037\177' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | cut -c1-40)
+            echo "mother: unrecognized bishop posture \"$shown\"; treating as normal" >&2
             echo normal
             ;;
     esac

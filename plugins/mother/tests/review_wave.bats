@@ -978,6 +978,60 @@ BISHOP
     [ "$(_rw_job_json "$id" '.review_wave.status')" = "shipped" ]
 }
 
+@test "wave under Bishop's "Pump the brakes" runs only the phi-security lens (plus adherence) on a PHI repo and skips the rest as posture" {
+    local id="w-e2"
+    cat > "$_MOCK_BIN/bishop" <<'BISHOP'
+#!/usr/bin/env bash
+if [ "${1:-}" = "get" ] && [ "${2:-}" = "posture" ]; then
+    echo "Pump the brakes"
+fi
+exit 0
+BISHOP
+    chmod +x "$_MOCK_BIN/bishop"
+    export MOTHER_POSTURE_ENABLED=1
+    RW_PHI=true
+    local lenses
+    lenses=$(_rw_lenses '.default = ["correctness","tests","ops-infra","phi-security"]
+                         | .mandatory = ["phi-security"] | .scopes = {}')
+    _rw_pr "$id"
+    _rw_job "$id" "$(_rw_crew "$lenses")"
+    _rw_run "$id"
+
+    [ "$(_rw_job_json "$id" '.state')" = "succeeded" ]
+    [ "$(_rw_rv_keys)" = "archie perri-lens.phi-security" ]
+    _rw_ev "$id" '[.[] | select(.kind == "lens_skipped") | .detail | {lens, reason}] | sort_by(.lens)
+        == [{lens: "correctness", reason: "posture"}, {lens: "ops-infra", reason: "posture"}, {lens: "tests", reason: "posture"}]'
+    _rw_ev "$id" '[.[] | select(.kind == "review_cycle_started") | .detail.reviewers] == [["archie:adherence", "perri:phi-security"]]'
+    [ "$(_rw_lens "$id" phi-security '.state')" = "done" ]
+    [ "$(_rw_lens "$id" tests '.state')" = "skipped" ]
+    [ "$(_rw_lens "$id" tests '.skip_reason')" = "posture" ]
+    [ "$(_rw_job_json "$id" '.review_wave.status')" = "shipped" ]
+}
+
+@test "wave under Bishop's "Ease up" (= normal) runs every default lens and skips none the phi-security lens (plus adherence) on a PHI repo and skips the rest as posture" {
+    local id="w-e3"
+    cat > "$_MOCK_BIN/bishop" <<'BISHOP'
+#!/usr/bin/env bash
+if [ "${1:-}" = "get" ] && [ "${2:-}" = "posture" ]; then
+    echo "Ease up"
+fi
+exit 0
+BISHOP
+    chmod +x "$_MOCK_BIN/bishop"
+    export MOTHER_POSTURE_ENABLED=1
+    RW_PHI=true
+    local lenses
+    lenses=$(_rw_lenses '.default = ["correctness","tests","ops-infra","phi-security"]
+                         | .mandatory = ["phi-security"] | .scopes = {}')
+    _rw_pr "$id"
+    _rw_job "$id" "$(_rw_crew "$lenses")"
+    _rw_run "$id"
+
+    [ "$(_rw_job_json "$id" '.state')" = "succeeded" ]
+    [ "$(_rw_rv_keys)" = "archie perri-lens.correctness perri-lens.ops-infra perri-lens.phi-security perri-lens.tests" ]
+    _rw_ev "$id" '[.[] | select(.kind == "lens_skipped")] | length == 0'
+}
+
 @test "wave: once spend has reached the budget the non-mandatory lenses are skipped as budget, the mandatory one still runs on the floor, and the job says it is over budget" {
     local id="w-f1"
     local lenses

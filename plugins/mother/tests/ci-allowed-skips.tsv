@@ -3,3 +3,4 @@
 # With MOTHER_TEST_STRICT_SKIPS=1 (set by .github/workflows/test.yml) a TAP `# skip` for any test not listed here
 # fails the shard — so "go missing", "broker build failed" or "socket never appeared" can't hide as a skip.
 # Locally, skips stay allowed. Prefer installing the missing tool in the workflow over adding a row.
+posture.bats	local drift canary: real bishop posture is a label Mother recognizes	needs a real bishop install, which CI runners do not have; the CI-runnable fixture canary covers the vocabulary
