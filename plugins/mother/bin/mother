@@ -2032,8 +2032,7 @@ cmd_force_start() {
     # Shell out to bishop to get posture (mirrors _resolve_posture in mother-run-job
     # but without depending on that script's functions being in scope here).
     if command -v bishop >/dev/null 2>&1; then
-        posture=$(bishop get posture 2>/dev/null || echo "normal")
-        case "$posture" in conservative|normal|elevated|flush) ;; *) posture="normal" ;; esac
+        posture=$(_normalize_posture "$(bishop get posture 2>/dev/null || echo "")")
     fi
 
     # A queued job may be held behind unsatisfied `--depends-on` gates (see
