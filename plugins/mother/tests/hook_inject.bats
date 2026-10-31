@@ -347,7 +347,17 @@ _run_hook_focus() {
     [[ "$output" == *"title-jnone"* ]]
 }
 
-@test "hook shows all three when NOSTROMO_FOCUS_TAG is unset or empty" {
+@test "hook shows all three when NOSTROMO_FOCUS_TAG is truly unset" {
+    _seed_focus_jobs
+    _run_hook_focus jf1 jf2 jnone
+    unset NOSTROMO_FOCUS_TAG
+    run bash -c "printf '%s' '{\"session_id\":\"sess-focus\"}' | '$HOOK'"
+    [[ "$output" == *"title-jf1"* ]]
+    [[ "$output" == *"title-jf2"* ]]
+    [[ "$output" == *"title-jnone"* ]]
+}
+
+@test "hook shows all three when NOSTROMO_FOCUS_TAG is empty" {
     _seed_focus_jobs
     _run_hook_focus jf1 jf2 jnone
     NOSTROMO_FOCUS_TAG= run bash -c "printf '%s' '{\"session_id\":\"sess-focus\"}' | '$HOOK'"

@@ -1342,7 +1342,7 @@ _focus_add() {
 @test "origin focus: invalid tags are dropped, job still queues, value not echoed" {
     local long
     long=$(printf 'a%.0s' $(seq 1 129))
-    for bad in "a b" "x;rm" "$long"; do
+    for bad in "a b" "x;rm" "$long" $'a\nb' $'abc\n' $'a\x01b'; do
         _focus_add --origin-focus "$bad"
         [ "$status" -eq 0 ]
         local id
@@ -1351,6 +1351,26 @@ _focus_add() {
         [[ "$output" != *"x;rm"* ]]
         [[ "$output" != *"$long"* ]]
     done
+}
+
+@test "origin focus: invalid NOSTROMO_FOCUS_TAG is dropped, not replaced by NOSTROMO_PTY_ID" {
+    local plan="$MOTHER_ROOT/plan.md"
+    make_plan "$plan"
+    unset MOTHER_ORIGIN_FOCUS MOTHER_ORIGIN_FOCUS_NAME
+    NOSTROMO_FOCUS_TAG=$'bad\ntag' NOSTROMO_PTY_ID=pty1 run mother add --plan-file "$plan" \
+        --repo testrepo --repo-path "$FAKE_REPO" --branch feature/test
+    [ "$status" -eq 0 ]
+    local id
+    id=$(printf '%s\n' "$output" | grep -E '^[0-9]{8}T' | tail -1)
+    [ "$(jq '.origin | has("focus")' "$JOBS_DIR/$id.json")" = "false" ]
+}
+
+@test "origin focus: a name without a valid focus is not stored" {
+    _focus_add --origin-focus "a b" --origin-focus-name "Orphan"
+    [ "$status" -eq 0 ]
+    local id
+    id=$(printf '%s\n' "$output" | grep -E '^[0-9]{8}T' | tail -1)
+    [ "$(jq '.origin | has("focus_name")' "$JOBS_DIR/$id.json")" = "false" ]
 }
 
 @test "origin focus: name is cleaned and capped at 120 characters" {

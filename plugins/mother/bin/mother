@@ -764,12 +764,14 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         fi
     fi
     [ -z "$origin_focus_name" ] && origin_focus_name="${MOTHER_ORIGIN_FOCUS_NAME:-}"
+    [ -z "$origin_focus" ] && origin_focus_name=""
     if [ -n "$origin_focus_name" ]; then
-        # Controls (C0/C1/DEL) removed, whitespace collapsed and trimmed,
+        # Controls (C0/C1/DEL) removed (NUL cannot occur in an argv string, so
+        # the class starts at \u0001 and never puts a NUL in the regex), whitespace collapsed and trimmed,
         # capped at 120 characters (jq slices by codepoint: UTF-8 safe).
         origin_focus_name=$(jq -rn --arg n "$origin_focus_name" '
             $n | gsub("[\t\n\r]"; " ")
-               | gsub("[\u0000-\u001f\u007f-\u009f]"; "")
+               | gsub("[\u0001-\u001f\u007f-\u009f]"; "")
                | gsub("\\s+"; " ")
                | gsub("^ | $"; "")
                | .[0:120]
@@ -3959,15 +3961,18 @@ cmd_events() {
     # Aggregate all events across jobs, keeping job id and title alongside
     local all
     all=$(find "$EVENTS_DIR" -maxdepth 1 -name '*.jsonl' -type f 2>/dev/null | while read -r f; do
-        local jobid title focus
+        local jobid title focus meta
         jobid=$(basename "$f" .jsonl)
         # Skip derivative plan files (events ending in -plan are actually .md, not .jsonl — guard anyway)
         [[ "$jobid" == *-plan ]] && continue
         title=""
         focus=""
         if [ -f "$(_job_path "$jobid")" ]; then
-            title=$(jq -r '.title // ""' "$(_job_path "$jobid")" 2>/dev/null || echo "")
-            focus=$(jq -r '.origin.focus // ""' "$(_job_path "$jobid")" 2>/dev/null || echo "")
+            # One jq for both fields: focus (a validated tag, one line) first,
+            # then the title raw, so a title containing tabs/newlines survives.
+            meta=$(jq -r '(.origin.focus // ""), (.title // "")' "$(_job_path "$jobid")" 2>/dev/null || echo "")
+            focus="${meta%%$'\n'*}"
+            [[ "$meta" == *$'\n'* ]] && title="${meta#*$'\n'}"
         fi
         jq -c --arg jobid "$jobid" --arg title "$title" --arg focus "$focus" \
             '. + {job_id: $jobid, title: $title} + (if $focus != "" then {origin_focus: $focus} else {} end)' "$f" 2>/dev/null
