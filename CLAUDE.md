@@ -423,7 +423,7 @@ stops `_dispatch_ready_jobs` starting anything new, defers the runner's adherenc
 re-spawned up to `MOTHER_REVIEW_RATELIMIT_RETRIES` times, then recorded as `error` (`error_reason: rate_limited`, never
 a pass, never a failed review). **Success means work happened:** `mother-run-job` fails a run whose own result event
 carries an `api_error_status` even at exit 0 (`_fail_on_api_error_result`), and `_rf_reconcile_and_record` adopts an
-existing PR only when the work_dir has a commit past `base_sha`. Nothing the backoff writes (question, events, hold
+existing PR only when the work_dir has a commit past `base_sha`. Only a result event with an `api_error_status` may set a wait (`retry_after_s`) or extend the pause; a text-only `rate_limited` backs off just its own job. Nothing the backoff writes (question, events, hold
 detail) contains the worker's `tail_excerpt`. `force-start` does not bypass `not_before` or the pause.
 
 ## Operator attention and notifications
