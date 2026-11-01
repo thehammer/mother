@@ -2252,7 +2252,7 @@ _install_core_job_helpers() {
                 _reason_lit=$(_failure_reason_literal "$detail") || _reason_lit='"unspecified"'
                 _job_update ".failure_reason = $_reason_lit | .failure_routed = null" ;;
             succeeded)
-                _job_update ".failure_reason = null" ;;
+                _job_update ".failure_reason = null | .not_before = null | .backoff_count = null | .backoff_first_at = null" ;;
         esac
         case "$new" in
             running)    _job_update ".started_at = \"$(iso_now)\"" ;;
@@ -2677,6 +2677,11 @@ WRAP
     RESULT_GRACE_SECONDS="${MOTHER_RESULT_GRACE_SECONDS:-300}"
     IDLE_REAP_SECONDS="${MOTHER_IDLE_REAP_SECONDS:-1800}"
 
+    case "${MOTHER_BACKOFF_CLEAR_TURNS:-}" in
+        ''|*[!0-9]*|0) MOTHER_BACKOFF_CLEAR_TURNS_N=5 ;;
+        *) MOTHER_BACKOFF_CLEAR_TURNS_N=$MOTHER_BACKOFF_CLEAR_TURNS ;;
+    esac
+
     # Poll for the marker file.
     cancel_requested=0
     final_result_epoch=0
@@ -2726,6 +2731,26 @@ WRAP
                 # to avoid picking up PR URLs left by previous runs on the same log file
                 # (e.g. escalation retries on the same job ID).
                 _live_capture_pr_url
+            fi
+
+            # A run that got several real assistant turns through (default 5,
+            # MOTHER_BACKOFF_CLEAR_TURNS) is not being rate limited any more:
+            # clear the backoff bookkeeping. One turn is not enough: a job that
+            # squeezes one turn in and then hits a 429 again would otherwise
+            # restart at the 30 s base every cycle and never reach the give-up.
+            # A successful end clears it too (see _transition). Claude emits a
+            # synthetic assistant message to report an API error; that one does
+            # not count.
+            if [ -n "$(jq -r '.backoff_count // empty' "$job_file" 2>/dev/null)" ]; then
+                _clear_turns=$MOTHER_BACKOFF_CLEAR_TURNS_N
+                _real_turns=$(tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
+                    | jq -R -c 'fromjson? | select(.type == "assistant"
+                        and (.message.model // "") != "<synthetic>" and .isApiErrorMessage != true) | 1' \
+                        2>/dev/null | wc -l | tr -d ' ')
+                if [ "${_real_turns:-0}" -ge "$_clear_turns" ]; then
+                    _job_update '.not_before = null | .backoff_count = null | .backoff_first_at = null'
+                    _append_event "backoff_cleared" "$(jq -nc --argjson t "$_real_turns" '{turns: $t}')"
+                fi
             fi
 
             if [ "$final_result_epoch" -eq 0 ]; then
@@ -3615,6 +3640,26 @@ if [ "$_final_wpid" != "$worker_pid" ]; then
     exit 0
 fi
 
+# A run can exit 0 (or be reaped after its result) with a result event that is
+# really an API error: `api_error_status: 429` + `subtype: success`. That run
+# did no work, so it must never become `succeeded` (an existing PR on the
+# branch would otherwise get adopted as its artifact). Classify the run's own
+# result event; on an explicit API error, fail with the classified reason so
+# route-failure handles it (429/529 back off, billing/auth hold). Returns 0
+# when it failed the job, 1 when the result is not an API error.
+_fail_on_api_error_result() {
+    local c d
+    c=$(mother_classify_exit "$log_path" "$log_offset_at_spawn" 1 2>/dev/null) || return 1
+    printf '%s' "$c" | jq -e '
+        (.api_error_status != null)
+        and (.reason | IN("api_error","rate_limited","api_overloaded","billing","auth_error"))' \
+        >/dev/null 2>&1 || return 1
+    d=$(printf '%s' "$c" | jq -c --argjson code "${exit_code:-0}" '. + {exit_code: $code}')
+    _append_metrics "failed" "$d"
+    _transition failed "$d"
+    return 0
+}
+
 # Final transition. Usage rows are recorded BEFORE the terminal _transition
 # call so that _transition's cost recompute (see lib/usage.sh / _transition
 # below) includes this run's row.
@@ -3629,7 +3674,9 @@ elif [ -n "$reaped_reason" ]; then
     # ever seeing a result (idle timeout mid-work), attempt a continuation
     # first; fall back to failed if the continuation cap is reached.
     if [ "$final_result_epoch" -gt 0 ]; then
-        if _verify_artifact_or_fail; then
+        if _fail_on_api_error_result; then
+            :
+        elif _verify_artifact_or_fail; then
             _append_metrics "succeeded" "$(jq -nc --arg reason "$reaped_reason" '{reaped: $reason}')"
             _transition succeeded "$(jq -nc --arg pr "$pr_url" --arg reason "$reaped_reason" '{pr_url: $pr, reaped: $reason}')"
         else
@@ -3645,7 +3692,9 @@ elif [ -n "$reaped_reason" ]; then
         _transition failed "$_fail_detail"
     fi
 elif [ "$exit_code" = "0" ]; then
-    if _verify_artifact_or_fail; then
+    if _fail_on_api_error_result; then
+        :
+    elif _verify_artifact_or_fail; then
         _append_metrics "succeeded" '{}'
         _transition succeeded "$(jq -nc --arg pr "$pr_url" '{pr_url: $pr}')"
     else

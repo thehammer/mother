@@ -176,6 +176,35 @@ _fr_class() {
     done
 }
 
+@test "mother_failure_class: rate_limited and api_overloaded -> backoff (wait and retry the same tier)" {
+    local r
+    for r in rate_limited api_overloaded; do
+        run _fr_class "$r"
+        if [ "$output" != "backoff" ]; then echo "$r -> '$output'" >&2; return 1; fi
+    done
+}
+
+@test "mother_failure_class: billing and auth_error -> hold (a bigger model cannot fix the account)" {
+    local r
+    for r in billing auth_error; do
+        run _fr_class "$r"
+        if [ "$output" != "hold" ]; then echo "$r -> '$output'" >&2; return 1; fi
+    done
+}
+
+@test "mother_failure_class: api_error stays escalate next to the new classes" {
+    run _fr_class api_error
+    [ "$output" = "escalate" ]
+}
+
+@test "mother_failure_class: MOTHER_BACKOFF_ENABLED=0 sends rate_limited, api_overloaded, billing and auth_error back to escalate (old routing)" {
+    local r
+    for r in rate_limited api_overloaded billing auth_error; do
+        MOTHER_BACKOFF_ENABLED=0 run _fr_class "$r"
+        if [ "$output" != "escalate" ]; then echo "$r -> '$output'" >&2; return 1; fi
+    done
+}
+
 # ===========================================================================
 # reconcile_then_hold  (no_pr_no_push)
 # ===========================================================================
@@ -484,6 +513,145 @@ _fr_make_retryable() {
     assert_job_field "fr-esc-off" '.failure_routed' "true"
     assert_job_field "fr-esc-off" '.escalation_count' "0"
     [ "$(_fr_ev "fr-esc-off" failure_routed | jq -r '.why')" = "escalation_disabled" ]
+}
+
+# ===========================================================================
+# Reconcile guard: a run that added no commit must not adopt a PR that was
+# already there. Incident: three 429 failures at $0 and no work done, then
+# `reconcile --auto` "adopted" the pre-existing PR and the job became
+# `succeeded`. In route-failure's reconcile step (classes reconcile_then_hold
+# and the legacy escalate class) a PR is adopted only when the job's work_dir
+# repo has at least one commit past the job's base (.base_sha, else .base_ref).
+# ===========================================================================
+
+# A repo shaped like the incident: an open PR whose head is HEAD, and a job that
+# added nothing on top of it. main -> pr-head (the PR's commit) <- feature/<id>.
+# Usage: _fr_make_noop_job <id> <failure_reason> <mode> [extra-jq-filter]
+#   mode base_is_head   .base_ref = pr-head (HEAD == base; no .base_sha)
+#   mode sha_is_head    .base_ref = main (HEAD is ahead of it) but .base_sha = HEAD
+#   mode sha_is_main    .base_ref = main and .base_sha = main's sha (HEAD is a commit past base; no
+#                       current_run, so the base-based fallback applies)
+#   mode start_is_head  base as sha_is_main, but current_run.head_sha_at_start = HEAD: the branch already
+#                       carries the PR and this run added nothing
+#   mode start_is_main  base as sha_is_main, current_run.head_sha_at_start = main's sha: this run
+#                       committed the PR's commit
+# Sets FR_PR_URL.
+_fr_make_noop_job() {
+    local id="$1" reason="$2" mode="$3" extra="${4:-.}"
+    local repo="$MOTHER_ROOT/fr-noop-$id"
+    FR_PR_URL="https://github.com/thehammer/mother/pull/9$(printf '%02d' $((RANDOM % 100)))"
+    git init -q "$repo"
+    git -C "$repo" config user.email "test@test.com"
+    git -C "$repo" config user.name "Test"
+    git -C "$repo" commit -q --allow-empty -m init
+    git -C "$repo" branch -M main
+    git -C "$repo" remote add origin "https://github.com/thehammer/mother.git"
+    local main_sha; main_sha=$(git -C "$repo" rev-parse HEAD)
+    git -C "$repo" checkout -q -b pr-head
+    git -C "$repo" commit -q --allow-empty -m "the PR's own commit"
+    git -C "$repo" checkout -q -b "feature/$id" pr-head
+    local head; head=$(git -C "$repo" rev-parse HEAD)
+    gh_mock_set_commit_pulls "$head" "$FR_PR_URL" open
+    gh_mock_set_pr "$FR_PR_URL" OPEN "pr-head" "$head"
+    local base_filter
+    case "$mode" in
+        base_is_head) base_filter='.base_ref = "pr-head"' ;;
+        sha_is_head)  base_filter='.base_ref = "main" | .base_sha = "'"$head"'"' ;;
+        sha_is_main)  base_filter='.base_ref = "main" | .base_sha = "'"$main_sha"'"' ;;
+        start_is_head) base_filter='.base_ref = "main" | .base_sha = "'"$main_sha"'" | .current_run = {head_sha_at_start: "'"$head"'"}' ;;
+        start_is_main) base_filter='.base_ref = "main" | .base_sha = "'"$main_sha"'" | .current_run = {head_sha_at_start: "'"$main_sha"'"}' ;;
+        *) echo "bad mode $mode" >&2; return 1 ;;
+    esac
+    _fr_make_job "$id" "$reason" \
+        '.work_dir = "'"$repo"'" | .repo_path = "'"$repo"'" | '"$base_filter"' | ('"$extra"')'
+}
+
+@test "reconcile guard: a max_turns failure whose HEAD == base does NOT adopt the PR already on that head; escalation is refused by the open-PR guard, so it is held" {
+    _fr_make_noop_job "fr-noop-esc" "max_turns" base_is_head
+
+    run mother route-failure "fr-noop-esc"
+    [ "$status" -eq 0 ]
+
+    [ "$(_fr_ev_count fr-noop-esc succeeded)" = "0" ]
+    [ "$(_fr_ev_count fr-noop-esc reconciled)" = "0" ]
+    [ "$(_fr_ev "fr-noop-esc" reconcile_skipped | jq -r '.reason')" = "no_new_commit" ]
+    assert_job_field "fr-noop-esc" '.pr_url' "null"
+    # Not adopted. `mother escalate` refuses while the branch has an open PR, so
+    # the job is held for the operator instead of silently left failed.
+    assert_job_field "fr-noop-esc" '.current_tier' "tier_0"
+    assert_job_field "fr-noop-esc" '.escalation_count' "0"
+    _fr_assert_held "fr-noop-esc" "max_turns" "no_new_commit"
+}
+
+@test "reconcile guard: a no_pr_no_push failure whose HEAD == base does NOT adopt the PR; it is held as nothing_to_reconcile" {
+    _fr_make_noop_job "fr-noop-hold" "no_pr_no_push" base_is_head
+
+    run mother route-failure "fr-noop-hold"
+    [ "$status" -eq 0 ]
+
+    [ "$(_fr_ev_count fr-noop-hold succeeded)" = "0" ]
+    [ "$(_fr_ev_count fr-noop-hold reconciled)" = "0" ]
+    [ "$(_fr_ev "fr-noop-hold" reconcile_skipped | jq -r '.reason')" = "no_new_commit" ]
+    assert_job_field "fr-noop-hold" '.pr_url' "null"
+    _fr_assert_held "fr-noop-hold" "no_pr_no_push" "nothing_to_reconcile"
+}
+
+@test "reconcile guard: the base is .base_sha when present — HEAD == base_sha is 'no new commit' even though base_ref is behind HEAD" {
+    _fr_make_noop_job "fr-noop-sha" "max_turns" sha_is_head
+
+    run mother route-failure "fr-noop-sha"
+    [ "$status" -eq 0 ]
+
+    [ "$(_fr_ev_count fr-noop-sha succeeded)" = "0" ]
+    [ "$(_fr_ev "fr-noop-sha" reconcile_skipped | jq -r '.reason')" = "no_new_commit" ]
+    assert_job_field "fr-noop-sha" '.pr_url' "null"
+}
+
+@test "reconcile guard: a rework run on a branch that already carries the PR, with no new commit since the run started, is NOT adopted (max_turns)" {
+    _fr_make_noop_job "fr-noop-start" "max_turns" start_is_head
+
+    run mother route-failure "fr-noop-start"
+    [ "$status" -eq 0 ]
+
+    [ "$(_fr_ev_count fr-noop-start succeeded)" = "0" ]
+    [ "$(_fr_ev_count fr-noop-start reconciled)" = "0" ]
+    [ "$(_fr_ev "fr-noop-start" reconcile_skipped | jq -r '.reason')" = "no_new_commit" ]
+    [ "$(jq -r .state "$JOBS_DIR/fr-noop-start.json")" != "succeeded" ]
+    assert_job_field "fr-noop-start" '.pr_url' "null"
+}
+
+@test "reconcile guard fallback: without head_sha_at_start, a commit past .base_sha counts as work" {
+    _fr_make_noop_job "fr-noop-fb" "max_turns" sha_is_main
+
+    run mother route-failure "fr-noop-fb"
+    [ "$status" -eq 0 ]
+
+    assert_job_field "fr-noop-fb" '.state' "succeeded"
+    [ "$(_fr_ev_count fr-noop-fb reconcile_skipped)" = "0" ]
+}
+
+@test "reconcile guard control: HEAD moved past the run's starting head is real work, so the PR is adopted" {
+    _fr_make_noop_job "fr-noop-ctl" "max_turns" start_is_main
+
+    run mother route-failure "fr-noop-ctl"
+    [ "$status" -eq 0 ]
+
+    assert_job_field "fr-noop-ctl" '.state' "succeeded"
+    assert_job_field "fr-noop-ctl" '.pr_url' "$FR_PR_URL"
+    [ "$(_fr_ev_count fr-noop-ctl reconcile_skipped)" = "0" ]
+    [ "$(_fr_ev "fr-noop-ctl" failure_routed | jq -r '.action')" = "reconciled" ]
+}
+
+@test "reconcile guard: a work_dir that is not a git repo keeps the old behaviour (no reconcile_skipped, escalates)" {
+    mkdir -p "$MOTHER_ROOT/not-a-repo"
+    _fr_make_job "fr-norepo" "max_turns" '.work_dir = "'"$MOTHER_ROOT"'/not-a-repo"'
+
+    run mother route-failure "fr-norepo"
+    [ "$status" -eq 0 ]
+
+    [ "$(_fr_ev_count fr-norepo reconcile_skipped)" = "0" ]
+    assert_job_field "fr-norepo" '.state' "ready"
+    assert_job_field "fr-norepo" '.escalation_count' "1"
 }
 
 @test "route-failure refuses a job that is not failed and changes nothing" {

@@ -102,6 +102,8 @@ plan-adherence review. Here's what was added and how to work with it.
 | `failure_routed` | bool\|null | Set `true` by `mother route-failure` when it deliberately leaves a job `failed` (`left_failed`) so the runner stops re-examining it. Cleared by the next `failed` transition. |
 | `auto_retry_count` | int | Number of as-is (no tier bump) automatic retries the failure router has granted (max 1). Reset to `0` by `mother resume` — an operator resuming the job is a fresh chance, not a continuation of the failed retry budget. |
 | `operator_hold` | object\|null | `{failure_reason, sub_reason, detail, held_at}` — present while a job is held (`activity: operator_hold`). Cleared (set to `null`) by `mother retry`, `mother reconcile`, and `mother resume`. |
+| `not_before` | int\|null | Epoch seconds. A `ready` job with `not_before` in the future is not dispatched (`mother list` shows `[BACKOFF 2m]`). Set by `route-failure` for `backoff`; cleared by `resume`, `retry`, `escalate` by a successful end of a run, and by a run that gets `MOTHER_BACKOFF_CLEAR_TURNS` (5) real assistant turns through. A value further than `MOTHER_BACKOFF_RETRY_AFTER_MAX_S` (3600) in the future is treated as expired. |
+| `backoff_count` / `backoff_first_at` | int\|null / int\|null | Rate-limit backoffs so far and the epoch of the first (kept across backoffs; the 15-minute give-up is measured from it). Cleared with `not_before`. Never touch `current_tier`, `escalation_count`, `retry_count` or `auto_retry_count`. |
 | `rwx_sandbox` | object | `{reset_key, reset_at, last_reset_outcome}` — audit only. `reset_key` is the attempt key `"<escalation_count>:<retry_count>"`: a spawn whose key equals the stored one (resume, continuation, adherence rework, later pipeline phase) skips the reset; `mother retry` and escalation change the key and trigger one. Stored even when the reset failed. |
 | `current_run.*` (baseline) | object | In addition to `log_offset`/`spawned_at`/`session_id`: `head_sha_at_start`, `remote_ref`, `remote_sha_at_start`, `pr_url_at_start`, `had_artifact_at_start` — what already existed on origin/as a PR when this run began (audit fields for the rework-advance check). |
 
@@ -203,6 +205,7 @@ All background behaviours can be disabled without redeploying:
 - `MOTHER_TOKEN_ALERT_THRESHOLD=N` — cumulative token count (default: 100,000,000) that trips the sticky `token_alert_at` field and the statusline's `$!N` count.
 - `MOTHER_COST_CAP_GRACE_SECONDS=N` — seconds a job with `max_cost_usd` set is given, after crossing the cap, for a cooperative `mother await` before the runner force-pauses it (default: 300).
 - `MOTHER_FAILURE_ROUTING_ENABLED=0` — restore the pre-routing behavior: every `failed` job takes the legacy reconcile-then-escalate path in `_auto_escalate_failed`, regardless of `.failure_reason` (default: `1`).
+- `MOTHER_BACKOFF_ENABLED=0` — restore the pre-backoff routing: `rate_limited`, `api_overloaded`, `billing` and `auth_error` all take the `escalate` class again, and the dispatcher/reviewers ignore `$MOTHER_ROOT/ratelimit-until` (default: `1`). Tuning: `MOTHER_BACKOFF_BASE_S` (30), `MOTHER_BACKOFF_CAP_S` (300), `MOTHER_BACKOFF_JITTER_PCT` (20), `MOTHER_BACKOFF_MAX_S` (900, the give-up point and the longest a reviewer waits on the pause), `MOTHER_BACKOFF_RETRY_AFTER_MAX_S` (3600, clamps a server-given retry-after), `MOTHER_REVIEW_RATELIMIT_RETRIES` (2). See "Rate-limit backoff" below.
 - `MOTHER_REWORK_ADVANCE_CHECK_ENABLED=0` — disable `_verify_run_advanced_or_fail` (default: `1`), so a run that starts with an existing PR/pushed branch can report `succeeded` without pushing anything new.
 - `MOTHER_ADHERENCE_MAX_RUNS_PER_SHA=N` — adherence review spawns per job per PR head SHA before the runner flags the job for attention instead of looping (default: 3). `MOTHER_ADHERENCE_LOOP_THRESHOLD=N` (default 5) — reviews per hour on one job above which the `adherence_loop` needs-attention item / `mother doctor` warning appears.
 - `MOTHER_LENSES_ENABLED=0` — disable the HC-14 review wave: jobs with a `lenses` crew section behave as repos without one (gates, then `gh pr ready`, then post-PR adherence).
@@ -382,6 +385,8 @@ persisted `.failure_reason` and `.failure_routed != true`. Jobs that pre-date
 | `rework_no_new_commit` | `hold` | Hold immediately. Deliberately does **not** reconcile — that would adopt the stale PR and undo the rework-advance check. |
 | `branch_create_failed`, `checkout_failed` | `hold` | Hold immediately; these fail identically every time (e.g. wrong `--base`). |
 | `worktree_create_failed`, `runner_died_early`, `unspecified`, empty | `retry_once` | One as-is retry (no tier bump, adherence state untouched, a consumed operator answer is replayed), then hold `retry_exhausted`. |
+| `rate_limited`, `api_overloaded` | `backoff` | Never reconciles, never escalates. Back to `ready`/`queued` at the **same** tier with `.not_before` = now + delay (`retry-after`, else 30 s doubling, cap 300 s, +<=20% jitter); `backoff_count` +1; event `failure_routed {action: backed_off, reason, delay_s, backoff_count}`. `rate_limited` also extends `$MOTHER_ROOT/ratelimit-until`. Past `MOTHER_BACKOFF_MAX_S` since `backoff_first_at`: hold `backoff_exhausted`. |
+| `billing`, `auth_error` | `hold` | Hold immediately (an operator must fix the account); never reconciles or escalates. |
 | anything else | `escalate` | Reconcile, then escalate if `escalation_count < 2`; otherwise stay `failed` with `failure_routed: true`. |
 
 **Hold** = `state: awaiting`, `activity: operator_hold`, `paused_reason:
@@ -417,6 +422,20 @@ another main-dir job is running in the same repo (then it emits
 | `rework_advance_verified` | `{remote_ref, remote_sha_at_start, remote_sha_at_end}` | A run that began with an artifact advanced it |
 | `auto_stash_not_found` | `{stash_message}` | Marker existed but no matching stash |
 | `auto_stash_restore_deferred` | `{stash_message, conflicting_job_id}` | Orphan reaper couldn't safely restore |
+
+### Rate-limit backoff
+
+`lib/backoff.sh` holds the primitives; `mother route-failure`'s `_rf_backoff` applies them. `mother-usage classify-exit`
+maps a result event's `api_error_status` to a reason (429 `rate_limited`; 529/503/other 5xx `api_overloaded`; 402 or a
+billing body `billing`; 401/403 `auth_error`; else `api_error`) and reports `retry_after_s`. The shared pause
+`$MOTHER_ROOT/ratelimit-until` (one epoch-seconds integer, written under `_with_lock`, never cleared: it expires)
+stops `_dispatch_ready_jobs` starting anything new, defers the runner's adherence pass (not counted as a run), and makes
+`review-lens`, `review-phase` and `adherence-review` wait before spawning. A reviewer whose run ended on a 429 is
+re-spawned up to `MOTHER_REVIEW_RATELIMIT_RETRIES` times, then recorded as `error` (`error_reason: rate_limited`, never
+a pass, never a failed review). **Success means work happened:** `mother-run-job` fails a run whose own result event
+carries an `api_error_status` even at exit 0 (`_fail_on_api_error_result`), and `_rf_reconcile_and_record` adopts an
+existing PR only when HEAD moved past the run's starting head (`current_run.head_sha_at_start`; a commit past `base_sha` when that is missing). `MOTHER_BACKOFF_MAX_COUNT` (10) caps consecutive backoffs before the `backoff_exhausted` hold. Only a result event with an `api_error_status` may set a wait (`retry_after_s`) or extend the pause; a text-only `rate_limited` backs off just its own job. Nothing the backoff writes (question, events, hold
+detail) contains the worker's `tail_excerpt`. `force-start` does not bypass `not_before` or the pause.
 
 ## Operator attention and notifications
 

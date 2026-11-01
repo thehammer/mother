@@ -11,10 +11,24 @@
 #   reconcile_then_hold  reconcile --auto; if nothing adopted, hold. Never escalate.
 #   hold                 hold for the operator immediately (no reconcile, no retry).
 #   retry_once           one as-is retry (no tier bump), then hold.
+#   backoff              rate limit / overload (429, 529, 503, 5xx): back to `ready` at the
+#                        SAME tier after a delay (`.not_before`); hold once it has gone on
+#                        too long. Never reconciles, never escalates (lib/backoff.sh).
 #   escalate             legacy: reconcile, then escalate if escalation_count < 2.
+#
+# MOTHER_BACKOFF_ENABLED=0 maps rate_limited / api_overloaded / billing /
+# auth_error to `escalate` again (the pre-backoff routing).
 
 mother_failure_class() {
     case "${1:-}" in
+        rate_limited|api_overloaded|billing|auth_error)
+            if [ "${MOTHER_BACKOFF_ENABLED:-1}" = "0" ]; then
+                echo "escalate"
+            elif [ "$1" = "rate_limited" ] || [ "$1" = "api_overloaded" ]; then
+                echo "backoff"
+            else
+                echo "hold"
+            fi ;;
         no_pr_no_push)
             echo "reconcile_then_hold" ;;
         rework_no_new_commit|branch_create_failed|checkout_failed)
@@ -78,6 +92,30 @@ EOF
             cat <<EOF
 Job $id failed during workspace setup ($sub) for branch $branch from base $base. This fails the same way on every retry, so Mother is not retrying or escalating. A common cause is a wrong --base (e.g. the repo default is 'master', not 'origin/main').
 Fix: mother cancel $id, then re-add the job with the correct --base.
+EOF
+            ;;
+        no_new_commit)
+            cat <<EOF
+Job $id's latest run ended ('$reason') without adding a commit past its base, and its branch already has an open pull request. Mother did not adopt that PR as this job's result (it did no work on it) and cannot escalate onto it.
+Options:
+  mother reconcile $id --pr-url <url>     (if that PR really is this job's result)
+  mother resume $id "<instructions>"
+  mother cancel $id
+EOF
+            ;;
+        backoff_exhausted)
+            # Mother-written only: nothing from the worker's output goes in.
+            printf 'Job %s was rate limited for %s minutes (HTTP %s). Options: mother resume %s go (retry now) | mother cancel %s\n' \
+                "$id" "$(printf '%s' "$detail" | jq -r '.waited_minutes // "?"' 2>/dev/null)" \
+                "$(printf '%s' "$detail" | jq -r '.api_error_status // 429' 2>/dev/null)" "$id" "$id"
+            ;;
+        billing|auth_error)
+            cat <<EOF
+Job $id failed with '$reason' (an API billing or credentials problem). Retrying or escalating will not help; Mother is holding it until you fix the account.
+Options:
+  mother retry $id        (after fixing billing / credentials)
+  mother resume $id "<instructions>"
+  mother cancel $id
 EOF
             ;;
         retry_exhausted)

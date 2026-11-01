@@ -516,6 +516,7 @@ _CTX_OVERFLOW_RE = re.compile(r"prompt is too long|context (window|length)", re.
 _RATE_LIMIT_RE = re.compile(r"rate.?limit|429|usage limit", re.I)
 _OVERLOADED_RE = re.compile(r"overloaded|529", re.I)
 _BILLING_RE = re.compile(r"credit balance|billing", re.I)
+_RETRY_AFTER_RE = re.compile(r"retry[-_ ]after\D{0,4}(\d{1,7})", re.I)
 _BANNER_RE = re.compile(r"^=== mother job \S+ starting at (.+?) ===\s*$")
 
 
@@ -581,11 +582,58 @@ def _run_slice_for_event(log_path, event_ts):
     return offset, end
 
 
+def _api_status_int(status):
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
+def _api_error_reason(status, result_text):
+    """Map a result event's api_error_status (and, with no usable status, its
+    result text) to a failure reason. 429 is a rate limit and 529/503/other
+    5xx are overload: transient, never the worker's fault. 402 / a billing
+    body (with no status or a 400: "credit balance is too low" arrives as a 400) and 401/403 need an operator. Anything else stays `api_error`."""
+    code = _api_status_int(status)
+    if code == 429:
+        return "rate_limited"
+    if code in (529, 503) or (code is not None and 500 <= code <= 599):
+        return "api_overloaded"
+    if code == 402:
+        return "billing"
+    if code in (401, 403):
+        return "auth_error"
+    if code in (None, 400) and _BILLING_RE.search(result_text or ""):
+        return "billing"
+    return "api_error"
+
+
+def _retry_after_seconds(result_event):
+    """Seconds the API asked us to wait, from the result event's own keys or a
+    `retry-after: N` in its result text. None when absent. Only an event that
+    carries an api_error_status is trusted: free text in a log tail (a worker's
+    own output) never sets a wait. Callers clamp the value."""
+    if not result_event or result_event.get("api_error_status") is None:
+        return None
+    for key in ("retry_after_s", "retry_after", "retry-after"):
+        try:
+            n = int(float(result_event.get(key)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if n > 0:
+            return n
+    m = _RETRY_AFTER_RE.search(str(result_event.get("result") or ""))
+    if m and int(m.group(1)) > 0:
+        return int(m.group(1))
+    return None
+
+
 def classify_exit(log_path, offset, exit_code, end=None):
     """Classify why a worker process exited with the given exit_code, given
     its log file and the byte range [offset, end) covering the run in
     question. Returns the same dict shape cmd_classify_exit prints as JSON:
-    reason, exit_code, result_subtype, api_error_status, tail_excerpt.
+    reason, exit_code, result_subtype, api_error_status, result_is_error,
+    tail_excerpt, retry_after_s.
 
     This is the one classification codepath in the process — both
     cmd_classify_exit (the CLI subcommand) and build_retro (which
@@ -621,7 +669,7 @@ def classify_exit(log_path, offset, exit_code, end=None):
     elif exit_code >= 128:
         reason = f"worker_signal_{exit_code - 128}"
     elif result_event and (result_event.get("is_error") or api_error_status):
-        reason = "api_error"
+        reason = _api_error_reason(api_error_status, str(result_event.get("result") or ""))
     elif result_subtype == "error_max_turns":
         reason = "max_turns"
     elif result_subtype == "error_during_execution":
@@ -639,13 +687,18 @@ def classify_exit(log_path, offset, exit_code, end=None):
     else:
         reason = "claude_exit_nonzero"
 
-    return {
+    out = {
         "reason": reason,
         "exit_code": exit_code,
         "result_subtype": result_subtype,
         "api_error_status": api_error_status,
+        "result_is_error": bool(result_event and result_event.get("is_error")),
         "tail_excerpt": tail_excerpt,
+        "retry_after_s": None,
     }
+    if reason in ("rate_limited", "api_overloaded"):
+        out["retry_after_s"] = _retry_after_seconds(result_event)
+    return out
 
 
 def cmd_classify_exit(args):
@@ -1333,6 +1386,34 @@ def _retro_review_wave_tables(root, in_window, rows_by_job):
     return wave_table, refuted_table
 
 
+def _retro_backoffs_table(root, in_window):
+    """Per repo: jobs that were backed off for a rate limit / overload, how
+    long each wait was (median of the scheduled delays) and how many gave up
+    into a `backoff_exhausted` hold. Counts and durations only."""
+    per_repo = {}
+    for job, path, archived in in_window:
+        waits, give_ups = [], 0
+        for ev in _load_events(_events_path_for(root, job, archived)):
+            if ev.get("kind") != "failure_routed":
+                continue
+            d = ev.get("detail") or {}
+            if d.get("action") == "backed_off" and isinstance(d.get("delay_s"), (int, float)):
+                waits.append(d["delay_s"])
+            elif d.get("action") == "held" and d.get("sub_reason") == "backoff_exhausted":
+                give_ups += 1
+        if not waits and not give_ups:
+            continue
+        r = per_repo.setdefault(job.get("repo", "unknown"), {"jobs_backed_off": 0, "waits": [], "give_ups": 0})
+        r["jobs_backed_off"] += 1
+        r["waits"].extend(waits)
+        r["give_ups"] += give_ups
+    return {repo: {"jobs_backed_off": r["jobs_backed_off"],
+                   "backoffs": len(r["waits"]),
+                   "median_wait_s": statistics.median(r["waits"]) if r["waits"] else None,
+                   "give_ups": r["give_ups"]}
+            for repo, r in per_repo.items()}
+
+
 def build_retro(root, since_dt, jobs_meta, backfilled_count=None, backfill=False):
     """Build the retro report as a dict keyed by table name. Pure function
     over already-loaded job metadata — no filesystem writes."""
@@ -1764,6 +1845,7 @@ def build_retro(root, since_dt, jobs_meta, backfilled_count=None, backfill=False
     rw, rc = _retro_review_wave_tables(root, in_window, rows_by_job)
     tables["review_wave"] = rw
     tables["refuted_claims"] = rc
+    tables["backoffs"] = _retro_backoffs_table(root, in_window)
 
     if backfilled_count is not None:
         tables["_meta"] = {"backfilled_rows": backfilled_count, "since": since_dt.isoformat(),
@@ -1793,6 +1875,7 @@ _RETRO_TITLES = [
     ("progress_flags", "Progress flags"),
     ("review_wave", "Review wave"),
     ("refuted_claims", "Refuted claims"),
+    ("backoffs", "Rate-limit backoffs"),
 ]
 
 
@@ -1890,6 +1973,9 @@ def _coverage_line(key, data, tables):
         return f"flags raised: {data.get('raised', 0)}"
     if key == "review_wave":
         return f"{data.get('cycles', 0)} wave cycle(s) across {data.get('jobs', 0)} job(s)"
+    if key == "backoffs":
+        return (f"jobs backed off: {sum(v.get('jobs_backed_off', 0) for v in data.values())} across "
+                f"{len(data)} repo(s); give-ups: {sum(v.get('give_ups', 0) for v in data.values())}")
     if key == "refuted_claims":
         return (f"{data.get('total', 0)} refuted finding(s); refuted findings sent to a worker: "
                 f"{data.get('refuted_sent_to_worker', 0)} (must be 0)")

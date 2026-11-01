@@ -351,7 +351,7 @@ EOF
     reason=$(printf '%s' "$output" | jq -r '.reason')
     api_status=$(printf '%s' "$output" | jq -r '.api_error_status')
     [ "$reason" = "api_error" ]
-    [ "$api_status" = "529" ]
+    [ "$api_status" = "400" ]
 }
 
 @test "classify-exit: result subtype error_max_turns -> max_turns" {
@@ -413,6 +413,114 @@ EOF
 @test "classify-exit: never exits non-zero regardless of input" {
     run mother-usage classify-exit --log "/tmp/nonexistent-$$" --offset 0 --exit-code 1
     [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# classify-exit: rate-limit back-off inputs (retry_after_s, result_is_error).
+#
+# A 429/529 is "wait and retry the same tier", so the classifier now also
+# reports how long the API asked us to wait (retry_after_s, integer or null)
+# and whether the result event itself flagged an error (result_is_error).
+# The reason -> status rules themselves are one-per-test in failure_reasons.bats.
+
+# _result_log <path> <result-event-json-fragment>
+# A two-line transcript (one assistant turn, then a result event built from the
+# fragment, always subtype=success, is_error=true like the real incident).
+_result_log() {
+    local path="$1" frag="$2"
+    {
+        cat "$FIXTURES/result_rate_limited_429.jsonl" | head -1
+        jq -nc --argjson f "$frag" \
+            '{type: "result", subtype: "success", is_error: true, total_cost_usd: 0} + $f'
+    } > "$path"
+}
+
+_classify() { mother-usage classify-exit --log "$1" --offset 0 --exit-code "${2:-1}"; }
+
+@test "classify-exit: 429 result carries api_error_status 429, result_is_error true and retry_after_s null (no hint given)" {
+    run _classify "$FIXTURES/result_rate_limited_429.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+    [ "$(printf '%s' "$output" | jq -r '.api_error_status')" = "429" ]
+    [ "$(printf '%s' "$output" | jq -r '.result_is_error')" = "true" ]
+    printf '%s' "$output" | jq -e 'has("retry_after_s") and .retry_after_s == null' >/dev/null
+}
+
+@test "classify-exit: retry_after_s is taken from the result event's retry_after_s key" {
+    run _classify "$FIXTURES/result_rate_limited_429_retry_after.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+    printf '%s' "$output" | jq -e '.retry_after_s == 90 and (.retry_after_s | type == "number")' >/dev/null
+}
+
+@test "classify-exit: retry_after_s also accepts the result event keys retry_after and retry-after" {
+    _result_log "$MOTHER_ROOT/ra-underscore.jsonl" '{"api_error_status":429,"retry_after":45}'
+    run _classify "$MOTHER_ROOT/ra-underscore.jsonl"
+    [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "45" ]
+
+    _result_log "$MOTHER_ROOT/ra-dash.jsonl" '{"api_error_status":429,"retry-after":30}'
+    run _classify "$MOTHER_ROOT/ra-dash.jsonl"
+    [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "30" ]
+}
+
+@test "classify-exit: retry_after_s is parsed from the result text when no key carries it" {
+    _result_log "$MOTHER_ROOT/ra-text.jsonl" '{"api_error_status":429,"result":"API Error 429: slow down. Please retry after 120 seconds."}'
+    run _classify "$MOTHER_ROOT/ra-text.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+    [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "120" ]
+
+    _result_log "$MOTHER_ROOT/ra-text2.jsonl" '{"api_error_status":429,"result":"rate limited (retry-after: 17)"}'
+    run _classify "$MOTHER_ROOT/ra-text2.jsonl"
+    [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "17" ]
+}
+
+@test "classify-exit: a retry-after in the log tail with no result event is ignored (free text never sets a wait); still rate_limited" {
+    {
+        head -1 "$FIXTURES/result_rate_limited_429.jsonl"
+        echo "Error: 429 rate limit exceeded. Retry-After: 45"
+    } > "$MOTHER_ROOT/ra-tail.jsonl"
+    run _classify "$MOTHER_ROOT/ra-tail.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+    [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "null" ]
+    # No result event at all -> result_is_error is false.
+    [ "$(printf '%s' "$output" | jq -r '.result_is_error')" = "false" ]
+}
+
+@test "classify-exit: a 5000-digit retry-after and an infinite retry_after key cannot crash the classifier (reason still rate_limited)" {
+    local digits; digits=$(printf '9%.0s' $(seq 1 5000))
+    _result_log "$MOTHER_ROOT/ra-huge.jsonl" '{"api_error_status":429,"result":"retry-after: '"$digits"'"}'
+    run _classify "$MOTHER_ROOT/ra-huge.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+
+    _result_log "$MOTHER_ROOT/ra-inf.jsonl" '{"api_error_status":429,"retry_after":1e999}'
+    run _classify "$MOTHER_ROOT/ra-inf.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "rate_limited" ]
+}
+
+@test "classify-exit: a result event's own retry_after_s key wins over a different number in its text" {
+    _result_log "$MOTHER_ROOT/ra-both.jsonl" '{"api_error_status":429,"retry_after_s":90,"result":"retry after 5 minutes"}'
+    run _classify "$MOTHER_ROOT/ra-both.jsonl"
+    [ "$(printf '%s' "$output" | jq -r '.retry_after_s')" = "90" ]
+}
+
+@test "classify-exit: result_is_error is false and retry_after_s null for a non-error result (max_turns)" {
+    run _classify "$FIXTURES/result_max_turns.jsonl"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.reason')" = "max_turns" ]
+    [ "$(printf '%s' "$output" | jq -r '.result_is_error')" = "false" ]
+    printf '%s' "$output" | jq -e '.retry_after_s == null' >/dev/null
+}
+
+@test "classify-exit: the existing output fields are unchanged (reason, exit_code, result_subtype, api_error_status, tail_excerpt)" {
+    run _classify "$FIXTURES/result_overloaded_529.jsonl"
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e '
+        .reason == "api_overloaded" and .exit_code == 1 and .result_subtype == "success"
+        and .api_error_status == 529 and (.tail_excerpt | type == "string")' >/dev/null
 }
 
 # ===========================================================================

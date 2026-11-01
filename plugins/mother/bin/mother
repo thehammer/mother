@@ -49,6 +49,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/request-types.sh" ] && source "$MOTHER_LIB_DIR/request-types.sh"
 # shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/backoff.sh" ]       && source "$MOTHER_LIB_DIR/backoff.sh"
+# shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/criteria.sh" ] && source "$MOTHER_LIB_DIR/criteria.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/findings.sh" ]      && source "$MOTHER_LIB_DIR/findings.sh"
@@ -1044,9 +1046,10 @@ cmd_list() {
                 (.kind // ""),
                 (.adherence_status // ""),
                 (if (.state == "running" or .state == "awaiting") then ($pm[.id].label // "") else "" end),
-                (if (.state == "running" or .state == "awaiting") then ([($pm[.id].flags // [])[]?.reason] | join(",")) else "" end)
+                (if (.state == "running" or .state == "awaiting") then ([($pm[.id].flags // [])[]?.reason] | join(",")) else "" end),
+                (if .state == "ready" then (.not_before // "") else "" end)
             ] | map((. // "") | tostring | gsub("[\n\r\t]"; " ")) | join($us)' | \
-            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel pflags; do
+            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel pflags notbefore; do
                 cost_display="-"
                 if [ -n "$max_cost" ]; then
                     if [ "$st" = "running" ] && [ -n "$live_cost" ]; then
@@ -1068,6 +1071,9 @@ cmd_list() {
                     local pl_label
                     pl_label=$(_pipeline_list_label "$(_job_path "$id")" 2>/dev/null) || pl_label=""
                     [ -n "${pl_label:-}" ] && state_display="$st [$pl_label]"
+                elif [ -n "${notbefore:-}" ] && [ -n "$(mother_backoff_label "$notbefore")" ]; then
+                    # Rate-limit backoff: ready, but not dispatched until not_before.
+                    state_display="$st [BACKOFF $(mother_backoff_label "$notbefore")]"
                 elif [ "${activity:-}" = "review_hold" ]; then
                     # Checked before adherence: a wave hold after a second
                     # adherence fail also carries adherence_status=blocked_for_human.
@@ -1350,6 +1356,12 @@ cmd_status() {
         local esc_count; esc_count=$(jq -r '.escalation_count // 0' "$job_file")
         local kind; kind=$(jq -r '.kind // ""' "$job_file" 2>/dev/null) || kind=""
 
+        local _bo_label; _bo_label=$(mother_backoff_label "$(jq -r 'if .state == "ready" then (.not_before // "") else "" end' "$job_file")")
+        if [ -n "$_bo_label" ]; then
+            echo ""
+            echo "⏳ [BACKOFF $_bo_label] Rate limited (backoff #$(jq -r '.backoff_count // 0' "$job_file")): Mother starts it again at the same tier when the wait ends."
+            echo ""
+        fi
         if [ "$activity" = "adherence_blocked" ]; then
             echo ""
             echo "⚠️  [ADHERENCE-BLOCKED] This job requires human review."
@@ -2208,6 +2220,7 @@ cmd_retry() {
         | .adherence_sha_runs = 0
         | (if ((.needs_attention | objects | .reason) // "") == "adherence_loop_capped" then .needs_attention = null else . end)
         | .failure_routed = null
+        | .not_before = null | .backoff_count = null | .backoff_first_at = null
         | (if $hold == 1 then .activity = null | .operator_hold = null else . end)
     ' "$job_file") || _die "retry: jq update failed"
     _atomic_write "$job_file" "$merged"
@@ -2302,6 +2315,7 @@ cmd_escalate() {
         | (if ((.needs_attention | objects | .reason) // "") == "adherence_loop_capped" then .needs_attention = null else . end)
         | .force_start = null
         | .force_ignore_deps = null
+        | .not_before = null | .backoff_count = null | .backoff_first_at = null
     ' "$job_file") || _die "escalate: jq update failed"
     _atomic_write "$job_file" "$merged"
     _append_event "$id" "escalated" \
@@ -2502,6 +2516,8 @@ HITEOF
 #   reconcile_then_hold  reconcile --auto, else hold. Never escalates.
 #   hold                 hold immediately.
 #   retry_once           one as-is retry (no tier bump), then hold.
+#   backoff              rate limit / overload: `ready` again at the same tier after
+#                        `.not_before`; hold (backoff_exhausted) after too long.
 #   escalate             legacy: reconcile, then escalate if under the cap.
 # "Hold" = state awaiting / activity operator_hold with a concrete question;
 # it is non-terminal, so teardown never touches the worktree holding the work.
@@ -2575,11 +2591,113 @@ _rf_try_reconcile() {
     ( cmd_reconcile "$id" --auto )
 }
 
+# True unless the failed run demonstrably added nothing: a run that added no
+# commit must not "adopt" a PR that was already there (that is how a job that
+# did no work became `succeeded`). "Added nothing" means HEAD is still the
+# commit the run started from (.current_run.head_sha_at_start): comparing with
+# the job's base would count the existing PR's own commits as this run's work.
+# Only when the starting head is missing/unresolvable does it fall back to
+# "no commit past the base". A work_dir that is gone or not a repo can't be
+# checked, so it keeps the old behaviour.
+_rf_run_made_commit() {
+    local job_file wd start base head
+    job_file=$(_job_path "$1")
+    wd=$(jq -r '.work_dir // empty' "$job_file")
+    [ -n "$wd" ] && git -C "$wd" rev-parse --git-dir >/dev/null 2>&1 || return 0
+    start=$(jq -r '.current_run.head_sha_at_start // empty' "$job_file")
+    if [ -n "$start" ] && git -C "$wd" rev-parse --verify -q "$start^{commit}" >/dev/null 2>&1; then
+        head=$(git -C "$wd" rev-parse HEAD 2>/dev/null) || return 0
+        [ "$head" != "$(git -C "$wd" rev-parse "$start^{commit}")" ]
+        return
+    fi
+    base=$(mother_job_diff_base "$job_file" 2>/dev/null)
+    [ -n "$base" ] && git -C "$wd" rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1 || return 0
+    [ "$(git -C "$wd" rev-list --count "$base..HEAD" 2>/dev/null || echo 1)" -gt 0 ]
+}
+
 # reconcile --auto; on success record the routing verdict. Returns reconcile's rc.
+# Refuses (rc 3, event `reconcile_skipped`) when the run made no new commit.
+_RF_RECONCILE_SKIPPED=0
 _rf_reconcile_and_record() {
+    _RF_RECONCILE_SKIPPED=0
+    if ! _rf_run_made_commit "$1"; then
+        _RF_RECONCILE_SKIPPED=1
+        _append_event "$1" "reconcile_skipped" '{"reason":"no_new_commit"}'
+        return 3
+    fi
     _rf_try_reconcile "$1" || return $?
     _append_event "$1" "failure_routed" '{"action":"reconciled"}'
     return 0
+}
+
+# `queued` while any dependency isn't `succeeded`, else `ready`.
+_rf_ready_or_queued() {
+    local dep dep_state
+    for dep in $(jq -r '.depends_on // [] | .[]' "$1"); do
+        dep_state="missing"
+        [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
+        if [ "$dep_state" != "succeeded" ]; then echo queued; return; fi
+    done
+    echo ready
+}
+
+# Back off a rate-limited / overloaded job: same tier, `ready` again once
+# `.not_before` passes. No tier, escalation_count, retry_count or
+# auto_retry_count change. Gives up (hold) after MOTHER_BACKOFF_MAX_S.
+# Everything written here is Mother's own text: the worker's tail excerpt is
+# dropped from the detail so it never reaches the question or an event.
+# _rf_backoff <id> <failure_reason> <detail-json>
+_rf_backoff() {
+    local id="$1" reason="$2" detail="$3"
+    local job_file; job_file=$(_job_path "$id")
+    detail=$(printf '%s' "$detail" | jq -c 'del(.tail_excerpt)' 2>/dev/null) || detail='{}'
+    local now count first max
+    now=$(date +%s)
+    count=$(_backoff_int "$(jq -r '.backoff_count // 0' "$job_file")" 0)
+    first=$(_backoff_int "$(jq -r '.backoff_first_at // 0' "$job_file")" 0)
+    max=$(_backoff_int "${MOTHER_BACKOFF_MAX_S:-}" 900)
+    # Lifetime cap on consecutive backoffs (the counter only resets after a run
+    # that really got going), so a job that keeps hitting the limit can't loop.
+    local max_count; max_count=$(_backoff_int "${MOTHER_BACKOFF_MAX_COUNT:-}" 10)
+    if { [ "$first" -gt 0 ] && [ $((now - first)) -gt "$max" ]; } \
+        || { [ "$max_count" -gt 0 ] && [ "$count" -ge "$max_count" ]; }; then
+        local waited=0
+        [ "$first" -le 0 ] || waited=$(((now - first) / 60))
+        detail=$(printf '%s' "$detail" | jq -c --argjson m "$waited" '. + {waited_minutes: $m}')
+        _rf_hold "$id" "$reason" "backoff_exhausted" "$detail"
+        # Kind != paused_reason on purpose: a later, unrelated operator_hold
+        # on this job must stay answerable with plain text.
+        mother_decision_open "$id" "backoff_exhausted" '["resume_with_guidance","cancel"]' >/dev/null
+        return 0
+    fi
+
+    local delay not_before new_state
+    # Only a real API error result (it carries api_error_status) may set the
+    # wait or the shared pause; a text-only match backs off just this job.
+    local ra=0 api_status
+    api_status=$(printf '%s' "$detail" | jq -r '.api_error_status // empty' 2>/dev/null)
+    [ -z "$api_status" ] || ra=$(printf '%s' "$detail" | jq -r '.retry_after_s // 0' 2>/dev/null)
+    delay=$(mother_backoff_delay "$count" "$ra")
+    not_before=$((now + delay))
+    new_state=$(_rf_ready_or_queued "$job_file")
+    local merged
+    merged=$(jq --arg s "$new_state" --argjson nb "$not_before" --argjson now "$now" '
+        .state = $s
+        | .finished_at = null
+        | .worker_pid = null
+        | .cancel_requested = null
+        | .pause_requested = null
+        | .final_result_at = null
+        | .not_before = $nb
+        | .backoff_count = ((.backoff_count // 0) + 1)
+        | .backoff_first_at = (.backoff_first_at // $now)
+    ' "$job_file") || _die "route-failure: jq update failed"
+    _atomic_write "$job_file" "$merged"
+    [ "$reason" != "rate_limited" ] || [ -z "$api_status" ] || mother_ratelimit_extend "$not_before"
+    _append_event "$id" "failure_routed" \
+        "$(jq -nc --arg r "$reason" --argjson d "$delay" --argjson n "$((count + 1))" \
+            '{action: "backed_off", reason: $r, delay_s: $d, backoff_count: $n}')"
+    echo "$id: backed off ${delay}s ($reason) -> $new_state"
 }
 
 # As-is retry of an infra failure, at most once; then hold.
@@ -2594,12 +2712,7 @@ _rf_retry_once() {
         _rf_hold "$id" "$reason" "retry_exhausted" "$detail"
         return 0
     fi
-    local dep dep_state new_state="ready"
-    for dep in $(jq -r '.depends_on // [] | .[]' "$job_file"); do
-        dep_state="missing"
-        [ -f "$(_job_path "$dep")" ] && dep_state=$(jq -r .state "$(_job_path "$dep")")
-        if [ "$dep_state" != "succeeded" ]; then new_state="queued"; break; fi
-    done
+    local new_state; new_state=$(_rf_ready_or_queued "$job_file")
     # Replay an operator answer the failed run consumed at spawn.
     local ev replay="null"
     ev=$(_events_path "$id")
@@ -2646,6 +2759,13 @@ _rf_reconcile_or_escalate() {
         return 0
     else
         why="escalate_refused"
+        # Escalation refuses while the branch has an open PR. If we also
+        # declined to adopt that PR (the run added no commit), nothing else
+        # will ever look at this job: hand it to the operator.
+        if [ "$_RF_RECONCILE_SKIPPED" = "1" ]; then
+            _rf_hold "$id" "$(jq -r '.failure_reason // "unspecified"' "$job_file")" "no_new_commit" "$(_rf_last_failed_detail "$id")"
+            return 0
+        fi
     fi
     # The next `failed` transition clears the flag.
     _job_update "$id" '.failure_routed = true'
@@ -2678,7 +2798,11 @@ cmd_route_failure() {
                 _rf_hold "$id" "$reason" "nothing_to_reconcile" "$detail"
             fi
             ;;
-        hold)       _rf_hold "$id" "$reason" "$reason" "$detail" ;;
+        hold)
+            # billing / auth_error: keep the worker's output out of the hold.
+            case "$reason" in billing|auth_error) detail=$(printf '%s' "$detail" | jq -c 'del(.tail_excerpt)') ;; esac
+            _rf_hold "$id" "$reason" "$reason" "$detail" ;;
+        backoff)    _rf_backoff "$id" "$reason" "$detail" ;;
         retry_once) _rf_retry_once "$id" "$reason" "$detail" ;;
         *)          _rf_reconcile_or_escalate "$id" ;;
     esac
@@ -2911,10 +3035,20 @@ EOF
     tmpfile=$(mktemp)
     local review_log
     review_log="$LOGS_DIR/$id.review-${reviewer}-c$(jq -r '.pipeline.review_cycle // 0' "$job_file" 2>/dev/null).log"
-    ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" \
-        "${MOTHER_CLAUDE_ARGS[@]}" -p --output-format stream-json --verbose <<< "$review_prompt" ) \
-        > "$review_log" 2>/dev/null
-    local review_rc=$?
+    local review_rc _rl_try=0 review_rate_limited=0
+    local _rl_max; _rl_max=$(_backoff_int "${MOTHER_REVIEW_RATELIMIT_RETRIES:-}" 2)
+    while :; do
+        review_rate_limited=0
+        mother_backoff_enabled && mother_ratelimit_wait
+        ( cd "$work_dir" && claude --dangerously-skip-permissions --agent "$reviewer" --model "$reviewer_model" \
+            "${MOTHER_CLAUDE_ARGS[@]}" -p --output-format stream-json --verbose <<< "$review_prompt" ) \
+            > "$review_log" 2>/dev/null
+        review_rc=$?
+        mother_backoff_enabled && mother_reviewer_rate_limited "$review_log" "$_rl_try" || break
+        review_rate_limited=1
+        [ "$_rl_try" -lt "$_rl_max" ] || break
+        _rl_try=$((_rl_try + 1))
+    done
     # findings_extract/verdict text want the reviewer's plain-text response;
     # extract it from the last result event when the stream is stream-json,
     # falling back to the raw file itself (a plaintext mock in tests, or a
@@ -2925,9 +3059,10 @@ EOF
     # A reviewer that crashed (non-zero exit) or produced no output did not
     # review anything. Fail like an unparseable review (exit 2, nothing
     # recorded) instead of falling through to "no findings block" = clean pass.
-    if [ "$review_rc" -ne 0 ] || ! grep -q '[^[:space:]]' "$tmpfile" 2>/dev/null; then
+    if [ "$review_rc" -ne 0 ] || [ "$review_rate_limited" -eq 1 ] || ! grep -q '[^[:space:]]' "$tmpfile" 2>/dev/null; then
         local fail_reason="empty_output"
         [ "$review_rc" -ne 0 ] && fail_reason="exit_nonzero"
+        [ "$review_rate_limited" -eq 1 ] && fail_reason="rate_limited"
         rm -f "$tmpfile"
         _append_event "$id" "review_failed" \
             "$(jq -nc --arg r "$reviewer" --arg why "$fail_reason" --argjson rc "$review_rc" \
@@ -3119,13 +3254,26 @@ EOF
     # Read-only by construction: no --dangerously-skip-permissions. Headless runs
     # can't prompt, so anything outside the allowlist is denied.
     # MOTHER_REVIEW_LENS tells a test stand-in which lens it is answering for.
-    ( cd "$work_dir" && MOTHER_REVIEW_LENS="$lens" claude --agent perri-lens --model "$model" \
-        --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(cat:*),Bash(rg:*),Bash(grep:*)" \
-        --disallowedTools "Write,Edit,NotebookEdit,WebFetch,WebSearch" \
-        --max-budget-usd "$budget" "${MOTHER_CLAUDE_ARGS[@]}" \
-        -p --output-format stream-json --verbose <<< "$prompt" ) \
-        > "$lens_log" 2>/dev/null
-    local lens_rc=$?
+    # A rate-limited lens waits for the shared pause and is re-spawned (up to
+    # MOTHER_REVIEW_RATELIMIT_RETRIES times); one still limited after that is
+    # an `error` lens, never a pass and never a failed review.
+    local lens_rc _rl_try=0 lens_rate_limited=0
+    local _rl_max; _rl_max=$(_backoff_int "${MOTHER_REVIEW_RATELIMIT_RETRIES:-}" 2)
+    while :; do
+        lens_rate_limited=0
+        mother_backoff_enabled && mother_ratelimit_wait
+        ( cd "$work_dir" && MOTHER_REVIEW_LENS="$lens" claude --agent perri-lens --model "$model" \
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(cat:*),Bash(rg:*),Bash(grep:*)" \
+            --disallowedTools "Write,Edit,NotebookEdit,WebFetch,WebSearch" \
+            --max-budget-usd "$budget" "${MOTHER_CLAUDE_ARGS[@]}" \
+            -p --output-format stream-json --verbose <<< "$prompt" ) \
+            > "$lens_log" 2>/dev/null
+        lens_rc=$?
+        mother_backoff_enabled && mother_reviewer_rate_limited "$lens_log" "$_rl_try" || break
+        lens_rate_limited=1
+        [ "$_rl_try" -lt "$_rl_max" ] || break
+        _rl_try=$((_rl_try + 1))
+    done
 
     local tmpfile; tmpfile=$(mktemp)
     _extract_transcript_result_text "$lens_log" > "$tmpfile" 2>/dev/null \
@@ -3138,9 +3286,10 @@ EOF
     # A lens that crashed or never emitted a findings block did not review
     # anything: record it as error (contract lens state), never as a clean
     # pass. An explicit empty findings block ([]) is a genuine clean result.
-    if [ "$lens_rc" -ne 0 ] || [ -z "$raw_findings" ]; then
+    if [ "$lens_rc" -ne 0 ] || [ -z "$raw_findings" ] || [ "$lens_rate_limited" -eq 1 ]; then
         local err_reason="no_findings_block"
         [ "$lens_rc" -ne 0 ] && err_reason="exit_nonzero"
+        [ "$lens_rate_limited" -eq 1 ] && err_reason="rate_limited"
         _append_event "$id" "review_no_findings_block" \
             "$(jq -nc --arg r "perri:$lens" --arg why "$err_reason" '{reviewer: $r, reason: $why}')"
         type mother_record_run_usage >/dev/null 2>&1 && mother_record_run_usage "$id" "error" "$lens_log" 0 "" \
@@ -3508,6 +3657,8 @@ cmd_adherence_review() {
     local adherence_attempt=$((esc_attempts + 1))
     local adherence_log="$LOGS_DIR/$id.adherence-${adherence_attempt}.log"
     local raw_verdict
+    # Wait on the shared rate-limit pause rather than spend a review on a 429.
+    mother_backoff_enabled && mother_ratelimit_wait
     claude --dangerously-skip-permissions --agent archie --model "$archie_model" \
         "${MOTHER_CLAUDE_ARGS[@]}" -p --output-format stream-json --verbose <<< "$review_prompt" \
         > "$adherence_log" 2>/dev/null || true
@@ -3546,6 +3697,19 @@ cmd_adherence_review() {
                     adherence_attempt: $attempt
                 }')"
     }
+
+    if mother_backoff_enabled && mother_reviewer_rate_limited "$adherence_log" 0; then
+        # Rate limited: an error, not a verdict. It must not count against the
+        # per-SHA review cap (the runner pre-incremented it), and the pause
+        # just extended keeps the runner from retrying until it lifts.
+        _record_adherence_usage "" "error"
+        [ "$pre_ready" -eq 1 ] && _adherence_pre_ready_side_file "$id" "$pre_cycle" "" error "" "$pre_head"
+        _job_update "$id" '.adherence_sha_runs = (if (.adherence_sha_runs // 0) > 0 then .adherence_sha_runs - 1 else 0 end)' || true
+        _append_event "$id" "adherence_rate_limited" \
+            "$(jq -nc --argjson w "$(mother_ratelimit_remaining)" '{wait_s: $w}')"
+        echo "mother: adherence-review: rate limited; not a verdict, will retry after the pause" >&2
+        return 2
+    fi
 
     if [ -z "$verdict" ]; then
         # Could not parse verdict — treat as error, don't mutate job state.
@@ -3882,6 +4046,7 @@ cmd_resume() {
         | .activity = null
         | .operator_hold = null
         | .auto_retry_count = 0
+        | .not_before = null | .backoff_count = null | .backoff_first_at = null
         | .state = "ready"
         | '"$(_decision_resume_jq "$decision_kind")"'
         | '"$MOTHER_DECISION_RESOLVE_JQ"

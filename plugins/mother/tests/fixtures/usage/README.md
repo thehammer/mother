@@ -129,4 +129,26 @@ deliberately sets `is_error: true`.
 - `result_execution_error.jsonl` → `result.subtype == "error_during_execution"`,
   `is_error: false` → expected reason `execution_error`.
 - `result_api_error.jsonl` → `result.is_error == true` with
-  `api_error_status: 529` → expected reason `api_error`.
+  `api_error_status: 400` → expected reason `api_error`. The status is
+  deliberately a non-retryable one: 429 means `rate_limited`, 529/503/any other
+  5xx `api_overloaded`, 402 `billing`, 401/403 `auth_error` (see below), so a
+  400 is what "an API error that is none of those" looks like.
+
+### result_*.jsonl with a retryable / account-level API status
+All of these are shaped like the real incident (an account rate-limited, three
+workers in a minute): `result.subtype == "success"` **and** `is_error == true`,
+zero cost, run exit code 1. The status decides the reason; the `.result` text is
+free-form and never needed for the classification.
+
+- `result_rate_limited_429.jsonl` → `api_error_status: 429`, no retry hint →
+  `rate_limited`, `retry_after_s: null`.
+- `result_rate_limited_429_retry_after.jsonl` → same, plus
+  `"retry_after_s": 90` on the result event → `rate_limited`, `retry_after_s: 90`.
+- `result_overloaded_529.jsonl` → `api_error_status: 529` → `api_overloaded`.
+- `result_billing_402.jsonl` → `api_error_status: 402` → `billing`.
+- `result_auth_401.jsonl` → `api_error_status: 401` → `auth_error`.
+
+The tests generate the remaining one-off variants (503, a generic 500, 403,
+`retry_after` / `retry-after` key spellings, retry-after parsed from the result
+text or the log tail, billing detected from the result text) inline rather than
+adding a fixture per spelling.
