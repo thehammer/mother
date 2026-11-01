@@ -667,7 +667,19 @@ cmd_add() {
         echo "mother: add: warning: plan's Target branch ('$plan_target_branch') differs from --branch ('$branch') — using --branch" >&2
     fi
 
-    [ -z "$title" ] && title=$(head -1 "$plan_file" | sed -E 's/^#+ *//;s/^[[:space:]]+//;s/[[:space:]]+$//')
+    if [ -z "$title" ]; then
+        # The title is the plan's first non-empty line, which must be an ATX
+        # heading: a note above the "# Title" would otherwise become the job
+        # (and PR) title. --title bypasses the check.
+        local first_line
+        first_line=$(grep -m1 -E '[^[:space:]]' "$plan_file" | tr -d '\r' || true)
+        if ! printf '%s\n' "$first_line" | grep -Eq '^#{1,6} +[^[:space:]]'; then
+            local shown
+            shown=$(printf '%s' "$first_line" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-80)
+            _die "add: plan's first line is not a '# Title' heading: \"$shown\" — put the '# Title' heading on the first line of the plan, or pass --title"
+        fi
+        title=$(printf '%s\n' "$first_line" | sed -E 's/^#+ *//;s/^[[:space:]]+//;s/[[:space:]]+$//')
+    fi
     [ -z "$title" ] && title="(untitled)"
 
     # Parse and validate the suggested_config block from the plan.
@@ -5255,7 +5267,8 @@ Add options:
                            keeps it queued and lists it under `mother status`
                            needs-attention. `mother force-start ID --ignore-deps` releases a
                            queued job past its dependency gate.
-  --title TEXT         (default: first heading of plan file)
+  --title TEXT         (default: the plan's first line, which must be a '# Title'
+                       heading; otherwise add is refused unless --title is given)
   --format json|text   (default: text — prints job id only)
   --label TEXT         free-text origin label for this job
   --origin-project NAME  override auto-detected originating project name

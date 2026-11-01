@@ -6,6 +6,10 @@ All notable changes to Mother are documented here. Format based on
 
 ## [Unreleased]
 
+### Changed
+
+- `mother add` refuses a plan whose first non-empty line is not an ATX heading (`# Title`), naming the offending line, so a note above the title can no longer become the job/PR title. `--title` bypasses the check. The title now comes from the first non-empty line.
+
 ## [0.3.9] - 2026-11-01
 
 Release bump: the plugin cache is keyed by version, and 0.3.8 predates the changed `hooks/mother-inject.sh` (#101), so `claude plugin update` reported "already at the latest version" while `mother status` kept warning `plugin_cache_stale`. Contents of this release: the entries below (origin focus hook change, posture labels, rate-limit backoff).

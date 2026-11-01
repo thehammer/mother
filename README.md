@@ -207,6 +207,10 @@ stops still run), `MOTHER_PREVIEW_BACKEND` (`cli`, the only value), `MOTHER_PREV
 
 ## Routing, escalation, and adherence review
 
+### Plan title
+
+The job title comes from the plan's first non-empty line, which must be a `# Title` heading (`#` to `######`, a space, then text). `mother add` refuses a plan that starts with anything else (a note, a blockquote, `#hashtag`) unless `--title TEXT` is given.
+
 ### Plan-time routing (`suggested_config`)
 
 Every plan must end with a `suggested_config:` YAML block (inside a fenced
