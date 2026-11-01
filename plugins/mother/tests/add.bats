@@ -1395,3 +1395,97 @@ _focus_add() {
     [ "$status" -eq 0 ]
     [ "$(jq '.origin | has("focus") or has("focus_name")' "$JOBS_DIR/$output.json")" = "false" ]
 }
+
+# ---------------------------------------------------------------------------
+# plan title guard — first non-empty line must be an ATX heading
+
+_title_add() {
+    run mother add --plan-file "$1" --repo testrepo --repo-path "$FAKE_REPO" \
+        --branch feature/test "${@:2}"
+}
+
+_title_plan() {  # <dest> <first-lines...>: prepend text to the standard plan
+    local dest="$1"; shift
+    make_plan "$dest.base"
+    { printf '%b' "$*"; cat "$dest.base"; } > "$dest"
+}
+
+@test "title guard: blockquote above the title is refused, no job created" {
+    local plan="$MOTHER_ROOT/p.md"
+    _title_plan "$plan" '> **Ada sign-off:** note\n\n'
+    _title_add "$plan"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Ada sign-off"* ]]
+    [[ "$output" == *"--title"* ]]
+    [ -z "$(ls "$JOBS_DIR"/*.json 2>/dev/null)" ]
+}
+
+@test "title guard: plan starting with a heading is titled from it" {
+    local plan="$MOTHER_ROOT/p.md"
+    make_plan "$plan"
+    _title_add "$plan"
+    [ "$status" -eq 0 ]
+    run jq -r '.title' "$JOBS_DIR/$output.json"
+    [ "$output" = "Test plan" ]
+}
+
+@test "title guard: --title bypasses the check" {
+    local plan="$MOTHER_ROOT/p.md"
+    _title_plan "$plan" '> a note\n\n'
+    _title_add "$plan" --title "Explicit"
+    [ "$status" -eq 0 ]
+    run jq -r '.title' "$JOBS_DIR/$output.json"
+    [ "$output" = "Explicit" ]
+}
+
+@test "title guard: #hashtag first line is refused" {
+    local plan="$MOTHER_ROOT/p.md"
+    _title_plan "$plan" '#hashtag\n\n'
+    _title_add "$plan"
+    [ "$status" -ne 0 ]
+    [ -z "$(ls "$JOBS_DIR"/*.json 2>/dev/null)" ]
+}
+
+@test "title guard: bare # first line is refused" {
+    local plan="$MOTHER_ROOT/p.md"
+    _title_plan "$plan" '#\n\n'
+    _title_add "$plan"
+    [ "$status" -ne 0 ]
+    [ -z "$(ls "$JOBS_DIR"/*.json 2>/dev/null)" ]
+}
+
+@test "title guard: '# ' with only spaces is refused" {
+    local plan="$MOTHER_ROOT/p.md"
+    _title_plan "$plan" '#   \n\n'
+    _title_add "$plan"
+    [ "$status" -ne 0 ]
+}
+
+@test "title guard: leading blank lines then heading is accepted with that title" {
+    local plan="$MOTHER_ROOT/p.md"
+    _title_plan "$plan" '\n\n## Real Title\n\n'
+    _title_add "$plan"
+    [ "$status" -eq 0 ]
+    run jq -r '.title' "$JOBS_DIR/$output.json"
+    [ "$output" = "Real Title" ]
+}
+
+@test "title guard: control characters in the offending line are not echoed raw" {
+    local plan="$MOTHER_ROOT/p.md"
+    _title_plan "$plan" 'note \033[31mred\033[0m\a here\n\n'
+    _title_add "$plan"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"note "* ]]
+    [[ "$output" != *$'\033'* ]]
+    [[ "$output" != *$'\a'* ]]
+}
+
+@test "title guard: offending line is truncated to 80 characters" {
+    local plan="$MOTHER_ROOT/p.md"
+    local long; long=$(printf 'x%.0s' $(seq 1 120))
+    _title_plan "$plan" "$long\n\n"
+    _title_add "$plan"
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"$(printf 'x%.0s' $(seq 1 81))"* ]]
+    [[ "$output" == *"$(printf 'x%.0s' $(seq 1 80))"* ]]
+}
