@@ -32,6 +32,7 @@ const (
 	ErrMalformed       = "malformed"        // envelope/command failed to parse or validate
 	ErrUnavailable     = "unavailable"      // broker transiently unable to serve; back off + retry
 	ErrVersionMismatch = "version_mismatch" // client/broker protocol version incompatible
+	ErrNoResetKnown    = "no_reset_known"   // quota-gate off_until_reset with no usable future window reset
 	ErrUnauthorized    = "unauthorized"     // answer from a Mother worker (peer guard); reserved for the network-auth path (W4)
 	ErrInternal        = "internal"         // broker-side failure (e.g. CLI shell-out errored)
 )

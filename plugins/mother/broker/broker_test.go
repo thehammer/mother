@@ -1583,10 +1583,14 @@ func TestMapCLIError_forceStartMustBeReadyOrQueuedMapsToInvalidState(t *testing.
 // HC-02: answer {job, text, option, source}, worker guard, error mapping
 // ---------------------------------------------------------------------------
 
-// fakeGuard is an injectable workerGuard for handleAnswer tests.
-type fakeGuard struct{ worker bool }
+// fakeGuard is an injectable workerGuard. worker: the peer is a Mother worker
+// (denied for answer and quota-gate). unknown: the peer pid could not be read
+// (answer fails open, quota-gate fails closed).
+type fakeGuard struct{ worker, unknown bool }
 
 func (g fakeGuard) fromWorker(conn *clientConn) bool { return g.worker }
+
+func (g fakeGuard) fromWorkerOrUnknown(conn *clientConn) bool { return g.worker || g.unknown }
 
 // newHubWithRecordingCLI installs a fake `mother` that records argv (one per
 // line) to <dir>/args and stdin to <dir>/stdin, then prints stderrMsg to

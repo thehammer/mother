@@ -356,7 +356,8 @@ _quota_feed_json() {
     for kind in bishop cache; do
         if [ "$kind" = bishop ]; then f="$MOTHER_BISHOP_POSTURE_FILE"; else f="$MOTHER_RATE_LIMIT_CACHE"; fi
         [ -r "$f" ] || continue
-        m=$(_file_mtime "$f"); a=$((now - m)); [ "$a" -lt 0 ] && a=0
+        m=$(_file_mtime "$f"); a=$((now - m))
+        [ "$a" -lt 0 ] && continue   # a future mtime is not a fresh reading
         w=$(_quota_normalize "$f" "$kind")
         [ -n "$w" ] || continue
         if [ -z "$best_age" ] || [ "$a" -lt "$best_age" ]; then best_age="$a"; fi
@@ -402,14 +403,70 @@ _quota_gate_write_locked() {
     _atomic_write "$f" "$content"
 }
 
+# _quota_with_lock <tries> <cmd...>: _with_lock for the safety switch's lockdir
+# with an owner file and a stale-lock takeover. A killed `mother quota` used to
+# leave `quota-gate.json.lockdir` behind and make every later change fail. The
+# lock is taken over when its recorded owner pid is dead, or when it is older
+# than MOTHER_QUOTA_LOCK_STALE_S (30s; an owner-less dir counts by age). The
+# takeover renames the dir away first, so only one taker wins. Tries are 50ms
+# apart; the daemon passes a small count (a stuck lock must not stall a tick).
+_quota_with_lock() {
+    local tries_max="$1"; shift
+    local lockdir; lockdir="$(_quota_gate_file).lockdir"
+    local tries=0 owner age stale
+    mkdir -p "$MOTHER_ROOT" 2>/dev/null
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        owner=$(cat "$lockdir/owner" 2>/dev/null)
+        age=$(( $(date +%s) - $(_file_mtime "$lockdir") ))
+        stale=0
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then stale=1
+        elif [ "$age" -gt "${MOTHER_QUOTA_LOCK_STALE_S:-30}" ]; then stale=1; fi
+        if [ "$stale" -eq 1 ]; then
+            if mv "$lockdir" "$lockdir.stale.$$" 2>/dev/null; then
+                rm -f "$lockdir.stale.$$/owner"; rmdir "$lockdir.stale.$$" 2>/dev/null || true
+                echo "mother: took over a stale quota-gate lock (owner ${owner:-unknown})" >&2
+            fi
+            tries=$((tries + 1))
+            [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the quota-gate lock" >&2; return 1; }
+            continue
+        fi
+        sleep 0.05
+        tries=$((tries + 1))
+        [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the quota-gate lock" >&2; return 1; }
+    done
+    echo "$$" > "$lockdir/owner" 2>/dev/null || true
+    "$@"
+    local rc=$?
+    rm -f "$lockdir/owner"; rmdir "$lockdir" 2>/dev/null || true
+    return $rc
+}
+
+# _quota_switch_feed_json: the feed used to pick the `until` of an
+# off_until_reset. Feed-path overrides (MOTHER_BISHOP_POSTURE_FILE,
+# MOTHER_RATE_LIMIT_CACHE) are honoured only under MOTHER_TEST_ROOT=1 (the test
+# harness): otherwise an environment variable could forge the reset time that
+# decides when the safety switch re-arms. Production reads the real paths.
+_quota_switch_feed_json() {
+    if [ "${MOTHER_TEST_ROOT:-}" = "1" ]; then _quota_feed_json; return; fi
+    (
+        MOTHER_BISHOP_POSTURE_FILE="${HOME:-}/.claude/budget-posture.json"
+        MOTHER_RATE_LIMIT_CACHE="$MOTHER_ROOT/rate-limits.json"
+        _quota_feed_json
+    )
+}
+
+# Longest `until` accepted: the 7-day window plus an hour of slack.
+_QUOTA_MAX_UNTIL_AHEAD_S=608400
+
 # _quota_gate_set <on|off|off_until_reset> <changed_by> [expect_state [expect_until]]:
 # THE writer of the switch. Prints a one-line human result on stdout; returns 1
-# on a bad state. The read, the comparison and the write all happen inside one
-# lock, so concurrent callers cannot both apply the same change. Same-state
+# on a bad state, 3 (message `no_reset_known` on stderr) when off_until_reset is
+# asked for and no usable future reset is known: that is refused, never turned
+# into a plain `off`. The read, the comparison and the write all happen inside
+# one lock, so concurrent callers cannot both apply the same change. Same-state
 # calls change nothing (no rewrite, no audit line), except off_until_reset,
-# which refreshes `until` to the earliest future reset. off_until_reset stores
-# that reset; with none known it stores `off` and says so, unless the stored
-# `until` is still in the future (then it is kept). With expect_state set (the
+# which refreshes `until` to the earliest valid future reset (within now + 7d +
+# 1h; anything further out is treated as unknown). With expect_state set (the
 # automatic expiry flip) nothing is written unless the switch is still exactly
 # in that state (and, when given, has that `until`).
 _quota_gate_set() {
@@ -418,15 +475,16 @@ _quota_gate_set() {
     local until="null" now
     now=$(date +%s)
     if [ "$want" = off_until_reset ]; then
-        until=$(_quota_feed_json | jq -r --argjson now "$now" '
-            [.five_hour.resets_at, .seven_day.resets_at | select(. > $now)] | min // "null"')
+        until=$(_quota_switch_feed_json | jq -r --argjson now "$now" --argjson max "$_QUOTA_MAX_UNTIL_AHEAD_S" '
+            [.five_hour.resets_at, .seven_day.resets_at
+             | select(type == "number" and . > $now and . <= ($now + $max))] | min // "null"')
     fi
-    _with_lock "$(_quota_gate_file)" _quota_gate_set_locked "$want" "$by" "$until" "$now" "$ex_state" "$ex_until"
+    _quota_with_lock "${_QUOTA_LOCK_TRIES:-200}" _quota_gate_set_locked "$want" "$by" "$until" "$now" "$ex_state" "$ex_until"
 }
 
 _quota_gate_set_locked() {
     local want="$1" by="$2" until="$3" now="$4" ex_state="$5" ex_until="$6"
-    local cur from cur_until note=""
+    local cur from cur_until
     cur=$(_quota_gate_read)
     from=$(printf '%s' "$cur" | jq -r '.state')
     cur_until=$(printf '%s' "$cur" | jq -r '.until // "null"')
@@ -441,8 +499,8 @@ _quota_gate_set_locked() {
             echo "quota gate already off_until_reset"
             return 0
         fi
-        want=off
-        note=" (no window reset time is known, so this is plain off; use \`mother quota on\` to re-enable)"
+        echo "quota: no_reset_known: off-until-reset needs a known window reset within 7 days and none is (stale feed, expired or too-distant resets); the gate is unchanged. Use \`mother quota off\` to turn it off until you turn it back on." >&2
+        return 3
     fi
     if [ "$from" = "$want" ] && { [ "$want" != off_until_reset ] || [ "$cur_until" = "$until" ]; }; then
         echo "quota gate already $want"
@@ -458,12 +516,14 @@ _quota_gate_set_locked() {
     jq -nc --arg at "$iso" --arg by "$by" --arg from "$from" --arg to "$want" --argjson until "$until" \
         '{ts: $at, changed_by: $by, from: $from, to: $to, until: $until}' >> "$(_quota_audit_file)"
     echo "mother: quota gate $from -> $want (by $by)" >&2
-    echo "quota gate $from -> $want$note"
+    echo "quota gate $from -> $want"
 }
 
 # _quota_gate_open: returns 0 when the switch lets everything through (off, or
 # off_until_reset before its reset); flips an expired off_until_reset back to
-# `on` (logged and audited) and returns 1.
+# `on` (logged and audited) and returns 1. The flip waits at most ~0.25s for the
+# lock: if it cannot be taken the answer is still 1 (gate ON, fail closed) and a
+# later tick retries, so a stuck lock cannot stall the daemon.
 _quota_gate_open() {
     local cur st until now
     cur=$(_quota_gate_read)
@@ -474,7 +534,7 @@ _quota_gate_open() {
             until=$(_quota_int "$(printf '%s' "$cur" | jq -r '.until // 0')")
             now=$(date +%s)
             if [ "$now" -ge "$until" ]; then
-                _quota_gate_set on "auto:reset" off_until_reset "$until" >/dev/null || true
+                _QUOTA_LOCK_TRIES=4 _quota_gate_set on "auto:reset" off_until_reset "$until" >/dev/null || true
                 return 1
             fi
             return 0 ;;

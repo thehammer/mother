@@ -444,6 +444,14 @@ _disk_recheck_idle() {
 _spawn_job() {
     local job_id="$1"
 
+    # Never start a second supervisor while the previous one for this job is
+    # still alive (it may still be winding down a pause, or running
+    # continuation handling): both would share the worktree.
+    if _supervisor_alive_for_job "$job_id"; then
+        _log "not spawning $job_id: a previous supervisor is still alive"
+        return 1
+    fi
+
     # Pre-transition ready → running so the next poll tick doesn't re-pick
     # this job. mother-run-job tolerates both ready and running as starting
     # states. If the fork fails, the job stays `running` with no tmux window;
@@ -1114,16 +1122,33 @@ EOF
 
 _auto_resume_check() {
     local now; now=$(date +%s)
-    local f state reason resume_at id merged released=0
+    local f state reason resume_at id merged released=0 why
     # An open gate (switch off, or off_until_reset still in force) releases every
     # quota-parked job on this tick, as an elapsed auto_resume_at would.
     _quota_gate_open && released=1
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
-        [ "$state" = "awaiting" ] || continue
         reason=$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)
+        # Gate open: withdraw a pause the daemon asked for but the supervisor has
+        # not acted on yet, so the worker is never paused after the switch flips.
+        if [ "$released" -eq 1 ] && [ "$state" = "running" ] && [ "$(jq -r '.pause_requested // false' "$f" 2>/dev/null)" = "true" ]; then
+            case "$reason" in quota_*)
+                merged=$(jq '.pause_requested = null | .paused_reason = null | .auto_resume_at = null' "$f") \
+                    && _atomic_write "$f" "$merged"
+                _log "withdrew pause request of $(jq -r '.id' "$f") (quota gate is open)" ;;
+            esac
+            continue
+        fi
+        [ "$state" = "awaiting" ] || continue
         case "$reason" in quota_*) ;; *) continue ;; esac
+        id=$(jq -r '.id' "$f")
+        # The pause is marked `awaiting` before the old supervisor has killed its
+        # worker (up to 10s): releasing now would start a second supervisor on the
+        # same worktree. Wait until the old one is gone.
+        if _supervisor_alive_for_job "$id"; then continue; fi
+        why=window_reset
+        if [ "$released" -eq 1 ]; then why=gate_off; fi
         if [ "$released" -eq 0 ]; then
             resume_at=$(_quota_int "$(jq -r '.auto_resume_at // 0' "$f" 2>/dev/null)")
             [ "$resume_at" -gt 0 ] || continue
@@ -1133,11 +1158,12 @@ _auto_resume_check() {
             # window (back-to-back heavy use) we should keep waiting.
             if ! _quota_check; then continue; fi
         fi
-        id=$(jq -r '.id' "$f")
-        _log "auto-resuming $id (paused_reason=$reason; resume window has passed)"
-        merged=$(jq --arg ts "$(_iso_now)" '
+        _log "auto-resuming $id (paused_reason=$reason; $why)"
+        local answer="Quota window has reset — continue from where you left off."
+        [ "$why" != gate_off ] || answer="The quota gate was switched off — continue from where you left off."
+        merged=$(jq --arg ts "$(_iso_now)" --arg answer "$answer" '
             .state = "ready"
-            | .pending_answer = "Quota window has reset — continue from where you left off."
+            | .pending_answer = $answer
             | .resumed_at = $ts
             | .resume_count = ((.resume_count // 0) + 1)
             | .auto_resume_at = null
@@ -1145,7 +1171,7 @@ _auto_resume_check() {
             | .pause_requested = null
         ' "$f") && _atomic_write "$f" "$merged"
         _append_event "$id" "auto_resumed" \
-            "$(jq -nc --arg r "$reason" '{from_paused_reason: $r}')"
+            "$(jq -nc --arg r "$reason" --arg why "$why" '{from_paused_reason: $r, reason: $why}')"
     done
 }
 
@@ -1181,6 +1207,8 @@ _maybe_pause_running() {
         fs=$(jq -r '.force_start // false' "$job_file" 2>/dev/null)
         [ "$fs" = "true" ] && continue   # forced — never pause for quota
 
+        # The operator may have flipped the switch since this pass started.
+        _quota_gate_open && return 0
         merged=$(jq --arg r "$reason" --argjson ts "$resume_at" '
             .pause_requested = true
             | .paused_reason = $r
@@ -1878,7 +1906,7 @@ _dispatch_ready_jobs() {
             break
         fi
         _disk_dispatch_ok "$next" || break
-        _spawn_job "$next"
+        _spawn_job "$next" || break
     done
     [ "$over_cap" -eq 1 ] && _maybe_pause_running
     return 0
@@ -2001,6 +2029,12 @@ case "${1:-}" in
         # starting the daemon loop. Used by low_disk_guard.bats.
         # Usage: mother-runner --dispatch-tick
         _dispatch_ready_jobs
+        exit 0
+        ;;
+    --pause-tick)
+        # Test entry point: run one _maybe_pause_running pass and exit.
+        # Usage: mother-runner --pause-tick
+        _maybe_pause_running
         exit 0
         ;;
     --auto-resume-tick)

@@ -15,7 +15,7 @@ type quotaWatcher struct {
 	runner   *commandRunner
 	emit     func(rawEvent)
 	interval time.Duration
-	last     json.RawMessage // last block seen; nil until primed
+	last     json.RawMessage // last block seen, minus the ticking age; nil until primed
 }
 
 func newQuotaWatcher(runner *commandRunner, emit func(rawEvent), interval time.Duration) *quotaWatcher {
@@ -26,7 +26,7 @@ func newQuotaWatcher(runner *commandRunner, emit func(rawEvent), interval time.D
 // (subscribers already get it in their snapshot).
 func (q *quotaWatcher) prime() {
 	if b := q.runner.quotaBlock(); b != nil {
-		q.last = compactJSON(b)
+		q.last = comparable(b)
 	}
 }
 
@@ -51,12 +51,13 @@ func (q *quotaWatcher) tick() {
 	if b == nil {
 		return
 	}
+	key := comparable(b)
 	b = compactJSON(b)
-	if q.last != nil && bytes.Equal(b, q.last) {
+	if q.last != nil && bytes.Equal(key, q.last) {
 		return
 	}
 	first := q.last == nil
-	q.last = b
+	q.last = key
 	if first {
 		return
 	}
@@ -70,4 +71,21 @@ func compactJSON(b json.RawMessage) json.RawMessage {
 		return b
 	}
 	return buf.Bytes()
+}
+
+// comparable is the block with `feed_age_s` removed: the age grows with every
+// poll, so comparing it would publish an event each interval. Everything that
+// matters to a client (gate, source, stale, windows) is still compared; the
+// event itself carries the current block, age included.
+func comparable(b json.RawMessage) json.RawMessage {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return compactJSON(b)
+	}
+	delete(m, "feed_age_s")
+	out, err := json.Marshal(m) // map keys marshal sorted: stable
+	if err != nil {
+		return compactJSON(b)
+	}
+	return out
 }

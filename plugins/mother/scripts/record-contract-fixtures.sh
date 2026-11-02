@@ -621,7 +621,7 @@ prefixes.sort(key=lambda x: -len(x[0]))
 job_real = meta["JOB"]
 
 # --- key-based stable numbers / strings
-FIXED_NUM = {"duration_s": 1, "elapsed_active_s": 120, "worker_pid": 4242, "supervisor_pid": 4241,
+FIXED_NUM = {"feed_age_s": 0, "duration_s": 1, "elapsed_active_s": 120, "worker_pid": 4242, "supervisor_pid": 4241,
              "live_tokens": 0, "live_cost_usd": 0, "pid": 4242, "pct_moved_at_active_s": 60, "log_offset": 0,
              "usd": 0, "actual_cost_usd": 0, "actual_tokens": 0}
 QUANTISE = {"stage_frac": 0.25}       # key -> step; the real value depends on a few seconds of wall clock

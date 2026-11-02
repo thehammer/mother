@@ -308,6 +308,45 @@ _attention_quota_items() {
          hint: "neither Bishop (~/.claude/budget-posture.json) nor the statusline cache is fresh, so the quota gate cannot see usage and lets work through; check `mother quota status`"}'
 }
 
+# `quota_gate_off` is raised while the safety switch is off, or off_until_reset
+# before its reset (the same "open" test the gate uses, without flipping
+# anything). It is derived from the switch file on every call, so it can never
+# outlive the state; `since` is the switch's changed_at, so an ack
+# (`mother ack quota quota_gate_off`, acks/_quota.json) lapses when the state
+# changes (off -> off_until_reset rewrites changed_at). The Mac badge and this
+# item together mean an open gate is never silent.
+_quota_gate_off_since() {   # prints "<state>\t<since>" when the gate is open, nothing otherwise
+    type _quota_gate_read >/dev/null 2>&1 || return 0
+    local cur st since until
+    cur=$(_quota_gate_read)
+    st=$(printf '%s' "$cur" | jq -r '.state')
+    case "$st" in
+        off) ;;
+        off_until_reset)
+            until=$(_quota_int "$(printf '%s' "$cur" | jq -r '.until // 0')")
+            [ "$(date +%s)" -lt "$until" ] || return 0 ;;
+        *) return 0 ;;
+    esac
+    since=$(printf '%s' "$cur" | jq -r '.changed_at // ""')
+    printf '%s\t%s\n' "$st" "$since"
+}
+
+_attention_quota_gate_items() {
+    local row st since acked=false
+    row=$(_quota_gate_off_since)
+    [ -n "$row" ] || return 0
+    st="${row%%$'\t'*}"; since="${row#*$'\t'}"
+    if [ -f "$MOTHER_ROOT/acks/_quota.json" ] \
+        && [ "$(jq -r '.quota_gate_off.since // ""' "$MOTHER_ROOT/acks/_quota.json" 2>/dev/null)" = "$since" ]; then
+        acked=true
+    fi
+    jq -nc --arg st "$st" --arg since "$since" --argjson acked "$acked" '
+        {kind: "quota_gate_off", job_id: "", repo: "", branch: "",
+         reason: "quota_gate_off", since: $since,
+         detail: {acked: $acked, since: $since, state: $st},
+         hint: "the quota gate is switched off, so Mother will not pause near the limits; turn it back on with `mother quota on`"}'
+}
+
 # ---------- public ----------
 
 # mother_attention_items — print the needs-attention list as a JSON array.
@@ -321,6 +360,7 @@ mother_attention_items() {
       _attention_stash_items
       _attention_plugin_cache_items
       _attention_quota_items
+      _attention_quota_gate_items
     } | jq -cs '.' 2>/dev/null || echo '[]'
 }
 

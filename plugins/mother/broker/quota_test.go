@@ -9,7 +9,11 @@ package main
 //     `mother quota on|off|off-until-reset --source broker:<origin>`; an unknown
 //     state is rejected as `malformed` without touching the CLI; setting the
 //     current state again is fine (the CLI makes it a no-op) and acks ok.
-//   - ok ack data: {ok:true, state, quota}.
+//   - ok ack data: {ok:true, state, quota[, note]}: state is the gate as stored
+//     (read back from `quota status --json`), never an echo of the request; note
+//     carries a notable CLI remark such as "already off".
+//   - a CLI refusal for want of a known window reset is the error code
+//     no_reset_known, distinct from unauthorized.
 //   - quota-gate is advertised in hello capabilities.
 
 import (
@@ -66,18 +70,33 @@ func jsonEqual(t *testing.T, got, want json.RawMessage) bool {
 }
 
 // newQuotaHub installs a fake `mother` CLI that
-//   - answers `quota status --json` with the fixture's quota_block,
-//   - answers `quota on|off|off-until-reset ...` with exit 0, or, when
-//     failMsg is non-empty, prints failMsg to stderr and exits 1,
+//   - answers `quota status --json` with <rec>/block.json (initially the
+//     fixture's quota_block),
+//   - answers `quota on|off|off-until-reset ...` with exit 0 and, like the real
+//     CLI, moves the stored gate in block.json to the requested state (unless
+//     <rec>/nochange exists), or, when failMsg is non-empty, prints failMsg to
+//     stderr and exits 1 leaving block.json alone. If <rec>/say exists its
+//     contents are printed to stdout instead of the default change message.
 //   - appends every invocation (space-joined argv) to <rec>/calls.
+//
+// The hub's worker guard is a permissive fake: guard behaviour has its own tests.
 func newQuotaHub(t *testing.T, failMsg string) (*testHub, string, quotaFixture) {
 	t.Helper()
 	fx := loadQuotaFixture(t)
 	th := newTestHub(t, 1024)
+	th.hub.guard = fakeGuard{}
 	rec := t.TempDir()
 	blockFile := filepath.Join(rec, "block.json")
 	if err := os.WriteFile(blockFile, fx.QuotaBlock, 0o644); err != nil {
 		t.Fatalf("write block: %v", err)
+	}
+	// One block per gate state, exactly as `mother quota status --json` would
+	// print it after that state is stored.
+	for _, st := range []string{"on", "off", "off_until_reset"} {
+		b := quotaBlockWithGate(t, fx, st)
+		if err := os.WriteFile(filepath.Join(rec, "block."+st+".json"), b, 0o644); err != nil {
+			t.Fatalf("write block.%s: %v", st, err)
+		}
 	}
 	failFile := filepath.Join(rec, "fail")
 	if failMsg != "" {
@@ -92,7 +111,12 @@ if [ "$1" = quota ]; then
     status) cat '` + blockFile + `'; exit 0 ;;
     on|off|off-until-reset)
       if [ -f '` + failFile + `' ]; then cat '` + failFile + `' >&2; exit 1; fi
-      echo "quota gate changed"; exit 0 ;;
+      if [ ! -f '` + rec + `/nochange' ]; then
+        st=$(echo "$2" | tr - _)
+        cp '` + rec + `/block.'"$st"'.json' '` + blockFile + `'
+      fi
+      if [ -f '` + rec + `/say' ]; then cat '` + rec + `/say'; else echo "quota gate changed"; fi
+      exit 0 ;;
   esac
 fi
 echo "mother: unknown subcommand: $*" >&2
@@ -104,6 +128,25 @@ exit 1
 	}
 	th.runner.cliPath = cli
 	return th, rec, fx
+}
+
+// quotaBlockWithGate is the fixture block with its gate set to state (until is
+// only kept while off_until_reset).
+func quotaBlockWithGate(t *testing.T, fx quotaFixture, state string) json.RawMessage {
+	t.Helper()
+	var blk map[string]any
+	if err := json.Unmarshal(fx.QuotaBlock, &blk); err != nil {
+		t.Fatal(err)
+	}
+	blk["gate"] = state
+	if state != "off_until_reset" {
+		blk["until"] = nil
+	}
+	b, err := json.Marshal(blk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 // quotaCalls returns the recorded invocations that change the gate (everything
@@ -235,8 +278,11 @@ func TestQuotaGate_acceptsEachStateAndRoutesToTheMatchingCLISubcommand(t *testin
 			if gotState != tc.state {
 				t.Errorf("ack state = %q, want %q", gotState, tc.state)
 			}
-			if q, ok := data["quota"]; !ok || !jsonEqual(t, q, fx.QuotaBlock) {
-				t.Errorf("ack quota = %s, want the fixture block", q)
+			if q, ok := data["quota"]; !ok || !jsonEqual(t, q, quotaBlockWithGate(t, fx, tc.state)) {
+				t.Errorf("ack quota = %s, want the block for gate %s", q, tc.state)
+			}
+			if note, present := data["note"]; present && string(note) != `""` {
+				t.Errorf("an ordinary change carries no note, got %s", note)
 			}
 
 			want := []string{"quota", tc.sub, "--source", "broker:nostromo"}
@@ -313,6 +359,68 @@ func TestQuotaGate_isIdempotentTheSameStateTwiceAcksOkBothTimes(t *testing.T) {
 		if data["ok"] != true || data["state"] != "off" {
 			t.Errorf("ack %s = %v, want ok:true state:off", id, data)
 		}
+	}
+}
+
+func TestQuotaGate_ackStateIsTheStoredStateReadBackNotTheRequestEcho(t *testing.T) {
+	th, rec, fx := newQuotaHub(t, "")
+	// The stored gate is on, and the CLI changes nothing (exit 0) for this request.
+	if err := os.WriteFile(filepath.Join(rec, "block.json"), quotaBlockWithGate(t, fx, "on"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rec, "nochange"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ack := quotaGateAck(t, th, "q9", map[string]any{"state": "off", "origin": "nostromo"})
+	data := mustDecodeData(t, ack)
+	if data["ok"] != true {
+		t.Fatalf("ack = %v, want ok:true", data)
+	}
+	if data["state"] != "on" {
+		t.Errorf("ack state = %v, want the stored state %q (not the requested %q)", data["state"], "on", "off")
+	}
+	q, _ := json.Marshal(data["quota"])
+	if !jsonEqual(t, q, quotaBlockWithGate(t, fx, "on")) {
+		t.Errorf("ack quota = %s, want the stored block", q)
+	}
+}
+
+func TestQuotaGate_whenTheCLISaysSomethingNotableTheAckCarriesANote(t *testing.T) {
+	th, rec, fx := newQuotaHub(t, "")
+	if err := os.WriteFile(filepath.Join(rec, "block.json"), quotaBlockWithGate(t, fx, "off"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rec, "say"), []byte("quota gate already off\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ack := quotaGateAck(t, th, "q10", map[string]any{"state": "off", "origin": "nostromo"})
+	data := mustDecodeData(t, ack)
+	if data["ok"] != true || data["state"] != "off" {
+		t.Fatalf("ack = %v, want ok:true state:off", data)
+	}
+	note, _ := data["note"].(string)
+	if !strings.Contains(note, "already") {
+		t.Errorf("ack note = %q (ack %v), want it to carry the CLI's 'already off' remark", note, data)
+	}
+}
+
+func TestQuotaGate_noResetKnownIsAnErrorAckWithItsOwnCodeAndTheGateIsUntouched(t *testing.T) {
+	// Even if the CLI's message also says "refused", this is not an authorization failure.
+	th, rec, fx := newQuotaHub(t, "mother: quota: no_reset_known: off-until-reset refused: no future window reset is known (stale feed, expired or too-distant resets); the gate is unchanged")
+	if err := os.WriteFile(filepath.Join(rec, "block.json"), quotaBlockWithGate(t, fx, "on"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ack := quotaGateAck(t, th, "q11", map[string]any{"state": "off_until_reset", "origin": "nostromo"})
+	data := mustDecodeData(t, ack)
+	if data["ok"] != false {
+		t.Fatalf("ack = %v, want ok:false", data)
+	}
+	if code := ackErrCode(t, data); code != "no_reset_known" {
+		t.Errorf("error.code = %q, want %q", code, "no_reset_known")
+	}
+	b, _ := os.ReadFile(filepath.Join(rec, "block.json"))
+	if !jsonEqual(t, b, quotaBlockWithGate(t, fx, "on")) {
+		t.Errorf("stored block changed after a refused request: %s", b)
 	}
 }
 

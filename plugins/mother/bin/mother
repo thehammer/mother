@@ -5548,9 +5548,40 @@ _quota_fmt_time() {
     echo "$c ($u)"
 }
 
+# _quota_in_worker: true when this process is inside a Mother job: MOTHER_JOB_ID
+# is set (even empty), or any ancestor's command line has a token whose basename
+# is `mother-run-job` (so `env -u MOTHER_JOB_ID mother quota off` is still caught).
+_quota_in_worker() {
+    [ -z "${MOTHER_JOB_ID+x}" ] || return 0
+    local pid=$$ depth=0 line ppid tok
+    while [ "$depth" -lt 32 ] && [ "${pid:-0}" -gt 1 ]; do
+        line=$(ps -o ppid=,command= -p "$pid" 2>/dev/null) || return 1
+        [ -n "$line" ] || return 1
+        set -f; set -- $line; set +f
+        ppid="$1"; shift
+        for tok in "$@"; do
+            [ "${tok##*/}" = "mother-run-job" ] && return 0
+        done
+        pid="$ppid"; depth=$((depth + 1))
+    done
+    return 1
+}
+
+# _quota_refuse <requested> <reason> <source>: audit-log a refused switch change
+# (quota-gate-refusals.jsonl, separate from the change audit trail so that one
+# stays "who changed it, from, to") and exit non-zero.
+_quota_refuse() {
+    jq -nc --arg at "$(_iso_now)" --arg req "$1" --arg why "$2" --arg src "$3" \
+        '{ts: $at, requested: $req, reason: $why, source: $src}' >> "$MOTHER_ROOT/quota-gate-refusals.jsonl" 2>/dev/null || true
+    echo "mother: quota gate change to $1 refused: $2" >&2
+    _die "quota: refused: the quota gate is operator-controlled ($2)"
+}
+
 # mother quota status [--json] | on | off | off-until-reset [--source S]
 # The one CLI for the quota gate switch; the broker's `quota-gate` command
 # calls it too, so `_quota_gate_set` (lib/state.sh) stays the only writer.
+# --source is `cli` (default) or `broker:<token>` ([A-Za-z0-9._-]{1,64}); the
+# automatic `auto:*` writers call _quota_gate_set directly, never through here.
 cmd_quota() {
     local sub="${1:-status}"; shift || true
     local json=0 by="cli"
@@ -5581,8 +5612,18 @@ cmd_quota() {
             [ -z "$until_e" ] || echo "off until: $(_quota_fmt_time "$until_e")"
             ;;
         on|off|off-until-reset)
-            [ -z "${MOTHER_JOB_ID:-}" ] || _die "quota: refused: the quota gate is operator-controlled (MOTHER_JOB_ID is set)"
-            _quota_gate_set "$(printf '%s' "$sub" | tr - _)" "$by" || return 1
+            local want; want="$(printf '%s' "$sub" | tr - _)"
+            if _quota_in_worker; then
+                mkdir -p "$MOTHER_ROOT"
+                _quota_refuse "$want" "caller is inside a Mother job" "$(printf '%s' "$by" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+            fi
+            case "$by" in
+                cli) ;;
+                broker:*) printf '%s' "${by#broker:}" | grep -Eq '^[A-Za-z0-9._-]{1,64}$' \
+                              || _die "quota: bad --source: the broker token must match [A-Za-z0-9._-]{1,64}" ;;
+                *) _die "quota: bad --source: only 'cli' or 'broker:<token>' is accepted" ;;
+            esac
+            _quota_gate_set "$want" "$by" || return $?
             ;;
         *) _die "usage: mother quota status [--json] | on | off | off-until-reset" ;;
     esac
@@ -5605,11 +5646,18 @@ cmd_ack() {
     [ -z "${MOTHER_JOB_ID:-}" ] || _die "ack: refused — attention is acknowledged by the operator, not by a worker (MOTHER_JOB_ID is set)"
     [ -n "$id" ] && [ -n "$reason" ] || _die "usage: mother ack <id> <reason> [--source cli|nostromo_app|broker_client]"
     case "$source" in cli|nostromo_app|broker_client) ;; *) _die "ack: unknown source: $source" ;; esac
-    if [ "$id" = "quota" ] && [ "$reason" = "quota_feed_stale" ]; then
-        # Not tied to a job: `mother ack quota quota_feed_stale`.
-        local marker="$MOTHER_ROOT/quota-feed-stale.json" qsince
-        [ -f "$marker" ] || _die "ack: quota_feed_stale is not raised (the quota feed is fresh)"
-        qsince=$(jq -r '.since // ""' "$marker")
+    if [ "$id" = "quota" ] && { [ "$reason" = "quota_feed_stale" ] || [ "$reason" = "quota_gate_off" ]; }; then
+        # Not tied to a job: `mother ack quota quota_feed_stale|quota_gate_off`.
+        local qsince
+        if [ "$reason" = "quota_feed_stale" ]; then
+            local marker="$MOTHER_ROOT/quota-feed-stale.json"
+            [ -f "$marker" ] || _die "ack: quota_feed_stale is not raised (the quota feed is fresh)"
+            qsince=$(jq -r '.since // ""' "$marker")
+        else
+            local grow; grow=$(_quota_gate_off_since)
+            [ -n "$grow" ] || _die "ack: quota_gate_off is not raised (the quota gate is on)"
+            qsince="${grow#*$'\t'}"
+        fi
         mkdir -p "$MOTHER_ROOT/acks"
         _with_lock "$MOTHER_ROOT/acks/_quota.json" _ack_write "$MOTHER_ROOT/acks/_quota.json" "$reason" "$qsince" "$source" \
             || _die "ack: could not write acks/_quota.json"

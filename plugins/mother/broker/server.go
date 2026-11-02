@@ -739,7 +739,7 @@ func (cl *client) handleQuotaGate(m Message) {
 		Origin string `json:"origin"`
 	}
 	_ = json.Unmarshal(m.Data, &a)
-	if g := cl.hub.guard; g != nil && g.fromWorker(cl.conn) {
+	if g := cl.hub.guard; g != nil && g.fromWorkerOrUnknown(cl.conn) {
 		cl.ack(errAck(m.T, m.ID, ErrUnauthorized, "changing the quota gate from inside a Mother job is not allowed"))
 		return
 	}

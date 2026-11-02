@@ -73,6 +73,8 @@ func mapCLIError(stderr string) string {
 	switch {
 	case strings.Contains(s, "no such job"):
 		return ErrNoSuchJob
+	case strings.Contains(s, "no_reset_known"):
+		return ErrNoResetKnown
 	case strings.Contains(s, "refused"):
 		return ErrUnauthorized
 	case strings.Contains(s, "invalid_state:"):
@@ -212,13 +214,26 @@ func (c *commandRunner) quotaGate(state, origin string) cmdResult {
 		return fail(ErrMalformed, "quota-gate: state must be one of on, off, off_until_reset")
 	}
 	origin = sanitizeOrigin(origin)
-	_, stderr, code := c.runCLI("", "quota", sub, "--source", "broker:"+origin)
+	stdout, stderr, code := c.runCLI("", "quota", sub, "--source", "broker:"+origin)
 	if code != "" {
 		return fail(code, strings.TrimSpace(stderr))
 	}
-	payload := map[string]any{"state": state}
-	if q := c.quotaBlock(); q != nil {
-		payload["quota"] = q
+	// The ack reports the STORED state, read back, never an echo of the request.
+	q := c.quotaBlock()
+	if q == nil {
+		return fail(ErrInternal, "quota-gate: the change was applied but the stored state could not be read back")
+	}
+	var blk struct {
+		Gate string `json:"gate"`
+	}
+	if json.Unmarshal(q, &blk) != nil || blk.Gate == "" {
+		return fail(ErrInternal, "quota-gate: the stored state could not be read back")
+	}
+	payload := map[string]any{"state": blk.Gate, "quota": q}
+	// A no-op ("quota gate already off") is worth telling the client; an
+	// ordinary change is already visible in the stored state.
+	if note := strings.TrimSpace(stdout); strings.Contains(note, "already") || strings.Contains(note, "unchanged") {
+		payload["note"] = note
 	}
 	return ok(payload)
 }
