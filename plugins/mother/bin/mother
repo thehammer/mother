@@ -5605,7 +5605,7 @@ cmd_ack() {
     [ -z "${MOTHER_JOB_ID:-}" ] || _die "ack: refused — attention is acknowledged by the operator, not by a worker (MOTHER_JOB_ID is set)"
     [ -n "$id" ] && [ -n "$reason" ] || _die "usage: mother ack <id> <reason> [--source cli|nostromo_app|broker_client]"
     case "$source" in cli|nostromo_app|broker_client) ;; *) _die "ack: unknown source: $source" ;; esac
-    if [ "$reason" = "quota_feed_stale" ]; then
+    if [ "$id" = "quota" ] && [ "$reason" = "quota_feed_stale" ]; then
         # Not tied to a job: `mother ack quota quota_feed_stale`.
         local marker="$MOTHER_ROOT/quota-feed-stale.json" qsince
         [ -f "$marker" ] || _die "ack: quota_feed_stale is not raised (the quota feed is fresh)"

@@ -787,3 +787,177 @@ _stale_items() {
         | $want - $have | length')
     [ "$missing" = "0" ]
 }
+
+# ---------------------------------------------------------------------------
+# PR #106 review fix-ups
+# ---------------------------------------------------------------------------
+
+_park_job() {   # <id> <window reason> <resume-at epoch>
+    make_job "$1" awaiting ".paused_reason = \"$2\" | .auto_resume_at = $3"
+}
+_job_state() { jq -r .state "$JOBS_DIR/$1.json"; }
+
+@test "parked: 'mother quota off' releases a quota-parked job on the next tick, before auto_resume_at" {
+    _bishop 10 100
+    _park_job parked-1 quota_7d "$(( $(_now) + 259200 ))"
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    [ "$(_job_state parked-1)" = "awaiting" ]     # gate on: stays parked
+    mother quota off >/dev/null 2>&1
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    [ "$(_job_state parked-1)" = "ready" ]
+    [ "$(jq -r .paused_reason "$JOBS_DIR/parked-1.json")" = "null" ]
+}
+
+@test "parked: off_until_reset in force releases parked jobs too" {
+    _bishop 10 100
+    _park_job parked-2 quota_5h "$(( $(_now) + 9000 ))"
+    mother quota off-until-reset >/dev/null 2>&1
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    [ "$(_job_state parked-2)" = "ready" ]
+}
+
+@test "parked: the gate being open never releases an awaiting job parked for a non-quota reason" {
+    _bishop 10 100
+    make_job other-1 awaiting '.paused_reason = "gate_hold" | .auto_resume_at = 1'
+    make_job other-2 awaiting '.paused_reason = null'
+    mother quota off >/dev/null 2>&1
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    [ "$(_job_state other-1)" = "awaiting" ]
+    [ "$(_job_state other-2)" = "awaiting" ]
+}
+
+@test "runner tick: at 100% weekly with the gate on a ready job waits; 'mother quota off' lets the next tick start it" {
+    _bishop 10 100
+    local fake="$MOTHER_ROOT/fake-bin"; mkdir -p "$fake"
+    printf '#!/usr/bin/env bash\necho "$*" >> "%s/run-job-calls"\nexit 0\n' "$MOTHER_ROOT" > "$fake/mother-run-job"
+    chmod +x "$fake/mother-run-job"
+    export MOTHER_POSTURE_ENABLED=0 MOTHER_CONCURRENCY=2
+    make_job gated-1 ready ".repo_path = \"$MOTHER_ROOT\""
+    MOTHER_BIN_DIR="$fake" mother-runner --dispatch-tick >/dev/null 2>&1 || true
+    [ "$(_job_state gated-1)" = "ready" ]
+    [ ! -s "$MOTHER_ROOT/run-job-calls" ]
+    mother quota off >/dev/null 2>&1
+    MOTHER_BIN_DIR="$fake" mother-runner --dispatch-tick >/dev/null 2>&1 || true
+    local i=0; while [ ! -s "$MOTHER_ROOT/run-job-calls" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+    [ -s "$MOTHER_ROOT/run-job-calls" ]
+    [ "$(_job_state gated-1)" != "ready" ]
+}
+
+@test "feed: a string used_pct makes the Bishop file unusable; the cache is used instead" {
+    jq -nc '{five_hour:{used_pct:"100",resets_at:9999999999},seven_day:{used_pct:10,resets_at:9999999999}}' > "$MOTHER_BISHOP_POSTURE_FILE"
+    _cache 20 30
+    [ "$(_qf .source)" = "cache" ]
+    [ "$(_qf .windows.five_hour.used_pct)" = "20" ]
+}
+
+@test "feed: a null seven_day window makes Bishop unusable and with no cache the source is none, never bishop at 0%" {
+    jq -nc '{five_hour:{used_pct:10,resets_at:9999999999},seven_day:null}' > "$MOTHER_BISHOP_POSTURE_FILE"
+    [ "$(_qf .source)" = "none" ]
+    [ "$(_qf .stale)" = "true" ]
+}
+
+@test "feed: a missing window makes Bishop unusable (falls to the cache)" {
+    jq -nc '{five_hour:{used_pct:99,resets_at:9999999999}}' > "$MOTHER_BISHOP_POSTURE_FILE"
+    _cache 5 6
+    [ "$(_qf .source)" = "cache" ]
+}
+
+@test "feed: a null used_pct is unusable, not 0%" {
+    jq -nc '{five_hour:{used_pct:null,resets_at:9999999999},seven_day:{used_pct:10,resets_at:9999999999}}' > "$MOTHER_BISHOP_POSTURE_FILE"
+    [ "$(_qf .source)" = "none" ]
+}
+
+@test "epochs: a float until in the past flips off_until_reset to on" {
+    _bishop 100 100
+    _gate_file off_until_reset "$(( $(_now) - 100 )).5"
+    run _lib _quota_check
+    [ "$status" -eq 1 ]
+    [ "$(_qf .gate)" = "on" ]
+    [ "$(jq -r .state "$GATE_FILE")" = "on" ]
+}
+
+@test "epochs: a float resets_at is truncated in the status and the stored until" {
+    local r=$(( $(_now) + 3600 ))
+    _bishop 10 10 "$r.75" "$(( r + 1000 )).25"
+    mother quota off-until-reset >/dev/null 2>&1
+    [ "$(jq -r .until "$GATE_FILE")" = "$r" ]
+    [ "$(_qf .windows.five_hour.resets_at)" = "$r" ]
+}
+
+@test "cas: two concurrent evaluators of an expired off_until_reset write exactly one audit line" {
+    _bishop 10 10
+    _gate_file off_until_reset "$(( $(_now) - 5 ))"
+    ( _lib _quota_gate_open ) & local a=$!
+    ( _lib _quota_gate_open ) & local b=$!
+    wait "$a" || true; wait "$b" || true
+    [ "$(_audit_lines)" = "1" ]
+    [ "$(jq -r .state "$GATE_FILE")" = "on" ]
+}
+
+@test "cas: an expired auto flip never overwrites an explicit 'off' that landed first" {
+    _bishop 100 100
+    _gate_file off_until_reset "$(( $(_now) - 5 ))"
+    # The evaluator has read the expired state; an operator then says off.
+    run _lib 'cur=$(_quota_gate_read); mother quota off >/dev/null 2>&1; _quota_gate_set on auto:reset off_until_reset >/dev/null'
+    [ "$(jq -r .state "$GATE_FILE")" = "off" ]
+    [ "$(jq -r .changed_by "$GATE_FILE")" = "cli" ]
+}
+
+@test "re-issue: off-until-reset with a stale stored until takes the new earliest future reset" {
+    local r=$(( $(_now) + 3600 ))
+    _bishop 10 10 "$r" "$(( r + 5000 ))"
+    _gate_file off_until_reset "$(( $(_now) - 50 ))"
+    run mother quota off-until-reset
+    [ "$status" -eq 0 ]
+    [[ "$output" != *already* ]]
+    [ "$(jq -r .until "$GATE_FILE")" = "$r" ]
+}
+
+@test "re-issue: off-until-reset with a stale until and no known future reset becomes off and says so" {
+    _bishop 10 10 1 1
+    _gate_file off_until_reset "$(( $(_now) - 50 ))"
+    run mother quota off-until-reset
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"plain off"* ]]
+    [ "$(jq -r .state "$GATE_FILE")" = "off" ]
+}
+
+@test "re-issue: off-until-reset refreshes a still-future until to the earlier new reset" {
+    local r=$(( $(_now) + 3600 ))
+    _bishop 10 10 "$r" "$(( r + 5000 ))"
+    _gate_file off_until_reset "$(( r + 5000 ))"
+    run mother quota off-until-reset
+    [ "$(jq -r .until "$GATE_FILE")" = "$r" ]
+}
+
+@test "cap: MOTHER_QUOTA_CAP_5H_PCT=90% is read as 90, not a crash" {
+    _bishop 95 10
+    MOTHER_QUOTA_CAP_5H_PCT='90%' run mother quota status --json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r .windows.five_hour.cap_pct)" = "90" ]
+    [ "$(echo "$output" | jq -r .cap_invalid)" = "false" ]
+    MOTHER_QUOTA_CAP_5H_PCT='90%' run _lib _quota_check
+    [ "$status" -eq 1 ]
+}
+
+@test "cap: a non-numeric cap falls back to 90 and is flagged cap_invalid" {
+    _bishop 95 10
+    MOTHER_QUOTA_CAP_7D_PCT='lots' run mother quota status --json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r .windows.seven_day.cap_pct)" = "90" ]
+    [ "$(echo "$output" | jq -r .cap_invalid)" = "true" ]
+    MOTHER_QUOTA_CAP_5H_PCT='lots' run _lib _quota_check
+    [ "$status" -eq 1 ]   # 95 >= default 90
+}
+
+@test "ack: a job id other than 'quota' is not the quota special case" {
+    _lib mother_attention_write    # no feed -> stale marker exists
+    run mother ack some-job quota_feed_stale
+    [ "$status" -ne 0 ]
+    [ ! -e "$MOTHER_ROOT/acks/_quota.json" ]
+}
+
+@test "fixture: _doc says feed_age_s is null without a usable feed file, and the block has cap_invalid" {
+    run jq -e '(._doc | test("no usable feed file")) and (.quota_block.cap_invalid == false) and (._doc | test("cap_invalid"))' "$FIXTURE"
+    [ "$status" -eq 0 ]
+}

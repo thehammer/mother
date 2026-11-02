@@ -1,5 +1,5 @@
 {
-  "_doc": "Golden fixture for the quota gate wire shape. Nostromo decodes exactly this; keep it stable (additive changes only). quota_block is the `quota` key of every broker subscribe snapshot (data: {sub, jobs, quota}) and of the quota-gate ack; it is the output of `mother quota status --json`. gate: on|off|off_until_reset. until: epoch seconds, set only while gate is off_until_reset (else null). changed_at/changed_by: when/who last changed the switch (null if never; changed_by is cli, broker:<origin> or auto:reset). source: bishop|cache|none (none = no fresh feed). feed_age_s: age of the feed file by mtime (null if no feed file). stale: true when source is none (the gate lets work through and the daemon raises the quota_feed_stale attention item). windows.*.used_pct is 0 for an expired window; resets_at is epoch seconds or null. quota-gate command: data {state: on|off|off_until_reset, origin?}; ok ack data {ok:true, state, quota}; unknown state -> ok:false error.code malformed.",
+  "_doc": "Golden fixture for the quota gate wire shape. Nostromo decodes exactly this; keep it stable (additive changes only). quota_block is the `quota` key of every broker subscribe snapshot (data: {sub, jobs, quota}) and of the quota-gate ack; it is the output of `mother quota status --json`. gate: on|off|off_until_reset. until: epoch seconds, set only while gate is off_until_reset (else null). changed_at/changed_by: when/who last changed the switch (null if never; changed_by is cli, broker:<origin> or auto:reset). source: bishop|cache|none (none = no fresh feed). feed_age_s: age of the feed file by mtime (null when there is no usable feed file: missing or unparseable). cap_invalid: true when a configured cap was not numeric and the default 90 is in use. stale: true when source is none (the gate lets work through and the daemon raises the quota_feed_stale attention item). windows.*.used_pct is 0 for an expired window; resets_at is epoch seconds or null. quota-gate command: data {state: on|off|off_until_reset, origin?}; ok ack data {ok:true, state, quota}; unknown state -> ok:false error.code malformed.",
   "quota_block": {
     "gate": "off_until_reset",
     "until": 1793658600,
@@ -8,6 +8,7 @@
     "source": "bishop",
     "feed_age_s": 42,
     "stale": false,
+    "cap_invalid": false,
     "windows": {
       "five_hour": {"used_pct": 23.0, "cap_pct": 90, "resets_at": 1793658600},
       "seven_day": {"used_pct": 100.0, "cap_pct": 90, "resets_at": 1793930400}

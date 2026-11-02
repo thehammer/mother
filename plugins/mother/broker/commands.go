@@ -9,11 +9,13 @@ package main
 // CLI exit/stderr is mapped to the closed B8 error enumeration.
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type commandRunner struct {
@@ -22,6 +24,8 @@ type commandRunner struct {
 	eventsDir string
 	extraEnv  []string // env to pass to the CLI (MOTHER_ROOT etc.)
 	acksDir   string   // $MOTHER_ROOT/acks — read-only, for attention_reasons
+
+	quotaTimeout time.Duration // bound on `quota status --json`; 0 = defaultQuotaTimeout
 }
 
 // cmdResult is what a handler returns: on success payload is the ack data
@@ -38,7 +42,13 @@ func fail(code, msg string) cmdResult     { return cmdResult{code: code, msg: ms
 // runCLI executes `mother <args...>` with optional stdin, returning stdout,
 // combined stderr, and the mapped error code ("" on success).
 func (c *commandRunner) runCLI(stdin string, args ...string) (string, string, string) {
-	cmd := exec.Command(c.cliPath, args...)
+	return c.runCLIContext(context.Background(), stdin, args...)
+}
+
+// runCLIContext is runCLI with a deadline/cancellation: a timed-out CLI is
+// killed and reported as a failure.
+func (c *commandRunner) runCLIContext(ctx context.Context, stdin string, args ...string) (string, string, string) {
+	cmd := exec.CommandContext(ctx, c.cliPath, args...)
 	cmd.Env = append(os.Environ(), c.extraEnv...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -46,6 +56,7 @@ func (c *commandRunner) runCLI(stdin string, args ...string) (string, string, st
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
+	cmd.WaitDelay = time.Second
 	err := cmd.Run()
 	stderr := errBuf.String()
 	if err != nil {
@@ -170,11 +181,21 @@ var quotaGateStates = map[string]string{
 	"off_until_reset": "off-until-reset",
 }
 
+// defaultQuotaTimeout bounds the `mother quota status --json` shell-out so a
+// hung CLI cannot block a subscribe or the quota watcher.
+const defaultQuotaTimeout = 5 * time.Second
+
 // quotaBlock returns `mother quota status --json` (the snapshot's `quota`
 // block, shape documented by tests/fixtures/quota_block.json), or nil when
 // the CLI cannot produce it.
 func (c *commandRunner) quotaBlock() json.RawMessage {
-	out, _, code := c.runCLI("", "quota", "status", "--json")
+	timeout := c.quotaTimeout
+	if timeout <= 0 {
+		timeout = defaultQuotaTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, _, code := c.runCLIContext(ctx, "", "quota", "status", "--json")
 	out = strings.TrimSpace(out)
 	if code != "" || !json.Valid([]byte(out)) {
 		return nil

@@ -1114,23 +1114,25 @@ EOF
 
 _auto_resume_check() {
     local now; now=$(date +%s)
-    local f state reason resume_at id merged
+    local f state reason resume_at id merged released=0
+    # An open gate (switch off, or off_until_reset still in force) releases every
+    # quota-parked job on this tick, as an elapsed auto_resume_at would.
+    _quota_gate_open && released=1
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
         [ "$state" = "awaiting" ] || continue
         reason=$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)
         case "$reason" in quota_*) ;; *) continue ;; esac
-        resume_at=$(jq -r '.auto_resume_at // 0' "$f" 2>/dev/null)
-        case "$resume_at" in ''|null) resume_at=0 ;; esac
-        # Strip fractional seconds defensively.
-        resume_at="${resume_at%.*}"
-        [ "$resume_at" -gt 0 ] || continue
-        [ "$now" -ge "$resume_at" ] || continue
-        # Only resume if quota is now actually under cap. The window may
-        # have reset on the clock but if we're already pushing the next
-        # window (back-to-back heavy use) we should keep waiting.
-        if ! _quota_check; then continue; fi
+        if [ "$released" -eq 0 ]; then
+            resume_at=$(_quota_int "$(jq -r '.auto_resume_at // 0' "$f" 2>/dev/null)")
+            [ "$resume_at" -gt 0 ] || continue
+            [ "$now" -ge "$resume_at" ] || continue
+            # Only resume if quota is now actually under cap. The window may
+            # have reset on the clock but if we're already pushing the next
+            # window (back-to-back heavy use) we should keep waiting.
+            if ! _quota_check; then continue; fi
+        fi
         id=$(jq -r '.id' "$f")
         _log "auto-resuming $id (paused_reason=$reason; resume window has passed)"
         merged=$(jq --arg ts "$(_iso_now)" '
@@ -1157,7 +1159,7 @@ _maybe_pause_running() {
     reason=$(_quota_offending_window)
     [ -n "$reason" ] || return 0
     resume_at=$(_quota_resume_at_for "$reason")
-    [ "${resume_at:-0}" -gt 0 ] || return 0
+    [ "$(_quota_int "${resume_at:-0}")" -gt 0 ] || return 0
 
     local f pid job_id job_file fr ar cr pr merged
     for f in "$CHILDREN_DIR"/*.json; do
@@ -1999,6 +2001,13 @@ case "${1:-}" in
         # starting the daemon loop. Used by low_disk_guard.bats.
         # Usage: mother-runner --dispatch-tick
         _dispatch_ready_jobs
+        exit 0
+        ;;
+    --auto-resume-tick)
+        # Test entry point: run one _auto_resume_check pass and exit without
+        # starting the daemon loop. Used by quota_gate.bats.
+        # Usage: mother-runner --auto-resume-tick
+        _auto_resume_check
         exit 0
         ;;
     --archive-tick)

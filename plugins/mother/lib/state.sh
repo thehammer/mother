@@ -302,16 +302,47 @@ _file_mtime() {
 _quota_normalize() {
     local f="$1" kind="$2"
     [ -r "$f" ] || return 0
+    # A window with no numeric usage (string, null, missing) makes the whole
+    # file unusable: it must fall through to the next source, never read as 0%.
     jq -c --arg kind "$kind" '
-        def num: if type == "number" then . else 0 end;
-        def win($k): (.[$k] // {}) as $w
-            | {used_pct: (($w.used_pct // $w.used_percentage // 0) | num),
-               resets_at: (($w.resets_at // 0) | num)};
+        def usage: (.used_pct // .used_percentage);
+        def okwin: type == "object" and ((usage | type) == "number");
+        def win($k): .[$k] as $w
+            | {used_pct: ($w | usage),
+               resets_at: ((($w.resets_at // 0) | if type == "number" then floor else 0 end))};
         if type != "object" then empty
         elif ($kind == "bishop" and .stale_input == true) then empty
-        elif ((.five_hour | type) != "object") and ((.seven_day | type) != "object") then empty
+        elif ((.five_hour | okwin) and (.seven_day | okwin)) | not then empty
         else {five_hour: win("five_hour"), seven_day: win("seven_day")} end
     ' "$f" 2>/dev/null
+}
+
+# _quota_int <value> [default]: truncate a possibly fractional epoch/percent to
+# an integer; anything that is not a plain non-negative number becomes <default> (0).
+_quota_int() {
+    local v="${1:-}"
+    v="${v%.*}"
+    case "$v" in ''|*[!0-9]*) v="${2:-0}" ;; esac
+    echo "$v"
+}
+
+# _quota_cap <5h|7d>: the configured cap as an integer percent. A trailing `%`
+# is stripped; a non-numeric value falls back to 90 (see _quota_cap_invalid).
+_quota_cap() {
+    local v
+    case "$1" in 5h) v="$MOTHER_QUOTA_CAP_5H_PCT" ;; *) v="$MOTHER_QUOTA_CAP_7D_PCT" ;; esac
+    v="${v%\%}"
+    _quota_int "$v" 90
+}
+
+# _quota_cap_invalid: prints true when either configured cap is not numeric.
+_quota_cap_invalid() {
+    local v w bad=false
+    for w in "$MOTHER_QUOTA_CAP_5H_PCT" "$MOTHER_QUOTA_CAP_7D_PCT"; do
+        v="${w%\%}"
+        case "$v" in ''|*[!0-9.]*|.|*.*.*) bad=true ;; esac
+    done
+    echo "$bad"
 }
 
 # _quota_feed_json: one JSON object describing the feed the gate uses:
@@ -346,9 +377,7 @@ _quota_feed_json() {
 _quota_pct_for_window() {
     local pct
     pct=$(_quota_feed_json | jq -r --arg f "$1" '.[$f].used_pct // 0' 2>/dev/null)
-    pct="${pct%.*}"
-    case "$pct" in ''|null|-*) pct=0 ;; esac
-    echo "$pct"
+    _quota_int "$pct"
 }
 
 # _quota_gate_read: print the switch as {state, changed_at, changed_by, until}.
@@ -359,7 +388,7 @@ _quota_gate_read() {
     [ -r "$f" ] && out=$(jq -c '
         if (type == "object") and (.state == "off" or .state == "off_until_reset")
         then {state, changed_at: (.changed_at // null), changed_by: (.changed_by // null),
-              until: (if .state == "off_until_reset" and (.until | type) == "number" then .until else null end)}
+              until: (if .state == "off_until_reset" and (.until | type) == "number" then (.until | floor) else null end)}
         elif (type == "object") and .state == "on"
         then {state: "on", changed_at: (.changed_at // null), changed_by: (.changed_by // null), until: null}
         else empty end' "$f" 2>/dev/null)
@@ -373,36 +402,59 @@ _quota_gate_write_locked() {
     _atomic_write "$f" "$content"
 }
 
-# _quota_gate_set <on|off|off_until_reset> <changed_by>: THE writer of the
-# switch. Prints a one-line human result on stdout; returns 1 on a bad state.
-# Same-state calls change nothing (no rewrite, no audit line). off_until_reset
-# stores the earliest future resets_at of the two windows; with none known it
-# stores `off` and says so.
+# _quota_gate_set <on|off|off_until_reset> <changed_by> [expect_state [expect_until]]:
+# THE writer of the switch. Prints a one-line human result on stdout; returns 1
+# on a bad state. The read, the comparison and the write all happen inside one
+# lock, so concurrent callers cannot both apply the same change. Same-state
+# calls change nothing (no rewrite, no audit line), except off_until_reset,
+# which refreshes `until` to the earliest future reset. off_until_reset stores
+# that reset; with none known it stores `off` and says so, unless the stored
+# `until` is still in the future (then it is kept). With expect_state set (the
+# automatic expiry flip) nothing is written unless the switch is still exactly
+# in that state (and, when given, has that `until`).
 _quota_gate_set() {
-    local want="$1" by="${2:-cli}"
+    local want="$1" by="${2:-cli}" ex_state="${3:-}" ex_until="${4:-}"
     case "$want" in on|off|off_until_reset) ;; *) echo "quota: unknown state: $want (expected on, off or off_until_reset)" >&2; return 1 ;; esac
-    local cur from now until="null" note=""
-    cur=$(_quota_gate_read)
-    from=$(printf '%s' "$cur" | jq -r '.state')
+    local until="null" now
     now=$(date +%s)
     if [ "$want" = off_until_reset ]; then
         until=$(_quota_feed_json | jq -r --argjson now "$now" '
             [.five_hour.resets_at, .seven_day.resets_at | select(. > $now)] | min // "null"')
-        if [ "$until" = "null" ]; then
-            want=off
-            note=" (no window reset time is known, so this is plain off; use \`mother quota on\` to re-enable)"
+    fi
+    _with_lock "$(_quota_gate_file)" _quota_gate_set_locked "$want" "$by" "$until" "$now" "$ex_state" "$ex_until"
+}
+
+_quota_gate_set_locked() {
+    local want="$1" by="$2" until="$3" now="$4" ex_state="$5" ex_until="$6"
+    local cur from cur_until note=""
+    cur=$(_quota_gate_read)
+    from=$(printf '%s' "$cur" | jq -r '.state')
+    cur_until=$(printf '%s' "$cur" | jq -r '.until // "null"')
+    if [ -n "$ex_state" ]; then
+        if [ "$from" != "$ex_state" ] || { [ -n "$ex_until" ] && [ "$cur_until" != "$ex_until" ]; }; then
+            echo "quota gate unchanged ($from)"
+            return 0
         fi
     fi
-    if [ "$from" = "$want" ]; then
+    if [ "$want" = off_until_reset ] && [ "$until" = "null" ]; then
+        if [ "$from" = off_until_reset ] && [ "$(_quota_int "$cur_until")" -gt "$now" ]; then
+            echo "quota gate already off_until_reset"
+            return 0
+        fi
+        want=off
+        note=" (no window reset time is known, so this is plain off; use \`mother quota on\` to re-enable)"
+    fi
+    if [ "$from" = "$want" ] && { [ "$want" != off_until_reset ] || [ "$cur_until" = "$until" ]; }; then
         echo "quota gate already $want"
         return 0
     fi
+    [ "$want" = off_until_reset ] || until="null"
     local iso; iso=$(_iso_now 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
     local content
     content=$(jq -nc --arg s "$want" --arg at "$iso" --arg by "$by" --argjson until "$until" \
         '{state: $s, changed_at: $at, changed_by: $by}
          + (if $s == "off_until_reset" then {until: $until} else {} end)')
-    _with_lock "$(_quota_gate_file)" _quota_gate_write_locked "$(_quota_gate_file)" "$content" || return 1
+    _quota_gate_write_locked "$(_quota_gate_file)" "$content" || return 1
     jq -nc --arg at "$iso" --arg by "$by" --arg from "$from" --arg to "$want" --argjson until "$until" \
         '{ts: $at, changed_by: $by, from: $from, to: $to, until: $until}' >> "$(_quota_audit_file)"
     echo "mother: quota gate $from -> $want (by $by)" >&2
@@ -419,10 +471,10 @@ _quota_gate_open() {
     case "$st" in
         off) return 0 ;;
         off_until_reset)
-            until=$(printf '%s' "$cur" | jq -r '.until // 0')
+            until=$(_quota_int "$(printf '%s' "$cur" | jq -r '.until // 0')")
             now=$(date +%s)
-            if [ "$now" -ge "${until:-0}" ]; then
-                _quota_gate_set on "auto:reset" >/dev/null || true
+            if [ "$now" -ge "$until" ]; then
+                _quota_gate_set on "auto:reset" off_until_reset "$until" >/dev/null || true
                 return 1
             fi
             return 0 ;;
@@ -438,8 +490,8 @@ _quota_check() {
     local p5 p7
     p5=$(_quota_pct_for_window five_hour)
     p7=$(_quota_pct_for_window seven_day)
-    if [ "$p5" -ge "$MOTHER_QUOTA_CAP_5H_PCT" ] \
-        || [ "$p7" -ge "$MOTHER_QUOTA_CAP_7D_PCT" ]; then
+    if [ "$p5" -ge "$(_quota_cap 5h)" ] \
+        || [ "$p7" -ge "$(_quota_cap 7d)" ]; then
         return 1
     fi
     return 0
@@ -452,8 +504,8 @@ _quota_offending_window() {
     local p5 p7
     p5=$(_quota_pct_for_window five_hour)
     p7=$(_quota_pct_for_window seven_day)
-    if [ "$p5" -ge "$MOTHER_QUOTA_CAP_5H_PCT" ]; then echo "quota_5h"; return; fi
-    if [ "$p7" -ge "$MOTHER_QUOTA_CAP_7D_PCT" ]; then echo "quota_7d"; return; fi
+    if [ "$p5" -ge "$(_quota_cap 5h)" ]; then echo "quota_5h"; return; fi
+    if [ "$p7" -ge "$(_quota_cap 7d)" ]; then echo "quota_7d"; return; fi
     echo ""
 }
 
@@ -462,19 +514,19 @@ _quota_offending_window() {
 _quota_resume_at_for() {
     local w
     case "$1" in quota_5h) w=five_hour ;; quota_7d) w=seven_day ;; *) echo 0; return ;; esac
-    _quota_feed_json | jq -r --arg w "$w" '.[$w].resets_at // 0' 2>/dev/null || echo 0
+    _quota_int "$(_quota_feed_json | jq -r --arg w "$w" '.[$w].resets_at // 0' 2>/dev/null)"
 }
 
 # _quota_status_json: the object `mother quota status --json` prints and the
 # broker snapshot carries (docs: tests/fixtures/quota_block.json).
 _quota_status_json() {
-    local feed gate
+    local feed gate c5 c7 bad
     feed=$(_quota_feed_json)
     gate=$(_quota_gate_read)
-    jq -nc --argjson f "$feed" --argjson g "$gate" \
-        --argjson c5 "$MOTHER_QUOTA_CAP_5H_PCT" --argjson c7 "$MOTHER_QUOTA_CAP_7D_PCT" '
+    c5=$(_quota_cap 5h); c7=$(_quota_cap 7d); bad=$(_quota_cap_invalid)
+    jq -nc --argjson f "$feed" --argjson g "$gate" --argjson c5 "$c5" --argjson c7 "$c7" --argjson bad "$bad" '
         {gate: $g.state, until: $g.until, changed_at: $g.changed_at, changed_by: $g.changed_by,
-         source: $f.source, feed_age_s: $f.feed_age_s, stale: $f.stale,
+         source: $f.source, feed_age_s: $f.feed_age_s, stale: $f.stale, cap_invalid: $bad,
          windows: {five_hour: {used_pct: $f.five_hour.used_pct, cap_pct: $c5, resets_at: ($f.five_hour.resets_at | if . > 0 then . else null end)},
                    seven_day: {used_pct: $f.seven_day.used_pct, cap_pct: $c7, resets_at: ($f.seven_day.resets_at | if . > 0 then . else null end)}}}'
 }
