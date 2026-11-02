@@ -364,8 +364,17 @@ hang off it once enabled:
   blocking window has reset and the cache shows quota is genuinely under
   cap.
 
-Enable by adding one line to your statusline that ingests the rate-limit
-data from Claude Code's per-render JSON payload:
+**Feed.** The gate reads Bishop's `~/.claude/budget-posture.json` first and
+falls back to the statusline cache (below) only when Bishop's file is missing,
+unparseable or marked `stale_input`. If neither is fresh (30 minutes by mtime)
+the gate lets work through and Mother raises a `quota_feed_stale` attention
+item. **Switch:** `mother quota status|on|off|off-until-reset` (state in
+`$MOTHER_ROOT/quota-gate.json`; `off-until-reset` passes until the first 5h/7d
+reset).
+
+The statusline cache is the fallback source. To feed it, add one line to your
+statusline that ingests the rate-limit data from Claude Code's per-render JSON
+payload:
 
 ```bash
 # in your statusline.sh, after `input=$(cat)` (or wherever you read stdin):
@@ -373,9 +382,8 @@ source "$HOME/Code/mother/plugins/mother/statusline/segment.sh"
 mother_capture_rate_limits "$input"
 ```
 
-Without this line, `mother_capture_rate_limits` doesn't run, the cache
-stays unwritten, the daemon's quota check returns "no signal → no gate,"
-and Mother behaves the same as it did before quota awareness shipped.
+Without Bishop or this line there is no fresh feed: the quota check returns
+"no signal → no gate" and `quota_feed_stale` is raised.
 
 The cache is only fresh while a Claude Code session is rendering its
 statusline. Smart-staleness handling: if a window's `resets_at` has
@@ -426,7 +434,9 @@ Defaults preserve current behavior — every variable is optional.
 | `MOTHER_CARGO_TARGET_IDLE_MINUTES` | `10` | A worktree `target/` with anything modified within this many minutes is kept |
 | `MOTHER_CARGO_TARGET_PURGE_EXCLUDE` | (empty) | Job `repo` names (space or comma separated) whose worktree `target/` dirs are never purged |
 | `MOTHER_RECONCILE_ENABLED` | `1` | Let the daemon try `mother reconcile --auto` on a failed job before escalating it |
-| `MOTHER_RATE_LIMIT_CACHE` | `$MOTHER_ROOT/rate-limits.json` | Where the statusline writes 5h/7d quota state |
+| `MOTHER_BISHOP_POSTURE_FILE` | `~/.claude/budget-posture.json` | Primary quota feed (Bishop) |
+| `MOTHER_QUOTA_FEED_MAX_AGE_S` | `1800` | A feed file older than this (mtime) is stale |
+| `MOTHER_RATE_LIMIT_CACHE` | `$MOTHER_ROOT/rate-limits.json` | Fallback: where the statusline writes 5h/7d quota state |
 | `MOTHER_QUOTA_CAP_5H_PCT` | `90` | Refuse new dispatches when the 5h window is at or over this percentage |
 | `MOTHER_QUOTA_CAP_7D_PCT` | `90` | Same for the 7d window |
 

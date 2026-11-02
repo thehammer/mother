@@ -163,6 +163,62 @@ func (c *commandRunner) ack(job, reason, source string) cmdResult {
 	return ok(map[string]any{"job": job, "reason": reason})
 }
 
+// quotaGateStates maps the wire states to the `mother quota` subcommands.
+var quotaGateStates = map[string]string{
+	"on":              "on",
+	"off":             "off",
+	"off_until_reset": "off-until-reset",
+}
+
+// quotaBlock returns `mother quota status --json` (the snapshot's `quota`
+// block, shape documented by tests/fixtures/quota_block.json), or nil when
+// the CLI cannot produce it.
+func (c *commandRunner) quotaBlock() json.RawMessage {
+	out, _, code := c.runCLI("", "quota", "status", "--json")
+	out = strings.TrimSpace(out)
+	if code != "" || !json.Valid([]byte(out)) {
+		return nil
+	}
+	return json.RawMessage(out)
+}
+
+// quotaGate routes to `mother quota <state> --source broker:<origin>`. The CLI
+// is the single writer and audits the change (who, from, to, when); setting
+// the current state again is a no-op that still replies ok.
+func (c *commandRunner) quotaGate(state, origin string) cmdResult {
+	sub, known := quotaGateStates[state]
+	if !known {
+		return fail(ErrMalformed, "quota-gate: state must be one of on, off, off_until_reset")
+	}
+	origin = sanitizeOrigin(origin)
+	_, stderr, code := c.runCLI("", "quota", sub, "--source", "broker:"+origin)
+	if code != "" {
+		return fail(code, strings.TrimSpace(stderr))
+	}
+	payload := map[string]any{"state": state}
+	if q := c.quotaBlock(); q != nil {
+		payload["quota"] = q
+	}
+	return ok(payload)
+}
+
+// sanitizeOrigin keeps an audit "who" to a short, printable token.
+func sanitizeOrigin(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		}
+		if b.Len() >= 64 {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return "client"
+	}
+	return b.String()
+}
+
 // queryList serves the `mother list --format json` equivalent from memory.
 func (c *commandRunner) queryList(f listFilter) cmdResult {
 	c.store.pruneMissing()

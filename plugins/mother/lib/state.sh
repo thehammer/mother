@@ -260,54 +260,181 @@ mother_compose_project() {
 
 # ---------- quota awareness ----------
 #
-# Claude Code's statusline payload exposes the user's rolling 5h/7d quota
-# usage with reset epochs. Outside an interactive Claude Code session that
-# data is unreachable directly — but the user's statusline can dump the
-# `rate_limits` slice to a cache file (see plugins/mother/statusline/segment.sh
-# `mother_capture_rate_limits`), and the daemon reads that cache here.
-#
-# Cache schema (the `rate_limits` object as Claude Code emits it):
-#   { "five_hour": {"used_percentage": N, "resets_at": <epoch>},
-#     "seven_day": {"used_percentage": N, "resets_at": <epoch>} }
+# The gate reads the user's rolling 5h/7d quota usage from, in order:
+#   1. Bishop's budget-posture file (MOTHER_BISHOP_POSTURE_FILE, default
+#      ~/.claude/budget-posture.json, refreshed about every 60s). Per window
+#      `used_pct` (or `used_percentage`) and `resets_at`; unusable when missing,
+#      unparseable, or `stale_input: true`.
+#   2. The old statusline cache (MOTHER_RATE_LIMIT_CACHE), written only while an
+#      interactive Claude Code session renders (statusline/segment.sh
+#      `mother_capture_rate_limits`):
+#        { "five_hour": {"used_percentage": N, "resets_at": <epoch>},
+#          "seven_day": {"used_percentage": N, "resets_at": <epoch>} }
+# A source is only used while its file mtime is within MOTHER_QUOTA_FEED_MAX_AGE_S
+# (default 1800). With no fresh source the source is `none`: the gate does not
+# block on a dead feed, but the daemon raises the `quota_feed_stale` attention
+# item (lib/attention.sh) so that is never silent.
 #
 # Caps are operator-tunable percentages. Default 90% means "Mother stops
-# dispatching when either window reaches 90% of the quota." Set lower to
-# leave more headroom for interactive use.
+# dispatching when either window reaches 90% of the quota."
+#
+# A three-state switch (on | off | off_until_reset) lives in
+# $MOTHER_ROOT/quota-gate.json. `_quota_gate_set` is its only writer; the CLI
+# (`mother quota`) and the broker's `quota-gate` command both call it.
 
 : "${MOTHER_RATE_LIMIT_CACHE:=$MOTHER_ROOT/rate-limits.json}"
+: "${MOTHER_BISHOP_POSTURE_FILE:=${HOME:-}/.claude/budget-posture.json}"
 : "${MOTHER_QUOTA_CAP_5H_PCT:=90}"
 : "${MOTHER_QUOTA_CAP_7D_PCT:=90}"
+: "${MOTHER_QUOTA_FEED_MAX_AGE_S:=1800}"
 
-# _quota_pct_for_window: stdout the effective used_percentage for a given
-# window name ("five_hour" or "seven_day"). Smart staleness: if the
-# window's resets_at is in the past, the window has rolled over since the
-# cache was written, so we treat its percentage as 0 (in our favor).
-# Returns 0 (silently) if the cache is missing/empty/malformed — no signal
-# means no gating.
+_quota_gate_file() { echo "$MOTHER_ROOT/quota-gate.json"; }
+_quota_audit_file() { echo "$MOTHER_ROOT/quota-gate-audit.jsonl"; }
+
+# _file_mtime <file>: epoch mtime (BSD or GNU stat); 0 when unreadable.
+_file_mtime() {
+    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+# _quota_normalize <file> <bishop|cache>: print the normalized windows as
+# {five_hour:{used_pct,resets_at}, seven_day:{...}} when the file is usable,
+# nothing otherwise.
+_quota_normalize() {
+    local f="$1" kind="$2"
+    [ -r "$f" ] || return 0
+    jq -c --arg kind "$kind" '
+        def num: if type == "number" then . else 0 end;
+        def win($k): (.[$k] // {}) as $w
+            | {used_pct: (($w.used_pct // $w.used_percentage // 0) | num),
+               resets_at: (($w.resets_at // 0) | num)};
+        if type != "object" then empty
+        elif ($kind == "bishop" and .stale_input == true) then empty
+        elif ((.five_hour | type) != "object") and ((.seven_day | type) != "object") then empty
+        else {five_hour: win("five_hour"), seven_day: win("seven_day")} end
+    ' "$f" 2>/dev/null
+}
+
+# _quota_feed_json: one JSON object describing the feed the gate uses:
+#   {source: bishop|cache|none, feed_age_s: N|null, stale: bool,
+#    five_hour: {used_pct, resets_at}, seven_day: {...}}
+# Expired windows (resets_at in the past) are reported at 0%.
+_quota_feed_json() {
+    local now; now=$(date +%s)
+    local max="$MOTHER_QUOTA_FEED_MAX_AGE_S"
+    local src="none" age="" win="" best_age="" f kind m a w
+    for kind in bishop cache; do
+        if [ "$kind" = bishop ]; then f="$MOTHER_BISHOP_POSTURE_FILE"; else f="$MOTHER_RATE_LIMIT_CACHE"; fi
+        [ -r "$f" ] || continue
+        m=$(_file_mtime "$f"); a=$((now - m)); [ "$a" -lt 0 ] && a=0
+        w=$(_quota_normalize "$f" "$kind")
+        [ -n "$w" ] || continue
+        if [ -z "$best_age" ] || [ "$a" -lt "$best_age" ]; then best_age="$a"; fi
+        if [ "$a" -le "$max" ]; then src="$kind"; age="$a"; win="$w"; break; fi
+    done
+    [ -n "$win" ] || win='{"five_hour":{"used_pct":0,"resets_at":0},"seven_day":{"used_pct":0,"resets_at":0}}'
+    [ -n "$age" ] || age="$best_age"
+    printf '%s' "$win" | jq -c --arg src "$src" --arg age "$age" --argjson now "$now" '
+        def eff: if .resets_at > 0 and $now > .resets_at then .used_pct = 0 else . end;
+        {source: $src, feed_age_s: (if $age == "" then null else ($age | tonumber) end),
+         stale: ($src == "none"),
+         five_hour: (.five_hour | eff), seven_day: (.seven_day | eff)}'
+}
+
+# _quota_pct_for_window: stdout the effective integer used percentage for
+# "five_hour" or "seven_day". 0 when there is no fresh feed (no signal means
+# no gating) or the window has already reset.
 _quota_pct_for_window() {
-    local field="$1"
-    local cache="$MOTHER_RATE_LIMIT_CACHE"
-    [ -r "$cache" ] || { echo 0; return; }
-    local rl; rl=$(cat "$cache" 2>/dev/null)
-    [ -n "$rl" ] || { echo 0; return; }
-    local pct reset now
-    pct=$(printf '%s' "$rl" | jq -r --arg f "$field" '.[$f].used_percentage // 0' 2>/dev/null || echo 0)
-    reset=$(printf '%s' "$rl" | jq -r --arg f "$field" '.[$f].resets_at // 0' 2>/dev/null || echo 0)
-    now=$(date +%s)
-    # Strip fractional seconds defensively; bash arithmetic only handles ints.
+    local pct
+    pct=$(_quota_feed_json | jq -r --arg f "$1" '.[$f].used_pct // 0' 2>/dev/null)
     pct="${pct%.*}"
-    case "$pct" in ''|null) pct=0 ;; esac
-    case "$reset" in ''|null) reset=0 ;; esac
-    if [ "$reset" -gt 0 ] && [ "$now" -gt "$reset" ]; then
-        echo 0
-    else
-        echo "$pct"
+    case "$pct" in ''|null|-*) pct=0 ;; esac
+    echo "$pct"
+}
+
+# _quota_gate_read: print the switch as {state, changed_at, changed_by, until}.
+# A missing, unreadable or corrupt file (or unknown state) means `on`.
+_quota_gate_read() {
+    local f; f=$(_quota_gate_file)
+    local out=""
+    [ -r "$f" ] && out=$(jq -c '
+        if (type == "object") and (.state == "off" or .state == "off_until_reset")
+        then {state, changed_at: (.changed_at // null), changed_by: (.changed_by // null),
+              until: (if .state == "off_until_reset" and (.until | type) == "number" then .until else null end)}
+        elif (type == "object") and .state == "on"
+        then {state: "on", changed_at: (.changed_at // null), changed_by: (.changed_by // null), until: null}
+        else empty end' "$f" 2>/dev/null)
+    [ -n "$out" ] || out='{"state":"on","changed_at":null,"changed_by":null,"until":null}'
+    printf '%s' "$out"
+}
+
+_quota_gate_write_locked() {
+    local f="$1" content="$2"
+    mkdir -p "$MOTHER_ROOT"
+    _atomic_write "$f" "$content"
+}
+
+# _quota_gate_set <on|off|off_until_reset> <changed_by>: THE writer of the
+# switch. Prints a one-line human result on stdout; returns 1 on a bad state.
+# Same-state calls change nothing (no rewrite, no audit line). off_until_reset
+# stores the earliest future resets_at of the two windows; with none known it
+# stores `off` and says so.
+_quota_gate_set() {
+    local want="$1" by="${2:-cli}"
+    case "$want" in on|off|off_until_reset) ;; *) echo "quota: unknown state: $want (expected on, off or off_until_reset)" >&2; return 1 ;; esac
+    local cur from now until="null" note=""
+    cur=$(_quota_gate_read)
+    from=$(printf '%s' "$cur" | jq -r '.state')
+    now=$(date +%s)
+    if [ "$want" = off_until_reset ]; then
+        until=$(_quota_feed_json | jq -r --argjson now "$now" '
+            [.five_hour.resets_at, .seven_day.resets_at | select(. > $now)] | min // "null"')
+        if [ "$until" = "null" ]; then
+            want=off
+            note=" (no window reset time is known, so this is plain off; use \`mother quota on\` to re-enable)"
+        fi
     fi
+    if [ "$from" = "$want" ]; then
+        echo "quota gate already $want"
+        return 0
+    fi
+    local iso; iso=$(_iso_now 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    local content
+    content=$(jq -nc --arg s "$want" --arg at "$iso" --arg by "$by" --argjson until "$until" \
+        '{state: $s, changed_at: $at, changed_by: $by}
+         + (if $s == "off_until_reset" then {until: $until} else {} end)')
+    _with_lock "$(_quota_gate_file)" _quota_gate_write_locked "$(_quota_gate_file)" "$content" || return 1
+    jq -nc --arg at "$iso" --arg by "$by" --arg from "$from" --arg to "$want" --argjson until "$until" \
+        '{ts: $at, changed_by: $by, from: $from, to: $to, until: $until}' >> "$(_quota_audit_file)"
+    echo "mother: quota gate $from -> $want (by $by)" >&2
+    echo "quota gate $from -> $want$note"
+}
+
+# _quota_gate_open: returns 0 when the switch lets everything through (off, or
+# off_until_reset before its reset); flips an expired off_until_reset back to
+# `on` (logged and audited) and returns 1.
+_quota_gate_open() {
+    local cur st until now
+    cur=$(_quota_gate_read)
+    st=$(printf '%s' "$cur" | jq -r '.state')
+    case "$st" in
+        off) return 0 ;;
+        off_until_reset)
+            until=$(printf '%s' "$cur" | jq -r '.until // 0')
+            now=$(date +%s)
+            if [ "$now" -ge "${until:-0}" ]; then
+                _quota_gate_set on "auto:reset" >/dev/null || true
+                return 1
+            fi
+            return 0 ;;
+    esac
+    return 1
 }
 
 # _quota_check: returns 0 (under cap, dispatch OK) or 1 (at-or-over cap,
-# hold). Both windows are checked; either tripping is enough to gate.
+# hold). Both windows are checked; either tripping is enough to gate. Always
+# passes while the switch is off.
 _quota_check() {
+    _quota_gate_open && return 0
     local p5 p7
     p5=$(_quota_pct_for_window five_hour)
     p7=$(_quota_pct_for_window seven_day)
@@ -331,16 +458,25 @@ _quota_offending_window() {
 }
 
 # _quota_resume_at_for: stdout the resets_at epoch for a given window name
-# (`quota_5h` or `quota_7d`). 0 if the cache is missing.
+# (`quota_5h` or `quota_7d`). 0 when unknown.
 _quota_resume_at_for() {
-    local cache="$MOTHER_RATE_LIMIT_CACHE"
-    [ -r "$cache" ] || { echo 0; return; }
-    local rl; rl=$(cat "$cache" 2>/dev/null)
-    case "$1" in
-        quota_5h) printf '%s' "$rl" | jq -r '.five_hour.resets_at // 0' 2>/dev/null || echo 0 ;;
-        quota_7d) printf '%s' "$rl" | jq -r '.seven_day.resets_at // 0' 2>/dev/null || echo 0 ;;
-        *) echo 0 ;;
-    esac
+    local w
+    case "$1" in quota_5h) w=five_hour ;; quota_7d) w=seven_day ;; *) echo 0; return ;; esac
+    _quota_feed_json | jq -r --arg w "$w" '.[$w].resets_at // 0' 2>/dev/null || echo 0
+}
+
+# _quota_status_json: the object `mother quota status --json` prints and the
+# broker snapshot carries (docs: tests/fixtures/quota_block.json).
+_quota_status_json() {
+    local feed gate
+    feed=$(_quota_feed_json)
+    gate=$(_quota_gate_read)
+    jq -nc --argjson f "$feed" --argjson g "$gate" \
+        --argjson c5 "$MOTHER_QUOTA_CAP_5H_PCT" --argjson c7 "$MOTHER_QUOTA_CAP_7D_PCT" '
+        {gate: $g.state, until: $g.until, changed_at: $g.changed_at, changed_by: $g.changed_by,
+         source: $f.source, feed_age_s: $f.feed_age_s, stale: $f.stale,
+         windows: {five_hour: {used_pct: $f.five_hour.used_pct, cap_pct: $c5, resets_at: ($f.five_hour.resets_at | if . > 0 then . else null end)},
+                   seven_day: {used_pct: $f.seven_day.used_pct, cap_pct: $c7, resets_at: ($f.seven_day.resets_at | if . > 0 then . else null end)}}}'
 }
 
 # ---------- Bishop budget-posture helpers ----------

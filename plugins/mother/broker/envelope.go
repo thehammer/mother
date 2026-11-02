@@ -54,7 +54,8 @@ const (
 	CmdCancel      = "cancel"
 	CmdRetry       = "retry"
 	CmdForceStart  = "force-start"
-	CmdAck         = "ack" // acknowledge a raised attention reason (HC-03)
+	CmdAck         = "ack"        // acknowledge a raised attention reason (HC-03)
+	CmdQuotaGate   = "quota-gate" // set the quota gate switch: on | off | off_until_reset
 )
 
 // Output event sub-types (data.subtype on TypeOutput events). These mirror
@@ -96,7 +97,7 @@ var liveCategories = w1Categories
 // w1Commands is the set of commands this W1 broker accepts.
 var w1Commands = []string{
 	CmdSubscribe, CmdUnsubscribe, CmdQueryList, CmdQueryGet,
-	CmdAnswer, CmdCancel, CmdRetry, CmdForceStart, CmdAck,
+	CmdAnswer, CmdCancel, CmdRetry, CmdForceStart, CmdAck, CmdQuotaGate,
 }
 
 // w1Features are capability strings that are not commands or categories.

@@ -273,6 +273,41 @@ _attention_plugin_cache_items() {
     fi
 }
 
+# Quota feed health. `quota_feed_stale` is raised while neither Bishop's file nor
+# the statusline cache is fresh (`_quota_feed_json`, lib/state.sh): the gate then
+# cannot see usage and passes. The marker file keeps `since` stable across
+# refreshes; mother_attention_write (the daemon) is its only maintainer.
+# Acknowledged with `mother ack quota quota_feed_stale` (acks/_quota.json),
+# which applies only while the marker's `since` is unchanged.
+_quota_stale_marker() { echo "$MOTHER_ROOT/quota-feed-stale.json"; }
+
+_attention_quota_sync() {
+    type _quota_feed_json >/dev/null 2>&1 || return 0
+    local marker; marker=$(_quota_stale_marker)
+    if [ "$(_quota_feed_json | jq -r '.stale')" = "true" ]; then
+        [ -f "$marker" ] || _atomic_write "$marker" "$(jq -nc --arg s "$(_iso_now)" '{since: $s}')"
+    else
+        rm -f "$marker"
+    fi
+}
+
+_attention_quota_items() {
+    local marker; marker=$(_quota_stale_marker)
+    [ -f "$marker" ] || return 0
+    local since feed acked=false
+    since=$(jq -r '.since // ""' "$marker" 2>/dev/null)
+    if [ -f "$MOTHER_ROOT/acks/_quota.json" ] \
+        && [ "$(jq -r '.quota_feed_stale.since // ""' "$MOTHER_ROOT/acks/_quota.json" 2>/dev/null)" = "$since" ]; then
+        acked=true
+    fi
+    feed=$(_quota_feed_json)
+    jq -nc --argjson f "$feed" --arg since "$since" --argjson acked "$acked" '
+        {kind: "quota_feed_stale", job_id: "", repo: "", branch: "",
+         reason: "quota_feed_stale", since: $since,
+         detail: {acked: $acked, since: $since, feed_age_s: $f.feed_age_s},
+         hint: "neither Bishop (~/.claude/budget-posture.json) nor the statusline cache is fresh, so the quota gate cannot see usage and lets work through; check `mother quota status`"}'
+}
+
 # ---------- public ----------
 
 # mother_attention_items — print the needs-attention list as a JSON array.
@@ -285,6 +320,7 @@ mother_attention_items() {
       _attention_adherence_loop_items
       _attention_stash_items
       _attention_plugin_cache_items
+      _attention_quota_items
     } | jq -cs '.' 2>/dev/null || echo '[]'
 }
 
@@ -292,6 +328,7 @@ mother_attention_items() {
 # $MOTHER_ROOT/attention.json (always valid JSON; `[]` when nothing to report).
 mother_attention_write() {
     local items
+    _attention_quota_sync 2>/dev/null || true
     items=$(mother_attention_items)
     printf '%s' "$items" | jq -e 'type == "array"' >/dev/null 2>&1 || items='[]'
     _atomic_write "$MOTHER_ROOT/attention.json" "$items"
