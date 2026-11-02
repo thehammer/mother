@@ -423,8 +423,14 @@ _quota_with_lock() {
         elif [ "$age" -gt "${MOTHER_QUOTA_LOCK_STALE_S:-30}" ]; then stale=1; fi
         if [ "$stale" -eq 1 ]; then
             if mv "$lockdir" "$lockdir.stale.$$" 2>/dev/null; then
-                rm -f "$lockdir.stale.$$/owner"; rmdir "$lockdir.stale.$$" 2>/dev/null || true
-                echo "mother: took over a stale quota-gate lock (owner ${owner:-unknown})" >&2
+                # Another taker may have replaced the dir between our read and the
+                # rename: only discard it if it is still the one we judged stale.
+                if [ "$(cat "$lockdir.stale.$$/owner" 2>/dev/null)" = "$owner" ]; then
+                    rm -f "$lockdir.stale.$$/owner"; rmdir "$lockdir.stale.$$" 2>/dev/null || true
+                    echo "mother: took over a stale quota-gate lock (owner ${owner:-unknown})" >&2
+                else
+                    mv "$lockdir.stale.$$" "$lockdir" 2>/dev/null || true
+                fi
             fi
             tries=$((tries + 1))
             [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the quota-gate lock" >&2; return 1; }
