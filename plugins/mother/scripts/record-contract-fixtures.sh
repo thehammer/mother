@@ -58,6 +58,10 @@ unset MOTHER_ROOT MOTHER_LIVE_ROOT MOTHER_JOB_ID
 # Hermetic: no ambient identity may reach a recording (origin.session, worker ids, focus tags).
 unset MOTHER_ORIGIN_SESSION CLAUDE_SESSION_ID CLAUDE_AGENT_NAME MOTHER_ORIGIN_FOCUS MOTHER_ORIGIN_FOCUS_NAME \
       MOTHER_ORIGIN_PROJECT NOSTROMO_FOCUS_TAG NOSTROMO_PTY_ID
+# Pin the git identity too: an ambient GIT_AUTHOR_NAME (CI sets one) overrides the repo config and
+# changes every commit sha. These equal the values the scenario repos configure.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+export GIT_AUTHOR_NAME="Test" GIT_AUTHOR_EMAIL="test@example.com" GIT_COMMITTER_NAME="Test" GIT_COMMITTER_EMAIL="test@example.com"
 export GIT_AUTHOR_DATE="2026-10-01T00:00:00Z" GIT_COMMITTER_DATE="2026-10-01T00:00:00Z"
 
 # shellcheck source=/dev/null

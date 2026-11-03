@@ -350,6 +350,7 @@ seed_live_job() {
     local out="$BATS_TEST_TMPDIR/polluted"
     CLAUDE_SESSION_ID=polluted-claude-session MOTHER_ORIGIN_SESSION=polluted-origin-session \
         MOTHER_ORIGIN_FOCUS=polluted-focus NOSTROMO_FOCUS_TAG=polluted-tag \
+        GIT_AUTHOR_NAME=polluted GIT_AUTHOR_EMAIL=polluted@invalid GIT_COMMITTER_NAME=polluted \
         run "$PLUGIN/scripts/record-contract-fixtures.sh" --out "$out"
     [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
     local f
