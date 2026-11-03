@@ -5206,6 +5206,9 @@ Usage:
                                               (acknowledge a raised attention reason: progress_stalled,
                                               burn_ahead, gates_incomplete, decision_awaiting. Stays
                                               acked until the condition clears and returns. Operator-only)
+  mother quota status [--json]               (quota gate: state, feed source/age, per-window used %/cap/reset)
+  mother quota on|off|off-until-reset        (off passes everything; off-until-reset until the first 5h/7d reset)
+  mother ack quota quota_feed_stale          (acknowledge the stale quota feed item)
   mother force-start ID [--yes] [--ignore-deps]  (override quota cap; --ignore-deps also skips dependency gates)
   mother retry ID [--yes]
   mother escalate ID [--yes]                 (bump failed job to next model tier)
@@ -5441,9 +5444,14 @@ Worker prompt env vars:
   MOTHER_DEFAULT_MODEL    (default: sonnet)   fallback model when not set by plan
   MOTHER_DEFAULT_EFFORT   (default: medium)   fallback effort when not set by plan
 
-Quota gate env vars (require statusline integration — see segment.sh
-`mother_capture_rate_limits`):
-  MOTHER_RATE_LIMIT_CACHE  path the statusline writes rate_limits to
+Quota gate env vars (the gate reads Bishop's budget-posture file first, then
+the statusline cache; neither fresh = no gating plus a quota_feed_stale
+attention item; `mother quota` switches the gate on/off):
+  MOTHER_BISHOP_POSTURE_FILE  Bishop's file with per-window used_pct and
+                           resets_at (default: ~/.claude/budget-posture.json).
+  MOTHER_QUOTA_FEED_MAX_AGE_S  a feed older than this (file mtime) is stale
+                           (default: 1800).
+  MOTHER_RATE_LIMIT_CACHE  fallback path the statusline writes rate_limits to
                            (default: ~/.mother/rate-limits.json).
   MOTHER_QUOTA_CAP_5H_PCT  refuse new dispatches when 5h window is at
                            or over this percentage (default: 90).
@@ -5528,6 +5536,105 @@ _ack_write() {
         --arg at "$(_iso_now)" --arg src "$source" '.[$r] = {since: $s, at: $at, source: $src}')"
 }
 
+# ---------- quota gate ----------
+
+# _quota_fmt_time <epoch|null>: "Mon 2026-11-02 3:10 PM CST (2026-11-02 21:10 UTC)".
+_quota_fmt_time() {
+    local e="$1" c u
+    case "$e" in ''|null|0) echo "unknown"; return ;; esac
+    c=$(TZ=America/Chicago date -d "@$e" '+%a %Y-%m-%d %-I:%M %p %Z' 2>/dev/null \
+        || TZ=America/Chicago date -r "$e" '+%a %Y-%m-%d %-I:%M %p %Z' 2>/dev/null) || c="$e"
+    u=$(date -u -d "@$e" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || date -u -r "$e" '+%Y-%m-%d %H:%M UTC' 2>/dev/null) || u="$e"
+    echo "$c ($u)"
+}
+
+# _quota_in_worker: true when this process is inside a Mother job: MOTHER_JOB_ID
+# is set (even empty), or any ancestor's command line has a token whose basename
+# is `mother-run-job` (so `env -u MOTHER_JOB_ID mother quota off` is still caught).
+# Fails CLOSED: when `ps` cannot be run or its output cannot be parsed, the answer
+# is "yes" and _QUOTA_WORKER_WHY says why (callers print it). A plain terminal,
+# tmux pane or script has a readable chain up to pid 1 and passes.
+_QUOTA_WORKER_WHY=""
+_quota_in_worker() {
+    _QUOTA_WORKER_WHY="caller is inside a Mother job"
+    [ -z "${MOTHER_JOB_ID+x}" ] || return 0
+    local pid=$$ depth=0 line ppid tok
+    while [ "$depth" -lt 32 ] && [ "${pid:-0}" -gt 1 ]; do
+        line=$(ps -o ppid=,command= -p "$pid" 2>/dev/null) || { _QUOTA_WORKER_WHY="process ancestry unreadable (ps failed)"; return 0; }
+        [ -n "$line" ] || { _QUOTA_WORKER_WHY="process ancestry unreadable (ps gave no output)"; return 0; }
+        set -f; set -- $line; set +f
+        ppid="$1"; shift
+        case "$ppid" in ''|*[!0-9]*) _QUOTA_WORKER_WHY="process ancestry unreadable (unparseable ps output)"; return 0 ;; esac
+        for tok in "$@"; do
+            [ "${tok##*/}" = "mother-run-job" ] && return 0
+        done
+        pid="$ppid"; depth=$((depth + 1))
+    done
+    return 1
+}
+
+# _quota_refuse <requested> <reason> <source>: audit-log a refused switch change
+# (quota-gate-refusals.jsonl, separate from the change audit trail so that one
+# stays "who changed it, from, to") and exit non-zero.
+_quota_refuse() {
+    jq -nc --arg at "$(_iso_now)" --arg req "$1" --arg why "$2" --arg src "$3" \
+        '{ts: $at, requested: $req, reason: $why, source: $src}' >> "$MOTHER_ROOT/quota-gate-refusals.jsonl" 2>/dev/null || true
+    echo "mother: quota gate change to $1 refused: $2" >&2
+    _die "quota: refused: the quota gate is operator-controlled ($2)"
+}
+
+# mother quota status [--json] | on | off | off-until-reset [--source S]
+# The one CLI for the quota gate switch; the broker's `quota-gate` command
+# calls it too, so `_quota_gate_set` (lib/state.sh) stays the only writer.
+# --source is `cli` (default) or `broker:<token>` ([A-Za-z0-9._-]{1,64}); the
+# automatic `auto:*` writers call _quota_gate_set directly, never through here.
+cmd_quota() {
+    local sub="${1:-status}"; shift || true
+    local json=0 by="cli"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            --source) [ $# -ge 2 ] || _die "quota: --source needs a value"; by="$2"; shift 2 ;;
+            *) _die "quota: unexpected argument: $1" ;;
+        esac
+    done
+    case "$sub" in
+        status)
+            if [ "$json" -eq 1 ]; then _quota_status_json; return 0; fi
+            local st; st=$(_quota_status_json)
+            printf '%s' "$st" | jq -r '"gate:    " + .gate
+                + (if .changed_at then "  (since " + .changed_at + (if .changed_by then " by " + .changed_by else "" end) + ")" else "" end)
+                + "\nsource:  " + .source + (if .stale then "  (STALE: no fresh feed; the gate is not blocking anything)" else "" end)
+                + "\nfeed age: " + (if .feed_age_s == null then "n/a" else (.feed_age_s | tostring) + "s" end)'
+            local w reset until_e
+            for w in five_hour seven_day; do
+                reset=$(printf '%s' "$st" | jq -r --arg w "$w" '.windows[$w].resets_at')
+                printf '%-9s %s%% used / %s%% cap, resets %s\n' "$w:" \
+                    "$(printf '%s' "$st" | jq -r --arg w "$w" '.windows[$w].used_pct')" \
+                    "$(printf '%s' "$st" | jq -r --arg w "$w" '.windows[$w].cap_pct')" \
+                    "$(_quota_fmt_time "$reset")"
+            done
+            until_e=$(printf '%s' "$st" | jq -r '.until // empty')
+            [ -z "$until_e" ] || echo "off until: $(_quota_fmt_time "$until_e")"
+            ;;
+        on|off|off-until-reset)
+            local want; want="$(printf '%s' "$sub" | tr - _)"
+            if _quota_in_worker; then
+                mkdir -p "$MOTHER_ROOT"
+                _quota_refuse "$want" "$_QUOTA_WORKER_WHY" "$(printf '%s' "$by" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+            fi
+            case "$by" in
+                cli) ;;
+                broker:*) printf '%s' "${by#broker:}" | grep -Eq '^[A-Za-z0-9._-]{1,64}$' \
+                              || _die "quota: bad --source: the broker token must match [A-Za-z0-9._-]{1,64}" ;;
+                *) _die "quota: bad --source: only 'cli' or 'broker:<token>' is accepted" ;;
+            esac
+            _quota_gate_set "$want" "$by" || return $?
+            ;;
+        *) _die "usage: mother quota status [--json] | on | off | off-until-reset" ;;
+    esac
+}
+
 # mother ack <id> <reason> [--source cli|nostromo_app|broker_client]
 # Acknowledge a raised typed attention reason. The ack is keyed to the
 # condition's current `since`, so it lapses when the condition clears and
@@ -5545,6 +5652,34 @@ cmd_ack() {
     [ -z "${MOTHER_JOB_ID:-}" ] || _die "ack: refused — attention is acknowledged by the operator, not by a worker (MOTHER_JOB_ID is set)"
     [ -n "$id" ] && [ -n "$reason" ] || _die "usage: mother ack <id> <reason> [--source cli|nostromo_app|broker_client]"
     case "$source" in cli|nostromo_app|broker_client) ;; *) _die "ack: unknown source: $source" ;; esac
+    if [ "$id" = "quota" ] && { [ "$reason" = "quota_feed_stale" ] || [ "$reason" = "quota_gate_off" ]; }; then
+        # Not tied to a job: `mother ack quota quota_feed_stale|quota_gate_off`.
+        # Same guard as the switch itself (presence of MOTHER_JOB_ID, even empty,
+        # and ancestry), so `MOTHER_JOB_ID= mother ack ...` or `env -u` from under a
+        # worker cannot silence the gate-off alert. Refusals go to the audit log.
+        if _quota_in_worker; then
+            mkdir -p "$MOTHER_ROOT"
+            _quota_refuse "ack:$reason" "$_QUOTA_WORKER_WHY" "$(printf '%s' "$source" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+        fi
+        local qsince
+        if [ "$reason" = "quota_feed_stale" ]; then
+            local marker="$MOTHER_ROOT/quota-feed-stale.json"
+            [ -f "$marker" ] || _die "ack: quota_feed_stale is not raised (the quota feed is fresh)"
+            qsince=$(jq -r '.since // ""' "$marker")
+        else
+            local grow; grow=$(_quota_gate_off_since)
+            [ -n "$grow" ] || _die "ack: quota_gate_off is not raised (the quota gate is on)"
+            qsince="${grow#*$'\t'}"
+        fi
+        mkdir -p "$MOTHER_ROOT/acks"
+        _with_lock "$MOTHER_ROOT/acks/_quota.json" _ack_write "$MOTHER_ROOT/acks/_quota.json" "$reason" "$qsince" "$source" \
+            || _die "ack: could not write acks/_quota.json"
+        jq -nc --arg at "$(_iso_now)" --arg r "$reason" --arg src "$source" \
+            '{ts: $at, event: "ack", reason: $r, source: $src}' >> "$(_quota_audit_file)" 2>/dev/null || true
+        mother_attention_write 2>/dev/null || true
+        echo "quota: acknowledged $reason"
+        return 0
+    fi
     case " $MOTHER_ATTENTION_REASONS " in
         *" $reason "*) ;;
         *) _die "ack: unknown reason: $reason (expected one of: $MOTHER_ATTENTION_REASONS)" ;;
@@ -5583,6 +5718,7 @@ main() {
         plan)              cmd_plan "$@" ;;
         cancel)            cmd_cancel "$@" ;;
         ack)               cmd_ack "$@" ;;
+        quota)             cmd_quota "$@" ;;
         force-start)       cmd_force_start "$@" ;;
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;

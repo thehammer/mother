@@ -345,6 +345,21 @@ seed_live_job() {
     fi
 }
 
+@test "(b2) recording from a shell with session and focus variables set is identical to the committed fixtures" {
+    need_go
+    local out="$BATS_TEST_TMPDIR/polluted"
+    CLAUDE_SESSION_ID=polluted-claude-session MOTHER_ORIGIN_SESSION=polluted-origin-session \
+        MOTHER_ORIGIN_FOCUS=polluted-focus NOSTROMO_FOCUS_TAG=polluted-tag \
+        GIT_AUTHOR_NAME=polluted GIT_AUTHOR_EMAIL=polluted@invalid GIT_COMMITTER_NAME=polluted \
+        run "$PLUGIN/scripts/record-contract-fixtures.sh" --out "$out"
+    [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+    local f
+    for f in $SCENARIOS; do
+        cmp -s "$out/$f.ndjson" "$FIX/$f.ndjson" || { diff "$FIX/$f.ndjson" "$out/$f.ndjson" | head -5 >&2; false; }
+    done
+    ! grep -q polluted "$out"/*.ndjson
+}
+
 # ---------------------------------------------------------------- (c) C1 reconnect / resync
 
 @test "(c) lens_wave last snapshot carries gates, review_wave, progress, decision, attention_reasons" {

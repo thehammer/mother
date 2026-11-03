@@ -223,16 +223,52 @@ _count_running_children() {
 # write — sometimes leaving the job stuck in `failed: runner_died`
 # despite the work being committed.
 _supervisor_alive_for_job() {
-    local job_id="$1" f pid jid
+    _supervisor_pid_for_job "$1" >/dev/null
+}
+
+# _supervisor_pid_for_job <job_id>: print the pid of a live supervisor entry for
+# the job and return 0; return 1 when there is none. An entry whose file is older
+# than MOTHER_SUPERVISOR_STALE_S (default 900) and whose pid is no longer a
+# `mother-run-job` process is a reused pid: the entry is cleared and not counted.
+# When `ps` cannot say what the pid is, the entry is trusted (alive).
+_supervisor_pid_for_job() {
+    local job_id="$1" f pid jid cmd tok age is_run
     for f in "$CHILDREN_DIR"/*.json; do
         [ -f "$f" ] || continue
         pid="$(basename "$f" .json)"
         jid="$(jq -r '.job_id // empty' "$f" 2>/dev/null)"
-        if [ "$jid" = "$job_id" ] && kill -0 "$pid" 2>/dev/null; then
-            return 0
+        [ "$jid" = "$job_id" ] || continue
+        kill -0 "$pid" 2>/dev/null || continue
+        age=$(( $(date +%s) - $(_file_mtime "$f") ))
+        if [ "$age" -gt "${MOTHER_SUPERVISOR_STALE_S:-900}" ] && cmd=$(ps -o command= -p "$pid" 2>/dev/null) && [ -n "$cmd" ]; then
+            is_run=0
+            set -f; for tok in $cmd; do [ "${tok##*/}" = "mother-run-job" ] && is_run=1; done; set +f
+            if [ "$is_run" -eq 0 ]; then
+                _log "clearing supervisor entry $pid for $job_id: pid reused by another process (entry ${age}s old)"
+                rm -f "$f"
+                continue
+            fi
         fi
+        echo "$pid"
+        return 0
     done
     return 1
+}
+
+# _note_waiting_on_supervisor <job_id>: a job is being held back by a supervisor
+# entry that is still alive. Say so in the job's events, at most once per
+# MOTHER_SUPERVISOR_WAIT_NOTE_S (default 600) per job, so a hung supervisor is
+# visible without a line per tick.
+_note_waiting_on_supervisor() {
+    local id="$1" pid mark now last
+    pid=$(_supervisor_pid_for_job "$id") || return 0
+    mark="$RUNNER_DIR/supervisor-wait/$id"
+    now=$(date +%s)
+    last=$(_file_mtime "$mark")
+    [ $((now - last)) -ge "${MOTHER_SUPERVISOR_WAIT_NOTE_S:-600}" ] || return 0
+    mkdir -p "$RUNNER_DIR/supervisor-wait" && : > "$mark"
+    _log "$id: waiting on supervisor pid $pid before it can be started again"
+    _append_event "$id" "quota_release_waiting_on_supervisor" "$(jq -nc --argjson p "$pid" '{supervisor_pid: $p}')"
 }
 
 # ---------- broker supervision (B9) ----------
@@ -308,7 +344,8 @@ _pick_next_ready() {
     local now hz; now=$(date +%s); hz=$(mother_backoff_horizon_s)
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | while read -r f; do
         jq -r --argjson now "$now" --argjson hz "$hz" \
-            'select(.state == "ready" and (((.not_before // 0) | tonumber? // 0) as $nb | $nb <= $now or $nb > $now + $hz)) | .created_at + "\t" + .id' "$f"
+            --arg skip " ${_DISPATCH_SKIP:-} " \
+            'select(.state == "ready" and (.id as $jid | ($skip | contains(" " + $jid + " ")) | not) and (((.not_before // 0) | tonumber? // 0) as $nb | $nb <= $now or $nb > $now + $hz)) | .created_at + "\t" + .id' "$f"
     done | sort | head -1 | cut -f2
 }
 
@@ -316,7 +353,8 @@ _pick_next_forced_ready() {
     local now hz; now=$(date +%s); hz=$(mother_backoff_horizon_s)
     find "$JOBS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | while read -r f; do
         jq -r --argjson now "$now" --argjson hz "$hz" \
-            'select(.state == "ready" and (.force_start == true) and (((.not_before // 0) | tonumber? // 0) as $nb | $nb <= $now or $nb > $now + $hz)) | .created_at + "\t" + .id' "$f"
+            --arg skip " ${_DISPATCH_SKIP:-} " \
+            'select(.state == "ready" and (.force_start == true) and (.id as $jid | ($skip | contains(" " + $jid + " ")) | not) and (((.not_before // 0) | tonumber? // 0) as $nb | $nb <= $now or $nb > $now + $hz)) | .created_at + "\t" + .id' "$f"
     done | sort | head -1 | cut -f2
 }
 
@@ -443,6 +481,14 @@ _disk_recheck_idle() {
 
 _spawn_job() {
     local job_id="$1"
+
+    # Never start a second supervisor while the previous one for this job is
+    # still alive (it may still be winding down a pause, or running
+    # continuation handling): both would share the worktree.
+    if _supervisor_alive_for_job "$job_id"; then
+        _log "not spawning $job_id: a previous supervisor is still alive"
+        return 1
+    fi
 
     # Pre-transition ready → running so the next poll tick doesn't re-pick
     # this job. mother-run-job tolerates both ready and running as starting
@@ -1112,30 +1158,62 @@ EOF
 #   - The job is already `awaiting` (paused for some other reason).
 #   - The job has `cancel_requested` — operator wants it gone, not preserved.
 
+# _withdraw_quota_pause <job_file>: runs under the job lock (the supervisor and
+# other writers take it too), re-reading the file so a change made since the
+# caller looked is not overwritten. Returns 1 when there was nothing to withdraw.
+_withdraw_quota_pause() {
+    local f="$1" merged
+    [ "$(jq -r '.state // ""' "$f" 2>/dev/null)" = "running" ] || return 1
+    [ "$(jq -r '.pause_requested // false' "$f" 2>/dev/null)" = "true" ] || return 1
+    case "$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)" in quota_*) ;; *) return 1 ;; esac
+    merged=$(jq '.pause_requested = null | .paused_reason = null | .auto_resume_at = null' "$f") \
+        && _atomic_write "$f" "$merged"
+}
+
 _auto_resume_check() {
     local now; now=$(date +%s)
-    local f state reason resume_at id merged
+    local f state reason resume_at id merged released=0 why
+    # An open gate (switch off, or off_until_reset still in force) releases every
+    # quota-parked job on this tick, as an elapsed auto_resume_at would.
+    _quota_gate_open && released=1
     for f in "$JOBS_DIR"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // ""' "$f" 2>/dev/null) || continue
-        [ "$state" = "awaiting" ] || continue
         reason=$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)
+        # Gate open: withdraw a pause the daemon asked for but the supervisor has
+        # not acted on yet, so the worker is never paused after the switch flips.
+        if [ "$released" -eq 1 ] && [ "$state" = "running" ] && [ "$(jq -r '.pause_requested // false' "$f" 2>/dev/null)" = "true" ]; then
+            case "$reason" in quota_*)
+                if _with_lock "$f" _withdraw_quota_pause "$f"; then
+                    _log "withdrew pause request of $(jq -r '.id' "$f") (quota gate is open)"
+                fi ;;
+            esac
+            continue
+        fi
+        [ "$state" = "awaiting" ] || continue
         case "$reason" in quota_*) ;; *) continue ;; esac
-        resume_at=$(jq -r '.auto_resume_at // 0' "$f" 2>/dev/null)
-        case "$resume_at" in ''|null) resume_at=0 ;; esac
-        # Strip fractional seconds defensively.
-        resume_at="${resume_at%.*}"
-        [ "$resume_at" -gt 0 ] || continue
-        [ "$now" -ge "$resume_at" ] || continue
-        # Only resume if quota is now actually under cap. The window may
-        # have reset on the clock but if we're already pushing the next
-        # window (back-to-back heavy use) we should keep waiting.
-        if ! _quota_check; then continue; fi
         id=$(jq -r '.id' "$f")
-        _log "auto-resuming $id (paused_reason=$reason; resume window has passed)"
-        merged=$(jq --arg ts "$(_iso_now)" '
+        # The pause is marked `awaiting` before the old supervisor has killed its
+        # worker (up to 10s): releasing now would start a second supervisor on the
+        # same worktree. Wait until the old one is gone.
+        if _supervisor_alive_for_job "$id"; then _note_waiting_on_supervisor "$id"; continue; fi
+        why=window_reset
+        if [ "$released" -eq 1 ]; then why=gate_off; fi
+        if [ "$released" -eq 0 ]; then
+            resume_at=$(_quota_int "$(jq -r '.auto_resume_at // 0' "$f" 2>/dev/null)")
+            [ "$resume_at" -gt 0 ] || continue
+            [ "$now" -ge "$resume_at" ] || continue
+            # Only resume if quota is now actually under cap. The window may
+            # have reset on the clock but if we're already pushing the next
+            # window (back-to-back heavy use) we should keep waiting.
+            if ! _quota_check; then continue; fi
+        fi
+        _log "auto-resuming $id (paused_reason=$reason; $why)"
+        local answer="Quota window has reset — continue from where you left off."
+        [ "$why" != gate_off ] || answer="The quota gate was switched off — continue from where you left off."
+        merged=$(jq --arg ts "$(_iso_now)" --arg answer "$answer" '
             .state = "ready"
-            | .pending_answer = "Quota window has reset — continue from where you left off."
+            | .pending_answer = $answer
             | .resumed_at = $ts
             | .resume_count = ((.resume_count // 0) + 1)
             | .auto_resume_at = null
@@ -1143,7 +1221,7 @@ _auto_resume_check() {
             | .pause_requested = null
         ' "$f") && _atomic_write "$f" "$merged"
         _append_event "$id" "auto_resumed" \
-            "$(jq -nc --arg r "$reason" '{from_paused_reason: $r}')"
+            "$(jq -nc --arg r "$reason" --arg why "$why" '{from_paused_reason: $r, reason: $why}')"
     done
 }
 
@@ -1157,7 +1235,7 @@ _maybe_pause_running() {
     reason=$(_quota_offending_window)
     [ -n "$reason" ] || return 0
     resume_at=$(_quota_resume_at_for "$reason")
-    [ "${resume_at:-0}" -gt 0 ] || return 0
+    [ "$(_quota_int "${resume_at:-0}")" -gt 0 ] || return 0
 
     local f pid job_id job_file fr ar cr pr merged
     for f in "$CHILDREN_DIR"/*.json; do
@@ -1179,6 +1257,8 @@ _maybe_pause_running() {
         fs=$(jq -r '.force_start // false' "$job_file" 2>/dev/null)
         [ "$fs" = "true" ] && continue   # forced — never pause for quota
 
+        # The operator may have flipped the switch since this pass started.
+        _quota_gate_open && return 0
         merged=$(jq --arg r "$reason" --argjson ts "$resume_at" '
             .pause_requested = true
             | .paused_reason = $r
@@ -1856,6 +1936,7 @@ _run_pipeline_job() {
 _RATELIMIT_ANNOUNCED=0
 _dispatch_ready_jobs() {
     local picker=_pick_next_ready over_cap=0 next paused=0
+    _DISPATCH_SKIP=""
     if mother_backoff_enabled && mother_ratelimit_active; then
         # A rate limit is shared by every API caller: start nothing new until
         # it lifts. Running jobs are untouched; ready jobs wait in place.
@@ -1875,9 +1956,17 @@ _dispatch_ready_jobs() {
             _disk_recheck_idle
             break
         fi
+        # A job whose previous supervisor is still alive is skipped for this pass,
+        # not allowed to hold back every other ready job behind it.
+        if _supervisor_alive_for_job "$next"; then
+            _note_waiting_on_supervisor "$next"
+            _DISPATCH_SKIP="$_DISPATCH_SKIP $next"
+            continue
+        fi
         _disk_dispatch_ok "$next" || break
-        _spawn_job "$next"
+        _spawn_job "$next" || break
     done
+    _DISPATCH_SKIP=""
     [ "$over_cap" -eq 1 ] && _maybe_pause_running
     return 0
 }
@@ -1999,6 +2088,19 @@ case "${1:-}" in
         # starting the daemon loop. Used by low_disk_guard.bats.
         # Usage: mother-runner --dispatch-tick
         _dispatch_ready_jobs
+        exit 0
+        ;;
+    --pause-tick)
+        # Test entry point: run one _maybe_pause_running pass and exit.
+        # Usage: mother-runner --pause-tick
+        _maybe_pause_running
+        exit 0
+        ;;
+    --auto-resume-tick)
+        # Test entry point: run one _auto_resume_check pass and exit without
+        # starting the daemon loop. Used by quota_gate.bats.
+        # Usage: mother-runner --auto-resume-tick
+        _auto_resume_check
         exit 0
         ;;
     --archive-tick)

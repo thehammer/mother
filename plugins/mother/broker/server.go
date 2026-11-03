@@ -269,11 +269,21 @@ func (h *hub) deliverOutputLocked(cl *client, s *subscription, ev rawEvent) {
 // updates its offset before calling emit (which blocks on h.mu), so the offset
 // we read here reflects exactly the bytes the live tail will start from.
 func (h *hub) subscribe(cl *client, sub *subscription) {
+	// The quota block shells out to `mother quota status --json`; build it
+	// before taking h.mu so a slow CLI never stalls event fan-out.
+	var quota json.RawMessage
+	if h.runner != nil {
+		quota = h.runner.quotaBlock()
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	cl.subs[sub.name] = sub
 	jobs := h.snapshotJobsLocked(sub)
-	data, _ := json.Marshal(map[string]any{"sub": sub.name, "jobs": jobs})
+	snap := map[string]any{"sub": sub.name, "jobs": jobs}
+	if quota != nil {
+		snap["quota"] = quota
+	}
+	data, _ := json.Marshal(snap)
 	if !cl.enqueue(newEvent(TypeSnapshot, "", data)) {
 		go cl.drop("slow client: outbound buffer overflow")
 		return
@@ -621,6 +631,8 @@ func (cl *client) handleLine(line []byte) {
 		cl.handleForceStart(m)
 	case CmdAck:
 		cl.handleAck(m)
+	case CmdQuotaGate:
+		cl.handleQuotaGate(m)
 	default:
 		cl.ack(errAck(m.T, m.ID, ErrMalformed, "unknown command: "+m.T))
 	}
@@ -719,6 +731,19 @@ func (cl *client) handleForceStart(m Message) {
 	}
 	_ = json.Unmarshal(m.Data, &a)
 	cl.respond(m, cl.hub.runner.forceStart(a.Job))
+}
+
+func (cl *client) handleQuotaGate(m Message) {
+	var a struct {
+		State  string `json:"state"`
+		Origin string `json:"origin"`
+	}
+	_ = json.Unmarshal(m.Data, &a)
+	if g := cl.hub.guard; g != nil && g.fromWorkerOrUnknown(cl.conn) {
+		cl.ack(errAck(m.T, m.ID, ErrUnauthorized, "changing the quota gate from inside a Mother job is not allowed"))
+		return
+	}
+	cl.respond(m, cl.hub.runner.quotaGate(a.State, a.Origin))
 }
 
 func (cl *client) handleAck(m Message) {

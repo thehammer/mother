@@ -60,6 +60,13 @@ setup_mother_env() {
     # run when it is set (HC-02 worker guard). Tests are never "inside a job".
     unset MOTHER_JOB_ID
 
+    # The quota gate reads Bishop's real file first; never let a test see it.
+    # A fresh 0% feed keeps the quota_feed_stale attention item out of unrelated
+    # tests (quota_gate.bats overrides the path for its own scenarios).
+    export MOTHER_BISHOP_POSTURE_FILE="$MOTHER_ROOT/bishop-posture.json"
+    printf '%s' '{"stale_input":false,"five_hour":{"used_pct":0,"resets_at":0},"seven_day":{"used_pct":0,"resets_at":0}}' \
+        > "$MOTHER_BISHOP_POSTURE_FILE"
+
     # Default: mock_claude exits 0
     export MOCK_CLAUDE_EXIT=0
     # Default: mock_claude records args to this file

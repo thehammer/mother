@@ -273,6 +273,80 @@ _attention_plugin_cache_items() {
     fi
 }
 
+# Quota feed health. `quota_feed_stale` is raised while neither Bishop's file nor
+# the statusline cache is fresh (`_quota_feed_json`, lib/state.sh): the gate then
+# cannot see usage and passes. The marker file keeps `since` stable across
+# refreshes; mother_attention_write (the daemon) is its only maintainer.
+# Acknowledged with `mother ack quota quota_feed_stale` (acks/_quota.json),
+# which applies only while the marker's `since` is unchanged.
+_quota_stale_marker() { echo "$MOTHER_ROOT/quota-feed-stale.json"; }
+
+_attention_quota_sync() {
+    type _quota_feed_json >/dev/null 2>&1 || return 0
+    local marker; marker=$(_quota_stale_marker)
+    if [ "$(_quota_feed_json | jq -r '.stale')" = "true" ]; then
+        [ -f "$marker" ] || _atomic_write "$marker" "$(jq -nc --arg s "$(_iso_now)" '{since: $s}')"
+    else
+        rm -f "$marker"
+    fi
+}
+
+_attention_quota_items() {
+    local marker; marker=$(_quota_stale_marker)
+    [ -f "$marker" ] || return 0
+    local since feed acked=false
+    since=$(jq -r '.since // ""' "$marker" 2>/dev/null)
+    if [ -f "$MOTHER_ROOT/acks/_quota.json" ] \
+        && [ "$(jq -r '.quota_feed_stale.since // ""' "$MOTHER_ROOT/acks/_quota.json" 2>/dev/null)" = "$since" ]; then
+        acked=true
+    fi
+    feed=$(_quota_feed_json)
+    jq -nc --argjson f "$feed" --arg since "$since" --argjson acked "$acked" '
+        {kind: "quota_feed_stale", job_id: "", repo: "", branch: "",
+         reason: "quota_feed_stale", since: $since,
+         detail: {acked: $acked, since: $since, feed_age_s: $f.feed_age_s},
+         hint: "neither Bishop (~/.claude/budget-posture.json) nor the statusline cache is fresh, so the quota gate cannot see usage and lets work through; check `mother quota status`"}'
+}
+
+# `quota_gate_off` is raised while the safety switch is off, or off_until_reset
+# before its reset (the same "open" test the gate uses, without flipping
+# anything). It is derived from the switch file on every call, so it can never
+# outlive the state; `since` is the switch's changed_at, so an ack
+# (`mother ack quota quota_gate_off`, acks/_quota.json) lapses when the state
+# changes (off -> off_until_reset rewrites changed_at). The Mac badge and this
+# item together mean an open gate is never silent.
+_quota_gate_off_since() {   # prints "<state>\t<since>" when the gate is open, nothing otherwise
+    type _quota_gate_read >/dev/null 2>&1 || return 0
+    local cur st since until
+    cur=$(_quota_gate_read)
+    st=$(printf '%s' "$cur" | jq -r '.state')
+    case "$st" in
+        off) ;;
+        off_until_reset)
+            until=$(_quota_int "$(printf '%s' "$cur" | jq -r '.until // 0')")
+            [ "$(date +%s)" -lt "$until" ] || return 0 ;;
+        *) return 0 ;;
+    esac
+    since=$(printf '%s' "$cur" | jq -r '.changed_at // ""')
+    printf '%s\t%s\n' "$st" "$since"
+}
+
+_attention_quota_gate_items() {
+    local row st since acked=false
+    row=$(_quota_gate_off_since)
+    [ -n "$row" ] || return 0
+    st="${row%%$'\t'*}"; since="${row#*$'\t'}"
+    if [ -f "$MOTHER_ROOT/acks/_quota.json" ] \
+        && [ "$(jq -r '.quota_gate_off.since // ""' "$MOTHER_ROOT/acks/_quota.json" 2>/dev/null)" = "$since" ]; then
+        acked=true
+    fi
+    jq -nc --arg st "$st" --arg since "$since" --argjson acked "$acked" '
+        {kind: "quota_gate_off", job_id: "", repo: "", branch: "",
+         reason: "quota_gate_off", since: $since,
+         detail: {acked: $acked, since: $since, state: $st},
+         hint: "the quota gate is switched off, so Mother will not pause near the limits; turn it back on with `mother quota on`"}'
+}
+
 # ---------- public ----------
 
 # mother_attention_items — print the needs-attention list as a JSON array.
@@ -285,6 +359,8 @@ mother_attention_items() {
       _attention_adherence_loop_items
       _attention_stash_items
       _attention_plugin_cache_items
+      _attention_quota_items
+      _attention_quota_gate_items
     } | jq -cs '.' 2>/dev/null || echo '[]'
 }
 
@@ -292,6 +368,7 @@ mother_attention_items() {
 # $MOTHER_ROOT/attention.json (always valid JSON; `[]` when nothing to report).
 mother_attention_write() {
     local items
+    _attention_quota_sync 2>/dev/null || true
     items=$(mother_attention_items)
     printf '%s' "$items" | jq -e 'type == "array"' >/dev/null 2>&1 || items='[]'
     _atomic_write "$MOTHER_ROOT/attention.json" "$items"

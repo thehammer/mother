@@ -55,6 +55,13 @@ done
 
 # Never inherit a real state tree (CLAUDE.md "State safety"); test_helper builds a temp one per scenario.
 unset MOTHER_ROOT MOTHER_LIVE_ROOT MOTHER_JOB_ID
+# Hermetic: no ambient identity may reach a recording (origin.session, worker ids, focus tags).
+unset MOTHER_ORIGIN_SESSION CLAUDE_SESSION_ID CLAUDE_AGENT_NAME MOTHER_ORIGIN_FOCUS MOTHER_ORIGIN_FOCUS_NAME \
+      MOTHER_ORIGIN_PROJECT NOSTROMO_FOCUS_TAG NOSTROMO_PTY_ID
+# Pin the git identity too: an ambient GIT_AUTHOR_NAME (CI sets one) overrides the repo config and
+# changes every commit sha. These equal the values the scenario repos configure.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+export GIT_AUTHOR_NAME="Test" GIT_AUTHOR_EMAIL="test@example.com" GIT_COMMITTER_NAME="Test" GIT_COMMITTER_EMAIL="test@example.com"
 export GIT_AUTHOR_DATE="2026-10-01T00:00:00Z" GIT_COMMITTER_DATE="2026-10-01T00:00:00Z"
 
 # shellcheck source=/dev/null
@@ -621,7 +628,7 @@ prefixes.sort(key=lambda x: -len(x[0]))
 job_real = meta["JOB"]
 
 # --- key-based stable numbers / strings
-FIXED_NUM = {"duration_s": 1, "elapsed_active_s": 120, "worker_pid": 4242, "supervisor_pid": 4241,
+FIXED_NUM = {"feed_age_s": 0, "duration_s": 1, "elapsed_active_s": 120, "worker_pid": 4242, "supervisor_pid": 4241,
              "live_tokens": 0, "live_cost_usd": 0, "pid": 4242, "pct_moved_at_active_s": 60, "log_offset": 0,
              "usd": 0, "actual_cost_usd": 0, "actual_tokens": 0}
 QUANTISE = {"stage_frac": 0.25}       # key -> step; the real value depends on a few seconds of wall clock

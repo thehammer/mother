@@ -34,6 +34,10 @@ const (
 // A small interface so tests can inject a fake ancestry.
 type workerGuard interface {
 	fromWorker(conn *clientConn) bool
+	// fromWorkerOrUnknown is the strict form used for `quota-gate` only: true
+	// when the peer is a worker OR cannot be identified (unreadable pid, failed
+	// ancestry lookup). A safety switch fails closed.
+	fromWorkerOrUnknown(conn *clientConn) bool
 }
 
 // processGuard is the production guard: peer pid from the socket, ancestry
@@ -53,28 +57,53 @@ func (g processGuard) fromWorker(conn *clientConn) bool {
 	return ancestryHasWorker(pid, g.lookup)
 }
 
+// fromWorkerOrUnknown fails CLOSED: when the peer pid cannot be read, `quota-gate`
+// is denied. That is always the case where peerPID is unsupported (anything but
+// darwin, e.g. the Linux CI runner), which is acceptable: the broker only ships
+// on macOS. See also clientConn.peerPID in transport.go.
+func (g processGuard) fromWorkerOrUnknown(conn *clientConn) bool {
+	pid, err := conn.peerPID()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mother-broker: quota-gate peer check failed (denying): %v\n", err)
+		return true
+	}
+	found, ok := ancestryWalk(pid, g.lookup)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "mother-broker: quota-gate peer ancestry unreadable (denying)\n")
+		return true
+	}
+	return found
+}
+
 // ancestryHasWorker walks pid's parent chain (at most maxAncestryDepth
 // levels) and reports whether any process on it is a `mother-run-job`
 // supervisor. A script's `comm` is its interpreter ("bash"), so the match is
 // on the basename of any token of the command line. Lookup errors, loops and
 // reaching pid 1 end the walk with false.
 func ancestryHasWorker(pid int, lookup func(pid int) (int, string, error)) bool {
+	found, _ := ancestryWalk(pid, lookup)
+	return found
+}
+
+// ancestryWalk is ancestryHasWorker plus whether the walk completed: ok is
+// false when a lookup failed before the chain ended.
+func ancestryWalk(pid int, lookup func(pid int) (int, string, error)) (found, ok bool) {
 	seen := map[int]bool{}
 	for depth := 0; depth < maxAncestryDepth && pid > 1 && !seen[pid]; depth++ {
 		seen[pid] = true
 		ppid, command, err := lookup(pid)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "mother-broker: answer peer check: pid %d lookup failed (allowing): %v\n", pid, err)
-			return false
+			fmt.Fprintf(os.Stderr, "mother-broker: peer check: pid %d lookup failed: %v\n", pid, err)
+			return false, false
 		}
 		for _, tok := range strings.Fields(command) {
 			if filepath.Base(tok) == workerSupervisorName {
-				return true
+				return true, true
 			}
 		}
 		pid = ppid
 	}
-	return false
+	return false, true
 }
 
 // psLookup reads a process's parent pid and full command line via ps(1).
