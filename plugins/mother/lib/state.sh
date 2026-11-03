@@ -292,8 +292,13 @@ _quota_gate_file() { echo "$MOTHER_ROOT/quota-gate.json"; }
 _quota_audit_file() { echo "$MOTHER_ROOT/quota-gate-audit.jsonl"; }
 
 # _file_mtime <file>: epoch mtime (BSD or GNU stat); 0 when unreadable.
+# GNU first: on GNU stat `-f` means "filesystem status", so `stat -f %m FILE` prints
+# filesystem info to stdout (and exits non-zero), which corrupted the value on Linux.
 _file_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+    local m
+    m=$(stat -c %Y "$1" 2>/dev/null) && [ -n "$m" ] && { echo "$m"; return 0; }
+    m=$(stat -f %m "$1" 2>/dev/null) && [ -n "$m" ] && { echo "$m"; return 0; }
+    echo 0
 }
 
 # _quota_normalize <file> <bishop|cache>: print the normalized windows as
@@ -429,6 +434,9 @@ _quota_with_lock() {
                     rm -f "$lockdir.stale.$$/owner"; rmdir "$lockdir.stale.$$" 2>/dev/null || true
                     echo "mother: took over a stale quota-gate lock (owner ${owner:-unknown})" >&2
                 else
+                    # Known, accepted window (theoretical): between the two renames the lock
+                    # path is briefly free, so a third process can take it; the put-back then
+                    # fails quietly and that process's lock stands.
                     mv "$lockdir.stale.$$" "$lockdir" 2>/dev/null || true
                 fi
             fi

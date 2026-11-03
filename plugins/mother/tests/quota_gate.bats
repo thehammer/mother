@@ -1273,13 +1273,19 @@ _job_state() { jq -r .state "$JOBS_DIR/$1.json"; }
     make_job dup-2 ready ".repo_path = \"$MOTHER_ROOT\""
     _live_supervisor dup-2
     local sup=$LIVE_SUP_PID
+    # The fake supervisor is registered and alive before the first pass looks at it.
+    kill -0 "$sup"
+    [ -f "$RUNNER_DIR/children/$sup.json" ]
     MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --dispatch-tick >/dev/null 2>&1 || true
     [ ! -s "$MOTHER_ROOT/run-job-calls" ]
+    [ "$(_job_state dup-2)" = "ready" ]
 
     kill "$sup"; wait "$sup" 2>/dev/null || true
     MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --dispatch-tick >/dev/null 2>&1 || true
-    local i=0; while [ ! -s "$MOTHER_ROOT/run-job-calls" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+    # The spawned stand-in writes its argv file asynchronously: wait for the file, not a fixed time.
+    local i=0; while [ ! -s "$MOTHER_ROOT/run-job-calls" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done
     [ "$(grep -c . "$MOTHER_ROOT/run-job-calls")" = "1" ]
+    [ "$(_job_state dup-2)" = "running" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -1505,4 +1511,161 @@ _dead_pid() { bash -c 'echo $$'; }
     [ "$(_qf .stale)" = "true" ]
     run _lib _quota_check
     [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# PR #106 round 3
+# ---------------------------------------------------------------------------
+
+@test "portability: _file_mtime is right under GNU stat, where 'stat -f' is filesystem status that prints junk" {
+    local fake="$MOTHER_ROOT/gnu-bin"; mkdir -p "$fake"
+    cat > "$fake/stat" <<'EOS'
+#!/usr/bin/env bash
+# GNU coreutils stat: -f is "filesystem status" (prints junk, fails on the bogus FILE), -c FORMAT is the file form.
+case "$1" in
+    -f) echo "  File: \"%m\""; echo "    ID: 0 Namelen: 255 Type: ext2/ext3"; exit 1 ;;
+    -c) /usr/bin/perl -e 'print((stat($ARGV[0]))[9], "\n")' "$3" ;;
+    *) exit 1 ;;
+esac
+EOS
+    chmod +x "$fake/stat"
+    local f="$MOTHER_ROOT/mt"; : > "$f"; _age "$f" 1000
+    local want; want=$(/usr/bin/perl -e 'print((stat($ARGV[0]))[9])' "$f")
+    run env PATH="$fake:$PATH" bash -c "set -u; source '$_LIB_DIR/state.sh'; _file_mtime '$f'"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$want" ]
+}
+
+@test "ack: MOTHER_JOB_ID set to empty cannot acknowledge quota_gate_off; the refusal is logged" {
+    _bishop 10 10
+    mother quota off >/dev/null 2>&1
+    _lib mother_attention_write
+    MOTHER_JOB_ID= run mother ack quota quota_gate_off
+    [ "$status" -ne 0 ]
+    [ ! -e "$MOTHER_ROOT/acks/_quota.json" ]
+    [ "$(grep -c . "$MOTHER_ROOT/quota-gate-refusals.jsonl")" = "1" ]
+    [ "$(jq -r .requested "$MOTHER_ROOT/quota-gate-refusals.jsonl")" = "ack:quota_gate_off" ]
+}
+
+@test "ack: a mother-run-job ancestor with MOTHER_JOB_ID unset cannot acknowledge quota_gate_off" {
+    _bishop 10 10
+    mother quota off >/dev/null 2>&1
+    _lib mother_attention_write
+    local fake="$MOTHER_ROOT/fake-sup"; mkdir -p "$fake"
+    printf '#!/usr/bin/env bash\nenv -u MOTHER_JOB_ID mother ack quota quota_gate_off\n' > "$fake/mother-run-job"
+    chmod +x "$fake/mother-run-job"
+    unset MOTHER_JOB_ID
+    run "$fake/mother-run-job"
+    [ "$status" -ne 0 ]
+    [ ! -e "$MOTHER_ROOT/acks/_quota.json" ]
+    [ "$(grep -c . "$MOTHER_ROOT/quota-gate-refusals.jsonl")" = "1" ]
+}
+
+@test "ack: an operator's ack still works and its source lands in the audit log" {
+    _bishop 10 10
+    mother quota off >/dev/null 2>&1
+    _lib mother_attention_write
+    run mother ack quota quota_gate_off --source nostromo_app
+    [ "$status" -eq 0 ]
+    [ -e "$MOTHER_ROOT/acks/_quota.json" ]
+    [ "$(tail -1 "$AUDIT_FILE" | jq -r '.event + ":" + .reason + ":" + .source')" = "ack:quota_gate_off:nostromo_app" ]
+}
+
+@test "cli: when ps cannot be run the switch change is refused (fails closed) and logged; a plain shell still works" {
+    local fake="$MOTHER_ROOT/noPS"; mkdir -p "$fake"
+    printf '#!/bin/sh\nexit 1\n' > "$fake/ps"; chmod +x "$fake/ps"
+    run env PATH="$fake:$PATH" "$_BIN_DIR/mother" quota off
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"ancestry unreadable"* ]]
+    [ ! -e "$GATE_FILE" ]
+    [ "$(grep -c . "$MOTHER_ROOT/quota-gate-refusals.jsonl")" = "1" ]
+    # Control: the real ps, from a plain (non-worker) shell, is allowed.
+    run mother quota off
+    [ "$status" -eq 0 ]
+    [ "$(_qf .gate)" = "off" ]
+}
+
+@test "cli: when ps prints nothing the switch change is refused too" {
+    local fake="$MOTHER_ROOT/emptyPS"; mkdir -p "$fake"
+    printf '#!/bin/sh\nexit 0\n' > "$fake/ps"; chmod +x "$fake/ps"
+    run env PATH="$fake:$PATH" "$_BIN_DIR/mother" quota on
+    [ "$status" -ne 0 ]
+    [ ! -e "$GATE_FILE" ]
+}
+
+@test "dispatch: a ready job held by a live old supervisor does not hold back a younger ready job; one event, not one per tick" {
+    _bishop 10 10
+    _fake_run_job
+    make_job hol-a ready ".repo_path = \"$MOTHER_ROOT\" | .created_at = \"2026-11-01T00:00:00Z\""
+    make_job hol-b ready ".repo_path = \"$MOTHER_ROOT\" | .created_at = \"2026-11-02T00:00:00Z\""
+    _live_supervisor hol-a
+    run env MOTHER_BIN_DIR="$FAKE_BIN" perl -e 'alarm 30; exec @ARGV' mother-runner --dispatch-tick
+    [ "$status" -ne 142 ]
+    local i=0; while [ ! -s "$MOTHER_ROOT/run-job-calls" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+    [ "$(grep -c . "$MOTHER_ROOT/run-job-calls")" = "1" ]
+    [[ "$(cat "$MOTHER_ROOT/run-job-calls")" == *hol-b* ]]
+    [ "$(_job_state hol-a)" = "ready" ]
+    [ "$(_job_state hol-b)" = "running" ]
+    # Second tick: still waiting, still only one event.
+    MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --dispatch-tick >/dev/null 2>&1 || true
+    [ "$(grep -c quota_release_waiting_on_supervisor "$EVENTS_DIR/hol-a.jsonl")" = "1" ]
+    [ "$(jq -rs '[.[] | select(.kind == "quota_release_waiting_on_supervisor")][0].detail.supervisor_pid' "$EVENTS_DIR/hol-a.jsonl")" = "$LIVE_SUP_PID" ]
+}
+
+@test "parked: a parked job held back by a live old supervisor says so in its events (once)" {
+    _bishop 10 100
+    _park_job parked-wait quota_7d "$(( $(_now) + 259200 ))"
+    _live_supervisor parked-wait
+    mother quota off >/dev/null 2>&1
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    [ "$(_job_state parked-wait)" = "awaiting" ]
+    [ "$(grep -c quota_release_waiting_on_supervisor "$EVENTS_DIR/parked-wait.jsonl")" = "1" ]
+}
+
+@test "supervisor entry: an old entry whose pid is not a mother-run-job (pid reuse) is cleared and the job is released" {
+    _bishop 10 100
+    _park_job parked-reuse quota_7d "$(( $(_now) + 259200 ))"
+    _live_supervisor parked-reuse
+    local sup=$LIVE_SUP_PID
+    mother quota off >/dev/null 2>&1
+    # Fresh entry: trusted, the job stays parked.
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    [ "$(_job_state parked-reuse)" = "awaiting" ]
+    # 16 minutes old and `sleep`, not mother-run-job: treated as dead.
+    _age "$RUNNER_DIR/children/$sup.json" 960
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    [ "$(_job_state parked-reuse)" = "ready" ]
+    [ ! -e "$RUNNER_DIR/children/$sup.json" ]
+}
+
+@test "supervisor entry: an old entry whose pid IS a mother-run-job is still trusted" {
+    _bishop 10 100
+    _park_job parked-real quota_7d "$(( $(_now) + 259200 ))"
+    local fake="$MOTHER_ROOT/fake-sup"; mkdir -p "$fake"
+    printf '#!/usr/bin/env bash\nsleep 300\n' > "$fake/mother-run-job"; chmod +x "$fake/mother-run-job"
+    "$fake/mother-run-job" >/dev/null 2>&1 3>&- &
+    local sup=$!; _BG_PIDS="${_BG_PIDS:-} $sup"
+    mkdir -p "$RUNNER_DIR/children"
+    jq -nc --argjson pid "$sup" '{pid: $pid, job_id: "parked-real", started_at: "2026-11-02T00:00:00Z"}' > "$RUNNER_DIR/children/$sup.json"
+    _age "$RUNNER_DIR/children/$sup.json" 3600
+    mother quota off >/dev/null 2>&1
+    mother-runner --auto-resume-tick >/dev/null 2>&1 || true
+    [ "$(_job_state parked-real)" = "awaiting" ]
+    [ -e "$RUNNER_DIR/children/$sup.json" ]
+}
+
+@test "pause in flight: withdrawing the pause request waits for the job lock" {
+    _bishop 10 100
+    make_job pausing-lock running ".pause_requested = true | .paused_reason = \"quota_7d\" | .auto_resume_at = $(( $(_now) + 86400 ))"
+    mother quota off >/dev/null 2>&1
+    mkdir "$JOBS_DIR/pausing-lock.json.lockdir"
+    mother-runner --auto-resume-tick >/dev/null 2>&1 &
+    local tick=$!
+    sleep 1
+    # Held lock: the request must still stand.
+    [ "$(jq -r '.pause_requested // false' "$JOBS_DIR/pausing-lock.json")" = "true" ]
+    rmdir "$JOBS_DIR/pausing-lock.json.lockdir"
+    wait "$tick" || true
+    [ "$(jq -r '.pause_requested // false' "$JOBS_DIR/pausing-lock.json")" = "false" ]
 }

@@ -55,6 +55,9 @@ done
 
 # Never inherit a real state tree (CLAUDE.md "State safety"); test_helper builds a temp one per scenario.
 unset MOTHER_ROOT MOTHER_LIVE_ROOT MOTHER_JOB_ID
+# Hermetic: no ambient identity may reach a recording (origin.session, worker ids, focus tags).
+unset MOTHER_ORIGIN_SESSION CLAUDE_SESSION_ID CLAUDE_AGENT_NAME MOTHER_ORIGIN_FOCUS MOTHER_ORIGIN_FOCUS_NAME \
+      MOTHER_ORIGIN_PROJECT NOSTROMO_FOCUS_TAG NOSTROMO_PTY_ID
 export GIT_AUTHOR_DATE="2026-10-01T00:00:00Z" GIT_COMMITTER_DATE="2026-10-01T00:00:00Z"
 
 # shellcheck source=/dev/null

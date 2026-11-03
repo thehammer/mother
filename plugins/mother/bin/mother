@@ -5551,14 +5551,20 @@ _quota_fmt_time() {
 # _quota_in_worker: true when this process is inside a Mother job: MOTHER_JOB_ID
 # is set (even empty), or any ancestor's command line has a token whose basename
 # is `mother-run-job` (so `env -u MOTHER_JOB_ID mother quota off` is still caught).
+# Fails CLOSED: when `ps` cannot be run or its output cannot be parsed, the answer
+# is "yes" and _QUOTA_WORKER_WHY says why (callers print it). A plain terminal,
+# tmux pane or script has a readable chain up to pid 1 and passes.
+_QUOTA_WORKER_WHY=""
 _quota_in_worker() {
+    _QUOTA_WORKER_WHY="caller is inside a Mother job"
     [ -z "${MOTHER_JOB_ID+x}" ] || return 0
     local pid=$$ depth=0 line ppid tok
     while [ "$depth" -lt 32 ] && [ "${pid:-0}" -gt 1 ]; do
-        line=$(ps -o ppid=,command= -p "$pid" 2>/dev/null) || return 1
-        [ -n "$line" ] || return 1
+        line=$(ps -o ppid=,command= -p "$pid" 2>/dev/null) || { _QUOTA_WORKER_WHY="process ancestry unreadable (ps failed)"; return 0; }
+        [ -n "$line" ] || { _QUOTA_WORKER_WHY="process ancestry unreadable (ps gave no output)"; return 0; }
         set -f; set -- $line; set +f
         ppid="$1"; shift
+        case "$ppid" in ''|*[!0-9]*) _QUOTA_WORKER_WHY="process ancestry unreadable (unparseable ps output)"; return 0 ;; esac
         for tok in "$@"; do
             [ "${tok##*/}" = "mother-run-job" ] && return 0
         done
@@ -5615,7 +5621,7 @@ cmd_quota() {
             local want; want="$(printf '%s' "$sub" | tr - _)"
             if _quota_in_worker; then
                 mkdir -p "$MOTHER_ROOT"
-                _quota_refuse "$want" "caller is inside a Mother job" "$(printf '%s' "$by" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+                _quota_refuse "$want" "$_QUOTA_WORKER_WHY" "$(printf '%s' "$by" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
             fi
             case "$by" in
                 cli) ;;
@@ -5648,6 +5654,13 @@ cmd_ack() {
     case "$source" in cli|nostromo_app|broker_client) ;; *) _die "ack: unknown source: $source" ;; esac
     if [ "$id" = "quota" ] && { [ "$reason" = "quota_feed_stale" ] || [ "$reason" = "quota_gate_off" ]; }; then
         # Not tied to a job: `mother ack quota quota_feed_stale|quota_gate_off`.
+        # Same guard as the switch itself (presence of MOTHER_JOB_ID, even empty,
+        # and ancestry), so `MOTHER_JOB_ID= mother ack ...` or `env -u` from under a
+        # worker cannot silence the gate-off alert. Refusals go to the audit log.
+        if _quota_in_worker; then
+            mkdir -p "$MOTHER_ROOT"
+            _quota_refuse "ack:$reason" "$_QUOTA_WORKER_WHY" "$(printf '%s' "$source" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+        fi
         local qsince
         if [ "$reason" = "quota_feed_stale" ]; then
             local marker="$MOTHER_ROOT/quota-feed-stale.json"
@@ -5661,6 +5674,8 @@ cmd_ack() {
         mkdir -p "$MOTHER_ROOT/acks"
         _with_lock "$MOTHER_ROOT/acks/_quota.json" _ack_write "$MOTHER_ROOT/acks/_quota.json" "$reason" "$qsince" "$source" \
             || _die "ack: could not write acks/_quota.json"
+        jq -nc --arg at "$(_iso_now)" --arg r "$reason" --arg src "$source" \
+            '{ts: $at, event: "ack", reason: $r, source: $src}' >> "$(_quota_audit_file)" 2>/dev/null || true
         mother_attention_write 2>/dev/null || true
         echo "quota: acknowledged $reason"
         return 0

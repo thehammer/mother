@@ -57,6 +57,10 @@ func (g processGuard) fromWorker(conn *clientConn) bool {
 	return ancestryHasWorker(pid, g.lookup)
 }
 
+// fromWorkerOrUnknown fails CLOSED: when the peer pid cannot be read, `quota-gate`
+// is denied. That is always the case where peerPID is unsupported (anything but
+// darwin, e.g. the Linux CI runner), which is acceptable: the broker only ships
+// on macOS. See also clientConn.peerPID in transport.go.
 func (g processGuard) fromWorkerOrUnknown(conn *clientConn) bool {
 	pid, err := conn.peerPID()
 	if err != nil {
