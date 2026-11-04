@@ -4655,7 +4655,7 @@ cmd_prune_temps() {
 }
 
 # `mother backup now|list|restore <file> [--yes]` — rotating backups of the state
-# tree and restore (lib/backup.sh). The daemon runs `backup now` on a timer.
+# tree and restore (lib/backup.sh). The daemon runs `backup now --auto` on a timer.
 cmd_backup() {
     type mother_backup_now >/dev/null 2>&1 || _die "lib/backup.sh is missing"
     local sub="${1:-}"
@@ -4664,7 +4664,7 @@ cmd_backup() {
         now)     mother_backup_now "$@" || exit 1 ;;
         list)    mother_backup_list "$@" ;;
         restore) mother_backup_restore "$@" || exit $? ;;
-        *)       _die "usage: mother backup now | list | restore <file> [--yes]" ;;
+        *)       _die "usage: mother backup now [--auto] | list [--summary] | restore <file> [--yes]" ;;
     esac
 }
 
@@ -5244,8 +5244,12 @@ Usage:
                                               including jobs enqueued by other sessions; DAYS must
                                               be an integer)
   mother prune-temps [--dry-run]              (remove orphaned *.tmp.*/*.bak.* state files)
-  mother backup now                           (back up the state tree now, to MOTHER_BACKUP_DIR, then prune)
-  mother backup list                          (backups, newest first, with size and job count)
+  mother backup now [--auto]                  (back up the state tree now, to MOTHER_BACKUP_DIR, then prune;
+                                              archive/ goes in its own mother-archive-* file, only when changed.
+                                              `backup now --auto` is what the runner uses: it skips an
+                                              unchanged state)
+  mother backup list [--summary]              (backups, newest first, with size and job count, then count,
+                                              total size, newest age and bytes written in the last 24h)
   mother backup restore <file> [--yes]        (restore a backup; refuses while the runner is running;
                                               the current state is moved to $MOTHER_ROOT/.pre-restore-<ts>/,
                                               never deleted)
@@ -5343,12 +5347,15 @@ Daemon env vars:
                                                  build cache is larger and no job is running
   MOTHER_GC_ENABLED            (default: 1)    run `mother gc` in the hourly sweep (0 to disable)
   MOTHER_BACKUP_ENABLED        (default: 1)    runner backs up the state tree on a timer (0 to disable)
-  MOTHER_BACKUP_INTERVAL       (default: 900)  seconds between backups
+  MOTHER_BACKUP_INTERVAL       (default: 3600) seconds between backup attempts (skipped when nothing changed)
+  MOTHER_BACKUP_MAX_AGE        (default: 21600) take a backup at least this often even if nothing changed (0 = never skip)
+  MOTHER_BACKUP_ARCHIVE_INTERVAL (default: 86400) a changed archive/ is backed up at most this often
+  MOTHER_BACKUP_WARN_GB        (default: 5)    `mother doctor` / `backup list --summary` warn above this size
   MOTHER_BACKUP_DIR            (default: ~/Library/Application Support/Mother/backups on macOS,
                                                  ${XDG_STATE_HOME:-~/.local/state}/mother/backups elsewhere;
                                                  must be outside MOTHER_ROOT)
-  MOTHER_BACKUP_KEEP_HOURS     (default: 24)   keep every backup newer than this
-  MOTHER_BACKUP_KEEP_DAYS      (default: 30)   then keep one backup per UTC day for this many days
+  MOTHER_BACKUP_KEEP_HOURS     (default: 12)   keep every backup newer than this
+  MOTHER_BACKUP_KEEP_DAYS      (default: 14)   then keep one backup per UTC day for this many days
   MOTHER_BACKUP_LOGS           (default: 0)    1 = include logs/ in backups
   MOTHER_CARGO_TARGET_PURGE    (default: 1)    `mother gc` deletes the target/ of a Cargo job worktree once no
                                                  job uses it (0/false/no/off: report only;

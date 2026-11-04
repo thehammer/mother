@@ -65,6 +65,24 @@ if command -v mother >/dev/null 2>&1; then
     [ -z "$_conc" ] || { echo "concurrency:"; printf '  • %s\n' "$_conc"; echo ""; }
 fi
 
+# --- state backups: size budget (advisory — never affects exit status) ---
+# Backups live outside the tree and are pruned by retention; this shows what they
+# cost (count, size, newest age, bytes written in the last 24h) and warns when
+# they exceed MOTHER_BACKUP_WARN_GB.
+if command -v mother >/dev/null 2>&1; then
+    _bk=$(mother backup list --summary 2>/dev/null)
+    if [ -n "$_bk" ]; then
+        echo "backups:"
+        printf '%s\n' "$_bk" | while IFS= read -r _line; do
+            case "$_line" in
+                warn:*) printf '  ✗ %s\n' "$_line" ;;
+                *)      printf '  • %s\n' "$_line" ;;
+            esac
+        done
+        echo ""
+    fi
+fi
+
 # --- looping adherence reviews (advisory — never affects exit status) ---
 # More than 5 adherence reviews on one job in the last hour means the review is
 # looping (see CHANGELOG 0.3.3); the same list feeds the statusline's ⚑ count.
