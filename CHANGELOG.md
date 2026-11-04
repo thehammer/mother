@@ -6,6 +6,17 @@ All notable changes to Mother are documented here. Format based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Backups review fix-ups.** Documented the restore gap: a job archived after the last archive tarball (up to 24h under `--auto`) is in neither the newest state backup nor its paired archive, so restoring the newest backup drops it (an older retained backup still has it). `mother backup restore` now prints a `note:` when the paired archive tarball is over 1h older than the state backup, and `mother doctor` / `backup list --summary` show the newest archive backup's age.
+- "Written in the last 24h" is now recorded at write time in `$MOTHER_ROOT/backups-written.log` (7 days kept) instead of summed from files left on disk, which under-reported by about half after prune; it falls back to an `(estimated)` on-disk figure when the log is empty.
+- `MOTHER_BACKUP_WARN_GB` must be a non-negative decimal number (`.` falls back to 5); prune removes orphaned hidden `.mother-*.tmp.<pid>` files (dead pid, over 1h old) left by a killed tar.
+- Note: up to about 15 archive tarballs (about 160 MB each, about 2.4 GB) can be retained when `archive/` changes daily, so the steady-state estimate is 3-4.5 GB.
+
+## [0.3.14] - 2026-11-04
+
+- **State backups no longer churn ~14 GB of disk a day.** The runner wrote a full ~146 MB `mother-state-*.tar.gz` every 15 minutes (96 kept) even though almost nothing changed. Now: `mother backup now --auto` (what the runner calls) skips the state tarball when a change fingerprint (`$RUNNER_DIR/last-backup.sig`; `cursors/` by count and size only, `attention.json`/`rate-limits.json` excluded) is unchanged, logging `unchanged, skipped`, but still takes one every `MOTHER_BACKUP_MAX_AGE` (6h) and still prunes. `archive/` moves to its own `mother-archive-<ts>.tar.gz`, written only when it changed and at most every `MOTHER_BACKUP_ARCHIVE_INTERVAL` (24h); restore of a state tarball also restores the matching archive tarball, and legacy single-file backups restore unchanged. New defaults: `MOTHER_BACKUP_INTERVAL` 900 -> 3600, `MOTHER_BACKUP_KEEP_HOURS` 24 -> 12, `MOTHER_BACKUP_KEEP_DAYS` 30 -> 14 (explicit values in `config.env` still win). Prune never deletes the newest state or archive backup. `mother backup list` gains a summary and `--summary`; `mother backup list --summary` and `mother doctor` show count, total size, newest age and bytes written in the last 24h, and warn above `MOTHER_BACKUP_WARN_GB` (5). Plugin version 0.3.14.
+
 ### Changed
 
 - `mother add` refuses a plan whose first non-empty line is not an ATX heading (`# Title`), naming the offending line, so a note above the title can no longer become the job/PR title. `--title` bypasses the check. The title now comes from the first non-empty line.

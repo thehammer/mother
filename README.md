@@ -402,9 +402,12 @@ Defaults preserve current behavior — every variable is optional.
 |---|---|---|
 | `MOTHER_ROOT` | `$MOTHER_LIVE_ROOT`, else `$HOME/.mother` | State dir (jobs, events, logs, locks). Workers are given the live path as `MOTHER_LIVE_ROOT`, not `MOTHER_ROOT` (see [State safety](#state-safety-and-backups)) |
 | `MOTHER_BACKUP_ENABLED` | `1` | Runner backs up the state tree on a timer (`0` to disable) |
-| `MOTHER_BACKUP_INTERVAL` | `900` | Seconds between backups |
+| `MOTHER_BACKUP_INTERVAL` | `3600` | Seconds between backup attempts (an attempt is skipped when nothing changed) |
+| `MOTHER_BACKUP_MAX_AGE` | `21600` | Take a backup at least this often even if nothing changed (`0` = never skip) |
+| `MOTHER_BACKUP_ARCHIVE_INTERVAL` | `86400` | `archive/` is backed up separately, only when it changed, at most this often |
+| `MOTHER_BACKUP_WARN_GB` | `5` | `mother doctor` / `backup list --summary` warn when backups exceed this |
 | `MOTHER_BACKUP_DIR` | macOS: `~/Library/Application Support/Mother/backups`; else `${XDG_STATE_HOME:-~/.local/state}/mother/backups` | Where backups go. Must be outside `$MOTHER_ROOT` |
-| `MOTHER_BACKUP_KEEP_HOURS` / `MOTHER_BACKUP_KEEP_DAYS` | `24` / `30` | Keep every backup from the last N hours, then one per UTC day for N days |
+| `MOTHER_BACKUP_KEEP_HOURS` / `MOTHER_BACKUP_KEEP_DAYS` | `12` / `14` | Keep every backup from the last N hours, then one per UTC day for N days |
 | `MOTHER_BACKUP_LOGS` | `0` | `1` includes `logs/` in backups (large) |
 | `MOTHER_WORKER_AGENT` | (auto) | Force a specific worker agent name |
 | `MOTHER_PREAMBLE_PATH` | `<plugin>/templates/preamble.md` | Capabilities preamble prepended to every worker's prompt; point at `/dev/null` to disable |
@@ -448,16 +451,23 @@ Mother's state tree is plain files and irreplaceable, so three independent layer
    Mother goes through `safe_rm_tree`, which refuses `/`, `$HOME` and any directory that is or contains the marker.
 2. **Workers never get the real path as `MOTHER_ROOT`.** They get `MOTHER_LIVE_ROOT`; Mother's own commands
    resolve `${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}`, tests set a temp `MOTHER_ROOT`.
-3. **Rotating backups outside the tree**, taken by the runner every 15 minutes:
+3. **Rotating backups outside the tree**, taken by the runner hourly (skipped when nothing changed):
 
 ```
 mother backup now                    # take a backup immediately, then prune
-mother backup list                   # newest first, with size and job count
+mother backup list                   # newest first, with size and job count, plus a size/age summary
+mother backup list --summary         # just the summary (count, total size, newest age, bytes written in 24h)
 mother backup restore <file> [--yes] # refuses while the runner is running (mother daemon stop first)
 ```
 
+`archive/` is stored in its own `mother-archive-<ts>.tar.gz`; restoring a state backup also restores the matching
+archive backup, and older single-file backups (with `archive/` inside) still restore as before.
 Restore moves the current `jobs/ events/ archive/ ...` to `$MOTHER_ROOT/.pre-restore-<ts>/` before extracting;
 nothing is deleted. Details in `docs/design.md` ("State safety").
+
+**Restore gap:** archiving moves jobs from `jobs/` into `archive/`. A job archived after the last archive tarball (up to 24h under `--auto`) is in neither the newest state backup nor its paired archive, so restoring the newest backup drops it; an older retained backup (dailies, up to 14 days) still has it. `mother backup restore` prints a `note:` when the paired archive tarball is more than 1h older than the state backup, and `mother doctor` shows the newest archive tarball's age.
+
+With `archive/` changing daily, up to about 15 archive tarballs (about 160 MB each, about 2.4 GB) can be retained, so the steady-state total is about 3-4.5 GB.
 
 ### Archiving
 

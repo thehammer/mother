@@ -419,7 +419,7 @@ the real tree, an explicit `MOTHER_ROOT` (tests) wins, and anything a worker spa
 
 ### 3. Backups and restore
 
-- The runner calls `mother backup now` at most every `MOTHER_BACKUP_INTERVAL` seconds (default 900), gated by
+- The runner calls `mother backup now` at most every `MOTHER_BACKUP_INTERVAL` seconds (default 3600) via `mother backup now --auto`, gated by
   `$RUNNER_DIR/last-backup.ts` (written before the run, like `_maybe_archive`) and bounded by a
   `MOTHER_BACKUP_TIMEOUT` watchdog (default 300s) so a slow `tar` cannot block dispatch.
 - Location: `MOTHER_BACKUP_DIR`, default `~/Library/Application Support/Mother/backups` (macOS) or
@@ -427,13 +427,25 @@ the real tree, an explicit `MOTHER_ROOT` (tests) wins, and anything a worker spa
 - Contents: `jobs events archive drafts cursors metrics attention.json rate-limits.json config.env`; `logs/` only
   with `MOTHER_BACKUP_LOGS=1`. (`metrics/runs.jsonl` is the retro / ETA-calibration history and `config.env`
   the durable operator settings; both are small and unrecoverable, so they ride along.)
+- Skip when unchanged: `--auto` fingerprints `jobs events drafts metrics config.env` (path, size, mtime) and `cursors/`
+  (file count and total size only, since it churns constantly) into `$RUNNER_DIR/last-backup.sig`; an equal
+  fingerprint skips the state tarball (logged `backup: unchanged, skipped`) unless the newest state tarball is older
+  than `MOTHER_BACKUP_MAX_AGE` (21600s). `attention.json` and `rate-limits.json` are daemon-rewritten constantly and
+  stay out of the fingerprint (still in the tarball). Prune runs on the skip path too.
+- Archive split: `archive/` (append-only) is written to `mother-archive-<ts>.tar.gz` only when its fingerprint
+  (`$RUNNER_DIR/last-backup-archive.sig`) changed and, under `--auto`, at most every
+  `MOTHER_BACKUP_ARCHIVE_INTERVAL` (86400s); the state tarball no longer contains it. Restore of a state tarball
+  without `archive/` also restores the newest archive tarball not newer than it; legacy single-file backups restore as before.
 - Format: `mother-state-<YYYYmmddTHHMMSSZ>.tar.gz`, written to a hidden temp name and `mv`'d into place, so a
   crash never leaves a half-written file that looks valid.
-- Retention (after each successful backup): keep everything newer than `MOTHER_BACKUP_KEEP_HOURS` (24); of the
-  older ones keep the newest per UTC day for `MOTHER_BACKUP_KEEP_DAYS` (30); prune the rest. Age comes from the
+- Retention (after each successful backup): keep everything newer than `MOTHER_BACKUP_KEEP_HOURS` (12); of the
+  older ones keep the newest per UTC day for `MOTHER_BACKUP_KEEP_DAYS` (14); prune the rest. The newest state and
+  archive backups are never pruned; an archive backup is kept only if it is the newest or the match of a retained state backup. Age comes from the
   timestamp in the file name, never mtime; files that don't match the name pattern are never touched.
-  `MOTHER_BACKUP_ENABLED=0` disables the timer.
-- CLI: `mother backup now`, `mother backup list` (newest first, size, `jobs=N`), and
+  `MOTHER_BACKUP_ENABLED=0` disables the timer. Stale hidden `.mother-*.tmp.<pid>` files (dead pid, over 1h old) left by a killed tar are pruned too.
+- **Restore gap:** archiving moves jobs from `jobs/` into `archive/`. A job archived after the last archive tarball (up to 24h under `--auto`) is in neither the newest state backup nor its paired archive, so restoring the newest backup drops it; an older retained backup (dailies, up to 14 days) still has it. `mother backup restore` prints a `note:` when the paired archive tarball is more than 1h older than the state backup, and `mother doctor` shows the newest archive tarball's age.
+- Bytes written: each backup appends `<epoch> <kind> <bytes> <name>` to `$MOTHER_ROOT/backups-written.log` (last 7 days kept, trimmed atomically on append); the "written in the last 24h" figure comes from it, falling back to the on-disk sum labelled `estimated` when the log is empty. Up to about 15 archive tarballs (about 160 MB each, about 2.4 GB) can be retained when `archive/` changes daily: steady state is 3-4.5 GB.
+- CLI: `mother backup now [--auto]`, `mother backup list [--summary]` (newest first, size, `jobs=N`, then total size/count/newest age/bytes written in 24h; `warn:` above `MOTHER_BACKUP_WARN_GB`, default 5; `mother doctor` shows the same), and
   `mother backup restore <file> [--yes]`. Restore refuses while `$RUNNER_DIR/runner.pid` names a live process
   (`mother daemon stop` first), validates the archive (relative paths, known top-level entries only) before
   touching anything, moves the current restorable entries to `$MOTHER_ROOT/.pre-restore-<ts>/` (never deleted),

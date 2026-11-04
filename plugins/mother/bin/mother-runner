@@ -74,7 +74,7 @@ MOTHER_ARCHIVE_INTERVAL="${MOTHER_ARCHIVE_INTERVAL:-3600}"   # seconds between r
 MOTHER_ARCHIVE_OLDER_THAN="${MOTHER_ARCHIVE_OLDER_THAN:-30}" # days
 MOTHER_ARCHIVE_TIMEOUT="${MOTHER_ARCHIVE_TIMEOUT:-300}"      # seconds before a stuck sweep is killed
 MOTHER_BACKUP_ENABLED="${MOTHER_BACKUP_ENABLED:-1}"           # back up the state tree on a timer (0 to disable)
-MOTHER_BACKUP_INTERVAL="${MOTHER_BACKUP_INTERVAL:-900}"       # seconds between state-tree backups
+MOTHER_BACKUP_INTERVAL="${MOTHER_BACKUP_INTERVAL:-3600}"      # seconds between state-tree backup attempts (skipped when unchanged)
 MOTHER_BACKUP_TIMEOUT="${MOTHER_BACKUP_TIMEOUT:-300}"         # seconds before a stuck backup is killed
 MOTHER_ATTENTION_INTERVAL="${MOTHER_ATTENTION_INTERVAL:-60}" # seconds between attention.json refreshes
 MOTHER_PROGRESS_INTERVAL="${MOTHER_PROGRESS_INTERVAL:-30}"   # seconds between progress ticks
@@ -853,7 +853,8 @@ _maybe_archive() {
     fi
 }
 
-# _maybe_backup: back up the state tree (`mother backup now`, lib/backup.sh) at
+# _maybe_backup: back up the state tree (`mother backup now --auto`, lib/backup.sh;
+# it skips the state tarball when nothing changed) at
 # most once per MOTHER_BACKUP_INTERVAL seconds, keyed off a timestamp file so it
 # survives restarts. Same shape as _maybe_archive: the marker is written BEFORE
 # the run, and a watchdog bounds it so a slow tar can't block dispatch.
@@ -868,7 +869,7 @@ _maybe_backup() {
     local timeout_flag="$RUNNER_DIR/backup-timed-out.flag"
     rm -f "$timeout_flag"
     (
-        "$MOTHER_BIN_DIR/mother" backup now 2>&1 | while read -r line; do _log "backup: $line"; done
+        "$MOTHER_BIN_DIR/mother" backup now --auto 2>&1 | while read -r line; do _log "backup: $line"; done
     ) &
     local backup_pid=$!
     # The watchdog owns its `sleep` and kills it when told to stand down (TERM),
