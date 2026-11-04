@@ -41,6 +41,7 @@ Mother's state tree (`~/.mother`: jobs, events, archive) is irreplaceable; on 20
 - **Backups:** the runner writes `mother-state-<UTC>.tar.gz` (plus a separate `mother-archive-<UTC>.tar.gz` for
   `archive/`) at most every `MOTHER_BACKUP_INTERVAL` (3600s) outside the tree, skipping when nothing changed;
   `mother backup now|list|restore`. See `docs/design.md` "State safety".
+  **Restore gap:** archiving moves jobs from `jobs/` into `archive/`. A job archived after the last archive tarball (up to 24h under `--auto`) is in neither the newest state backup nor its paired archive, so restoring the newest backup drops it; an older retained backup (dailies, up to 14 days) still has it. `mother backup restore` prints a `note:` when the paired archive tarball is more than 1h older than the state backup, and `mother doctor` shows the newest archive tarball's age.
 
 ## Bug report workflow
 

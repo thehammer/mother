@@ -442,7 +442,9 @@ the real tree, an explicit `MOTHER_ROOT` (tests) wins, and anything a worker spa
   older ones keep the newest per UTC day for `MOTHER_BACKUP_KEEP_DAYS` (14); prune the rest. The newest state and
   archive backups are never pruned; an archive backup is kept only if it is the newest or the match of a retained state backup. Age comes from the
   timestamp in the file name, never mtime; files that don't match the name pattern are never touched.
-  `MOTHER_BACKUP_ENABLED=0` disables the timer.
+  `MOTHER_BACKUP_ENABLED=0` disables the timer. Stale hidden `.mother-*.tmp.<pid>` files (dead pid, over 1h old) left by a killed tar are pruned too.
+- **Restore gap:** archiving moves jobs from `jobs/` into `archive/`. A job archived after the last archive tarball (up to 24h under `--auto`) is in neither the newest state backup nor its paired archive, so restoring the newest backup drops it; an older retained backup (dailies, up to 14 days) still has it. `mother backup restore` prints a `note:` when the paired archive tarball is more than 1h older than the state backup, and `mother doctor` shows the newest archive tarball's age.
+- Bytes written: each backup appends `<epoch> <kind> <bytes> <name>` to `$MOTHER_ROOT/backups-written.log` (last 7 days kept, trimmed atomically on append); the "written in the last 24h" figure comes from it, falling back to the on-disk sum labelled `estimated` when the log is empty. Up to about 15 archive tarballs (about 160 MB each, about 2.4 GB) can be retained when `archive/` changes daily: steady state is 3-4.5 GB.
 - CLI: `mother backup now [--auto]`, `mother backup list [--summary]` (newest first, size, `jobs=N`, then total size/count/newest age/bytes written in 24h; `warn:` above `MOTHER_BACKUP_WARN_GB`, default 5; `mother doctor` shows the same), and
   `mother backup restore <file> [--yes]`. Restore refuses while `$RUNNER_DIR/runner.pid` names a live process
   (`mother daemon stop` first), validates the archive (relative paths, known top-level entries only) before

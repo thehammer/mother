@@ -465,6 +465,10 @@ archive backup, and older single-file backups (with `archive/` inside) still res
 Restore moves the current `jobs/ events/ archive/ ...` to `$MOTHER_ROOT/.pre-restore-<ts>/` before extracting;
 nothing is deleted. Details in `docs/design.md` ("State safety").
 
+**Restore gap:** archiving moves jobs from `jobs/` into `archive/`. A job archived after the last archive tarball (up to 24h under `--auto`) is in neither the newest state backup nor its paired archive, so restoring the newest backup drops it; an older retained backup (dailies, up to 14 days) still has it. `mother backup restore` prints a `note:` when the paired archive tarball is more than 1h older than the state backup, and `mother doctor` shows the newest archive tarball's age.
+
+With `archive/` changing daily, up to about 15 archive tarballs (about 160 MB each, about 2.4 GB) can be retained, so the steady-state total is about 3-4.5 GB.
+
 ### Archiving
 
 - `mother archive <id> [--dry-run]` archives exactly one terminal-state job

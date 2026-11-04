@@ -133,6 +133,19 @@ _backup_name_epoch() {
     _backup_ts_epoch "${ts:0:16}"
 }
 
+# _backup_log_write <kind> <bytes> <name> — record one written backup in
+# $MOTHER_ROOT/backups-written.log as "<epoch> <kind> <bytes> <name>", dropping
+# lines older than 7 days (atomic rewrite). Best-effort: never fails a backup.
+_backup_log_write() {
+    local log="$MOTHER_ROOT/backups-written.log" now tmp
+    now=$(_backup_now_epoch); tmp="$log.tmp.$$"
+    {
+        [ -f "$log" ] && awk -v cut=$((now - 604800)) '$1 + 0 >= cut' "$log"
+        printf '%s %s %s %s\n' "$now" "$1" "$2" "$3"
+    } > "$tmp" 2>/dev/null && mv -f "$tmp" "$log" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
 # _backup_write_tar <prefix> <dest-dir> <item>... — tar the items (relative to
 # $MOTHER_ROOT) into <dest-dir>/<prefix>-<ts>.tar.gz atomically; print the path.
 _backup_write_tar() {
@@ -154,6 +167,7 @@ _backup_write_tar() {
         return 1
     fi
     mv -f "$tmp" "$final" || { rm -f "$tmp"; echo "backup failed (could not move into place)" >&2; return 1; }
+    _backup_log_write "${prefix#mother-}" "$(wc -c < "$final" 2>/dev/null | tr -d ' ')" "$(basename "$final")"
     printf '%s\n' "$final"
 }
 
@@ -293,6 +307,12 @@ mother_backup_prune() {
     case "$keep_h" in ''|*[!0-9]*) keep_h=12 ;; esac
     case "$keep_d" in ''|*[!0-9]*) keep_d=14 ;; esac
     now=$(_backup_now_epoch)
+    # Orphaned hidden temp files from a killed tar: exact pattern, > 1h old, pid dead.
+    for f in $(ls -1A "$dir" 2>/dev/null | grep -E '^\.mother-(state|archive)-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?\.tmp\.[0-9]+$'); do
+        kill -0 "${f##*.}" 2>/dev/null && continue
+        [ -n "$(find "$dir/$f" -maxdepth 0 -type f -mmin +60 2>/dev/null)" ] || continue
+        rm -f -- "${dir:?}/${f:?}" && echo "pruned $f"
+    done
     for f in $(_backup_files); do
         ts="${f#mother-state-}"; ts="${ts:0:16}"
         epoch=$(_backup_ts_epoch "$ts")
@@ -352,8 +372,9 @@ _backup_age_human() {
 # mother_backup_summary — the backup budget: count, total size, newest age and
 # bytes written in the last 24h, plus a `warn:` line above MOTHER_BACKUP_WARN_GB.
 mother_backup_summary() {
-    local dir f bytes now epoch count=0 total=0 written=0 newest=0 warn_gb
+    local dir f bytes now epoch count=0 total=0 written=0 newest=0 warn_gb label="" arch="" log newest_arch
     dir=$(mother_backup_dir); now=$(_backup_now_epoch)
+    log="$MOTHER_ROOT/backups-written.log"
     for f in $(_backup_files) $(_backup_archive_files); do
         bytes=$(wc -c < "$dir/$f" 2>/dev/null | tr -d ' '); bytes="${bytes:-0}"
         epoch=$(_backup_name_epoch "$f")
@@ -362,10 +383,18 @@ mother_backup_summary() {
         [ $((now - epoch)) -lt 86400 ] && written=$((written + bytes))
     done
     if [ "$count" -eq 0 ]; then echo "no backups in $dir"; return 0; fi
-    printf 'backups: %d files, %s total, newest %s ago, %s written in the last 24h\n' \
-        "$count" "$(_backup_human "$total")" "$(_backup_age_human $((now - newest)))" "$(_backup_human "$written")"
+    # Bytes recorded at write time survive pruning; the on-disk sum under-reports.
+    if [ -s "$log" ]; then
+        written=$(awk -v cut=$((now - 86400)) '$1 + 0 > cut { s += $3 } END { printf "%d", s }' "$log")
+    else
+        label=" (estimated)"
+    fi
+    newest_arch=$(_backup_archive_files | head -n1)
+    [ -z "$newest_arch" ] || arch=", newest archive backup $(_backup_age_human $((now - $(_backup_name_epoch "$newest_arch")))) ago"
+    printf 'backups: %d files, %s total, newest %s ago%s, %s written in the last 24h%s\n' \
+        "$count" "$(_backup_human "$total")" "$(_backup_age_human $((now - newest)))" "$arch" "$(_backup_human "$written")" "$label"
     warn_gb="${MOTHER_BACKUP_WARN_GB:-5}"
-    case "$warn_gb" in ''|*[!0-9.]*|*.*.*) warn_gb=5 ;; esac
+    [[ "$warn_gb" =~ ^([0-9]+\.?[0-9]*|\.[0-9]+)$ ]] && [[ "$warn_gb" =~ [0-9] ]] || warn_gb=5
     if awk -v t="$total" -v g="$warn_gb" 'BEGIN { exit !(t > g * 1073741824) }'; then
         printf 'warn: backups use %s (over %s GB). Lower MOTHER_BACKUP_KEEP_HOURS (now %s) or MOTHER_BACKUP_KEEP_DAYS (now %s), or raise MOTHER_BACKUP_INTERVAL (now %s) in config.env.\n' \
             "$(_backup_human "$total")" "$warn_gb" "${MOTHER_BACKUP_KEEP_HOURS:-12}" "${MOTHER_BACKUP_KEEP_DAYS:-14}" "${MOTHER_BACKUP_INTERVAL:-3600}"
@@ -467,7 +496,7 @@ mother_backup_restore() {
     fi
 
     # Validate everything before touching anything.
-    local tops top archive_file="" archive_note=""
+    local tops top archive_file="" archive_note="" gap_note=""
     tops=$(_backup_validate "$file") || return 1
     case "$(basename "$file")" in
         mother-archive-*) ;;                       # an archive backup restores alone
@@ -481,6 +510,11 @@ mother_backup_restore() {
                         local atops; atops=$(_backup_validate "$archive_file") || return 1
                         [ "$atops" = " archive" ] || { echo "archive backup $archive_file holds more than archive/; refusing" >&2; return 1; }
                         tops="$tops archive"
+                        local sts ats
+                        sts=$(_backup_name_epoch "$(basename "$file")"); ats=$(_backup_name_epoch "$pick")
+                        if [ $((sts - ats)) -gt 3600 ]; then
+                            gap_note="archive backup $(basename "$pick") is more than 1h older than state backup $(basename "$file"); jobs archived in between are not in this restore (an older state backup may still have them)"
+                        fi
                     else
                         archive_note="no archive backup found; archive/ left as it is"
                     fi ;;
@@ -521,6 +555,7 @@ mother_backup_restore() {
     echo "restored from $file:$tops"
     [ -n "$archive_file" ] && echo "  archive from $archive_file"
     [ -n "$archive_note" ] && echo "  note: $archive_note"
+    [ -n "$gap_note" ] && echo "  note: $gap_note"
     echo "  jobs: $jobs   archive files: $archived"
     [ -n "$moved" ] && echo "previous state kept at $aside"
     return 0

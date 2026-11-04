@@ -1443,3 +1443,107 @@ _seed_summary_fixtures() {
     grep -E 'MOTHER_BACKUP_KEEP_HOURS.*\(default: 12\)' <<<"$output"
     grep -E 'MOTHER_BACKUP_KEEP_DAYS.*\(default: 14\)' <<<"$output"
 }
+
+# ===========================================================================
+# PR #107 review fix-ups
+# ===========================================================================
+
+@test "restore prints a note (not an error) when the paired archive backup is over 1h older than the state backup" {
+    _fake_tarball mother-state-20260615T110000Z.tar.gz jobs/a.json '{}'
+    _fake_tarball mother-archive-20260615T090000Z.tar.gz archive/o.json '{}'
+
+    run mother backup restore mother-state-20260615T110000Z.tar.gz --yes </dev/null
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"note:"*"20260615T090000Z"*"20260615T110000Z"*"not in this restore"* ]]
+}
+
+@test "restore prints no archive-gap note when the archive backup is within 1h of the state backup" {
+    _fake_tarball mother-state-20260615T110000Z.tar.gz jobs/a.json '{}'
+    _fake_tarball mother-archive-20260615T103000Z.tar.gz archive/o.json '{}'
+
+    run mother backup restore mother-state-20260615T110000Z.tar.gz --yes </dev/null
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"not in this restore"* ]]
+}
+
+@test "backup list --summary shows the age of the newest archive backup" {
+    _seed_summary_fixtures
+
+    run mother backup list --summary
+
+    [[ "$output" =~ newest[[:space:]]archive[[:space:]]backup[[:space:]]2h[[:space:]]ago ]]
+}
+
+@test "backup list --summary reports bytes written from the write log even after prune removed the files" {
+    mkdir -p "$MOTHER_BACKUP_DIR"
+    head -c 1048576 /dev/zero > "$MOTHER_BACKUP_DIR/mother-state-20260615T110000Z.tar.gz"
+    export MOTHER_BACKUP_NOW_EPOCH
+    MOTHER_BACKUP_NOW_EPOCH=$(_epoch 2026-06-15T12:00:00Z)
+    local i
+    for i in $(seq 1 24); do
+        echo "$((MOTHER_BACKUP_NOW_EPOCH - i * 3500)) state 1048576 mother-state-x$i.tar.gz"
+    done > "$MOTHER_ROOT/backups-written.log"
+
+    run mother backup list --summary
+
+    [[ "$output" =~ 24(\.0)?[[:space:]]?MB[[:space:]]written[[:space:]]in[[:space:]]the[[:space:]]last[[:space:]]24h ]]
+    [[ "$output" != *"estimated"* ]]
+}
+
+@test "backup list --summary falls back to the on-disk figure, labelled estimated, when there is no write log" {
+    _seed_summary_fixtures
+
+    run mother backup list --summary
+
+    [[ "$output" =~ 2(\.0)?[[:space:]]?MB[[:space:]]written[[:space:]]in[[:space:]]the[[:space:]]last[[:space:]]24h.*estimated ]]
+}
+
+@test "backup now appends to the write log and trims entries older than 7 days" {
+    mkdir -p "$MOTHER_ROOT/jobs"; echo '{}' > "$MOTHER_ROOT/jobs/a.json"
+    echo "$(( $(date +%s) - 8 * 86400 )) state 100 mother-state-old.tar.gz" > "$MOTHER_ROOT/backups-written.log"
+
+    _backup_now
+    [ "$BK_RC" -eq 0 ]
+
+    run cat "$MOTHER_ROOT/backups-written.log"
+    [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -eq 1 ]
+    [[ "$output" == *" state "*"$(basename "$BK")" ]]
+    [[ "$output" != *"mother-state-old"* ]]
+}
+
+@test "MOTHER_BACKUP_WARN_GB='.' is invalid and falls back to the default 5 GB" {
+    _seed_summary_fixtures
+    export MOTHER_BACKUP_WARN_GB=.
+
+    run mother backup list --summary
+
+    [[ "$output" != *"warn:"* ]]
+}
+
+@test "prune removes stale orphaned hidden temp files, and only those" {
+    mkdir -p "$MOTHER_BACKUP_DIR"
+    _fake_stamp 20260615T110000Z
+    export MOTHER_BACKUP_NOW_EPOCH
+    MOTHER_BACKUP_NOW_EPOCH=$(_epoch 2026-06-15T12:00:00Z)
+    local d="$MOTHER_BACKUP_DIR"
+    echo x > "$d/.mother-state-20260615T100000Z.tmp.999999"      # stale, dead pid
+    echo x > "$d/.mother-archive-20260615T100000Z.tmp.999998"    # stale, dead pid
+    echo x > "$d/.mother-state-20260615T100000Z.tmp.$$"          # stale, live pid
+    echo x > "$d/.mother-state-20260615T110000Z.tmp.999997"      # recent, dead pid
+    echo x > "$d/.mother-other.tmp.999996"                       # wrong pattern
+    echo x > "$d/.mother-state-20260615T100000Z.tmp.999995.bak"  # wrong pattern
+    touch -t 202001010000 "$d/.mother-state-20260615T100000Z.tmp.999999" \
+        "$d/.mother-archive-20260615T100000Z.tmp.999998" "$d/.mother-state-20260615T100000Z.tmp.$$" \
+        "$d/.mother-other.tmp.999996" "$d/.mother-state-20260615T100000Z.tmp.999995.bak"
+
+    mother backup now >/dev/null 2>&1 || true
+
+    [ ! -e "$d/.mother-state-20260615T100000Z.tmp.999999" ]
+    [ ! -e "$d/.mother-archive-20260615T100000Z.tmp.999998" ]
+    [ -e "$d/.mother-state-20260615T100000Z.tmp.$$" ]
+    [ -e "$d/.mother-state-20260615T110000Z.tmp.999997" ]
+    [ -e "$d/.mother-other.tmp.999996" ]
+    [ -e "$d/.mother-state-20260615T100000Z.tmp.999995.bak" ]
+}
