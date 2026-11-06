@@ -1,0 +1,28 @@
+# Probe 1: auth. Vault token as CLAUDE_CODE_OAUTH_TOKEN, plus decoy masking check.
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: install-claude
+    run: |
+      curl -fsSL https://claude.ai/install.sh | bash
+      echo "$HOME/.local/bin" >> "$RWX_ENV/PATH" 2>/dev/null || true
+      $HOME/.local/bin/claude --version
+
+  - key: auth
+    use: install-claude
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ vaults.mother-spike.secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      SPIKE_DECOY: ${{ vaults.mother-spike.secrets.SPIKE_DECOY }}
+    run: |
+      echo "decoy-echo: $SPIKE_DECOY"
+      echo "decoy-echo-b64: $(printf %s "$SPIKE_DECOY" | base64)"
+      export PATH="$HOME/.local/bin:$PATH"
+      set +e
+      claude -p --model sonnet --max-turns 3 "Reply with the word ok" > /tmp/out.txt 2>/tmp/err.txt
+      rc=$?
+      echo "claude-exit: $rc"
+      echo "claude-stdout: $(head -c 600 /tmp/out.txt)"
+      echo "claude-stderr: $(head -c 600 /tmp/err.txt)"
+      exit $rc

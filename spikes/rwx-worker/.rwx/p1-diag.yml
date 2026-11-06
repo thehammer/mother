@@ -1,0 +1,17 @@
+# Probe 1 diagnostic: shape-only facts about the vault secret (booleans and length; never the value).
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: shape
+    env:
+      T: ${{ vaults.mother-spike.secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      D: ${{ vaults.mother-spike.secrets.SPIKE_DECOY }}
+    run: |
+      echo "len=${#T}"
+      case "$T" in sk-ant-oat01-*) echo "prefix_oat01=yes";; sk-ant-*) echo "prefix_other_sk_ant=yes";; *) echo "prefix_sk_ant=no";; esac
+      case "$T" in *[[:space:]]*) echo "has_whitespace=yes";; *) echo "has_whitespace=no";; esac
+      printf %s "$T" | grep -Eq '^[A-Za-z0-9_-]+$' && echo "charset_urlsafe=yes" || echo "charset_urlsafe=no"
+      [ "$T" = "$D" ] && echo "equals_decoy=yes" || echo "equals_decoy=no"
+      [ -z "$T" ] && echo "empty=yes" || echo "empty=no"

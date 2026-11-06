@@ -1,0 +1,22 @@
+# Probe 4 (egress part): quick table. WebSocket hold is p4-websocket.yml.
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: egress
+    run: |
+      which python3 pip3 node curl git || true
+      python3 --version || true
+      for u in https://api.anthropic.com https://github.com https://crates.io https://pypi.org https://registry.npmjs.org https://1.1.1.1 https://claude.ai; do
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$u" 2>/tmp/e); rc=$?
+        echo "EGRESS https $u rc=$rc http=$code err=$(head -c 120 /tmp/e | tr '\n' ' ')"
+      done
+      # TCP 22
+      if timeout 8 bash -c 'exec 3<>/dev/tcp/github.com/22; head -c 40 <&3' >/tmp/ssh.out 2>/tmp/ssh.err; then echo "EGRESS tcp22 github.com open banner=$(tr -d '\r\n' </tmp/ssh.out)"; else echo "EGRESS tcp22 github.com rc=$? (blocked or timeout) $(head -c 100 /tmp/ssh.err)"; fi
+      # UDP 51820 send-only
+      bash -c 'echo ping > /dev/udp/1.1.1.1/51820' && echo "EGRESS udp51820 send returned ok (delivery unconfirmable)" || echo "EGRESS udp51820 send failed rc=$?"
+      # WS candidates reachability (HTTP upgrade handshake)
+      for u in https://echo.websocket.org https://ws.postman-echo.com/raw https://ntfy.sh; do
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$u" 2>/dev/null); echo "EGRESS ws-candidate $u http=$code"
+      done

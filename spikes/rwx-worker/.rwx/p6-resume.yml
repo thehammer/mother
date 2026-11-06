@@ -1,0 +1,56 @@
+# Probe 6: resume a session in a SECOND task (fresh container), three path variants.
+# Input: .rwx/p6data/{<session>.jsonl,session_id,original_path} (transcript artifact from probe 5, gitignored).
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: install-claude
+    run: |
+      curl -fsSL https://claude.ai/install.sh | bash
+      $HOME/.local/bin/claude --version
+
+  - key: resume
+    use: install-claude
+    timeout: 20m
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ vaults.mother-spike.secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DATA: ${{ run.dir }}/p6data
+    run: |
+      export PATH="$HOME/.local/bin:$PATH"
+      SID=$(cat "$DATA/session_id")
+      ORIG=$(cat "$DATA/original_path")
+      enc() { printf %s "$1" | sed 's#[/.]#-#g'; }
+      echo "P6 session=$SID original_path=$ORIG enc_orig=$(enc "$ORIG") host=$(hostname) transcript_bytes=$(wc -c < "$DATA/$SID.jsonl")"
+      git clone --depth 1 https://github.com/thehammer/nostromo.git /tmp/nostromo-src
+
+      cat > /tmp/parse.py <<'PY'
+      import sys, json
+      raw = sys.stdin.read()
+      try:
+          d = json.loads(raw)
+          print("session_id=%s is_error=%s cost=%s result=%s" % (d.get("session_id"), d.get("is_error"), d.get("total_cost_usd"), str(d.get("result"))[:300].replace("\n", " ")))
+      except Exception:
+          print("unparsed:", raw[:200].replace("\n", " "))
+      PY
+
+      variant() {  # name, checkout dir, project-dir-name to restore into
+        name=$1; dir=$2; proj=$3
+        rm -rf "$HOME/.claude/projects"; rm -rf "$(dirname "$dir")"; mkdir -p "$(dirname "$dir")"
+        cp -r /tmp/nostromo-src "$dir"
+        mkdir -p "$HOME/.claude/projects/$proj"
+        cp "$DATA/$SID.jsonl" "$HOME/.claude/projects/$proj/"
+        cd "$dir"
+        set +e
+        out=$(printf '%s' "What file did you write and what was its first line? Answer in one short sentence." | claude -p --model sonnet --max-turns 3 --resume "$SID" --output-format json 2>/tmp/err)
+        rc=$?
+        set -e
+        echo "P6 variant=$name cwd=$dir restored_into=$proj rc=$rc"
+        echo "P6 variant=$name answer=$(printf %s "$out" | python3 /tmp/parse.py)"
+        echo "P6 variant=$name stderr=$(head -c 300 /tmp/err | tr '\n' ' ')"
+        echo "P6 variant=$name projects_after=$(ls "$HOME/.claude/projects" | tr '\n' ' ')"
+      }
+
+      variant a-same-path        "$ORIG"                         "$(enc "$ORIG")"
+      variant b-new-path-old-enc "$HOME/jobB/nostromo"           "$(enc "$ORIG")"
+      variant c-new-path-new-enc "$HOME/jobB/nostromo"           "$(enc "$HOME/jobB/nostromo")"

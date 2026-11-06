@@ -1,0 +1,98 @@
+# Probes 3 + 5 (+ source of 6 and 7): a real `claude -p` job on 4 vCPU against the public nostromo repo.
+# Init params:
+#   delay-seconds  sleep before claude starts (time to attach `rwx ssh` / `rwx logs`)
+#   idle-minutes   keep the task alive this long after claude finishes (probe 3 live tests, probe 7 idle cost)
+#   topic          ntfy.sh topic for outward progress pushes ("none" to disable)
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: install-claude
+    run: |
+      curl -fsSL https://claude.ai/install.sh | bash
+      $HOME/.local/bin/claude --version
+
+  - key: job
+    use: install-claude
+    timeout: 60m
+    runner:
+      cpus: 4
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ vaults.mother-spike.secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DELAY_SECONDS: ${{ init.delay-seconds }}
+      IDLE_MINUTES: ${{ init.idle-minutes }}
+      TOPIC: ${{ init.topic }}
+    run: |
+      export PATH="$HOME/.local/bin:$PATH"
+      T0=$(date +%s)
+      echo "STAGE start nproc=$(nproc) pwd=$(pwd) home=$HOME"
+      mkdir -p "$HOME/jobA" && cd "$HOME/jobA"
+      git clone --depth 1 https://github.com/thehammer/nostromo.git
+      cd nostromo
+      echo "STAGE cloned workdir=$(pwd) t+$(( $(date +%s) - T0 ))s"
+
+      # Outward progress pusher (probe 3c): posts one line per agent-log event to ntfy.sh. Content: counters only.
+      : > /tmp/agent.log
+      if [ "$TOPIC" != "none" ]; then
+        cat > /tmp/push.py <<'PY'
+      import json, subprocess, sys, time, urllib.request
+      topic = sys.argv[1]
+      n = 0
+      p = subprocess.Popen(["tail", "-n", "+1", "-F", "/tmp/agent.log"], stdout=subprocess.PIPE, text=True)
+      for line in p.stdout:
+          n += 1
+          try: ev = json.loads(line); kind = ev.get("type", "?")
+          except Exception: kind = "raw"
+          body = f"seq={n} type={kind} sent_ms={int(time.time()*1000)}".encode()
+          try: urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{topic}", data=body), timeout=10).read()
+          except Exception as e: print("PUSH_ERR", type(e).__name__, flush=True)
+      PY
+        python3 /tmp/push.py "$TOPIC" &
+        echo "STAGE pusher started"
+      fi
+
+      i=0
+      while [ "$i" -lt "$DELAY_SECONDS" ]; do echo "WAITING $i/$DELAY_SECONDS t=$(date -u +%T)"; sleep 10; i=$((i+10)); done
+
+      echo "STAGE claude-start t=$(date -u +%FT%TZ)"
+      C0=$(date +%s)
+      set +e
+      printf '%s' "Read docs/rwx-sandbox.md in this repo. List the three slowest tests or slowest steps mentioned in its timing information and suggest one concrete improvement. Write the answer to /tmp/out.md. The first line of /tmp/out.md must be a markdown H1 title. Reply with one sentence when done." | claude -p --model sonnet --max-turns 15 --output-format stream-json --verbose \
+        --add-dir /tmp --allowedTools "Read,Glob,Grep,Write" \
+        > /tmp/agent.log 2>/tmp/agent.err
+      rc=$?
+      echo "STAGE claude-exit rc=$rc stderr=$(head -c 300 /tmp/agent.err | tr '\n' ' ') wall=$(( $(date +%s) - C0 ))s t=$(date -u +%FT%TZ)"
+      sleep 3
+
+      # Extract result fields (no secrets in them)
+      python3 - <<'PY'
+      import json
+      res = None
+      for l in open("/tmp/agent.log"):
+          try: ev = json.loads(l)
+          except Exception: continue
+          if ev.get("type") == "result": res = ev
+      if res:
+          print("RESULT session_id=%s turns=%s duration_ms=%s cost_usd=%s is_error=%s" % (res.get("session_id"), res.get("num_turns"), res.get("duration_ms"), res.get("total_cost_usd"), res.get("is_error")))
+          print("RESULT usage=%s" % json.dumps(res.get("usage")))
+          open("/tmp/session_id", "w").write(res.get("session_id", ""))
+      else:
+          print("RESULT none")
+      PY
+      echo "OUTMD first_line=$(head -1 /tmp/out.md 2>/dev/null)"
+      echo "OUTMD size=$(wc -c < /tmp/out.md 2>/dev/null)"
+
+      # Artifacts (probe 3d): transcripts, agent log, out.md, diff, meta
+      mkdir -p "$RWX_ARTIFACTS"
+      cp -r "$HOME/.claude/projects" "$RWX_ARTIFACTS/claude-projects"
+      cp /tmp/agent.log "$RWX_ARTIFACTS/agent.log"
+      cp /tmp/out.md "$RWX_ARTIFACTS/out.md" 2>/dev/null || true
+      cp /tmp/session_id "$RWX_ARTIFACTS/session_id" 2>/dev/null || true
+      (cd "$HOME/jobA/nostromo" && git diff > "$RWX_ARTIFACTS/checkout.diff"; echo "$HOME/jobA/nostromo" > "$RWX_ARTIFACTS/original_path")
+      echo "ARTIFACT_SIZES $(du -sb "$RWX_ARTIFACTS"/* | tr '\n' ' ')"
+      ls -R "$HOME/.claude/projects" | head -20
+
+      end=$(( $(date +%s) + IDLE_MINUTES * 60 ))
+      while [ "$(date +%s)" -lt "$end" ]; do echo "IDLE t=$(date -u +%T)"; sleep 60; done
+      echo "STAGE done total=$(( $(date +%s) - T0 ))s"
