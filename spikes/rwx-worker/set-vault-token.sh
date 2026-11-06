@@ -11,6 +11,11 @@
 set -euo pipefail
 
 vault="${VAULT:-mother-spike}"
+org="$(rwx whoami 2>/dev/null | sed -n 's/^Organization: //p')"
+if [ "$org" != "carefeed" ]; then
+  echo "rwx is logged into '${org:-nothing}', not carefeed (the org this spike uses); nothing was set." >&2
+  exit 1
+fi
 read -r -s -p "Paste the sk-ant-oat token, then Enter: " token
 echo
 token="$(printf '%s' "$token" | tr -d '[:space:]')"

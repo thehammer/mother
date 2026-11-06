@@ -6,7 +6,7 @@ PRD: `.claude/prds/mother-cluster.md` (Phase 0, MC-11, MC-13, MC-22 to MC-25).
 
 ## Recommendation: GO WITH CONDITIONS (for RWX as a personal-repo worker kind, Phase 3)
 
-Everything that decides feasibility passed: the vault token authenticates `claude -p`, a real job runs and costs
+Everything except duration (pending, and able to flip the verdict) passed: the vault token authenticates `claude -p`, a real job runs and costs
 cents, a transcript restored on a different machine (even at a different checkout path) resumes correctly (so
 MC-13 is possible), the task can hold an outbound WebSocket and push progress out live, and the data can be pulled
 out live (logs, `rwx ssh`, outbound push) and at the end (artifacts).
@@ -37,8 +37,8 @@ Conditions, in order of how likely they are to bite:
 
 What flips it to no-go: a failed duration run that is a token or platform limit under 2 h; a policy change by
 Anthropic or RWX on unattended subscription tokens; or Carefeed objecting to a personal subscription token in a
-Carefeed RWX org. What flips it to plain go: both duration runs pass with all three `claude -p` calls ok, and the
-WebSocket drop turns out to be the echo server.
+Carefeed RWX org. What flips it to plain go: both duration runs pass with all three `claude -p` calls ok (the
+WebSocket drop was already shown to be the echo server: `wss://ntfy.sh` held 25 min with no drop).
 
 ## Probe table
 
@@ -46,7 +46,7 @@ WebSocket drop turns out to be the echo server.
 |---|---|---|---|---|
 | 1 | Auth | **PASS** after the owner re-set the secret. `claude -p --model sonnet "Reply with the word ok"` printed `ok`, exit 0. Decoy masked (`********`); **base64 of the decoy not masked.** First two attempts failed `401 Invalid bearer token` because the stored value was 143 chars with whitespace and no `sk-ant-` prefix (shape diagnostic, run `01a1b1ccc10d752591eda38bb8810311`). A locked vault was readable by CLI-launched runs for the vault's user without any access change. | pass `01a1b1d161937db2aaffb9dd83d66b33`; fail `01a1b1cc3fb07af2b25436873a2e2f2b`, `01a1b1cb3ac27b4aa756842512d8f846` | about $0.06 |
 | 2 | Duration | **PENDING.** Two 1 vCPU runs launched 17:07 UTC, no waiting. 270 min run and 510 min run both accepted by RWX and running. Each calls `claude -p` at start, at 2 h and at the end, heartbeat every 60 s. Smoke run (2 min) passed and `collect.sh` works on it. | 270 min: `01a1b1d48e49737eabae52814cea3675`; 510 min: `01a1b1d4979575059de9ec4e3bdee2cc`; smoke `01a1b1d1c6ee747c9a1ad20cb2e88756` | up to $1.13 and $2.14 (billed to timeout at worst) |
-| 3 | Live and final extraction | **PASS**, see detail below. | `01a1b1d89aa17477af551d5e9315cec5` (task `01a1b1d89aa572028f82eef30c3ae3cb`) | $0.49 (9 min lost to orphan children) |
+| 3 | Live and final extraction | **PASS with caveat** (`rwx logs` returned an empty archive for long-running tasks; push-out is the dependable live channel), see detail below. | `01a1b1d89aa17477af551d5e9315cec5` (task `01a1b1d89aa572028f82eef30c3ae3cb`) | $0.49 (9 min lost to orphan children) |
 | 4 | WebSocket and egress | **PASS.** 30 min hold to `wss://echo.websocket.org`, ping every 20 s: 91 pings, 89 pongs, 2 drops at about 10 min 10 s each, 2 reconnects (3 s each), RTT median 105 ms. Follow-up to `wss://ntfy.sh`, 25 min, protocol ping every 20 s: **0 drops**, RTT median 17 ms, so the drops were the echo server. Egress table below. | hold `01a1b1d6db4f76f1bd06a76a4cba10f7`; egress `01a1b1d4e3fb7acba83cf11f1bcf24c4`; follow-up `01a1b1f40bed7253b1cda8bea17d91db` | $0.13 + $0.01 + $0.11 (+ $0.04 cancelled run) |
 | 5 | A real job and its cost | **PASS.** 4 vCPU, clone nostromo (2 s), `claude -p --model sonnet`, 3 turns, wrote `/tmp/out.md` (first line `# Slowest steps in docs/rwx-sandbox.md`). Claude wall 9 s (7 s in the 20 min run), `total_cost_usd` 0.0482 (first, cold cache) and 0.0161 (second). Usage, run 1: input 6, cache_creation 9,910, cache_read 55,097, output 941. RWX: task 14 s, billed at the 1 minute minimum, 4 x 60 x $0.00007 = $0.0168. `claude` install is one task, cached after the first run (about 14 s as a cache hit). | `01a1b1d805957183bc91f4a301547783` | $0.017 RWX + $0.048 Claude (list price) |
 | 6 | Resume elsewhere | **PASS, all three variants.** Fresh container, transcript restored, `claude --resume <id> -p "What file did you write and what was its first line?"` answered `/tmp/out.md` and `# Slowest steps in docs/rwx-sandbox.md` in (a) same path, (b) different checkout path with the transcript under the ORIGINAL path's encoded name, (c) different path with the new path's encoded name. **No path rewriting was needed.** Session id preserved. | `01a1b1dfd63477028589970abad64c0c` | $0.008 RWX + $0.17 Claude |
@@ -102,7 +102,7 @@ because public servers and networks drop connections, but the platform is not th
 ## MC-13 (resume on another machine): feasible
 
 Probe 6 shows `claude --resume` works from a restored transcript on a fresh container with no path rewriting,
-even when the checkout path differs, as long as the transcript is under `~/.claude/projects/<any project dir>/`.
+even when the checkout path differs, with the transcript under either the original path's or the new path's encoded project dir in `~/.claude/projects/` (the two names tested).
 Checkpoint size: the transcript (186 KB for a 3 turn read-only job; grows with tool output) plus `git diff` of
 the checkout (empty here; the job wrote outside the repo). Caveats: only a short text session was resumed (no
 tool use after resume, so file state was not exercised) and the model answered from the transcript, not from
@@ -113,13 +113,14 @@ diff with a summary prompt.
 
 ## Spend
 
-- RWX compute: about $1.5 so far (all probes except the two duration runs' remaining time) and a projected total of about $4.3 once the duration runs end (worst case about $4.4 if both run to their timeouts), well under the $12 cap (computed from task runtimes x vCPUs x $0.00007 with the 1 minute minimum; the
+- RWX compute: about $1.5 so far (all probes except the two duration runs' remaining time) and a projected total of about $4.3 once the duration runs end (the $1.5 includes neither duration run; worst case about $4.8 if both run to their full timeouts: $1.13 + $2.14 on top), well under the $12 cap (computed from task runtimes x vCPUs x $0.00007 with the 1 minute minimum; the
   organisation-level `rwx billing usage` cannot isolate the spike). Hard cap was $12.
 - Claude (list price, from `total_cost_usd`): about $0.31 for probes 5 and 6 plus a handful of one-word calls.
   Some or all of it ran as subscription **overage** (see condition 2).
 
 ## What is NOT verified
 
+- Vault isolation from other Carefeed org members: `mother-spike` is locked with access for the owner only, and a CLI-launched run read it with no change, but nobody else tried to read it. Confirm before treating a personal token in a company vault as contained.
 - Runs beyond 2 minutes on one task for the token: the 4.5 h and 8.5 h runs are pending (`collect.sh`).
 - Any RWX maximum task duration; whether 510 m survives. Also whether the duration runs' logs can be read live (they could not, so `collect.sh` is for after they finish).
 - That the OAuth token itself is masked in logs (only the decoy was tested; the token is never read).

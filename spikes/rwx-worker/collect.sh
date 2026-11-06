@@ -36,9 +36,9 @@ log="$(ls "$dir"/*.log | head -1)"
 
 hb="$(grep -c 'stdout	HEARTBEAT' "$log" || true)"
 echo "heartbeats: $hb"
-echo "first heartbeat: $(grep 'stdout	HEARTBEAT' "$log" | head -1 | sed 's/.*t=//')"
-echo "last heartbeat:  $(grep 'stdout	HEARTBEAT' "$log" | tail -1 | sed 's/.*t=//')"
+echo "first heartbeat: $(grep 'stdout	HEARTBEAT' "$log" | head -1 | sed 's/.*t=//' | cat -v)"
+echo "last heartbeat:  $(grep 'stdout	HEARTBEAT' "$log" | tail -1 | sed 's/.*t=//' | cat -v)"
 echo "claude -p results:"
-grep 'stdout	CLAUDE_CALL' "$log" | sed 's/^[^	]*	stdout	/  /'
-grep 'stdout	DONE' "$log" | sed 's/^[^	]*	stdout	/  /' || true
+grep 'stdout	CLAUDE_CALL' "$log" | sed 's/^[^	]*	stdout	/  /' | cat -v || true
+grep 'stdout	DONE' "$log" | sed 's/^[^	]*	stdout	/  /' | cat -v || true
 echo "(log kept at $dir)"
