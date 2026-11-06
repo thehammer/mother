@@ -1,0 +1,70 @@
+# Probe 4 (WebSocket hold): wss:// echo for HOLD_MINUTES, app-level ping every 20 s.
+# Init: minutes (default 30), url (default wss://echo.websocket.org/), mode (echo = app-level echo; proto = WebSocket protocol ping/pong).
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: ws-hold
+    timeout: 50m
+    runner:
+      cpus: 1
+    env:
+      HOLD_MINUTES: ${{ init.minutes }}
+      WS_URL: ${{ init.url }}
+      WS_MODE: ${{ init.mode }}
+    run: |
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      export PATH="$HOME/.local/bin:$PATH"
+      cat > /tmp/ws_hold.py <<'PY'
+      import asyncio, os, time, websockets
+      URL = os.environ.get("WS_URL") or "wss://echo.websocket.org/"
+      MODE = os.environ.get("WS_MODE") or "echo"
+      HOLD = int(os.environ.get("HOLD_MINUTES", "30")) * 60
+      drops = reconnects = pings = pongs = 0
+      rtts = []
+      def log(m): print(f"WS {time.strftime('%FT%TZ', time.gmtime())} {m}", flush=True)
+      async def session(deadline):
+          global drops, pings, pongs
+          async with websockets.connect(URL, ping_interval=None, open_timeout=15) as ws:
+              log(f"connected url={URL} mode={MODE}")
+              try:
+                  greet = await asyncio.wait_for(ws.recv(), 5)
+                  log(f"greeting={str(greet)[:60]!r}")
+              except Exception as e:
+                  log(f"no greeting ({type(e).__name__})")
+              n = 0
+              while time.time() < deadline:
+                  n += 1; pings += 1
+                  t0 = time.time()
+                  try:
+                      if MODE == "proto":
+                          await asyncio.wait_for(await ws.ping(), 10)
+                      else:
+                          await ws.send(f"ping-{pings}")
+                          while True:
+                              r = await asyncio.wait_for(ws.recv(), 10)
+                              if r == f"ping-{pings}": break
+                      pongs += 1; rtts.append(time.time() - t0)
+                      if pings % 15 == 0: log(f"ok pings={pings} pongs={pongs} drops={drops} last_rtt_ms={rtts[-1]*1000:.0f}")
+                  except asyncio.TimeoutError:
+                      log(f"ping {pings} timed out"); raise ConnectionError("pong timeout")
+                  await asyncio.sleep(20)
+      async def main():
+          global drops, reconnects
+          deadline = time.time() + HOLD
+          first = True
+          while time.time() < deadline:
+              try:
+                  if not first: reconnects += 1; log(f"reconnect #{reconnects}")
+                  first = False
+                  await session(deadline)
+              except Exception as e:
+                  drops += 1; log(f"DROP #{drops}: {type(e).__name__}: {str(e)[:100]}")
+                  await asyncio.sleep(3)
+          rtts.sort()
+          med = rtts[len(rtts)//2]*1000 if rtts else -1
+          log(f"SUMMARY hold_s={HOLD} pings={pings} pongs={pongs} drops={drops} reconnects={reconnects} rtt_median_ms={med:.0f} rtt_max_ms={(rtts[-1]*1000 if rtts else -1):.0f}")
+      asyncio.run(main())
+      PY
+      uv run --no-project --with websockets python /tmp/ws_hold.py

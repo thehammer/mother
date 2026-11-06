@@ -1,0 +1,39 @@
+# Probe 2: duration. Init params: minutes (loop length), timeout (task timeout, e.g. 270m).
+# Heartbeat every 60 s; claude -p at start, at 120 min, and at the end.
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: install-claude
+    run: |
+      curl -fsSL https://claude.ai/install.sh | bash
+      $HOME/.local/bin/claude --version
+
+  - key: duration
+    use: install-claude
+    timeout: ${{ init.timeout }}
+    runner:
+      cpus: 1
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ vaults.mother-spike.secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      LOOP_MINUTES: ${{ init.minutes }}
+    run: |
+      export PATH="$HOME/.local/bin:$PATH"
+      call() {
+        out=$(claude -p --model sonnet --max-turns 3 "Reply with the word ok" 2>&1); rc=$?
+        echo "CLAUDE_CALL label=$1 rc=$rc out=$(printf %s "$out" | head -c 200 | tr '\n' ' ')"
+      }
+      call start
+      end=$(( $(date +%s) + LOOP_MINUTES * 60 ))
+      mid=$(( $(date +%s) + 120 * 60 ))
+      did_mid=0
+      n=0
+      while [ "$(date +%s)" -lt "$end" ]; do
+        n=$((n+1))
+        echo "HEARTBEAT n=$n t=$(date -u +%FT%TZ)"
+        if [ "$did_mid" = 0 ] && [ "$(date +%s)" -ge "$mid" ]; then call 2h; did_mid=1; fi
+        sleep 60
+      done
+      call end
+      echo "DONE heartbeats=$n t=$(date -u +%FT%TZ)"

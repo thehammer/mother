@@ -1,0 +1,24 @@
+# Probe 7: idle cost. Two parallel 1-vCPU tasks: (a) plain sleep 10 min (worker waiting for an answer),
+# (b) rwx-breakpoint with a 10 min attachment timeout (the only documented "pause" primitive).
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: idle-sleep
+    timeout: 15m
+    runner:
+      cpus: 1
+    run: |
+      echo "IDLE_START $(date -u +%T)"; echo state-before > /tmp/state.txt
+      sleep 600
+      echo "IDLE_END $(date -u +%T) state=$(cat /tmp/state.txt)"
+
+  - key: idle-breakpoint
+    timeout: 15m
+    runner:
+      cpus: 1
+    run: |
+      echo "BP_START $(date -u +%T)"; echo state-before > /tmp/state.txt
+      rwx-breakpoint --name=waiting --attachment-timeout=10m --session-timeout=1m
+      echo "BP_END $(date -u +%T) state=$(cat /tmp/state.txt)"
