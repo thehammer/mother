@@ -80,6 +80,8 @@ MOTHER_ATTENTION_INTERVAL="${MOTHER_ATTENTION_INTERVAL:-60}" # seconds between a
 MOTHER_PROGRESS_INTERVAL="${MOTHER_PROGRESS_INTERVAL:-30}"   # seconds between progress ticks
 MOTHER_PROGRESS_CALIBRATE_INTERVAL="${MOTHER_PROGRESS_CALIBRATE_INTERVAL:-$MOTHER_ARCHIVE_INTERVAL}" # seconds between progress calibrations
 MOTHER_PROGRESS_TIMEOUT="${MOTHER_PROGRESS_TIMEOUT:-60}"     # seconds before a stuck progress tick/calibration is killed
+MOTHER_LIMITER_INTERVAL="${MOTHER_LIMITER_INTERVAL:-10}"     # seconds between backpressure-limiter ticks (observe-only)
+MOTHER_LIMITER_TIMEOUT="${MOTHER_LIMITER_TIMEOUT:-20}"       # seconds before a stuck limiter tick is killed
 MOTHER_MIN_FREE_GB="${MOTHER_MIN_FREE_GB:-20}"               # pause dispatch below this much free disk (0 disables)
 MOTHER_LOWDISK_GC_INTERVAL="${MOTHER_LOWDISK_GC_INTERVAL:-600}" # min seconds between low-disk-triggered `mother gc` sweeps
 MOTHER_GC_ENABLED="${MOTHER_GC_ENABLED:-1}"                   # run `mother gc` hourly and on low disk (0 to disable)
@@ -965,6 +967,64 @@ _maybe_progress_tick() {
         _run_progress_bounded calibrate
     fi
     _run_progress_bounded progress-tick
+}
+
+# ---------- backpressure limiter (observe-only) ----------
+
+# _limiter_fault <why> — record that a limiter tick failed; dispatch carries on regardless.
+_limiter_fault() {
+    _log "limiter: $1"
+    jq -nc --argjson at "$(date +%s)" --arg why "$1" '{at: $at, why: $why}' \
+        > "$RUNNER_DIR/limiter-fault.json.tmp.$$" 2>/dev/null \
+        && mv "$RUNNER_DIR/limiter-fault.json.tmp.$$" "$RUNNER_DIR/limiter-fault.json"
+}
+
+# _limiter_apply <annotations json> — write the limiter's job annotations. Each one was already
+# diffed against the job file by mother-limiter, so a job is only rewritten when a value changed.
+# Only data_class, limiter.estimate and limiter.would are ever set: nothing dispatch reads.
+_limiter_apply() {
+    local ann id
+    printf '%s' "$1" | jq -c '.annotations[]?' 2>/dev/null | while read -r ann; do
+        id=$(printf '%s' "$ann" | jq -r '.id')
+        _job_update "$id" '
+            (if $a.data_class then .data_class = $a.data_class else . end)
+            | (if $a.estimate then .limiter.estimate = $a.estimate else . end)
+            | (if $a.would then .limiter.would = $a.would else . end)' --argjson a "$ann" 2>/dev/null || true
+    done
+}
+
+# One limiter tick under a watchdog (the loop is single-threaded; a wedged python must not stall
+# it). Failure or timeout writes limiter-fault.json and never affects dispatch (bet B6).
+_run_limiter_bounded() {
+    local out="$RUNNER_DIR/limiter-out.json" flag="$RUNNER_DIR/limiter-timed-out.flag" rc=0
+    rm -f "$out" "$flag"
+    "$MOTHER_BIN_DIR/mother-limiter" tick --root "$MOTHER_ROOT" >"$out" 2>>"$RUNNER_DIR/limiter.err" </dev/null &
+    local run_pid=$!
+    ( sleep "$MOTHER_LIMITER_TIMEOUT"; kill -9 "$run_pid" 2>/dev/null && : > "$flag" ) >/dev/null 2>&1 3>&- &
+    local watchdog_pid=$!
+    wait "$run_pid" 2>/dev/null || rc=$?
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    if [ -f "$flag" ]; then
+        rm -f "$flag"
+        _limiter_fault "tick exceeded ${MOTHER_LIMITER_TIMEOUT}s, killed pid $run_pid"
+    elif [ "$rc" -ne 0 ]; then
+        _limiter_fault "tick exited $rc"
+    else
+        rm -f "$RUNNER_DIR/limiter-fault.json"
+        _limiter_apply "$(cat "$out" 2>/dev/null)"
+    fi
+    rm -f "$out"
+}
+
+_maybe_limiter_tick() {
+    [ "${MOTHER_LIMITER_MODE:-observe}" = "off" ] && return 0
+    local now last marker="$RUNNER_DIR/last-limiter.ts"
+    now=$(date +%s)
+    last=$(_read_epoch_marker "$marker")
+    [ $((now - last)) -ge "$MOTHER_LIMITER_INTERVAL" ] || return 0
+    echo "$now" > "$marker"
+    _run_limiter_bounded
 }
 
 # ---------- awaiting notifications ----------
@@ -1935,8 +1995,26 @@ _run_pipeline_job() {
 # quota cap (over cap: forced jobs only, and running jobs may be paused) and by
 # the low-disk guard (low disk: nothing new starts; running jobs are untouched).
 _RATELIMIT_ANNOUNCED=0
+
+# _write_dispatch_last <paused> <over_cap> <low_disk> <spawned ids> <skipped ids> — what this
+# dispatch pass did, for the limiter's observe-only decision log. Read by mother-limiter only;
+# nothing in dispatch reads it.
+_write_dispatch_last() {
+    local running; running=$(_count_running_children)
+    jq -nc --argjson ts "$(date +%s)" --argjson running "${running:-0}" --argjson ceiling "$MOTHER_CONCURRENCY" \
+        --argjson paused "$([ "$1" = 1 ] && echo true || echo false)" \
+        --argjson over "$([ "$2" = 1 ] && echo true || echo false)" \
+        --argjson low "$([ "$3" = 1 ] && echo true || echo false)" \
+        --arg spawned "$4" --arg skipped "$5" \
+        '{ts: $ts, running: $running, ceiling: $ceiling, ratelimit_paused: $paused, quota_over_cap: $over,
+          low_disk: $low, spawned: ($spawned | split(" ") | map(select(length > 0))),
+          skipped: ($skipped | split(" ") | map(select(length > 0)))}' \
+        > "$RUNNER_DIR/dispatch-last.json.tmp.$$" 2>/dev/null \
+        && mv "$RUNNER_DIR/dispatch-last.json.tmp.$$" "$RUNNER_DIR/dispatch-last.json"
+}
+
 _dispatch_ready_jobs() {
-    local picker=_pick_next_ready over_cap=0 next paused=0
+    local picker=_pick_next_ready over_cap=0 next paused=0 low_disk=0 spawned="" skipped=""
     _DISPATCH_SKIP=""
     if mother_backoff_enabled && mother_ratelimit_active; then
         # A rate limit is shared by every API caller: start nothing new until
@@ -1962,12 +2040,15 @@ _dispatch_ready_jobs() {
         if _supervisor_alive_for_job "$next"; then
             _note_waiting_on_supervisor "$next"
             _DISPATCH_SKIP="$_DISPATCH_SKIP $next"
+            skipped="$skipped $next"
             continue
         fi
-        _disk_dispatch_ok "$next" || break
+        _disk_dispatch_ok "$next" || { low_disk=1; break; }
         _spawn_job "$next" || break
+        spawned="$spawned $next"
     done
     _DISPATCH_SKIP=""
+    _write_dispatch_last "$paused" "$over_cap" "$low_disk" "$spawned" "$skipped" || true
     [ "$over_cap" -eq 1 ] && _maybe_pause_running
     return 0
 }
@@ -1994,6 +2075,7 @@ _loop() {
         [ "${MOTHER_PIPELINE_ENABLED:-1}" = "1" ] && _run_pipeline_job
 
         _dispatch_ready_jobs
+        _maybe_limiter_tick
 
         _maybe_backup
         _maybe_archive
@@ -2089,6 +2171,13 @@ case "${1:-}" in
         # starting the daemon loop. Used by low_disk_guard.bats.
         # Usage: mother-runner --dispatch-tick
         _dispatch_ready_jobs
+        exit 0
+        ;;
+    --limiter-tick)
+        # Test entry point: run one _maybe_limiter_tick pass and exit. The interval gate is
+        # controlled via MOTHER_LIMITER_INTERVAL (0 = always) / $RUNNER_DIR/last-limiter.ts.
+        # Usage: mother-runner --limiter-tick
+        _maybe_limiter_tick
         exit 0
         ;;
     --pause-tick)

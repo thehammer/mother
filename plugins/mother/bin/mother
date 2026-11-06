@@ -890,6 +890,23 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
             }')
     fi
 
+    # Backpressure limiter annotations (MC-38): data class and expected burn. Best-effort:
+    # a failure leaves the fields absent and never fails the add.
+    if [ "${MOTHER_LIMITER_MODE:-observe}" != "off" ] && [ -x "$MOTHER_BIN_DIR/mother-limiter" ]; then
+        local lim_class lim_est lim_tmp
+        lim_class=$("$MOTHER_BIN_DIR/mother-limiter" classify --work-dir "$repo_path" --repo "$repo" 2>/dev/null || true)
+        case "$lim_class" in company|personal) job_json=$(printf '%s' "$job_json" | jq --arg c "$lim_class" '. + {data_class: $c}') ;; esac
+        lim_tmp=$(mktemp "${TMPDIR:-/tmp}/mother-limiter-job.XXXXXX" 2>/dev/null) || lim_tmp=""
+        if [ -n "$lim_tmp" ]; then
+            printf '%s' "$job_json" > "$lim_tmp"
+            lim_est=$("$MOTHER_BIN_DIR/mother-limiter" estimate --root "$MOTHER_ROOT" --job "$lim_tmp" 2>/dev/null || true)
+            rm -f "$lim_tmp"
+            if printf '%s' "$lim_est" | jq -e 'type == "object" and has("usd_per_min")' >/dev/null 2>&1; then
+                job_json=$(printf '%s' "$job_json" | jq --argjson e "$lim_est" '. + {limiter: {estimate: $e}}')
+            fi
+        fi
+    fi
+
     _atomic_write "$(_job_path "$id")" "$job_json"
     _append_event "$id" "queued" "$(jq -nc --arg title "$title" '{title: $title}')"
 
@@ -5466,6 +5483,24 @@ attention item; `mother quota` switches the gate on/off):
                            Lower these to leave more headroom for
                            interactive use; e.g. cap=70 reserves the
                            top 30% for non-Mother work.
+
+Backpressure limiter env vars (observe-only: it logs what it WOULD admit, hold or cut
+next to what dispatch did, and changes no dispatch behaviour; state in $MOTHER_ROOT/limiter/):
+  MOTHER_LIMITER_MODE          off = hard kill switch (default: observe; $MOTHER_ROOT/limiter/mode.json
+                               may also say off). Any other value runs observe-only.
+  MOTHER_LIMITER_INTERVAL      (default: 10)   seconds between limiter ticks
+  MOTHER_LIMITER_TIMEOUT       (default: 20)   watchdog on one tick; a hung tick writes limiter-fault.json
+  MOTHER_LIMITER_RESERVE_PCT   (default: 15)   share of the 5h window kept for interactive sessions
+  MOTHER_LIMITER_BURN_WINDOW_S (default: 600)  window for the fleet burn slope
+  MOTHER_LIMITER_DEFAULT_BURN_USD_PER_MIN (default: 0.5)  expected burn with no history
+  MOTHER_LIMITER_HISTORY_N / _HISTORY_MIN  (default: 20 / 3)  jobs used for a repo+actor estimate
+  MOTHER_LIMITER_CALM_S        (default: 900)  calm period per backoff step back up
+  MOTHER_LIMITER_COALESCE_S    (default: 120)  distress events within this of a cut are one cut
+  MOTHER_LIMITER_RAMP_START / _RAMP_STEP_S  (default: 2 / 300)  ramp after a window reset
+  MOTHER_LIMITER_INTERACTIVE_PCT_H / _INTERACTIVE_SUSTAIN_S  (default: 10 / 600)  interactive-demand threshold
+  MOTHER_LIMITER_K_MIN_SAMPLES (default: 12)   samples before the %-per-USD factor counts as calibrated
+  MOTHER_LIMITER_DECISIONS_MAX_MB (default: 20) rotate decisions.jsonl past this size
+  MOTHER_COMPANY_REPOS         space-separated repo names forced to data class company
 
 Progress indicator env vars:
   MOTHER_PROGRESS_ENABLED         (default: 1)    0 disables the indicator entirely

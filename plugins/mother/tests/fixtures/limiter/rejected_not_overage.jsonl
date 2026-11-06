@@ -1,0 +1,1 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1794010200,"rateLimitType":"five_hour","overageStatus":"disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":1,"resetsAt":1794010200,"status":"rejected","surpassedThreshold":1}}},"session_id":"x"}

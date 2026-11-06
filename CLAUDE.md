@@ -538,6 +538,56 @@ hook also drops any event older than `MOTHER_EVENTS_MAX_AGE_HOURS` (default 6,
 checkout; plugin versions are bumped so `claude plugin update` refreshes it.
 
 
+## Backpressure limiter
+
+Observe-only (L1; enforcement, surfaces and boundary holds are later slices). It computes what it *would* admit,
+hold or cut each tick and logs it next to what dispatch did. **It changes no dispatch behaviour.**
+
+- **Pure core (bet B1).** `lib/limiter_core.py` is the control law: stdlib `math`/`re` only, no file, clock or
+  process I/O, `now` is a parameter. Keep it that way (a unit test scans its imports) so the coordinator can host it
+  later. `bin/mother-limiter` (python3) is the I/O shell: `tick --root`, `status --json --root`,
+  `estimate --root --job`, `classify --work-dir --repo`.
+- **Runner.** `_maybe_limiter_tick` (`bin/mother-runner`, after `_dispatch_ready_jobs`) runs `tick` every
+  `MOTHER_LIMITER_INTERVAL` (10s) under a `MOTHER_LIMITER_TIMEOUT` (20s) watchdog. A timeout or non-zero exit writes
+  `$RUNNER_DIR/limiter-fault.json` `{at, why}` and the loop carries on (B6); a good tick removes it. Each dispatch
+  pass writes `$RUNNER_DIR/dispatch-last.json` (`{ts, running, ceiling, ratelimit_paused, quota_over_cap, low_disk,
+  spawned, skipped}`); nothing in dispatch reads it. Annotations go through `_job_update` only when a value
+  changed, and only `data_class`, `limiter.estimate` and `limiter.would` are ever written. Test entry:
+  `mother-runner --limiter-tick`.
+- **Modes.** `$MOTHER_ROOT/limiter/mode.json` `{"mode": "observe"|"off"}`; missing/corrupt = `observe`.
+  `MOTHER_LIMITER_MODE=off` is a hard kill switch that wins over the file. Any other value (including `enforce`,
+  L3) runs observe with one stderr line.
+- **Files** (`$MOTHER_ROOT/limiter/`): `state.json` (atomic; components, budget per window, interactive, per-job
+  would-decisions, log offsets, burn samples), `decisions.jsonl` (`{ts, mode, allowed, running, would, actual,
+  divergence}` when the decision set changes and at least every 300s; rotated to `.1` past
+  `MOTHER_LIMITER_DECISIONS_MAX_MB`), `burn-history.json` (hourly cache of finished-job burn).
+- **Knobs** (env, then `config.env`, then default; a non-numeric value falls back with a stderr line):
+  `MOTHER_LIMITER_INTERVAL` 10, `_TIMEOUT` 20, `_RESERVE_PCT` 15, `_BURN_WINDOW_S` 600,
+  `_DEFAULT_BURN_USD_PER_MIN` 0.5, `_HISTORY_N` 20, `_HISTORY_MIN` 3, `_CALM_S` 900, `_COALESCE_S` 120,
+  `_RAMP_START` 2, `_RAMP_STEP_S` 300, `_INTERACTIVE_PCT_H` 10, `_INTERACTIVE_SUSTAIN_S` 600, `_K_MIN_SAMPLES` 12,
+  `_DECISIONS_MAX_MB` 20; `MOTHER_COMPANY_REPOS` (space-separated repo names forced to `company`).
+- **Rules.** `allowed = min(MOTHER_CONCURRENCY, backoff_level, ramp_level)`. Distress (429/503/529 `api_retry`,
+  `result` with `api_error_status` 429/503/529, a non-overage rejected `rate_limit_event`, a `failure_routed` event
+  with `rate_limited`/`api_overloaded`) halves `allowed` (events within `COALESCE_S` are one cut); calm raises the
+  level one step per `CALM_S`. Overage-only rejections and `api_retry` with `error_status: null` are not distress.
+  A window reset (`resets_at` forward by more than half the window, or `used_pct` down 20+) restarts a ramp at
+  `RAMP_START`, +1 per `RAMP_STEP_S`. Budget codes (`budget_pace`, `reserve`, `interactive_personal`, preempt) are
+  `advisory` (not holds) when the quota gate is `off`/`off_until_reset` or the feed is stale (B3). `k` (% per USD)
+  is calibrated per window as the 25th percentile of samples with no reset, `used_pct < 99` and Mother spend above a
+  floor; until `MOTHER_LIMITER_K_MIN_SAMPLES` samples, `budget_pace` never holds. Pace holds at >= 1.0x.
+  Priority: effective class (company 0, personal 1, shifted by `priority_adjust`), then `created_at`, then id;
+  `force_start` skips budget terms only. `would_preempt` lists personal running jobs only.
+- **Feed.** Same freshness rules as `_quota_feed_json` / `_quota_gate_read` (`lib/state.sh`); a bats test runs both
+  on the same fixtures. If you change one reader, change the other.
+
+New job fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `data_class` | string | `company` (Carefeed origin owner, `MOTHER_PHI_REPOS`, or `MOTHER_COMPANY_REPOS`) or `personal`. Set at `mother add`; the tick fills it for older ready/queued jobs. |
+| `limiter.estimate` | object | `{usd_per_min, source: history\|fleet_p75\|default, basis: "<repo>+<actor>", samples, computed_at}` expected burn (MC-38). Refreshed at most hourly for non-running jobs. |
+| `limiter.would` | object | `{code, reason, advisory, at}` the observe-only decision for a `ready` job (`admit`, `concurrency_full`, `backoff`, `ramp`, `budget_pace`, `reserve`, `interactive_personal`, `retry_after`). Display/audit only. |
+
 ## Quality gates
 
 A repo opts in with `.mother/crew.yml` (`version: 1`; `gates:{mode, max_attempts 1..5,
