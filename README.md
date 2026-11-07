@@ -348,6 +348,16 @@ state row reflect reality rather than what the agent claimed:
   forward unchanged. The capabilities preamble teaches agents when to
   pause vs. when to fail-and-retry.
 
+## Backpressure limiter (observe-only)
+
+A central limiter watches Bishop's 5h/7d quota windows, the fleet's measured spend rate and any 429/overload
+signals, and records on every tick what it **would** admit, hold or cut: pace against what each window can
+sustain, a 15% 5h reserve for interactive sessions, a sharp cut on distress that grows back slowly, and a ramp
+after a window reset. In this release it only observes. Dispatch is unchanged (`MOTHER_CONCURRENCY` and the quota
+gate still decide). Read `$MOTHER_ROOT/limiter/state.json` and `limiter/decisions.jsonl` (would vs actual, with a
+`divergence` list), or `mother-limiter status --json --root ~/.mother`. `MOTHER_LIMITER_MODE=off` turns it off.
+Each job also gets a `data_class` (`company`/`personal`) and an expected burn (`limiter.estimate`) at `mother add`.
+
 ## Quota awareness
 
 Mother can read the user's true rolling 5h / 7d quota state from the
