@@ -51,6 +51,15 @@ setup_mother_env() {
     chmod +x "$_MOCK_BIN/claude"
     export PATH="$_MOCK_BIN:$_BIN_DIR:$PATH"
 
+    # Never reach the real Time Machine from tests: a no-op tmutil shim, and both
+    # Time Machine stopgaps off by default (tm_snapshot.bats opts back in with its
+    # own stub). Without this, low_disk_guard.bats' mocked low df would run a real
+    # `tmutil thinlocalsnapshots`, and every worktree test a real addexclusion.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$_MOCK_BIN/tmutil"
+    chmod +x "$_MOCK_BIN/tmutil"
+    export MOTHER_SNAPSHOT_THIN_BELOW_GB=0
+    export MOTHER_TM_EXCLUDE_WORKTREES=0
+
     # Point mother at the test MOTHER_ROOT
     export MOTHER_BIN_DIR="$_BIN_DIR"
     export MOTHER_LIB_DIR="$_LIB_DIR"
