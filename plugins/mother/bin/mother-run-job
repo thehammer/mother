@@ -2348,6 +2348,7 @@ _pid_under() {
 
 # Supervisor-local hold bookkeeping for the current spawn (script globals).
 _hold_cancelled=0
+_hold_hook_pids=""      # blocked hook pids collected at park time (stopped after the worker)
 _hold_active=0          # a .hold has been seen and .limiter_hold set
 _hold_boundary_epoch=0  # when the worker reached the boundary (.held appeared); 0 = not yet
 _hold_deferred_epoch=0  # last hold_giveup_deferred event
@@ -2408,17 +2409,22 @@ _hold_park() {
     # Sequence: .park -> re-validate .held (the hook is still blocking) -> state write -> (caller) kill ->
     # (caller) remove .park. Any failure removes .park and returns 1: nothing is stopped, nothing recorded.
     park_file="$RUNNER_DIR/$id.park"
+    _hold_hook_pids=""
     if [ "$boundary" = "tool" ]; then
+        _hold_calls_safe "$(date +%s)" || return 1
         if ! { printf '{"pid": %s, "at": %s}\n' "$$" "$(date +%s)" > "$park_file.tmp.$$" \
                  && mv "$park_file.tmp.$$" "$park_file"; } 2>/dev/null; then
             rm -f "$park_file.tmp.$$" "$park_file"
             return 1
         fi
-        if ! _hold_held_valid "$(date +%s)"; then rm -f "$park_file"; return 1; fi
+        if ! _hold_held_valid "$(date +%s)" || ! _hold_calls_safe "$(date +%s)"; then rm -f "$park_file"; return 1; fi
         # Test-only widening of the window between the last check and the state write.
         if [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ -n "${MOTHER_TEST_PARK_DELAY_S:-}" ]; then
             sleep "$MOTHER_TEST_PARK_DELAY_S"
+            # a call that started in the window aborts the park
+            if ! _hold_held_valid "$(date +%s)" || ! _hold_calls_safe "$(date +%s)"; then rm -f "$park_file"; return 1; fi
         fi
+        _hold_hook_pids=$(_hold_collect_hook_pids)
     fi
     # The state write is a read-modify-write under the job-file lock (as cancel and the runner's resume
     # take it); the lock is released before any event or other write, so it is never nested. _with_lock
@@ -2483,6 +2489,63 @@ _hold_held_valid() {
     [ $((now - _hold_held_at)) -lt "$(_hold_hook_max_s)" ]
 }
 
+_hold_call_stale_s() { _hold_num "${MOTHER_LIMITER_CALL_STALE_S:-}" 21600; }
+
+# _hold_calls_safe <now> — the in-flight rule: 0 only when at least one tool call is blocked in a live hook of
+# this worker and no call is running. Records live in $RUNNER_DIR/<id>.calls/<tool_use_id>.json (written by
+# hooks/mother-limiter-hold.sh). A record whose hook is dead counts as running (that is a tool executing
+# after its hook passed) until it is older than MOTHER_LIMITER_CALL_STALE_S, when it is discarded as a
+# lost PostToolUse. An unreadable record counts as running. No records at all = not safe (nothing proves a
+# boundary).
+_hold_calls_safe() {
+    local now="$1" dir="$RUNNER_DIR/$id.calls" f state pid at blocked=0 hmax stale
+    hmax=$(_hold_hook_max_s); stale=$(_hold_call_stale_s)
+    [ -d "$dir" ] || return 1
+    for f in "$dir"/*.json; do
+        [ -f "$f" ] || continue
+        state=$(jq -r '.state // empty' "$f" 2>/dev/null) || state=""
+        pid=$(jq -r '.pid // empty' "$f" 2>/dev/null) || pid=""
+        at=$(jq -r '.at // empty' "$f" 2>/dev/null) || at=""
+        case "$at" in ''|*[!0-9]*) at=$now ;; esac
+        if [ "$state" = "blocked" ] && kill -0 "$pid" 2>/dev/null && _pid_under "$pid" "${worker_pid:-0}"; then
+            blocked=1
+            continue
+        fi
+        # running (or a blocked record whose hook is gone)
+        if [ $((now - at)) -ge "$stale" ] && ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$f"
+            continue
+        fi
+        return 1
+    done
+    [ "$blocked" -eq 1 ]
+}
+
+# _hold_collect_hook_pids — pids (one per line) of this worker's blocked hooks, gathered while they are still
+# provably under the worker, so they can be stopped after it is terminated.
+_hold_collect_hook_pids() {
+    local f pid
+    for f in "$RUNNER_DIR/$id.calls"/*.json "$RUNNER_DIR/$id.held"; do
+        [ -f "$f" ] || continue
+        pid=$(jq -r '.pid // empty' "$f" 2>/dev/null) || continue
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        kill -0 "$pid" 2>/dev/null && _pid_under "$pid" "${worker_pid:-0}" && echo "$pid"
+    done | sort -u
+}
+
+# _hold_kill_hooks — after _terminate_worker: stop the hook processes (and their sleep children) recorded at
+# park time, by exact pid. Never the process group (it is the daemon's).
+_hold_kill_hooks() {
+    local p kids
+    for p in ${_hold_hook_pids:-}; do
+        kill -0 "$p" 2>/dev/null || continue
+        kids=$(pgrep -P "$p" 2>/dev/null || true)
+        [ -z "$kids" ] || kill -TERM $kids 2>/dev/null || true
+        kill -TERM "$p" 2>/dev/null || true
+    done
+    _hold_hook_pids=""
+}
+
 # _limiter_hold_tick — one poll-loop pass for the tool boundary. Returns 1 when the job was parked
 # (the caller then stops the worker and leaves the loop), else 0.
 _limiter_hold_tick() {
@@ -2506,6 +2569,14 @@ _limiter_hold_tick() {
     _hold_boundary_check "$now" || return 0
     local held_s=$((now - _hold_boundary_epoch))
     [ "$held_s" -ge "$(_hold_grace_s)" ] || return 0
+    if ! _hold_calls_safe "$now"; then
+        # A tool call is running (parallel call or subagent) or nothing is provably blocked: never stop it.
+        if [ $((now - _hold_deferred_epoch)) -ge 60 ]; then
+            _hold_deferred_epoch=$now
+            _hold_event "hold_giveup_deferred" "$(jq -nc --argjson h "$held_s" '{held_s: $h, reason: "tool_call_in_flight"}')"
+        fi
+        return 0
+    fi
     mtime=$(_log_mtime)
     if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -lt "$(_hold_quiet_s)" ]; then
         if [ $((now - _hold_deferred_epoch)) -ge 60 ]; then
@@ -2571,7 +2642,17 @@ _hold_settings_file() {
             --argjson t "$((grace + 300))" '$h + [{type: "command", command: $cmd, timeout: $t}]')
     fi
     [ "$hooks" != "[]" ] || return 0
-    jq -n --argjson h "$hooks" '{hooks: {PreToolUse: [{matcher: "*", hooks: $h}]}}' > "$settings_file" 2>/dev/null || return 0
+    # PostToolUse / PostToolUseFailure drop the call's in-flight record (see _hold_calls_safe); only with the
+    # hold hook, which is what writes the records.
+    local post=null
+    if [ "$mode" != "off" ]; then
+        post=$(jq -nc --arg cmd "$(printf '%q' "$MOTHER_LIB_DIR/../hooks/mother-limiter-hold.sh") post" \
+            '[{matcher: "*", hooks: [{type: "command", command: $cmd, timeout: 10}]}]')
+    fi
+    jq -n --argjson h "$hooks" --argjson post "$post" \
+        '{hooks: ({PreToolUse: [{matcher: "*", hooks: $h}]}
+                  + (if $post == null then {} else {PostToolUse: $post, PostToolUseFailure: $post} end))}' \
+        > "$settings_file" 2>/dev/null || return 0
     settings_args_quoted=" $(printf '%q' --settings) $(printf '%q' "$settings_file")"
 }
 
@@ -2824,7 +2905,9 @@ _spawn_and_wait() {
     cost_cap_flag="$RUNNER_DIR/$id.cost-cap"
     rm -f "$cost_cap_flag"
     # Stale limiter-hold flags from an earlier run must not park this one.
-    rm -f "$RUNNER_DIR/$id.held"
+    rm -f "$RUNNER_DIR/$id.held" "$RUNNER_DIR/$id.park"
+    type safe_rm_tree >/dev/null 2>&1 || source "$MOTHER_LIB_DIR/safe-rm.sh"
+    safe_rm_tree "$RUNNER_DIR/$id.calls"
     _hold_settings_file
 
     cat > "$wrapper" <<WRAP
@@ -2998,6 +3081,7 @@ WRAP
         # then the kill, as for the quota pause above).
         if ! _limiter_hold_tick; then
             _terminate_worker
+            _hold_kill_hooks
             rm -f "$RUNNER_DIR/$id.park"
             break
         fi

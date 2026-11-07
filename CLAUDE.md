@@ -699,6 +699,22 @@ mid-request. Nothing is held in observe/off.
   keeps waiting: no event, no kill. Only after a landed park does the caller `_terminate_worker`, then remove `.park`. While
   `.park` exists and its pid is alive the hook keeps blocking even if `.hold` is gone or `MOTHER_LIMITER_HOOK_MAX_S` passed,
   bounded by `MAX_S + MOTHER_LIMITER_HOOK_PARK_CAP_S` (120); a `.park` with a dead pid is ignored (fail open).
+- **In-flight tool calls (park only when every call is blocked).** Claude Code issues parallel tool calls (and subagents run
+  their own), so "the last hook is blocked" does not prove nothing is executing. The hook records every call in
+  `runner/<id>.calls/<tool_use_id>.json` = `{state: running|blocked, pid, at}` at PreToolUse (even with no `.hold`; input
+  without a `tool_use_id` is not recorded), marks it `blocked` while it blocks and `running` on release; `mother-limiter-hold.sh
+  post`, wired as `PostToolUse` and `PostToolUseFailure` in the same settings file, removes it. `_hold_calls_safe` allows a park
+  only when at least one call is blocked in a live hook under the worker and none is `running`; a record whose hook is dead
+  counts as running (the tool is executing) until older than `MOTHER_LIMITER_CALL_STALE_S` (21600, a lost PostToolUse), when it
+  is discarded; an unreadable record counts as running. It is checked before `.park` is written, after it, and (test delay
+  only) again before the state write; the hook records a call before it looks at `.hold`/`.park`, so a call starting in the
+  window is either seen or blocked by `.park`. A deferral emits `hold_giveup_deferred {reason: tool_call_in_flight}` (at most
+  once a minute). Spawn removes `<id>.park` and `<id>.calls/`. After `_terminate_worker` the supervisor stops the blocked hook
+  pids it recorded at park time (by exact pid, never the process group). Verified against a real session: `claude -p` with two
+  parallel Bash calls fires `PreToolUse` x2 then `PostToolUse` x2 with distinct `tool_use_id`s, and `PostToolUseFailure` for a
+  failing call.
+- **Gated test hooks.** `MOTHER_TEST_PARK_DELAY_S` (seconds slept inside `_hold_park` between the last check and the state
+  write) only takes effect under `MOTHER_TEST_ROOT=1`; it widens the window the park-sequence tests probe. Never set either in production.
 - **Phase boundary.** `_hold_wait_before_spawn` (top of `_spawn_and_wait`, and `_wave_cycle` before the adherence/lens spawns) waits
   while `.hold` exists (`held {boundary: "phase"}`, poll 2 s); past the grace period it parks the job without spawning (no worker to
   stop; a same-session prompt that never started is kept in `.limiter_resume_prompt` and replayed on resume). Reviewers already
@@ -712,7 +728,7 @@ mid-request. Nothing is held in observe/off.
   limiter is not enforcing; never while `_supervisor_alive_for_job`. Event `auto_resumed {from_paused_reason: "limiter_hold",
   reason: "limiter_admitted"|"limiter_not_enforcing"}`. The next worker re-enters the same session (`--resume`). `mother resume`
   by hand takes the ordinary answer path. `limiter_hold` awaiting jobs get no push notification and show as auto-resuming.
-- **Knobs:** `MOTHER_LIMITER_HOLD_GRACE_S` (600), `MOTHER_LIMITER_QUIET_S` (30); tests only: `MOTHER_LIMITER_HOOK_POLL_S` (2).
+- **Knobs:** `MOTHER_LIMITER_HOLD_GRACE_S` (600), `MOTHER_LIMITER_QUIET_S` (30), `MOTHER_LIMITER_CALL_STALE_S` (21600); tests only: `MOTHER_LIMITER_HOOK_POLL_S` (2).
 - **Surfaces.** `mother status <id>`: `⏸ [HELD <code>] <reason> (at boundary since 3m; gives up worker after 10m)`; `mother list`:
   `[HELD]`. Broker: `paused_for_limiter` folds to `awaiting` with `paused_reason`; `held`/`hold_released` are `activity` events.
 

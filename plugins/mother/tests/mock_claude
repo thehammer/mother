@@ -37,10 +37,11 @@
 #   MOCK_CLAUDE_TURNS          opt-in turn mode (L4 boundary holds): the mock runs N scripted "turns".
 #                              Before each turn it runs every PreToolUse hook command found in the
 #                              `--settings` file (when argv has one) with a minimal JSON payload on
-#                              stdin, as Claude Code would, and waits for it (a held hook parks the
+#                              stdin (with tool_use_id toolu_t<n>), as Claude Code would, and waits for it (a held hook parks the
 #                              mock right there). A turn is then "in flight" for
 #                              MOCK_CLAUDE_TURN_SLEEP seconds (default 1; fractions ok), during which
-#                              the file MOCK_CLAUDE_TURN_MARKER (if set) exists. Unset or 0 = off.
+#                              the file MOCK_CLAUDE_TURN_MARKER (if set) exists. After the turn the
+#                              PostToolUse hook commands of the settings file run for the same id. Unset or 0 = off.
 #   MOCK_CLAUDE_PID_FILE       if set, the mock's pid is written here at start (proves "same process").
 #   MOCK_CLAUDE_TURN_LOG       if set, one line per step is appended: "hook_start <n>", "hook_done <n>",
 #                              "turn_start <n>", "turn_end <n>", "term in_turn=<yes|no>" (SIGTERM seen).
@@ -92,7 +93,7 @@ if [ "$MOCK_CLAUDE_TURNS" -gt 0 ]; then
         while IFS= read -r hook_cmd; do
             [ -n "$hook_cmd" ] || continue
             _turn_log "hook_start $t"
-            printf '%s' '{"tool_name":"Bash","tool_input":{"command":"true"}}' | bash -c "$hook_cmd" >/dev/null 2>&1 &
+            printf '%s' "{\"tool_name\":\"Bash\",\"tool_use_id\":\"toolu_t$t\",\"tool_input\":{\"command\":\"true\"}}" | bash -c "$hook_cmd" >/dev/null 2>&1 &
             hook_pid=$!
             wait "$hook_pid" 2>/dev/null
             hook_pid=""
@@ -110,6 +111,14 @@ HOOKS
         [ -n "${MOCK_CLAUDE_TURN_MARKER:-}" ] && rm -f "$MOCK_CLAUDE_TURN_MARKER"
         in_turn=no
         _turn_log "turn_end $t"
+        post_cmds=""
+        [ -n "$settings_file" ] && [ -f "$settings_file" ] && post_cmds=$(jq -r '(.hooks.PostToolUse // [])[] | .hooks[]? | select(.type == "command") | .command' "$settings_file" 2>/dev/null)
+        while IFS= read -r hook_cmd; do
+            [ -n "$hook_cmd" ] || continue
+            printf '%s' "{\"tool_name\":\"Bash\",\"tool_use_id\":\"toolu_t$t\"}" | bash -c "$hook_cmd" >/dev/null 2>&1
+        done <<POSTHOOKS
+$post_cmds
+POSTHOOKS
         t=$((t + 1))
     done
     trap - TERM

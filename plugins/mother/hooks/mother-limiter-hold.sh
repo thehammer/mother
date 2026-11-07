@@ -21,6 +21,14 @@
 #     lock wait of at most 10 s plus a few file writes, so it is well inside the cap). A .park whose
 #     pid is dead (supervisor crashed) is ignored: the hook fails open as before.
 #
+#   - In-flight tracking: every tool call is recorded in $root/runner/<job>.calls/<tool_use_id> as
+#     {"state": "running"|"blocked", "pid": <hook pid>, "at": <epoch>} when its PreToolUse hook starts (even
+#     with no .hold), and removed by `mother-limiter-hold.sh post` (wired as PostToolUse and
+#     PostToolUseFailure). While this hook blocks it marks its call `blocked`; on release it goes back to
+#     `running` (the tool then executes). The supervisor parks a worker only when at least one call is
+#     blocked in a live hook and no call is running, so a parallel or subagent tool call that passed its
+#     hook earlier is never killed mid-request. Input without a tool_use_id is not recorded.
+#
 # Mother stops a worker parked here by terminating the worker process (the supervisor's give-up);
 # the TERM trap just removes the .held marker.
 
@@ -34,7 +42,44 @@ hold_file="$mother_root/runner/$job_id.hold"
 held_file="$mother_root/runner/$job_id.held"
 park_file="$mother_root/runner/$job_id.park"
 
-[ -f "$hold_file" ] || exit 0
+calls_dir="$mother_root/runner/$job_id.calls"
+
+# The tool call's id, from the hook's JSON on stdin (builtins only: this is the hot path). Empty when absent.
+call_id=""
+if IFS= read -r -d '' -t 5 _input; then :; fi
+if [[ "${_input:-}" =~ \"tool_use_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]+)\" ]]; then call_id="${BASH_REMATCH[1]}"; fi
+unset _input
+
+# _call_write <state> <at> — atomic; failure is silent (fail open: an unrecorded call just never parks).
+_call_write() {
+    [ -n "$call_id" ] || return 0
+    { [ -d "$calls_dir" ] || mkdir -p "$calls_dir"; } 2>/dev/null || return 0
+    { printf '{"state": "%s", "pid": %s, "at": %s}\n' "$1" "$$" "$2" > "$calls_dir/$call_id.tmp.$$" \
+        && mv "$calls_dir/$call_id.tmp.$$" "$calls_dir/$call_id.json"; } 2>/dev/null \
+        || rm -f "$calls_dir/$call_id.tmp.$$" 2>/dev/null
+    return 0
+}
+
+if [ "${1:-}" = "post" ]; then
+    [ -z "$call_id" ] || rm -f "$calls_dir/$call_id.json" 2>/dev/null
+    exit 0
+fi
+
+# _park_live — the supervisor's park marker exists and its pid is alive.
+_park_live() {
+    local pp
+    [ -f "$park_file" ] || return 1
+    pp=$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$park_file" 2>/dev/null)
+    case "$pp" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$pp" 2>/dev/null
+}
+
+# Record the call BEFORE looking at .hold/.park: the supervisor's recheck then either sees this call or this
+# hook sees the park.
+call_start=$(date +%s 2>/dev/null) || call_start=0
+_call_write running "$call_start"
+
+[ -f "$hold_file" ] || _park_live || exit 0
 
 max_s="${MOTHER_LIMITER_HOOK_MAX_S:-}"
 case "$max_s" in ''|*[!0-9]*) max_s=840 ;; esac
@@ -63,15 +108,6 @@ _write_held() {
         && mv "$held_file.tmp.$$" "$held_file"; } 2>/dev/null || { rm -f "$held_file.tmp.$$" 2>/dev/null; return 1; }
 }
 
-# _park_live — the supervisor's park marker exists and its pid is alive.
-_park_live() {
-    local pp
-    [ -f "$park_file" ] || return 1
-    pp=$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$park_file" 2>/dev/null)
-    case "$pp" in ''|*[!0-9]*) return 1 ;; esac
-    kill -0 "$pp" 2>/dev/null
-}
-
 # _blocking — keep holding the tool call? A live park marker wins over .hold and MAX_S (up to the cap).
 _blocking() {
     local now
@@ -80,6 +116,7 @@ _blocking() {
     [ -f "$hold_file" ] && [ $((now - start)) -lt "$max_s" ]
 }
 
+_call_write blocked "$call_start"
 _write_held || exit 0
 
 while :; do
@@ -92,7 +129,9 @@ while :; do
     # Release: drop .held first, then look at .park once more. A supervisor that wrote .park and then saw
     # our .held before this rm is covered here: the park is visible now, so we keep blocking.
     _cleanup
+    _call_write running "$call_start"
     _blocking || break
+    _call_write blocked "$call_start"
     _write_held || break
 done
 exit 0

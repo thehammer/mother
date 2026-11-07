@@ -801,3 +801,182 @@ _turn_starts() { grep -c '^turn_start' "$MOCK_CLAUDE_TURN_LOG" 2>/dev/null || tr
     kill "$hp"; wait "$hp" 2>/dev/null || true
     [ -f "$RUNNER_DIR/hj.held" ]
 }
+
+# ===========================================================================
+# round3: in-flight tool calls — never terminate a worker with a tool call running
+# ===========================================================================
+# The hold hook records each call as $RUNNER_DIR/<job>.calls/<tool_use_id>.json {state, pid, at}; the
+# PostToolUse hook (`mother-limiter-hold.sh post`) removes it. The supervisor parks only when some call is
+# blocked in a live hook of the worker and none is running.
+
+_call_file() { echo "$RUNNER_DIR/$1.calls/$2.json"; }
+_call_state() { jq -r .state "$(_call_file "$1" "$2")" 2>/dev/null; }
+_call_state_is() { [ "$(_call_state "$1" "$2")" = "$3" ]; }
+_call_gone() { [ ! -e "$(_call_file "$1" "$2")" ]; }
+_dead_pid() { sh -c 'exit 0' & local d=$!; wait "$d"; echo "$d"; }
+_put_call() {   # <job> <tool_use_id> <state> [at] — a record whose hook is dead (a tool executing after its hook passed)
+    mkdir -p "$RUNNER_DIR/$1.calls"
+    printf '{"state": "%s", "pid": %s, "at": %s}\n' "$3" "$(_dead_pid)" "${4:-$(_now)}" > "$(_call_file "$1" "$2")"
+}
+_tool_json() { printf '{"tool_name":"Bash","tool_use_id":"%s","tool_input":{"command":"true"}}' "$1"; }
+
+@test "round3-1a: the hook marks its call blocked (with its own pid) while blocking and running once released" {
+    export MOTHER_JOB_ID=cj
+    _hold_flag cj
+    _tool_json toolu_u1 | "$HOOK" >/dev/null 2>&1 &
+    local hp=$!; BG_PIDS="$BG_PIDS $hp"
+    _wait_for 5 _call_state_is cj toolu_u1 blocked
+    [ "$(jq -r .pid "$(_call_file cj toolu_u1)")" = "$hp" ]
+    [[ "$(jq -r .at "$(_call_file cj toolu_u1)")" =~ ^[0-9]+$ ]]
+    rm -f "$RUNNER_DIR/cj.hold"
+    _wait_for 5 bash -c "! kill -0 $hp"
+    wait "$hp"
+    [ "$(_call_state cj toolu_u1)" = "running" ]       # the tool now executes; only PostToolUse clears it
+}
+
+@test "round3-1b: with no .hold the hook still leaves a running record and exits fast" {
+    export MOTHER_JOB_ID=cj
+    local t0 t1; t0=$(_ms)
+    _tool_json toolu_u2 | "$HOOK"
+    t1=$(_ms)
+    [ $((t1 - t0)) -lt 1500 ]
+    [ "$(_call_state cj toolu_u2)" = "running" ]
+    [ "$(jq -r .pid "$(_call_file cj toolu_u2)")" -gt 0 ]
+}
+
+@test "round3-1c: post removes the call record, only that one" {
+    export MOTHER_JOB_ID=cj
+    _tool_json toolu_a | "$HOOK"
+    _tool_json toolu_b | "$HOOK"
+    [ -f "$(_call_file cj toolu_a)" ]; [ -f "$(_call_file cj toolu_b)" ]
+    _tool_json toolu_a | "$HOOK" post
+    _call_gone cj toolu_a
+    [ -f "$(_call_file cj toolu_b)" ]
+    run bash -c "printf '%s' '{\"tool_use_id\":\"toolu_zzz\"}' | '$HOOK' post"    # unknown id: harmless
+    [ "$status" -eq 0 ]; [ -z "$output" ]
+}
+
+@test "round3-1d: input without a tool_use_id writes no record, in either hook mode" {
+    export MOTHER_JOB_ID=cj
+    printf '%s' '{"tool_name":"Bash"}' | "$HOOK"
+    "$HOOK" </dev/null
+    printf '%s' '{"tool_name":"Bash"}' | "$HOOK" post
+    [ -z "$(ls -A "$RUNNER_DIR/cj.calls" 2>/dev/null)" ]
+}
+
+@test "round3-2: a parallel call that passed its hook and is still running blocks the park; its PostToolUse lets the park proceed" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=3 MOTHER_LIMITER_QUIET_S=1
+    _make_job r3p
+    _start_job r3p
+    _wait_for 10 _marker_present
+    _put_call r3p toolu_par running                # call A: hook passed, tool still executing
+    _hold_flag r3p backoff "cut"
+    _wait_for 30 _has_event r3p hold_giveup_deferred
+    [ "$(_ev r3p hold_giveup_deferred | jq -r .reason)" = "tool_call_in_flight" ]
+    sleep 5                                        # well past grace, quiet log
+    [ "$(_jf r3p .state)" = "running" ]
+    ! _has_event r3p paused_for_limiter
+    ! _turn_log_has "^term"
+    kill -0 "$SUP_PID"
+    # call A finishes: its PostToolUse hook removes the record
+    MOTHER_JOB_ID=r3p bash -c "$(printf '%q' "$HOOK") post" <<< "$(_tool_json toolu_par)"
+    _call_gone r3p toolu_par
+    _wait_for 40 _job_state_is r3p awaiting
+    [ "$(_jf r3p .paused_reason)" = "limiter_hold" ]
+    _wait_for 10 _turn_log_has "^term in_turn=no"
+    [ "$(_in_turn_terms)" = "0" ]
+    _wait_for 10 _has_event r3p paused_for_limiter
+}
+
+@test "round3-3: a long-running subagent (Task) call in flight blocks the park indefinitely" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=2 MOTHER_LIMITER_QUIET_S=1
+    _make_job r3t
+    _start_job r3t
+    _wait_for 10 _marker_present
+    _put_call r3t toolu_task running
+    _hold_flag r3t backoff "cut"
+    _wait_for 30 _has_event r3t hold_giveup_deferred
+    sleep 10
+    [ "$(_jf r3t .state)" = "running" ]
+    ! _has_event r3t paused_for_limiter
+    ! _turn_log_has "^term"
+    [ -f "$(_call_file r3t toolu_task)" ]
+}
+
+@test "round3-4a: a running record with a dead hook older than MOTHER_LIMITER_CALL_STALE_S is discarded and does not block parking" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=2 MOTHER_LIMITER_QUIET_S=1 MOTHER_LIMITER_CALL_STALE_S=2
+    _make_job r3s
+    _start_job r3s
+    _wait_for 10 _marker_present
+    _put_call r3s toolu_lost running $(( $(_now) - 100 ))   # its PostToolUse was lost long ago
+    _hold_flag r3s backoff "cut"
+    _wait_for 40 _job_state_is r3s awaiting
+    _wait_for 10 _turn_log_has "^term in_turn=no"
+    [ "$(_in_turn_terms)" = "0" ]
+    _call_gone r3s toolu_lost
+}
+
+@test "round3-4b: the same dead-hook record, not yet stale, does block parking" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=2 MOTHER_LIMITER_QUIET_S=1 MOTHER_LIMITER_CALL_STALE_S=3600
+    _make_job r3f
+    _start_job r3f
+    _wait_for 10 _marker_present
+    _put_call r3f toolu_lost running $(( $(_now) - 100 ))
+    _hold_flag r3f backoff "cut"
+    _wait_for 30 _has_event r3f hold_giveup_deferred
+    sleep 6
+    [ "$(_jf r3f .state)" = "running" ]
+    ! _turn_log_has "^term"
+    [ -f "$(_call_file r3f toolu_lost)" ]
+}
+
+@test "round3-5: a stale .park and stale .calls entries are cleared at worker spawn and do not affect a later park" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=2 MOTHER_LIMITER_QUIET_S=1
+    _make_job r3w
+    printf '{"pid": %s, "at": %s}\n' "$(_dead_pid)" "$(_now)" > "$RUNNER_DIR/r3w.park"
+    _put_call r3w toolu_old running
+    _put_call r3w toolu_old2 blocked
+    _start_job r3w
+    _wait_for 10 _marker_present
+    [ ! -e "$RUNNER_DIR/r3w.park" ]
+    _call_gone r3w toolu_old
+    _call_gone r3w toolu_old2
+    _hold_flag r3w backoff "cut"
+    _wait_for 40 _job_state_is r3w awaiting       # the stale running entry did not stop the park
+    _wait_for 10 _turn_log_has "^term in_turn=no"
+    [ "$(_in_turn_terms)" = "0" ]
+}
+
+@test "round3-6: a call that starts during the park window aborts the park: nothing killed, job running, .park removed" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=2 MOTHER_LIMITER_QUIET_S=1 MOTHER_TEST_PARK_DELAY_S=4
+    _make_job r3a
+    _start_job r3a
+    _wait_for 10 _marker_present
+    _hold_flag r3a backoff "cut"
+    _wait_for 30 _park_exists r3a
+    _put_call r3a toolu_late running               # a parallel call began inside the window
+    _wait_for 15 bash -c "! [ -f '$RUNNER_DIR/r3a.park' ]"
+    [ "$(_jf r3a .state)" = "running" ]
+    ! _turn_log_has "^term"
+    ! _has_event r3a paused_for_limiter
+    kill -0 "$SUP_PID"
+}
+
+@test "round3-7: the settings file wires PostToolUse and PostToolUseFailure to the hook's post mode; mode off has neither" {
+    export MOTHER_LIMITER_HOLD_GRACE_S=100
+    _make_job ps '.max_cost_usd = 5'
+    MOCK_CLAUDE_STDOUT='' run mother-run-job ps
+    local f="$RUNNER_DIR/ps.settings.json" ev
+    [ -f "$f" ]
+    for ev in PostToolUse PostToolUseFailure; do
+        [ "$(jq -r --arg e "$ev" '.hooks[$e][0].hooks[0].type' "$f")" = "command" ]
+        jq -r --arg e "$ev" '.hooks[$e][0].hooks[0].command' "$f" | grep -Eq 'mother-limiter-hold\.sh.* post$'
+    done
+    export MOTHER_LIMITER_MODE=off
+    _make_job pso '.max_cost_usd = 5'
+    MOCK_CLAUDE_STDOUT='' run mother-run-job pso
+    f="$RUNNER_DIR/pso.settings.json"
+    [ -f "$f" ]
+    [ "$(jq -r '.hooks.PostToolUse // "none"' "$f")" = "none" ]
+    [ "$(jq -r '.hooks.PostToolUseFailure // "none"' "$f")" = "none" ]
+}
