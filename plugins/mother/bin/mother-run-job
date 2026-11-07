@@ -2384,10 +2384,11 @@ _hold_release() {
 }
 
 # _hold_park <held_s> <boundary: tool|phase> — give the hold up: transition to awaiting first, then the
-# event; the caller stops the worker (when there is one) after this returns. A quota_* hold code parks as
+# event; the caller stops the worker (when there is one) after this returns 0. Returns 1 (nothing stopped,
+# nothing recorded, the hold carries on) when the park did not provably land. A quota_* hold code parks as
 # that quota reason (the existing auto-resume handles it); anything else as limiter_hold.
 _hold_park() {
-    local held_s="${1:-0}" boundary="${2:-tool}" code reason preason q resume_at
+    local held_s="${1:-0}" boundary="${2:-tool}" code reason preason q resume_at park_file park_ts
     # The flag's current code decides (a hold may have changed from backoff to quota_* since the first
     # tick); the latched .limiter_hold is the fallback when the flag is already gone.
     code=$(jq -r '.code // empty' "$RUNNER_DIR/$id.hold" 2>/dev/null)
@@ -2402,9 +2403,35 @@ _hold_park() {
             preason="limiter_hold"
             q="Held by the limiter: ${reason:-no reason given}. Mother resumes it automatically when the limiter admits it." ;;
     esac
+    # Park protocol (tool boundary; there is no hook to hold at a phase boundary): .park tells the hook to
+    # keep blocking, even if .hold goes away or its max wait passes, until we have stopped the worker.
+    # Sequence: .park -> re-validate .held (the hook is still blocking) -> state write -> (caller) kill ->
+    # (caller) remove .park. Any failure removes .park and returns 1: nothing is stopped, nothing recorded.
+    park_file="$RUNNER_DIR/$id.park"
+    if [ "$boundary" = "tool" ]; then
+        if ! { printf '{"pid": %s, "at": %s}\n' "$$" "$(date +%s)" > "$park_file.tmp.$$" \
+                 && mv "$park_file.tmp.$$" "$park_file"; } 2>/dev/null; then
+            rm -f "$park_file.tmp.$$" "$park_file"
+            return 1
+        fi
+        if ! _hold_held_valid "$(date +%s)"; then rm -f "$park_file"; return 1; fi
+        # Test-only widening of the window between the last check and the state write.
+        if [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ -n "${MOTHER_TEST_PARK_DELAY_S:-}" ]; then
+            sleep "$MOTHER_TEST_PARK_DELAY_S"
+        fi
+    fi
     # The state write is a read-modify-write under the job-file lock (as cancel and the runner's resume
-    # take it); the lock is released before any event or other write, so it is never nested.
-    _with_lock "$job_file" _hold_park_write "$q" "$preason"
+    # take it); the lock is released before any event or other write, so it is never nested. _with_lock
+    # fails after 10 s (and for good with a stale .lockdir), so the result is not trusted: re-read the job
+    # and require this park's own awaiting state before anything is recorded or the caller stops the worker.
+    park_ts=$(iso_now)
+    if ! _with_lock "$job_file" _hold_park_write "$q" "$preason" "$park_ts" \
+       || [ "$(jq -r --arg p "$preason" --arg ts "$park_ts" \
+               'if .state == "awaiting" and .paused_reason == $p and .paused_at == $ts then "ok" else "no" end' \
+               "$job_file" 2>/dev/null)" != "ok" ]; then
+        [ "$boundary" != "tool" ] || rm -f "$park_file"
+        return 1
+    fi
     resume_at=$(jq -r '.auto_resume_at // 0' "$job_file" 2>/dev/null); : "${resume_at:=0}"
     case "$code" in
         quota_*) _append_event "paused_for_quota" \
@@ -2416,10 +2443,11 @@ _hold_park() {
     esac
     rm -f "$RUNNER_DIR/$id.held"
     _hold_reset_state
+    return 0
 }
 
-_hold_park_write() {   # <question> <paused_reason> — runs under the job-file lock
-    _hold_merged=$(jq --arg q "$1" --arg p "$2" --arg ts "$(iso_now)" \
+_hold_park_write() {   # <question> <paused_reason> <paused_at> — runs under the job-file lock
+    _hold_merged=$(jq --arg q "$1" --arg p "$2" --arg ts "$3" \
         '.state = "awaiting" | .question = $q | .paused_reason = $p | .paused_at = $ts
          | .pause_requested = null | .limiter_hold = null' "$job_file" 2>/dev/null) \
         && _atomic_write "$job_file" "$_hold_merged"
@@ -2487,7 +2515,7 @@ _limiter_hold_tick() {
         fi
         return 0
     fi
-    _hold_park "$held_s" tool
+    _hold_park "$held_s" tool || return 0
     return 1
 }
 
@@ -2512,8 +2540,7 @@ _hold_wait_before_spawn() {
         fi
         now=$(date +%s)
         if [ $((now - start)) -ge "$(_hold_grace_s)" ]; then
-            _hold_park "$((now - start))" phase
-            return 1
+            if _hold_park "$((now - start))" phase; then return 1; fi
         fi
         sleep 2
     done
@@ -2971,6 +2998,7 @@ WRAP
         # then the kill, as for the quota pause above).
         if ! _limiter_hold_tick; then
             _terminate_worker
+            rm -f "$RUNNER_DIR/$id.park"
             break
         fi
 

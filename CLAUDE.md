@@ -693,6 +693,12 @@ mid-request. Nothing is held in observe/off.
   `.hold` flag's current code; the runner's `_resume_limiter_hold` re-checks `awaiting`/`limiter_hold` under the same lock.
 - **Quota holds when the limiter turns unhealthy.** If the limiter stops enforcing while a quota `.hold` exists, the old quota mid-run
   pause/kill path takes over (pre-existing behaviour).
+- **Park protocol (never kill unless parked).** `_hold_park` (tool boundary) writes `runner/<id>.park` (`{pid, at}` of the
+  supervisor), re-validates `.held`, writes the awaiting state, then re-reads the job and requires its own `awaiting` +
+  `paused_reason` + `paused_at`; any failure (including `_with_lock` timing out) removes `.park`, returns 1 and the tick
+  keeps waiting: no event, no kill. Only after a landed park does the caller `_terminate_worker`, then remove `.park`. While
+  `.park` exists and its pid is alive the hook keeps blocking even if `.hold` is gone or `MOTHER_LIMITER_HOOK_MAX_S` passed,
+  bounded by `MAX_S + MOTHER_LIMITER_HOOK_PARK_CAP_S` (120); a `.park` with a dead pid is ignored (fail open).
 - **Phase boundary.** `_hold_wait_before_spawn` (top of `_spawn_and_wait`, and `_wave_cycle` before the adherence/lens spawns) waits
   while `.hold` exists (`held {boundary: "phase"}`, poll 2 s); past the grace period it parks the job without spawning (no worker to
   stop; a same-session prompt that never started is kept in `.limiter_resume_prompt` and replayed on resume). Reviewers already

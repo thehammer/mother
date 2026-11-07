@@ -508,7 +508,7 @@ _rows() { jq -nc "$1"; }
     _wait_for 40 _job_state_is hq awaiting
     [ "$(_jf hq .paused_reason)" = "quota_5h" ]
     [ "$(_jf hq '.auto_resume_at > 0')" = "true" ]
-    _has_event hq paused_for_quota
+    _wait_for 10 _has_event hq paused_for_quota   # the state is written first, the event just after
     ! _has_event hq paused_for_limiter
     _wait_for 20 _supervisor_gone
     # the worker was never cut off inside a turn
@@ -600,6 +600,7 @@ _in_turn_terms() { grep -c '^term in_turn=yes' "$MOCK_CLAUDE_TURN_LOG" 2>/dev/nu
 }
 
 @test "fix1: .held removed (hook stopped) while the supervisor waits: no termination mid-turn; the next boundary parks" {
+    # NB: a guard, not a regression test: it also passes on the pre-fix head (the stale-boundary fix covers it).
     export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=5 MOTHER_LIMITER_HOLD_GRACE_S=4 MOTHER_LIMITER_QUIET_S=1
     _make_job fx2
     _start_job fx2
@@ -633,6 +634,100 @@ _in_turn_terms() { grep -c '^term in_turn=yes' "$MOCK_CLAUDE_TURN_LOG" 2>/dev/nu
     [ "$(_jf fx3 .state)" = "running" ]
     _wait_for 40 _job_state_is fx3 awaiting
     [ "$(_in_turn_terms)" = "0" ]
+}
+
+_park_exists() { [ -f "$RUNNER_DIR/$1.park" ]; }
+_turn_starts() { grep -c '^turn_start' "$MOCK_CLAUDE_TURN_LOG" 2>/dev/null || true; }
+
+@test "round2-1: a park whose state write fails stops nothing, records nothing, and the job stays running" {
+    export MOCK_CLAUDE_TURNS=3 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=5 MOTHER_LIMITER_QUIET_S=1
+    _make_job r21
+    _start_job r21
+    _wait_for 10 _marker_present
+    _hold_flag r21 backoff "cut"
+    _wait_for 20 _has_event r21 held
+    # the supervisor's atomic write goes through <job>.json.tmp.<its pid>: a directory there makes every write fail at once
+    mkdir "$JOBS_DIR/r21.json.tmp.$SUP_PID"
+    sleep 10                                     # grace passes; each park attempt fails to write
+    [ "$(_jf r21 .state)" = "running" ]
+    ! _has_event r21 paused_for_limiter
+    ! _turn_log_has "^term"
+    kill -0 "$SUP_PID"
+    # (and with the write path healthy again the very same hold parks normally)
+    rmdir "$JOBS_DIR/r21.json.tmp.$SUP_PID"
+    _wait_for 40 _job_state_is r21 awaiting
+    _wait_for 10 _turn_log_has "^term in_turn=no"
+    [ "$(_in_turn_terms)" = "0" ]
+    _wait_for 10 _has_event r21 paused_for_limiter
+}
+
+@test "round2-2a: .hold removed after .park is written: the hook keeps blocking and the kill lands only on a blocked worker" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=2 MOTHER_LIMITER_QUIET_S=1 MOTHER_TEST_PARK_DELAY_S=4
+    _make_job r22
+    _start_job r22
+    _wait_for 10 _marker_present
+    _hold_flag r22 backoff "cut"
+    _wait_for 30 _park_exists r22
+    local before; before=$(_turn_starts)
+    rm -f "$RUNNER_DIR/r22.hold"                 # the runner withdraws the hold inside the check-then-kill window
+    sleep 2
+    _held_exists r22                             # the hook is still blocking the tool call
+    [ "$(_turn_starts)" = "$before" ]            # the worker did not start another turn
+    [ "$(_jf r22 .state)" = "running" ]
+    _wait_for 20 _job_state_is r22 awaiting
+    _wait_for 10 _turn_log_has "^term in_turn=no"
+    [ "$(_in_turn_terms)" = "0" ]
+    [ "$(_turn_starts)" = "$before" ]
+    _wait_for 20 _supervisor_gone
+    [ ! -e "$RUNNER_DIR/r22.park" ]
+}
+
+@test "round2-2b: a stale .park from a dead supervisor does not block a later worker" {
+    export MOTHER_JOB_ID=pj
+    _hold_flag pj
+    sh -c 'exit 0' & local dead=$!; wait "$dead"
+    printf '{"pid": %s, "at": %s}\n' "$dead" "$(_now)" > "$RUNNER_DIR/pj.park"
+    "$HOOK" </dev/null >"$MOTHER_ROOT/hook.out" 2>&1 &
+    local hp=$!; BG_PIDS="$BG_PIDS $hp"
+    _wait_for 5 test -f "$RUNNER_DIR/pj.held"
+    rm -f "$RUNNER_DIR/pj.hold"
+    _wait_for 5 bash -c "! kill -0 $hp"           # released on the next poll despite the stale park
+    wait "$hp"
+    [ ! -e "$RUNNER_DIR/pj.held" ]
+    [ ! -s "$MOTHER_ROOT/hook.out" ]
+}
+
+@test "round2-2c: the hook's max wait elapsing after .park does not release the worker; removing .park does" {
+    export MOTHER_JOB_ID=pj MOTHER_LIMITER_HOOK_MAX_S=2 MOTHER_LIMITER_HOOK_PARK_CAP_S=30
+    _hold_flag pj
+    sleep 60 & local sup=$!; BG_PIDS="$BG_PIDS $sup"     # stands in for the live supervisor
+    "$HOOK" </dev/null >"$MOTHER_ROOT/hook.out" 2>&1 &
+    local hp=$!; BG_PIDS="$BG_PIDS $hp"
+    _wait_for 5 test -f "$RUNNER_DIR/pj.held"
+    printf '{"pid": %s, "at": %s}\n' "$sup" "$(_now)" > "$RUNNER_DIR/pj.park"
+    sleep 3.5                                            # max (2 s) has passed
+    kill -0 "$hp"
+    [ -f "$RUNNER_DIR/pj.held" ]
+    rm -f "$RUNNER_DIR/pj.hold"
+    sleep 1
+    kill -0 "$hp"                                        # .hold gone too: still blocking
+    rm -f "$RUNNER_DIR/pj.park"
+    _wait_for 5 bash -c "! kill -0 $hp"
+    wait "$hp"
+    [ ! -e "$RUNNER_DIR/pj.held" ]
+}
+
+@test "round2-2c: the park extension is bounded: the hook fails open at max + PARK_CAP_S even with a live .park" {
+    export MOTHER_JOB_ID=pj MOTHER_LIMITER_HOOK_MAX_S=1 MOTHER_LIMITER_HOOK_PARK_CAP_S=2
+    _hold_flag pj
+    sleep 30 & local sup=$!; BG_PIDS="$BG_PIDS $sup"
+    printf '{"pid": %s, "at": %s}\n' "$sup" "$(_now)" > "$RUNNER_DIR/pj.park"
+    local t0 t1; t0=$(_now)
+    run "$HOOK" </dev/null
+    t1=$(_now)
+    [ "$status" -eq 0 ]
+    [ $((t1 - t0)) -ge 3 ]; [ $((t1 - t0)) -lt 8 ]
+    [ ! -e "$RUNNER_DIR/pj.held" ]
 }
 
 @test "fix3: a hold that changed from backoff to quota_* before the park parks as a quota pause" {
