@@ -2195,6 +2195,12 @@ CAND_EOF
 # Delegates to _iso_now (sourced from state.sh) so worker-written timestamps
 # match the millisecond RFC 3339 format used everywhere else in job JSON.
 _install_core_job_helpers() {
+    # _switch_with_lock lives in lib/state.sh; SOURCE_ONLY=1 sourcing returns before the main
+    # source of it, so make sure it exists in both modes (before _with_lock is defined).
+    if ! type _switch_with_lock >/dev/null 2>&1; then
+        # shellcheck source=/dev/null
+        source "$MOTHER_LIB_DIR/state.sh"
+    fi
     iso_now() { _iso_now; }
     _atomic_write() {
         # NB: `path` collides with zsh's special array for PATH — use _target.
@@ -2202,18 +2208,13 @@ _install_core_job_helpers() {
         printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
     }
     _with_lock() {
+        # state.sh's _switch_with_lock records the owner pid and never takes over a live owner.
         local target="$1"; shift
-        local lockdir="${target}.lockdir"
-        local tries=0
-        while ! mkdir "$lockdir" 2>/dev/null; do
-            sleep 0.05
-            tries=$((tries + 1))
-            [ "$tries" -gt 200 ] && { echo "mother-run-job: could not acquire lock for $target after 10s" >&2; return 1; }
-        done
-        "$@"
-        local rc=$?
-        rmdir "$lockdir" 2>/dev/null || true
-        return $rc
+        if ! type _switch_with_lock >/dev/null 2>&1; then
+            echo "mother-run-job: _switch_with_lock is undefined (lib/state.sh not sourced); refusing to run unlocked" >&2
+            return 1
+        fi
+        _switch_with_lock "${target}.lockdir" "$target" 200 "$@"
     }
     _append_line() { printf '%s\n' "$2" >> "$1"; }
     _append_event() {
@@ -2376,10 +2377,11 @@ _hold_event() {
         --argjson x "$extra" '{code: ($cur.code // null), reason: ($cur.reason // null)} + $x')"
 }
 
-# _hold_release <held_s> — the flag is gone: hold_released, and .limiter_hold cleared.
+# _hold_release <held_s> — the flag is gone: .limiter_hold cleared, then hold_released. State first: an
+# observer that sees the event must never still see the hold.
 _hold_release() {
-    _append_event "hold_released" "$(jq -nc --argjson h "${1:-0}" '{held_s: $h}')"
     _job_update '.limiter_hold = null'
+    _append_event "hold_released" "$(jq -nc --argjson h "${1:-0}" '{held_s: $h}')"
     rm -f "$RUNNER_DIR/$id.held"
     _hold_reset_state
 }
@@ -2418,7 +2420,7 @@ _hold_park() {
             return 1
         fi
         if ! _hold_held_valid "$(date +%s)" || ! _hold_calls_safe "$(date +%s)"; then rm -f "$park_file"; return 1; fi
-        # Test-only widening of the window between the last check and the state write.
+        # TEST-ONLY (gated on MOTHER_TEST_ROOT=1): widening of the window between the last check and the state write.
         if [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ -n "${MOTHER_TEST_PARK_DELAY_S:-}" ]; then
             sleep "$MOTHER_TEST_PARK_DELAY_S"
             # a call that started in the window aborts the park
@@ -2495,12 +2497,15 @@ _hold_call_stale_s() { _hold_num "${MOTHER_LIMITER_CALL_STALE_S:-}" 21600; }
 # this worker and no call is running. Records live in $RUNNER_DIR/<id>.calls/<tool_use_id>.json (written by
 # hooks/mother-limiter-hold.sh). A record whose hook is dead counts as running (that is a tool executing
 # after its hook passed) until it is older than MOTHER_LIMITER_CALL_STALE_S, when it is discarded as a
-# lost PostToolUse. An unreadable record counts as running. No records at all = not safe (nothing proves a
-# boundary).
+# lost PostToolUse. An unreadable record counts as running, and so does an `_unidentified` marker (enforce
+# mode: a call whose hook got no tool_use_id or could not write its record). No records at all = not safe
+# (nothing proves a boundary).
 _hold_calls_safe() {
     local now="$1" dir="$RUNNER_DIR/$id.calls" f state pid at blocked=0 hmax stale
     hmax=$(_hold_hook_max_s); stale=$(_hold_call_stale_s)
     [ -d "$dir" ] || return 1
+    # A call the hook could not identify or record may be executing: never park (cleared at next spawn).
+    [ ! -e "$dir/_unidentified" ] || return 1
     for f in "$dir"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // empty' "$f" 2>/dev/null) || state=""
