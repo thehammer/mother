@@ -105,11 +105,24 @@ All of these hold at concurrency 6:
 
 If any fails, stay in observe mode, fix or retune, and redo step 2 at 6.
 
-## 4. Enforcement (not available yet)
+## 4. Enforcement
 
-Only after step 3: `mother limiter mode enforce`. That command arrives with the enforcement slice (L3); until
-then **this runbook stops at step 3** and the limiter stays observe-only. Do not set `MOTHER_LIMITER_MODE=enforce`:
-any value other than `observe` or `off` just runs observe with a warning.
+Only after step 3, and only you, at a terminal: `mother limiter mode enforce`. It is refused from a worker or an
+agent's subprocess (logged to `limiter/mode-refusals.jsonl`); changes are audited in `limiter/mode-audit.jsonl`.
+`mother limiter mode` prints the current mode. `MOTHER_LIMITER_MODE=enforce` in the environment is **not**
+honoured (only `off` is): enforcement lives in `limiter/mode.json`.
+
+Under enforce the limiter decides which ready jobs start (budget pace, reserve, backoff after distress, ramp after
+a reset, interactive demand for personal work; company work first, `--priority raise|lower`), bounded by
+`min(MOTHER_CONCURRENCY, allowed)`. Running jobs are never touched in this slice. The quota-gate 90% cap stays as a
+backstop; with the gate `off`/`off_until_reset` the budget terms are advisory (the `limiter_enforcing_gate_off`
+item says so). If the limiter goes stale or faults, dispatch falls back to fixed concurrency and `mother status`
+shows `limiter_fault`. Watch `mother limiter report`: under enforce, `divergence` entries are a bug signal.
+
+Timing allowance: the limiter reacts on its tick (`MOTHER_LIMITER_INTERVAL`, 10 s). A job it had already admitted
+can therefore start up to about one tick (~10 s) after a 429 lands, before the cut shows in the admit list. That is
+within the plan's 30 s allowance and is not a failure of enforcement; count it only if it exceeds ~30 s. Running
+jobs are never interrupted.
 
 ## 5. Backing out
 
@@ -118,7 +131,7 @@ any value other than `observe` or `off` just runs observe with a warning.
   CLI both read it), or set `MOTHER_LIMITER_MODE=off` in the daemon's environment (a hard kill switch that wins over
   everything; note a `mother limiter` run from your own shell may not see it, so the CLI can disagree with the daemon). `mother limiter --json`
   then prints `{"v":1,"mode":"off"}`.
-- Once enforcement exists: `mother limiter mode observe` returns to observe-only, and `MOTHER_LIMITER_MODE=off`
-  still turns it off completely.
+- `mother limiter mode observe` returns from enforce to observe-only (dispatch is exactly as before the limiter),
+  and `MOTHER_LIMITER_MODE=off` still turns it off completely.
 - To undo a concurrency step: set the previous `MOTHER_CONCURRENCY` in `~/.mother/config.env` and
   `mother daemon stop && mother daemon start`.

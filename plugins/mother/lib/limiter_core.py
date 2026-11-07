@@ -442,6 +442,7 @@ def tick(inp, prev, now, cfg):
     # ready jobs in priority order
     taken = 0
     admitted_burn = 0.0
+    admit_ids = []
     ready_out = []
     n_running = len(running)
     for j in sorted(inp.get("ready") or [], key=priority_key):
@@ -470,10 +471,16 @@ def tick(inp, prev, now, cfg):
             row["code"], row["reason"] = "admit", "admitted"
             taken += 1
             admitted_burn += burn
+            admit_ids.append(j["id"])
         else:
             row.update(decision="hold", code=code, reason=reason)
             if code in BUDGET_CODES and advisory:
+                # Advisory budget terms never hold work (bet B3): enforcement admits it, so it
+                # takes a slot and adds its burn like any admitted candidate (cumulative list).
                 row["advisory"] = True
+                taken += 1
+                admitted_burn += burn
+                admit_ids.append(j["id"])
         ready_out.append(row)
 
     st = {
@@ -493,6 +500,8 @@ def tick(inp, prev, now, cfg):
         },
         "interactive": inter,
         "ready": ready_out, "running": running_out,
+        # ordered ids enforcement may start: cumulative, never more than allowed - running
+        "admit": admit_ids,
         # carried between ticks
         "backoff": bo, "ramp": rp, "windows": {n: {"used_pct": wins[n]["used_pct"], "resets_at": wins[n].get("resets_at") or 0}
                                                for n in wins},
