@@ -57,7 +57,8 @@ unset _input
 
 # _mark_unidentified — enforce mode only: this call could not be recorded (no tool_use_id, or the record write
 # failed), so the supervisor can't know it is not running. Drop $calls_dir/_unidentified; _hold_calls_safe then
-# refuses to park until the next spawn clears the directory. Silent on failure (fail open). Runs only on the
+# refuses to park until the next spawn clears the directory. Silent on failure (fail open). Fail-open also covers
+# an unreadable or garbled limiter/mode.json: no marker is dropped, because enforce must be positively configured. Runs only on the
 # failure path, so the mode file is never read on the normal hot path.
 _mark_unidentified() {
     grep -q '"mode": *"enforce"' "$mother_root/limiter/mode.json" 2>/dev/null || return 0

@@ -610,3 +610,21 @@ _make_pipeline_succeeded_job() {
     # Must still show the branch's own real commit.
     [[ "$output" =~ "add feature work" ]]
 }
+
+# Concurrent reviewers each rewrite the whole job file; without the job lock one reviewer's slot is
+# lost (pipeline_driver "multiple reviewers each write to their own slot" flaked ~4/20).
+@test "review-phase: the slot write waits for the job lock (no unlocked read-modify-write)" {
+    _make_pipeline_succeeded_job "job-rf-lock"
+    export MOCK_CLAUDE_STDOUT="$(_valid_findings_stdout)"
+    local ld="$JOBS_DIR/job-rf-lock.json.lockdir"
+    sleep 60 & local holder=$!
+    mkdir -p "$ld"; printf '%s\n' "$holder" > "$ld/owner"
+
+    mother review-phase "job-rf-lock" --reviewer perri >/dev/null 2>&1 & local rp=$!
+    sleep 3
+    # The reviewer has long finished its (mock) run; it must still be waiting on the lock.
+    [ "$(jq -r '.pipeline.reviewer_findings.perri // "none"' "$JOBS_DIR/job-rf-lock.json")" = "none" ]
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null || true
+    wait "$rp"
+    [ "$(jq -r '.pipeline.reviewer_findings.perri | length' "$JOBS_DIR/job-rf-lock.json")" = "1" ]
+}

@@ -3256,17 +3256,12 @@ EOF
         "$(jq -nc --arg model "$reviewer_model" --arg effort "$reviewer_effort" --arg d "$decision" --argjson fc "$finding_count" \
             '{model: $model, effort: (($effort | select(length>0)) // null), decision: $d, finding_count: $fc}')"
 
-    # Persist to .pipeline.reviewer_findings.<reviewer> via atomic write.
+    # Persist to .pipeline.reviewer_findings.<reviewer>. Concurrent reviewers each rewrite the WHOLE job
+    # file, so the read-modify-write must run under the job lock or one reviewer's slot is lost.
     # Guard: ensure .pipeline and .pipeline.reviewer_findings exist as objects
     # before the targeted set, so jq doesn't reject a null intermediate path.
-    local merged_job
-    merged_job=$(jq --argjson rf "$tagged_findings" --arg r "$reviewer" '
-        (.pipeline //= {}) |
-        (.pipeline.reviewer_findings //= {}) |
-        .pipeline.reviewer_findings[$r] = $rf
-    ' "$job_file") \
+    _with_lock "$job_file" _review_slot_write "$job_file" "$tagged_findings" "$reviewer" \
         || _die "review-phase: jq update for reviewer_findings failed"
-    _atomic_write "$job_file" "$merged_job"
 
     # Emit reviewed event.
     _append_event "$id" "reviewed" \
@@ -3486,6 +3481,18 @@ EOF
 
     echo "$id: perri:$lens review: $finding_count findings ($decision)"
     return 0
+}
+
+# _review_slot_write <job_file> <findings-json> <reviewer>: set .pipeline.reviewer_findings.<reviewer>.
+# Call under _with_lock "<job_file>" (it re-reads the file).
+_review_slot_write() {
+    local jf="$1" rf="$2" r="$3" merged
+    merged=$(jq --argjson rf "$rf" --arg r "$r" '
+        (.pipeline //= {}) |
+        (.pipeline.reviewer_findings //= {}) |
+        .pipeline.reviewer_findings[$r] = $rf
+    ' "$jf") || return 1
+    _atomic_write "$jf" "$merged"
 }
 
 # ---------- _merge_reviewer_findings ----------

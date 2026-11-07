@@ -106,19 +106,11 @@ _bounded_run() {
 
 # Portable mkdir-based mutex (macOS lacks flock).
 # Usage: _with_lock <path> <command...>
+# Goes through _switch_with_lock so every holder records its pid in <lockdir>/owner: a lock whose
+# owner is dead is taken over, one whose owner is alive never is (10s wait, then failure).
 _with_lock() {
     local target="$1"; shift
-    local lockdir="${target}.lockdir"
-    local tries=0
-    while ! mkdir "$lockdir" 2>/dev/null; do
-        sleep 0.05
-        tries=$((tries + 1))
-        [ "$tries" -gt 200 ] && { echo "mother: could not acquire lock for $target after 10s" >&2; return 1; }
-    done
-    "$@"
-    local rc=$?
-    rmdir "$lockdir" 2>/dev/null || true
-    return $rc
+    _switch_with_lock "${target}.lockdir" "$target" 200 "$@"
 }
 
 _append_line() {
@@ -423,19 +415,33 @@ _quota_with_lock() {
 # shared with the limiter-mode switch (lib/limiter.sh). <label> names the switch in messages.
 _switch_with_lock() {
     local lockdir="$1" label="$2" tries_max="$3"; shift 3
-    local tries=0 owner age stale
+    local tries=0 owner ino mtime stale
+    # Re-entrant within one shell (and its subshells): a nested call for a lockdir this shell already
+    # holds (e.g. a job transition's usage recompute under `mother cancel`) just runs. A plain shell
+    # variable, never exported, so child processes still contend normally.
+    case "${_MOTHER_HELD_LOCKDIRS:-}" in *"|$lockdir|"*) "$@"; return $? ;; esac
     mkdir -p "$(dirname "$lockdir")" 2>/dev/null
     while ! mkdir "$lockdir" 2>/dev/null; do
+        # Identity of the lockdir we are judging: inode, owner, mtime (read in this order).
+        ino=$(ls -di "$lockdir" 2>/dev/null | awk '{print $1}')
         owner=$(cat "$lockdir/owner" 2>/dev/null)
-        age=$(( $(date +%s) - $(_file_mtime "$lockdir") ))
+        mtime=$(_file_mtime "$lockdir")
         stale=0
-        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then stale=1
-        elif [ "$age" -gt "${MOTHER_QUOTA_LOCK_STALE_S:-30}" ]; then stale=1; fi
+        if [ -z "$ino" ]; then
+            :   # vanished between mkdir and now: just retry
+        elif [ -n "$owner" ]; then
+            # A recorded owner decides alone: alive = never taken over, however long it holds.
+            kill -0 "$owner" 2>/dev/null || stale=1
+        elif [ $(( $(date +%s) - mtime )) -gt "${MOTHER_QUOTA_LOCK_STALE_S:-30}" ]; then
+            stale=1   # no owner recorded (crash before the owner write, or an old holder): age rule only
+        fi
         if [ "$stale" -eq 1 ]; then
             if mv "$lockdir" "$lockdir.stale.$$" 2>/dev/null; then
-                # Another taker may have replaced the dir between our read and the
-                # rename: only discard it if it is still the one we judged stale.
-                if [ "$(cat "$lockdir.stale.$$/owner" 2>/dev/null)" = "$owner" ]; then
+                # Another taker may have replaced the dir between our read and the rename: only
+                # discard it if it is still exactly the one we judged stale (same inode, owner, mtime).
+                if [ "$(ls -di "$lockdir.stale.$$" 2>/dev/null | awk '{print $1}')" = "$ino" ] \
+                   && [ "$(cat "$lockdir.stale.$$/owner" 2>/dev/null)" = "$owner" ] \
+                   && [ "$(_file_mtime "$lockdir.stale.$$")" = "$mtime" ]; then
                     rm -f "$lockdir.stale.$$/owner"; rmdir "$lockdir.stale.$$" 2>/dev/null || true
                     echo "mother: took over a stale $label lock (owner ${owner:-unknown})" >&2
                 else
@@ -454,8 +460,11 @@ _switch_with_lock() {
         [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the $label lock" >&2; return 1; }
     done
     echo "$$" > "$lockdir/owner" 2>/dev/null || true
+    local _outer_held="${_MOTHER_HELD_LOCKDIRS:-}"
+    _MOTHER_HELD_LOCKDIRS="${_outer_held}|$lockdir|"
     "$@"
     local rc=$?
+    _MOTHER_HELD_LOCKDIRS="$_outer_held"
     rm -f "$lockdir/owner"; rmdir "$lockdir" 2>/dev/null || true
     return $rc
 }

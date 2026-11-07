@@ -40,7 +40,17 @@ _usage_iso_now() {
     ' 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S.000Z
 }
 
-_usage_job_update() {
+# The job file is shared with other writers that hold <job>.json.lockdir (reviewers writing their slot,
+# the supervisor): an unlocked read-modify-write here silently drops their update. Take the same lock
+# when the caller's environment has _with_lock (state.sh / mother-run-job); never call this under it.
+_usage_job_locked() {
+    local jf="$1"; shift
+    if type _with_lock >/dev/null 2>&1; then _with_lock "$jf" "$@"; else "$@"; fi
+}
+
+_usage_job_update() { _usage_job_locked "$1" _usage_job_update_unlocked "$@"; }
+
+_usage_job_update_unlocked() {
     local job_file="$1" filter="$2"
     [ -f "$job_file" ] || return 1
     local merged; merged=$(jq "$filter" "$job_file" 2>/dev/null) || return 1
@@ -166,7 +176,9 @@ mother_recompute_job_cost() {
 # Same read-modify-write as _usage_job_update, but passes cost/tokens/complete
 # through jq --argjson (typed) instead of interpolating them into the filter
 # string.
-_usage_job_update_argjson() {
+_usage_job_update_argjson() { _usage_job_locked "$1" _usage_job_update_argjson_unlocked "$@"; }
+
+_usage_job_update_argjson_unlocked() {
     local job_file="$1" cost="$2" tokens="$3" complete="$4"
     [ -f "$job_file" ] || return 1
     local merged

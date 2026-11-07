@@ -236,6 +236,15 @@ _register_child() { printf '{"job_id":"%s"}\n' "$1" > "$RUNNER_DIR/children/$2.j
 # L4-3  give-up after the grace period
 # ===========================================================================
 
+@test "L4-2b: _hold_release clears .limiter_hold before it appends hold_released" {
+    _load_run_job
+    export id=hrel job_file="$JOBS_DIR/hrel.json"
+    jq -nc '{id:"hrel", state:"running", limiter_hold:{code:"backoff", reason:"r", since:1, at_boundary:true}}' > "$job_file"
+    _append_event() { jq -c '.limiter_hold' "$job_file" > "$BATS_TEST_TMPDIR/hold-at-event"; }
+    _hold_release 3
+    [ "$(cat "$BATS_TEST_TMPDIR/hold-at-event")" = "null" ]
+}
+
 @test "L4-3: a hold past the grace period with a quiet log parks the job awaiting/limiter_hold, appends paused_for_limiter and stops the worker" {
     export MOCK_CLAUDE_TURNS=3 MOCK_CLAUDE_TURN_SLEEP=1 MOTHER_LIMITER_HOLD_GRACE_S=2 MOTHER_LIMITER_QUIET_S=1
     _make_job hj3

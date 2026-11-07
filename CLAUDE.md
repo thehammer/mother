@@ -721,12 +721,14 @@ mid-request. Nothing is held in observe/off.
 - **Gated test hooks.** `MOTHER_TEST_PARK_DELAY_S` (seconds slept inside `_hold_park` between the last check and the state
   write) only takes effect under `MOTHER_TEST_ROOT=1`; it widens the window the park-sequence tests probe. **Test-only:** never set
   `MOTHER_TEST_ROOT` or `MOTHER_TEST_PARK_DELAY_S` in production (the code comment at the use site says the same).
-- **Unidentified calls block parking.** In enforce mode (`limiter/mode.json`), a hook that gets no `tool_use_id` or cannot write its call
+- **Unidentified calls block parking.** In enforce mode (`limiter/mode.json`; an unreadable or garbled file counts as not enforce, so the hook fails open and drops no marker: enforce must be positively configured), a hook that gets no `tool_use_id` or cannot write its call
   record drops `runner/<id>.calls/_unidentified`; `_hold_calls_safe` returns false while it exists, so the worker is never parked on a
   boundary that may hide a live unrecorded call. The spawn-time `.calls` cleanup clears it. Observe mode never writes it.
-- **Job lock takeover.** `_job_locked` (cancel/retry/resume/priority) and the runner's limiter apply take `<job>.json.lockdir` with
-  `_switch_with_lock`: the owner pid is recorded and a lockdir whose owner is dead (or an owner-less one older than
-  `MOTHER_QUOTA_LOCK_STALE_S`, 30s) is taken over. Other `_with_lock` users of the job file (supervisor) still write no owner file.
+- **Job lock takeover.** Every `<file>.lockdir` taker (`_with_lock` in `lib/state.sh` and `mother-run-job`, `_job_locked`, the runner's
+  limiter apply, the quota/limiter switches) goes through `_switch_with_lock`, which records the owner pid. A recorded owner that is
+  alive is never displaced, however long it holds; a dead one is taken over; an owner-less lockdir is taken over only past
+  `MOTHER_QUOTA_LOCK_STALE_S` (30s). The takeover renames the dir aside and discards it only if its inode, owner and mtime still match what
+  was judged stale, otherwise it puts it back.
 - **Phase boundary.** `_hold_wait_before_spawn` (top of `_spawn_and_wait`, and `_wave_cycle` before the adherence/lens spawns) waits
   while `.hold` exists (`held {boundary: "phase"}`, poll 2 s); past the grace period it parks the job without spawning (no worker to
   stop; a same-session prompt that never started is kept in `.limiter_resume_prompt` and replayed on resume). Reviewers already

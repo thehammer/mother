@@ -2202,18 +2202,9 @@ _install_core_job_helpers() {
         printf '%s' "$content" > "$tmp" && mv "$tmp" "$_target"
     }
     _with_lock() {
+        # state.sh's _switch_with_lock records the owner pid and never takes over a live owner.
         local target="$1"; shift
-        local lockdir="${target}.lockdir"
-        local tries=0
-        while ! mkdir "$lockdir" 2>/dev/null; do
-            sleep 0.05
-            tries=$((tries + 1))
-            [ "$tries" -gt 200 ] && { echo "mother-run-job: could not acquire lock for $target after 10s" >&2; return 1; }
-        done
-        "$@"
-        local rc=$?
-        rmdir "$lockdir" 2>/dev/null || true
-        return $rc
+        _switch_with_lock "${target}.lockdir" "$target" 200 "$@"
     }
     _append_line() { printf '%s\n' "$2" >> "$1"; }
     _append_event() {
@@ -2376,10 +2367,11 @@ _hold_event() {
         --argjson x "$extra" '{code: ($cur.code // null), reason: ($cur.reason // null)} + $x')"
 }
 
-# _hold_release <held_s> — the flag is gone: hold_released, and .limiter_hold cleared.
+# _hold_release <held_s> — the flag is gone: .limiter_hold cleared, then hold_released. State first: an
+# observer that sees the event must never still see the hold.
 _hold_release() {
-    _append_event "hold_released" "$(jq -nc --argjson h "${1:-0}" '{held_s: $h}')"
     _job_update '.limiter_hold = null'
+    _append_event "hold_released" "$(jq -nc --argjson h "${1:-0}" '{held_s: $h}')"
     rm -f "$RUNNER_DIR/$id.held"
     _hold_reset_state
 }
