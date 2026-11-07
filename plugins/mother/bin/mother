@@ -1308,6 +1308,8 @@ _status_overview() {
 
     echo "Concurrency: $(printf '%s' "$conc" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
     _status_rust_dirs_line "$rust_dirs"
+    jq -r 'select(type == "object" and .at) | "Last snapshot thin: \(.at), freed \(.freed_gb) GB (thinned \(.thinned))\(if .exit != 0 then " [tmutil exit \(.exit)]" else "" end)"' \
+        "$RUNNER_DIR/snapshot-thin.json" 2>/dev/null || true
     _limiter_text "$limiter" compact
     echo "Queue: $(printf '%s' "$counts" | jq -r 'to_entries | if length == 0 then "(no jobs)" else map("\(.key)=\(.value)") | join("  ") end')"
     echo ""

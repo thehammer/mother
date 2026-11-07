@@ -2884,6 +2884,7 @@ _spawn_and_wait() {
     # job's leftovers and nothing else. Empty (no TMPDIR export) if it can't be made.
     job_tmp="$MOTHER_ROOT/tmp/$id"
     mkdir -p "$job_tmp" 2>/dev/null || job_tmp=""
+    [ -n "$job_tmp" ] && _tm_exclude_path "$job_tmp"
     job_tmp_export=""
     [ -n "$job_tmp" ] && job_tmp_export="export TMPDIR=$(printf '%q' "$job_tmp")"
 
@@ -3478,6 +3479,32 @@ _refresh_base_sha() {
     return 0
 }
 
+# _tm_exclude_path <path> — sticky Time Machine exclusion (`tmutil addexclusion`,
+# no -p, no sudo) for a job-owned directory, so deleted worktrees and build
+# output stay out of backups. Best-effort: never fails or delays the job (the
+# call is bounded by a watchdog), logs once per job. Never call it with the main
+# checkout. MOTHER_TM_EXCLUDE_WORKTREES=0 disables.
+_tm_exclude_path() {
+    local p="$1" tm_pid wd_pid
+    [ "${MOTHER_TM_EXCLUDE_WORKTREES:-1}" = "0" ] && return 0
+    [ -n "$p" ] && [ -d "$p" ] || return 0
+    [ "$p" != "$repo_path" ] || return 0
+    command -v tmutil >/dev/null 2>&1 || return 0
+    tmutil addexclusion "$p" >/dev/null 2>&1 &
+    tm_pid=$!
+    ( trap 'kill "$sp" 2>/dev/null; exit 0' TERM
+      sleep 3 & sp=$!
+      wait "$sp"; kill "$tm_pid" 2>/dev/null ) >/dev/null 2>&1 3>&- &
+    wd_pid=$!
+    if wait "$tm_pid" 2>/dev/null; then
+        _append_event tm_excluded "$(jq -nc --arg p "$p" '{path: $p, ok: true}')" >/dev/null 2>&1 || true
+    else
+        _append_event tm_excluded "$(jq -nc --arg p "$p" '{path: $p, ok: false}')" >/dev/null 2>&1 || true
+    fi
+    kill "$wd_pid" 2>/dev/null; wait "$wd_pid" 2>/dev/null
+    return 0
+}
+
 # Resolve working directory.
 work_dir=""
 _workspace_lock_held=0
@@ -3497,6 +3524,7 @@ if [ "$isolation" = "worktree" ]; then
                 || { _transition failed "$(jq -nc --arg r "worktree_create_failed" '{reason: $r}')"; exit 1; }
             _refresh_base_sha "$wt_path"
         fi
+        _tm_exclude_path "$wt_path"
     fi
     work_dir="$wt_path"
 else
