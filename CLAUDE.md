@@ -540,7 +540,7 @@ checkout; plugin versions are bumped so `claude plugin update` refreshes it.
 
 ## Backpressure limiter
 
-Observe-only (L1; enforcement, surfaces and boundary holds are later slices). It computes what it *would* admit,
+Observe-only (L1; L2 added the surfaces below; enforcement and boundary holds are later slices). It computes what it *would* admit,
 hold or cut each tick and logs it next to what dispatch did. **It changes no dispatch behaviour.**
 
 - **Pure core (bet B1).** `lib/limiter_core.py` is the control law: stdlib `math`/`re` only, no file, clock or
@@ -586,12 +586,47 @@ hold or cut each tick and logs it next to what dispatch did. **It changes no dis
 - **Feed.** Same freshness rules as `_quota_feed_json` / `_quota_gate_read` (`lib/state.sh`); a bats test runs both
   on the same fixtures. If you change one reader, change the other.
 
+- **Surfaces (L2).** `mother-limiter status --json` prints the **limiter block**; `status --raw` keeps the old
+  `{mode, age_s, state}` dump. The block is built from `state.json` (plus `runner/limiter-fault.json` and
+  `quota-gate.json`) with no recomputation, because the broker calls it: `{v:1, mode, age_s, stale, fault,
+  concurrency{ceiling, allowed, effective, state steady|backoff|ramp|uncalibrated, detail}, burn{fleet_usd_per_min,
+  sustainable_usd_per_min, pace, window, calibrated}, reserve{pct, holding, enforceable}, interactive{state,
+  pct_per_hour}, overage_in_use, gate, last_distress{at, ago_s, kind, status, job_id}, distress_24h, waiting[]}`;
+  mode `off` prints exactly `{"v":1,"mode":"off"}`. `stale` = `state.json` missing or older than 3 x
+  `MOTHER_LIMITER_INTERVAL`; `fault` = the fault file's content. Both make the text surfaces say "limiter: not
+  running (...) — dispatch uses fixed concurrency". `effective` is the running-job count from the last tick.
+  The shape is a **cross-repo contract**: `tests/fixtures/limiter_block.json` (Nostromo vendors it) — additive
+  changes only, and a bats test diffs its key set against the CLI output.
+- **CLI.** `mother limiter [status] [--json]`, `mother limiter signals [--json]` (raw per-window values; resets via
+  `_quota_fmt_time`), `mother limiter report [--since 24h|ISO] [--json]` (`cmd_limiter`, next to `cmd_quota`). The
+  report reads `decisions.jsonl` (+ `.1`), `distress.jsonl` (tick-written, one line per distress event; falls back
+  to `failure_routed` job events when the file never existed) and `state.json`: divergences by type and code,
+  distress per 10 job-hours (job-hours from `actual.running` samples, each holding until the next, a gap capped at
+  900s), 5h exhaustion while admitting (a run of samples with 5h `used_pct` >= 100 and gate `on` that contains a
+  spawn; uses the decision line's `window {used_pct_5h, gate}`), calibration, and verdicts (429 < 1 per 10
+  job-hours, exhaustion 0, 5h `k` calibrated). `mother status` adds a 2-line summary under `Concurrency:` and
+  `limiter` in `--format json`. Runbook: `docs/runbooks/limiter-validation.md`.
+- **Wait reasons.** The tick gives every `ready`/`queued` job `limiter.wait` `{code, reason, source, advisory, would,
+  since}`: what ACTUALLY holds it, in dispatch's own order — `dep_wait`, `backoff` (future `not_before`),
+  `ratelimit_paused`, `quota_over_cap` (not for `force_start`), `low_disk`, `concurrency_full`, else `next`. `source`
+  is `dispatch`; the limiter's own different decision rides in `would {code, reason}`. It is written (via the
+  runner's `_limiter_apply_one`, which still only touches `data_class`/`limiter.*`) only when `code` changes; `since`
+  moves only then. The same rows, oldest job first, are `waiting` in the block (`st["waiting"]` in `state.json`).
+  `mother list` appends `[WAIT <code>]` (not for `backoff`, which already shows `[BACKOFF …]`); `mother status <id>`
+  prints `Waiting: <reason>`. `awaiting` jobs are not "waiting" here.
+- **Broker.** The subscribe snapshot gains `limiter` (omitted when `mother limiter status --json` fails), hello
+  lists the `limiter` category, and a block watcher (`broker/quotawatch.go`, shared with `quota`;
+  `MOTHER_BROKER_LIMITER_SEC`, default 15) publishes a `limiter` event only when the block's content changes (it
+  ignores `age_s`, `last_distress.ago_s`, `concurrency.detail` and waiting `reason`). No broker command changes the
+  limiter mode: that stays CLI-only and human-only.
+
 New job fields:
 
 | Field | Type | Description |
 |---|---|---|
 | `data_class` | string | `company` (Carefeed origin owner, `MOTHER_PHI_REPOS`, or `MOTHER_COMPANY_REPOS`) or `personal`. Set at `mother add`; the tick fills it for older ready/queued jobs. |
 | `limiter.estimate` | object | `{usd_per_min, source: history\|fleet_p75\|default, basis: "<repo>+<actor>", samples, computed_at}` expected burn (MC-38). Refreshed at most hourly for non-running jobs. |
+| `limiter.wait` | object | `{code, reason, source: dispatch, advisory, would {code, reason}\|null, since}` why a `ready`/`queued` job has not started (L2, see "Wait reasons"). Rewritten only when `code` changes. Display only. |
 | `limiter.would` | object | `{code, reason, advisory, at}` the observe-only decision for a `ready` job (`admit`, `concurrency_full`, `backoff`, `ramp`, `budget_pace`, `reserve`, `interactive_personal`, `retry_after`). Display/audit only. |
 
 ## Quality gates

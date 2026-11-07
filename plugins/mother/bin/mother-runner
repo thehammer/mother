@@ -1002,7 +1002,7 @@ _limiter_backoff_arm() {
 
 # _limiter_apply <annotations json> — write the limiter's job annotations. Each one was already
 # diffed against the job file by mother-limiter, so a job is only rewritten when a value changed.
-# Only data_class, limiter.estimate and limiter.would are ever set: nothing dispatch reads.
+# Only data_class, limiter.estimate, limiter.would and limiter.wait are ever set: nothing dispatch reads.
 _limiter_apply() {
     local ann id
     printf '%s' "$1" | jq -c '.annotations[]?' 2>/dev/null | while read -r ann; do
@@ -1023,7 +1023,8 @@ _limiter_apply_one() {
         select(.state == "ready" or .state == "queued")
         | (if $a.data_class then .data_class = $a.data_class else . end)
         | (if $a.estimate then .limiter.estimate = $a.estimate else . end)
-        | (if $a.would then .limiter.would = $a.would else . end)' "$file" 2>/dev/null) || return 0
+        | (if $a.would then .limiter.would = $a.would else . end)
+        | (if $a.wait then .limiter.wait = $a.wait else . end)' "$file" 2>/dev/null) || return 0
     [ -n "$merged" ] || return 0
     _atomic_write "$file" "$merged"
 }

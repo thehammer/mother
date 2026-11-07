@@ -271,9 +271,10 @@ func (h *hub) deliverOutputLocked(cl *client, s *subscription, ev rawEvent) {
 func (h *hub) subscribe(cl *client, sub *subscription) {
 	// The quota block shells out to `mother quota status --json`; build it
 	// before taking h.mu so a slow CLI never stalls event fan-out.
-	var quota json.RawMessage
+	var quota, limiter json.RawMessage
 	if h.runner != nil {
 		quota = h.runner.quotaBlock()
+		limiter = h.runner.limiterBlock()
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -282,6 +283,9 @@ func (h *hub) subscribe(cl *client, sub *subscription) {
 	snap := map[string]any{"sub": sub.name, "jobs": jobs}
 	if quota != nil {
 		snap["quota"] = quota
+	}
+	if limiter != nil {
+		snap["limiter"] = limiter
 	}
 	data, _ := json.Marshal(snap)
 	if !cl.enqueue(newEvent(TypeSnapshot, "", data)) {

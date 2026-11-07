@@ -3,7 +3,9 @@
 
   mother-limiter tick     --root R     gather inputs, run the control law, write limiter/state.json,
                                        append limiter/decisions.jsonl, print job annotations (JSON line)
-  mother-limiter status   --json --root R
+  mother-limiter status   --json [--raw] --root R   the limiter block (L2); --raw = the old {mode, age_s, state}
+  mother-limiter signals  --json --root R           raw window/pace/burn/reserve/distress values (L2)
+  mother-limiter report   [--since 24h|ISO] [--json] --root R   would vs actual, distress rate, verdicts (L2)
   mother-limiter estimate --root R --job <job.json>   MC-38 expected-burn object
   mother-limiter classify --work-dir D --repo NAME    company | personal
 
@@ -454,6 +456,47 @@ def tail_events(path, offset):
     return out, offset + end + 1
 
 
+def _cap_pct(root, name):
+    raw = str(setting(root, name, "90") or "90").strip().rstrip("%")
+    try:
+        return float(raw)
+    except ValueError:
+        return 90.0
+
+
+def _fmt_pct(v):
+    return ("%g" % round(float(v), 1))
+
+
+def _fmt_wait(left):
+    left = int(left)
+    return "%ds" % left if left < 60 else "%dm" % ((left + 59) // 60)
+
+
+def actual_wait(job, now, dl, feed, cfg, n_running, root):
+    """(code, reason): what actually holds a ready/queued job today, in dispatch's own order (MC-39)."""
+    dw = job.get("dep_wait") if isinstance(job.get("dep_wait"), dict) else None
+    if job.get("state") == "queued":
+        reason = (dw or {}).get("reason") or "waiting on dependencies"
+        return "dep_wait", str(reason)
+    nb = job.get("not_before")
+    if is_num(nb) and nb > now:
+        return "backoff", "rate-limit backoff, starts in %s" % _fmt_wait(nb - now)
+    if dl.get("ratelimit_paused"):
+        return "ratelimit_paused", "rate-limit pause: nothing new starts"
+    if dl.get("quota_over_cap") and job.get("force_start") is not True:
+        for label, key, env in (("5h", "five_hour", "MOTHER_QUOTA_CAP_5H_PCT"), ("7d", "seven_day", "MOTHER_QUOTA_CAP_7D_PCT")):
+            cap, used = _cap_pct(root, env), feed[key]["used_pct"]
+            if used >= cap:
+                return "quota_over_cap", "quota gate: %s at %s%% \u2265 cap %s%%" % (label, _fmt_pct(used), _fmt_pct(cap))
+        return "quota_over_cap", "quota gate: over cap"
+    if dl.get("low_disk"):
+        return "low_disk", "low disk: dispatch paused"
+    if n_running >= cfg["ceiling"]:
+        return "concurrency_full", "%d of %d running" % (n_running, cfg["ceiling"])
+    return "next", "next to start"
+
+
 def cmd_tick(args):
     root = os.path.abspath(args.root)
     mode = resolve_mode(root)
@@ -473,6 +516,7 @@ def cmd_tick(args):
 
     # jobs
     running, ready, costs, annotations, active = [], [], {}, [], []
+    n_running_jobs = 0
     class_cache = dict(prev.get("class_cache") or {})
 
     def class_of(j):
@@ -497,6 +541,8 @@ def cmd_tick(args):
             continue
         costs[j["id"]] = job_cost(j)
         state = j.get("state")
+        if state == "running":
+            n_running_jobs += 1
         if state in TERMINAL:
             continue
         active.append(j)
@@ -526,7 +572,8 @@ def cmd_tick(args):
             nb = j.get("not_before")
             if not (is_num(nb) and nb > now):
                 ready.append(info)
-        if changed or state == "ready":
+        if changed or state in ("ready", "queued"):
+            info["_job"] = j
             annotations.append(info)
 
     # cumulative Mother spend
@@ -572,13 +619,21 @@ def cmd_tick(args):
            "ready": [{k: v for k, v in r.items() if not k.startswith("_")} for r in ready],
            "mother_cum_usd": cum, "distress": events}
     st = core.tick(inp, prev, now, cfg)
+    if events:
+        try:
+            with open(os.path.join(ldir, "distress.jsonl"), "a", encoding="utf-8") as fh:
+                for e in events:
+                    fh.write(json.dumps({"ts": iso(now), "job_id": e.get("job_id"), "kind": e.get("kind"),
+                                         "status": e.get("status")}, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
     st.update(mode=mode, offsets=offsets, job_costs=seen, mother_cum_usd=cum, class_cache=class_cache,
               dispatch_ts=max(dl_ts, prev.get("dispatch_ts") or 0))
     st["budget"].update(source=feed["source"], feed_age_s=feed["feed_age_s"])
 
     # annotations: only what changed, and only for jobs nothing else is writing
     by_ready = {r["id"]: r for r in st["ready"]}
-    out_ann = []
+    out_ann, waiting = [], []
     for a in annotations:
         ann = {"id": a["id"]}
         ann.update(a["_changed"])
@@ -589,8 +644,24 @@ def cmd_tick(args):
             if any(cur.get(k) != w[k] for k in ("code", "advisory")):  # reason text carries a number: not a change
                 w["at"] = iso(now)
                 ann["would"] = w
+        if a["_state"] in ("ready", "queued"):
+            code, reason = actual_wait(a["_job"], now, dl, feed, cfg, n_running_jobs, root)
+            would = None
+            if r and r["decision"] == "hold" and r["code"] != code:
+                would = {"code": r["code"], "reason": r["reason"]}
+            old_w = a["_lim"].get("wait") if isinstance(a["_lim"].get("wait"), dict) else {}
+            same = old_w.get("code") == code and isinstance(old_w.get("since"), str)
+            since = old_w["since"] if same else iso(now)
+            waiting.append({"id": a["id"], "code": code, "reason": reason, "source": "dispatch",
+                            "advisory": False, "would": would, "since": since,
+                            "_created": a["created_at"]})
+            if not same:  # rewritten only when the code changes
+                ann["wait"] = {"code": code, "reason": reason, "source": "dispatch", "advisory": False,
+                               "would": would, "since": since}
         if len(ann) > 1:
             out_ann.append(ann)
+    waiting.sort(key=lambda w: (w["_created"], w["id"]))
+    st["waiting"] = [{k: v for k, v in w.items() if k != "_created"} for w in waiting]
 
     write_json_atomic(os.path.join(ldir, "state.json"), st)
     write_decision(root, ldir, st, dl, spawned_hint, now)
@@ -602,7 +673,7 @@ def write_decision(root, ldir, st, dl, spawned_hint, now):
     would = core.would_summary(st)
     actual = {"spawned": sorted(spawned_hint), "skipped": dl.get("skipped") or [],
               "ratelimit_paused": bool(dl.get("ratelimit_paused")), "quota_over_cap": bool(dl.get("quota_over_cap")),
-              "low_disk": bool(dl.get("low_disk")), "running": dl.get("running")}
+              "low_disk": bool(dl.get("low_disk")), "running": dl.get("running"), "ceiling": dl.get("ceiling")}
     div = []
     held = {h["id"]: h["code"] for h in would["hold"]}
     for jid in sorted(spawned_hint):
@@ -612,8 +683,9 @@ def write_decision(root, ldir, st, dl, spawned_hint, now):
         if r["would_hold"]:
             div.append({"id": r["id"], "kind": "would_hold_running_but_running"})
     line = {"ts": iso(now), "mode": "observe", "allowed": st["allowed"], "running": len(st["running"]),
-            "would": would, "actual": actual, "divergence": div}
-    sig = json.dumps([would, div, st["allowed"]], sort_keys=True)
+            "would": would, "actual": actual, "divergence": div,
+            "window": {"used_pct_5h": st["budget"]["five_hour"].get("used_pct"), "gate": st["budget"].get("gate")}}
+    sig = json.dumps([would, div, st["allowed"], actual["spawned"]], sort_keys=True)
     sig_path = os.path.join(ldir, "decisions.sig")
     last = read_json(sig_path) or {}
     if last.get("sig") == sig and now - (last.get("at") or 0) < 300:
@@ -632,8 +704,123 @@ def write_decision(root, ldir, st, dl, spawned_hint, now):
 
 # ---------- other subcommands ----------
 
+def _finite(v, nd=None):
+    if not is_num(v) or math.isnan(v) or math.isinf(v):
+        return None
+    return round(v, nd) if nd is not None else v
+
+
+def _num(v):
+    """Whole floats print as ints (15.0 -> 15) so the block reads naturally."""
+    return int(v) if is_num(v) and float(v).is_integer() else v
+
+
+def _ago_text(secs):
+    secs = max(0, int(secs))
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    return "%dh" % (secs // 3600) if secs < 86400 else "%dd" % (secs // 86400)
+
+
+def _in_text(secs):
+    """A countdown, rounded up so '+1 in 9m' does not flicker to 8m a second later."""
+    secs = max(0, int(secs))
+    return "%ds" % secs if secs < 60 else "%dm" % ((secs + 59) // 60)
+
+
+def _concurrency_state(st, cfg, now):
+    comp = st.get("components") or {}
+    ceiling = st.get("ceiling") or cfg["ceiling"]
+    bo_lv = comp.get("backoff_level", ceiling)
+    bo = st.get("backoff") or {}
+    ld = comp.get("last_distress") or {}
+    if bo_lv < ceiling:
+        cut = comp.get("last_cut_at")
+        base = max(bo.get("last_distress_at") or 0, bo.get("last_raise_at") or 0)
+        left = max(0, cfg["calm_s"] - (now - base)) if base else cfg["calm_s"]
+        bits = []
+        if cut:
+            bits.append("cut %s ago" % _ago_text(now - cut) + (" after %s" % ld["status"] if ld.get("status") else ""))
+        bits.append("+1 in %s" % _in_text(left))
+        return "backoff", "; ".join(bits)
+    rp = st.get("ramp") or {}
+    if comp.get("ramp_active"):
+        left = max(0, cfg["ramp_step_s"] - (now - (rp.get("last_step_at") or now)))
+        return "ramp", "ramp-up after window reset (level %s of %s); +1 in %s" % (rp.get("level"), ceiling, _in_text(left))
+    b5 = ((st.get("budget") or {}).get("five_hour") or {})
+    if not b5.get("calibrated"):
+        return "uncalibrated", "k not calibrated (%s of %s samples)" % (b5.get("k_samples", 0), int(cfg["k_min_samples"]))
+    return "steady", ""
+
+
+def build_block(root, now=None):
+    """The limiter block (contract: tests/fixtures/limiter_block.json). Built from state.json, the
+    runner's fault file and the quota gate; nothing is recomputed."""
+    now = int(time.time()) if now is None else now
+    mode = resolve_mode(root)
+    if mode == "off":
+        return {"v": 1, "mode": "off"}
+    cfg = load_cfg(root)
+    p = os.path.join(root, "limiter", "state.json")
+    st = read_json(p)
+    if not isinstance(st, dict) or st.get("v") != 1:
+        st = None
+    try:
+        age = max(0, int(now - os.stat(p).st_mtime))
+    except OSError:
+        age = None
+    interval = num_setting(root, "MOTHER_LIMITER_INTERVAL", 10)
+    stale = st is None or age is None or age > 3 * interval
+    fault = read_json(os.path.join(root, "runner", "limiter-fault.json"))
+    block = {"v": 1, "mode": mode, "age_s": age if st is not None else None, "stale": stale,
+             "fault": fault if isinstance(fault, dict) else None}
+    if st is None:
+        block.update(concurrency=None, burn=None, reserve=None, interactive=None, overage_in_use=False,
+                     gate=read_gate(root, now), last_distress=None, distress_24h=0, waiting=[])
+        return block
+    bud, comp = st.get("budget") or {}, st.get("components") or {}
+    cstate, detail = _concurrency_state(st, cfg, now)
+    block["concurrency"] = {"ceiling": st.get("ceiling"), "allowed": st.get("allowed"),
+                            "effective": len(st.get("running") or []), "state": cstate, "detail": detail}
+    # burn: the tighter window's pace (5h when neither has one)
+    wins = {"five_hour": bud.get("five_hour") or {}, "seven_day": bud.get("seven_day") or {}}
+    pick = "five_hour"
+    p7, p5 = _finite(wins["seven_day"].get("pace")), _finite(wins["five_hour"].get("pace"))
+    if p7 is not None and (p5 is None or p7 > p5):
+        pick = "seven_day"
+    w = wins[pick]
+    k, sus = w.get("k"), w.get("sustainable_pct_per_min")
+    block["burn"] = {"fleet_usd_per_min": _finite(bud.get("fleet_usd_per_min"), 2),
+                     "sustainable_usd_per_min": _finite(sus / k, 2) if is_num(k) and k > 0 and is_num(sus) else None,
+                     "pace": _finite(w.get("pace"), 2), "window": pick, "calibrated": bool(w.get("calibrated"))}
+    used5 = wins["five_hour"].get("used_pct")
+    reserve = bud.get("reserve_pct")
+    block["reserve"] = {"pct": _num(reserve),
+                        "holding": bool((not bud.get("stale")) and is_num(used5) and is_num(reserve)
+                                        and 100.0 - used5 <= reserve),
+                        "enforceable": not bud.get("advisory", True)}
+    it = st.get("interactive") or {}
+    block["interactive"] = {"state": it.get("state") or "unknown", "pct_per_hour": _finite(it.get("pct_per_hour"), 1)}
+    block["overage_in_use"] = bool(bud.get("overage_in_use"))
+    block["gate"] = bud.get("gate") or "on"
+    ld = comp.get("last_distress")
+    if isinstance(ld, dict) and is_num(ld.get("at")):
+        block["last_distress"] = {"at": iso(ld["at"]), "ago_s": max(0, int(now - ld["at"])), "kind": ld.get("kind"),
+                                  "status": ld.get("status"), "job_id": ld.get("job_id")}
+    else:
+        block["last_distress"] = None
+    block["distress_24h"] = len([t for t in (st.get("distress_log") or []) if now - t < 86400])
+    block["waiting"] = [w for w in (st.get("waiting") or []) if isinstance(w, dict)]
+    return block
+
+
 def cmd_status(args):
     root = os.path.abspath(args.root)
+    if not args.raw:
+        print(json.dumps(build_block(root), separators=(",", ":")))
+        return 0
     mode = resolve_mode(root)
     p = os.path.join(root, "limiter", "state.json")
     st = read_json(p)
@@ -645,6 +832,206 @@ def cmd_status(args):
     except OSError:
         age = None
     print(json.dumps({"mode": mode, "age_s": age, "state": st}, separators=(",", ":")))
+    return 0
+
+
+def cmd_signals(args):
+    """The raw values behind the block, per window (MC-39 'on demand')."""
+    root = os.path.abspath(args.root)
+    now = int(time.time())
+    block = build_block(root, now)
+    if block.get("mode") == "off":
+        print(json.dumps(block))
+        return 0
+    st = read_json(os.path.join(root, "limiter", "state.json"))
+    st = st if isinstance(st, dict) and st.get("v") == 1 else {}
+    bud, inter = st.get("budget") or {}, st.get("interactive") or {}
+    out_w = {}
+    for key in ("five_hour", "seven_day"):
+        w = bud.get(key) or {}
+        out_w[key] = {"used_pct": _finite(w.get("used_pct"), 1), "resets_at": w.get("resets_at") or None,
+                      "pace": _finite(w.get("pace"), 2),
+                      "sustainable_pct_per_min": _finite(w.get("sustainable_pct_per_min"), 4),
+                      "projected_pct_per_min": _finite(w.get("projected_pct_per_min"), 4),
+                      "k": _num(_finite(w.get("k"), 3)), "k_samples": w.get("k_samples", 0),
+                      "calibrated": bool(w.get("calibrated"))}
+    log = st.get("distress_log") or []
+    out = {"v": 1, "mode": block["mode"], "age_s": block["age_s"], "stale": block["stale"], "fault": block["fault"],
+           "feed": {"source": bud.get("source"), "age_s": bud.get("feed_age_s")},
+           "windows": out_w, "fleet_usd_per_min": _finite(bud.get("fleet_usd_per_min"), 3),
+           "reserve_pct": _num(bud.get("reserve_pct")),
+           "reserve_holding": (block.get("reserve") or {}).get("holding", False),
+           "interactive": {"state": inter.get("state") or "unknown", "pct_per_hour": _finite(inter.get("pct_per_hour"), 2)},
+           "overage_in_use": block["overage_in_use"], "gate": block["gate"],
+           "distress": {"h1": len([t for t in log if now - t < 3600]), "h24": len([t for t in log if now - t < 86400])}}
+    print(json.dumps(out, separators=(",", ":")))
+    return 0
+
+
+# ---------- report (MC-43 tuning, MC-41 tooling) ----------
+
+TARGET_429_PER_10H = 1.0
+MAX_SAMPLE_GAP_S = 900   # decisions are written at least every 300s while the limiter runs; a longer gap is an outage
+
+
+def parse_since(raw, now):
+    m = re.match(r"^(\d+)([mhd])$", raw or "")
+    if m:
+        return now - int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    t = parse_iso(raw)
+    if t is None:
+        raise ValueError("--since must be like 24h, 90m, 3d or an ISO timestamp (got %r)" % raw)
+    return t
+
+
+def _top(counter):
+    return [{"code": c, "count": n} for c, n in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def build_report(root, since_ts, now):
+    ldir = os.path.join(root, "limiter")
+    rows = []
+    for name in ("decisions.jsonl.1", "decisions.jsonl"):
+        for r in read_jsonl(os.path.join(ldir, name)):
+            t = parse_iso(r.get("ts")) if isinstance(r, dict) else None
+            if t is not None and since_ts <= t <= now:
+                r["_t"] = t
+                rows.append(r)
+    rows.sort(key=lambda r: r["_t"])
+
+    # divergences
+    kinds = {"would_hold_but_spawned": {}, "would_admit_but_waited": {}}
+    for r in rows:
+        for d in r.get("divergence") or []:
+            kinds.setdefault(d.get("kind") or "unknown", {})
+            c = d.get("code") or "-"
+            kinds[d.get("kind") or "unknown"][c] = kinds[d.get("kind") or "unknown"].get(c, 0) + 1
+        act = r.get("actual") or {}
+        admit = (r.get("would") or {}).get("admit") or []
+        if not admit:
+            continue
+        spawned = set(act.get("spawned") or [])
+        if act.get("ratelimit_paused"):
+            code = "ratelimit_paused"
+        elif act.get("quota_over_cap"):
+            code = "quota_over_cap"
+        elif act.get("low_disk"):
+            code = "low_disk"
+        elif is_num(act.get("running")) and is_num(act.get("ceiling")) and act["running"] >= act["ceiling"]:
+            code = "concurrency_full"
+        else:
+            continue
+        for jid in admit:
+            if jid not in spawned:
+                kinds["would_admit_but_waited"][code] = kinds["would_admit_but_waited"].get(code, 0) + 1
+    divergences = {k: {"count": sum(v.values()), "top_codes": _top(v)} for k, v in kinds.items()}
+
+    # job-hours: each sample's running count holds until the next sample (gaps capped)
+    job_s = 0.0
+    last_run = None
+    for a, b in zip(rows, rows[1:]):
+        run = (a.get("actual") or {}).get("running")
+        run = run if is_num(run) else last_run
+        if is_num(run):
+            last_run = run
+            job_s += run * min(b["_t"] - a["_t"], MAX_SAMPLE_GAP_S)
+    job_hours = job_s / 3600.0
+
+    # distress
+    dpath = os.path.join(ldir, "distress.jsonl")
+    d_count, d_codes = 0, {}
+    if os.path.exists(dpath):
+        for e in read_jsonl(dpath):
+            t = parse_iso(e.get("ts")) if isinstance(e, dict) else None
+            if t is not None and since_ts <= t <= now:
+                d_count += 1
+                key = str(e.get("status") or e.get("kind") or "-")
+                d_codes[key] = d_codes.get(key, 0) + 1
+    else:  # a soak that predates distress.jsonl: fall back to the routed failures in job events
+        for job, archived in iter_job_files(root):
+            for e in read_jsonl(events_path(root, job, archived)):
+                t = parse_iso(e.get("ts")) if isinstance(e, dict) else None
+                dist = core.classify_mother_event(e)
+                if dist and t is not None and since_ts <= t <= now:
+                    d_count += 1
+                    d_codes[str(dist["status"])] = d_codes.get(str(dist["status"]), 0) + 1
+    rate = (d_count / job_hours * 10.0) if job_hours > 0 else None
+
+    # 5h window exhausted while admitting: a run of samples at 100% with the gate on, with a spawn in it
+    exhaust, in_run, spawned_in_run = 0, False, False
+    for r in rows:
+        w = r.get("window") or {}
+        hot = is_num(w.get("used_pct_5h")) and w["used_pct_5h"] >= 100 and w.get("gate") == "on"
+        if hot:
+            in_run = True
+            spawned_in_run = spawned_in_run or bool((r.get("actual") or {}).get("spawned"))
+        else:
+            if in_run and spawned_in_run:
+                exhaust += 1
+            in_run = spawned_in_run = False
+    if in_run and spawned_in_run:
+        exhaust += 1
+
+    # calibration
+    st = read_json(os.path.join(ldir, "state.json"))
+    bud = (st or {}).get("budget") or {}
+    cfg = load_cfg(root)
+    calib = {}
+    for key in ("five_hour", "seven_day"):
+        w = bud.get(key) or {}
+        calib[key] = {"k": _finite(w.get("k"), 3), "samples": w.get("k_samples", 0),
+                      "min_samples": int(cfg["k_min_samples"]), "calibrated": bool(w.get("calibrated"))}
+
+    verdicts = [
+        {"name": "429 rate per 10 job-hours", "value": _finite(rate, 2), "target": "< %g" % TARGET_429_PER_10H,
+         "result": "N/A" if rate is None else ("PASS" if rate < TARGET_429_PER_10H else "FAIL")},
+        {"name": "5h exhausted while admitting", "value": exhaust, "target": "0",
+         "result": "PASS" if exhaust == 0 else "FAIL"},
+        {"name": "5h k calibrated", "value": calib["five_hour"]["calibrated"], "target": "true",
+         "result": "PASS" if calib["five_hour"]["calibrated"] else "FAIL"},
+    ]
+    return {"v": 1, "since": iso(since_ts), "until": iso(now), "decisions": len(rows), "divergences": divergences,
+            "distress": {"count": d_count, "by_status": d_codes, "job_hours": round(job_hours, 3),
+                         "per_10_job_hours": _finite(rate, 2)},
+            "exhaustion_while_admitting": {"count": exhaust}, "calibration": calib, "verdicts": verdicts}
+
+
+def render_report(rep):
+    lines = ["report: %s \u2192 %s (%d decision samples)" % (rep["since"], rep["until"], rep["decisions"]), ""]
+    lines.append("divergences (would vs actual):")
+    for kind, d in sorted(rep["divergences"].items()):
+        top = ", ".join("%s \u00d7%d" % (t["code"], t["count"]) for t in d["top_codes"][:3]) or "-"
+        lines.append("  %-26s %d   top codes: %s" % (kind, d["count"], top))
+    di = rep["distress"]
+    lines += ["", "distress: %d event(s) over %.2f job-hours%s" % (
+        di["count"], di["job_hours"], "" if di["per_10_job_hours"] is None else " = %.2f per 10 job-hours" % di["per_10_job_hours"])]
+    lines.append("5h exhausted while admitting: %d" % rep["exhaustion_while_admitting"]["count"])
+    lines += ["", "calibration:"]
+    for key, c in rep["calibration"].items():
+        lines.append("  %-9s k=%s  samples %d/%d  %s" % (key, "n/a" if c["k"] is None else c["k"], c["samples"],
+                                                         c["min_samples"], "calibrated" if c["calibrated"] else "uncalibrated"))
+    lines += ["", "verdicts:"]
+    for v in rep["verdicts"]:
+        if v["name"].startswith("429"):
+            val = "n/a (no job-hours in range)" if v["value"] is None else "%.1f per 10 job-hours" % v["value"]
+            lines.append("  429 rate: %s (target %s) %s" % (val, v["target"], v["result"]))
+        elif v["name"].startswith("5h exhausted"):
+            lines.append("  5h exhausted while admitting: %s (target %s) %s" % (v["value"], v["target"], v["result"]))
+        else:
+            lines.append("  %s: %s (target %s) %s" % (v["name"], "yes" if v["value"] else "no", v["target"], v["result"]))
+    return "\n".join(lines)
+
+
+def cmd_report(args):
+    root = os.path.abspath(args.root)
+    now = int(time.time())
+    try:
+        since = parse_since(args.since, now)
+    except ValueError as exc:
+        print("mother-limiter: %s" % exc, file=sys.stderr)
+        return 1
+    rep = build_report(root, since, now)
+    print(json.dumps(rep, separators=(",", ":")) if args.json else render_report(rep))
     return 0
 
 
@@ -670,8 +1057,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="mother-limiter")
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("tick"); t.add_argument("--root", required=True); t.set_defaults(fn=cmd_tick)
-    s = sub.add_parser("status"); s.add_argument("--json", action="store_true"); s.add_argument("--root", required=True)
-    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("status"); s.add_argument("--json", action="store_true"); s.add_argument("--raw", action="store_true")
+    s.add_argument("--root", required=True); s.set_defaults(fn=cmd_status)
+    g = sub.add_parser("signals"); g.add_argument("--json", action="store_true"); g.add_argument("--root", required=True)
+    g.set_defaults(fn=cmd_signals)
+    r = sub.add_parser("report"); r.add_argument("--since", default="24h"); r.add_argument("--json", action="store_true")
+    r.add_argument("--root", required=True); r.set_defaults(fn=cmd_report)
     e = sub.add_parser("estimate"); e.add_argument("--root", required=True); e.add_argument("--job", required=True)
     e.set_defaults(fn=cmd_estimate)
     c = sub.add_parser("classify"); c.add_argument("--work-dir", default=""); c.add_argument("--repo", required=True)

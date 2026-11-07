@@ -73,7 +73,7 @@ _age() {
 _tick() { mother-limiter tick --root "$MOTHER_ROOT" >/dev/null 2>&1; }
 
 # One field of limiter state, e.g. _lstate '.allowed'. Prints "null" with no state.
-_lstate() { mother-limiter status --json --root "$MOTHER_ROOT" | jq -r ".state | $1"; }
+_lstate() { mother-limiter status --raw --root "$MOTHER_ROOT" | jq -r ".state | $1"; }
 
 # The limiter tick the way the runner's loop runs it (interval gate disabled).
 _runner_tick() { MOTHER_LIMITER_INTERVAL=0 mother-runner --limiter-tick 3>&- >/dev/null 2>&1; }
@@ -466,8 +466,8 @@ _scenario() {
     [ "$(jq -r '.limiter.estimate.source' "$JOBS_DIR/obs-c.json")" = "default" ]
     [ "$(jq -r '.limiter.would.code' "$JOBS_DIR/obs-c.json")" = "reserve" ]
     [ "$(jq -r '.limiter.would | has("reason")' "$JOBS_DIR/obs-c.json")" = "true" ]
-    # nothing but those three keys under limiter
-    [ "$(jq -r '.limiter | keys | join(",")' "$JOBS_DIR/obs-c.json")" = "estimate,would" ]
+    # nothing but those keys under limiter (L2 adds `wait`: why the job is waiting)
+    [ "$(jq -r '.limiter | keys | join(",")' "$JOBS_DIR/obs-c.json")" = "estimate,wait,would" ]
 }
 
 @test "L1-9: a held-for-backoff or not_before job is left exactly as it was" {
@@ -580,7 +580,7 @@ _assert_feed_parity() {
     gate=$(bash -c "set -u; source '$_LIB_DIR/state.sh'; _quota_feed_json")
     rm -f "$MOTHER_ROOT/limiter/state.json"
     mother-limiter tick --root "$MOTHER_ROOT" >/dev/null 2>&1
-    lim=$(mother-limiter status --json --root "$MOTHER_ROOT" | jq -c '.state.budget')
+    lim=$(mother-limiter status --raw --root "$MOTHER_ROOT" | jq -c '.state.budget')
     echo "gate: $gate" >&2
     echo "limiter: $lim" >&2
     [ "$(jq -r .source <<<"$gate")" = "$1" ]
@@ -722,7 +722,7 @@ _assert_feed_parity() {
     _tick
     [ "$(_lstate '.budget.source')" = "bishop" ]
     [ "$(_lstate '.budget.stale')" = "false" ]
-    jq -e '(.state.budget.feed_age_s | type) == "number"' <(mother-limiter status --json --root "$MOTHER_ROOT") >/dev/null
+    jq -e '(.state.budget.feed_age_s | type) == "number"' <(mother-limiter status --raw --root "$MOTHER_ROOT") >/dev/null
 }
 
 # ===========================================================================
@@ -730,7 +730,7 @@ _assert_feed_parity() {
 # ===========================================================================
 
 @test "status --json with no state prints mode observe and a null state" {
-    run mother-limiter status --json --root "$MOTHER_ROOT"
+    run mother-limiter status --raw --root "$MOTHER_ROOT"
     [ "$status" -eq 0 ]
     [ "$(jq -cS . <<<"$output")" = '{"mode":"observe","state":null}' ]
 }
@@ -739,7 +739,7 @@ _assert_feed_parity() {
     _bishop 10 10
     make_job st-1 ready ".repo_path = \"$MOTHER_ROOT\""
     mother-limiter tick --root "$MOTHER_ROOT" >/dev/null
-    run mother-limiter status --json --root "$MOTHER_ROOT"
+    run mother-limiter status --raw --root "$MOTHER_ROOT"
     [ "$(jq -r .mode <<<"$output")" = "observe" ]
     [ "$(jq -r '.state.ready | length' <<<"$output")" = "1" ]
     [ "$(jq -r '.state.ready[0].id' <<<"$output")" = "st-1" ]
@@ -754,7 +754,7 @@ _assert_feed_parity() {
     [ "$status" -eq 0 ]
     [ ! -e "$MOTHER_ROOT/limiter/state.json" ]
     [ ! -e "$MOTHER_ROOT/limiter/decisions.jsonl" ]
-    run mother-limiter status --json --root "$MOTHER_ROOT"
+    run mother-limiter status --raw --root "$MOTHER_ROOT"
     [ "$(jq -r .mode <<<"$output")" = "off" ]
     # the runner's tick, too, leaves the job and the state tree alone
     jq -S . "$JOBS_DIR/m-1.json" > "$MOTHER_ROOT/m-before.json"
@@ -769,7 +769,7 @@ _assert_feed_parity() {
     MOTHER_LIMITER_MODE=off run mother-limiter tick --root "$MOTHER_ROOT"
     [ "$status" -eq 0 ]
     [ ! -e "$MOTHER_ROOT/limiter/state.json" ]
-    MOTHER_LIMITER_MODE=off run mother-limiter status --json --root "$MOTHER_ROOT"
+    MOTHER_LIMITER_MODE=off run mother-limiter status --raw --root "$MOTHER_ROOT"
     [ "$(jq -r .mode <<<"$output")" = "off" ]
 }
 
@@ -787,7 +787,7 @@ _assert_feed_parity() {
     [ -s "$MOTHER_ROOT/limiter/state.json" ]
     [ "$(wc -l < "$MOTHER_ROOT/enf.err" | tr -d ' ')" = "1" ]
     grep -qi 'enforce' "$MOTHER_ROOT/enf.err"
-    [ "$(MOTHER_LIMITER_MODE=enforce mother-limiter status --json --root "$MOTHER_ROOT" 2>/dev/null | jq -r .mode)" = "observe" ]
+    [ "$(MOTHER_LIMITER_MODE=enforce mother-limiter status --raw --root "$MOTHER_ROOT" 2>/dev/null | jq -r .mode)" = "observe" ]
     # it still only observes: the job is untouched but for annotations
     [ "$(jq -r .state "$JOBS_DIR/en-1.json")" = "ready" ]
 }

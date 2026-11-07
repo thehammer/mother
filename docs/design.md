@@ -553,6 +553,7 @@ fold so the snapshot is consistent with the live stream.
 | `await` | `awaiting_input` (carries question) | Resync — snapshot job record carries `question`/`paused_reason`. |
 | `current_activity` | broker-derived from the worker transcript | None (ephemeral); snapshot carries the latest value, no history. |
 | `quota` | `pause_requested`/`auto_resumed`/`paused_for_quota` | Resync for current pause state; live changes pushed. |
+| `limiter` | `mother limiter status --json`, polled by the broker (L2) | Resync — the snapshot's `limiter` key is current; an event is pushed only when the block's content changes. See "Limiter block" below. |
 | `output` | worker session stream (W2) | **Best-effort log-backed replay** — bounded tail on subscribe; live tail thereafter. See §output category below. |
 
 **Per-job ordering is guaranteed** (each job's events come from one append-only log,
@@ -565,6 +566,21 @@ feature): the seven state kinds map to themselves; `awaiting_input` and
 `retried`/`escalated` carry the resulting state in `detail.to_state`. The pipeline
 feature emits its phase/cycle events through `_append_event` using shared type names
 so the broker surfaces them under `activity` with zero broker changes.
+
+### Limiter block (L2)
+
+Like `quota`, the backpressure limiter's state rides on the snapshot and on live events, built by a CLI shell-out
+(`mother limiter status --json`, bounded like the quota one) rather than from job events:
+
+- **Snapshot:** `data: {sub, jobs, quota, limiter}`. The `limiter` key is omitted when the CLI fails.
+- **Event:** category `limiter`, kind `limiter`, `data: {limiter: <block>}`, published by a block watcher
+  (shared with the quota watcher; `MOTHER_BROKER_LIMITER_SEC`, default 15) only when the block's content changes.
+  `age_s`, `last_distress.ago_s`, `concurrency.detail` and the waiting rows' `reason` are derived from "now" and
+  ignored for that comparison. A subscription that does not ask for the `limiter` category gets no `limiter` events.
+- **Hello:** `limiter` is listed among the capabilities (categories).
+- **Shape:** `tests/fixtures/limiter_block.json` is the golden fixture (a `_doc` string documenting every field and
+  enum, the block, a snapshot envelope and an event envelope). Nostromo vendors it: additive changes only. With the
+  limiter off the block is `{"v":1,"mode":"off"}`. The mode switch is CLI-only; there is no broker command for it.
 
 ### current_activity (B6)
 
@@ -661,6 +677,7 @@ replayable, so it uses a softer policy:
 | `MOTHER_BROKER_OUTPUT_SEC` | `1` | Poll interval for `<id>.log` tailing (seconds). |
 | `MOTHER_BROKER_OUTPUT_REPLAY_BYTES` | `65536` | Byte window for best-effort replay on subscribe. |
 | `MOTHER_BROKER_OUTPUT_MAX_GAP` | `10000` | Per-subscription dropped-output ceiling before hard client drop. |
+| `MOTHER_BROKER_LIMITER_SEC` | `15` | Poll interval for the `limiter` block watcher (seconds). |
 
 ### Errors (B8)
 

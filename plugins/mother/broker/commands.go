@@ -205,6 +205,24 @@ func (c *commandRunner) quotaBlock() json.RawMessage {
 	return json.RawMessage(out)
 }
 
+// limiterBlock returns `mother limiter status --json` (the snapshot's `limiter`
+// block, shape documented by tests/fixtures/limiter_block.json), or nil when the
+// CLI cannot produce it. Bounded like quotaBlock.
+func (c *commandRunner) limiterBlock() json.RawMessage {
+	timeout := c.quotaTimeout
+	if timeout <= 0 {
+		timeout = defaultQuotaTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, _, code := c.runCLIContext(ctx, "", "limiter", "status", "--json")
+	out = strings.TrimSpace(out)
+	if code != "" || !json.Valid([]byte(out)) {
+		return nil
+	}
+	return json.RawMessage(out)
+}
+
 // quotaGate routes to `mother quota <state> --source broker:<origin>`. The CLI
 // is the single writer and audits the change (who, from, to, when); setting
 // the current state again is a no-op that still replies ok.

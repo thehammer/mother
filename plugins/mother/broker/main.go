@@ -120,6 +120,8 @@ func main() {
 
 	qw := newQuotaWatcher(runner, h.ingest, time.Duration(envInt("MOTHER_BROKER_QUOTA_SEC", 15))*time.Second)
 
+	lw := newLimiterWatcher(runner, h.ingest, time.Duration(envInt("MOTHER_BROKER_LIMITER_SEC", 15))*time.Second)
+
 	// W2: output source — tails logs/<id>.log for running jobs.
 	if cfg.outputEnabled {
 		os := newOutputSource(store, logsDir, time.Duration(cfg.outputSecs)*time.Second, h.ingest, cfg.outputMaxGap)
@@ -138,6 +140,8 @@ func main() {
 	go aw.run(done)
 	qw.prime()
 	go qw.run(done)
+	lw.prime()
+	go lw.run(done)
 	if h.outputSrc != nil {
 		go h.outputSrc.run(done)
 	}
