@@ -575,3 +575,27 @@ _classify() { mother-usage classify-exit --log "$1" --offset 0 --exit-code "${2:
     tmp_count=$(find "$(dirname "$dest")" -maxdepth 1 -name '*.tmp*' | wc -l | tr -d ' ')
     [ "$tmp_count" = "0" ]
 }
+
+# ---------------------------------------------------------------------------
+# Job-file writes from usage.sh take the job lock (a reviewer's concurrent slot write was being clobbered
+# by the unlocked recompute: pipeline_driver "multiple reviewers each write to their own slot" flaked).
+
+@test "mother_recompute_job_cost waits for the job lock instead of rewriting the job file under it" {
+    make_job uj-lock running
+    local ld="$JOBS_DIR/uj-lock.json.lockdir"
+    sleep 60 & local holder=$!
+    mkdir -p "$ld"; printf '%s\n' "$holder" > "$ld/owner"
+    run bash -c '
+        source "$MOTHER_LIB_DIR/state.sh"; source "$MOTHER_LIB_DIR/usage.sh"
+        ( mother_recompute_job_cost uj-lock ) 2>/dev/null &
+        rp=$!
+        sleep 2
+        jq -r ".actual_cost_usd // \"unset\"" "$JOBS_DIR/uj-lock.json"
+        kill '"$holder"'; wait '"$holder"' 2>/dev/null
+        wait "$rp"
+        jq -r ".actual_cost_usd // \"unset\"" "$JOBS_DIR/uj-lock.json"
+    '
+    kill "$holder" 2>/dev/null || true
+    [ "${lines[0]}" = "unset" ]
+    [ "${lines[1]}" = "0" ]
+}

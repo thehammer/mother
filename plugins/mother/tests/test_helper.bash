@@ -76,6 +76,11 @@ setup_mother_env() {
     printf '%s' '{"stale_input":false,"five_hour":{"used_pct":0,"resets_at":0},"seven_day":{"used_pct":0,"resets_at":0}}' \
         > "$MOTHER_BISHOP_POSTURE_FILE"
 
+    # The limiter tick (a python process every 10 s in the runner) and the hold hook's settings are off
+    # by default so timing-sensitive runner/wave tests aren't perturbed. Tests of the limiter itself
+    # (limiter_*.bats, contract.bats) opt back in with `unset MOTHER_LIMITER_MODE` after this setup.
+    export MOTHER_LIMITER_MODE=off
+
     # Default: mock_claude exits 0
     export MOCK_CLAUDE_EXIT=0
     # Default: mock_claude records args to this file

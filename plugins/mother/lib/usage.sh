@@ -40,7 +40,17 @@ _usage_iso_now() {
     ' 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S.000Z
 }
 
-_usage_job_update() {
+# The job file is shared with other writers that hold <job>.json.lockdir (reviewers writing their slot,
+# the supervisor): an unlocked read-modify-write here silently drops their update. Take the same lock
+# when the caller's environment has _with_lock (state.sh / mother-run-job); never call this under it.
+_usage_job_locked() {
+    local jf="$1"; shift
+    if type _with_lock >/dev/null 2>&1; then _with_lock "$jf" "$@"; else "$@"; fi
+}
+
+_usage_job_update() { _usage_job_locked "$1" _usage_job_update_unlocked "$@"; }
+
+_usage_job_update_unlocked() {
     local job_file="$1" filter="$2"
     [ -f "$job_file" ] || return 1
     local merged; merged=$(jq "$filter" "$job_file" 2>/dev/null) || return 1
@@ -50,24 +60,36 @@ _usage_job_update() {
 }
 
 # _usage_with_lock <lockable-file> <cmd> [args...]
-# Acquires a sibling "<lockable-file>.lockdir" mkdir-based lock (best-effort:
-# gives up and proceeds unlocked after ~10s of retries rather than hanging
-# forever), runs <cmd> with the remaining args, then releases the lock.
+# Acquires a sibling "<lockable-file>.lockdir" mkdir-based lock (owner pid recorded; a
+# live owner is never displaced; after ~10s without the lock nothing runs and it returns 1), runs <cmd> with the remaining args, then releases the lock.
 # Shared by every append-under-lock call site in this file (today:
 # _usage_append_event and mother_record_run_usage) so there is one
 # acquire/retry/release implementation instead of hand-copied ones that could
 # drift apart.
 _usage_with_lock() {
     local lockable="$1"; shift
-    local lockdir="${lockable}.lockdir"
-    local tries=0
+    # Same lock as every other taker of <file>.lockdir: _switch_with_lock records the owner pid,
+    # never displaces a live owner and takes over a dead one. A caller that doesn't have state.sh
+    # sourced gets the minimal owner-honouring equivalent below. On failure to acquire nothing runs.
+    if type _switch_with_lock >/dev/null 2>&1; then
+        _switch_with_lock "${lockable}.lockdir" "usage" 200 "$@"
+        return $?
+    fi
+    local lockdir="${lockable}.lockdir" tries=0 o
     while ! mkdir "$lockdir" 2>/dev/null; do
+        o=$(cat "$lockdir/owner" 2>/dev/null)
+        if [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null; then
+            rm -f "$lockdir/owner"; rmdir "$lockdir" 2>/dev/null || true; continue
+        fi
         sleep 0.05
         tries=$((tries + 1))
-        [ "$tries" -gt 200 ] && break
+        [ "$tries" -gt 200 ] && { echo "mother: could not acquire the usage lock for $lockable" >&2; return 1; }
     done
+    echo "$$" > "$lockdir/owner" 2>/dev/null || true
     "$@"
-    rmdir "$lockdir" 2>/dev/null || true
+    local rc=$?
+    rm -f "$lockdir/owner"; rmdir "$lockdir" 2>/dev/null || true
+    return $rc
 }
 
 _usage_append_line() { printf '%s\n' "$2" >> "$1"; }
@@ -166,7 +188,9 @@ mother_recompute_job_cost() {
 # Same read-modify-write as _usage_job_update, but passes cost/tokens/complete
 # through jq --argjson (typed) instead of interpolating them into the filter
 # string.
-_usage_job_update_argjson() {
+_usage_job_update_argjson() { _usage_job_locked "$1" _usage_job_update_argjson_unlocked "$@"; }
+
+_usage_job_update_argjson_unlocked() {
     local job_file="$1" cost="$2" tokens="$3" complete="$4"
     [ -f "$job_file" ] || return 1
     local merged

@@ -15,6 +15,7 @@ setup() {
     WORK="$(mktemp -d)"
     _CONTRACT_ORIG_PATH="$PATH"
     setup_mother_env
+    unset MOTHER_LIMITER_MODE   # the broker's limiter block is part of what the contract tests read
 }
 
 teardown() {

@@ -215,6 +215,9 @@ SCN=""; JOB=""; REPO=""; ORIGIN=""; REC=""; CTL=""; CMD_N=0; TICK_N=0
 new_scenario() {
     SCN="$1"
     setup_mother_env
+    # The recorder documents the limiter-on behaviour the committed fixtures were recorded with;
+    # setup_mother_env turns the limiter off for the bats harness, so undo that here.
+    unset MOTHER_LIMITER_MODE
     export MOTHER_POSTURE_ENABLED=0 MOTHER_GATES_ENABLED=1 MOTHER_LENSES_ENABLED=1
     export MOTHER_IDLE_REAP_SECONDS=120 MOTHER_RESULT_GRACE_SECONDS=120
     export MOTHER_PHI_REPOS="admin-portal referral-monitor"

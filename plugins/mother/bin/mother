@@ -2014,7 +2014,9 @@ cmd_plan() {
 # same job, and don't call it from inside another `_with_lock "$(_job_path <id>)"`.
 _job_locked() {
     local id="$1"; shift
-    _with_lock "$(_job_path "$id")" _in_subshell "$@"
+    # _switch_with_lock records the owner pid and takes over a lockdir whose owner is dead, so a
+    # command killed inside its lock window can't wedge later cancel/retry/resume/priority calls.
+    _switch_with_lock "$(_job_path "$id").lockdir" "job" 200 _in_subshell "$@"
 }
 _in_subshell() { ( "$@" ); }
 
@@ -3256,17 +3258,12 @@ EOF
         "$(jq -nc --arg model "$reviewer_model" --arg effort "$reviewer_effort" --arg d "$decision" --argjson fc "$finding_count" \
             '{model: $model, effort: (($effort | select(length>0)) // null), decision: $d, finding_count: $fc}')"
 
-    # Persist to .pipeline.reviewer_findings.<reviewer> via atomic write.
+    # Persist to .pipeline.reviewer_findings.<reviewer>. Concurrent reviewers each rewrite the WHOLE job
+    # file, so the read-modify-write must run under the job lock or one reviewer's slot is lost.
     # Guard: ensure .pipeline and .pipeline.reviewer_findings exist as objects
     # before the targeted set, so jq doesn't reject a null intermediate path.
-    local merged_job
-    merged_job=$(jq --argjson rf "$tagged_findings" --arg r "$reviewer" '
-        (.pipeline //= {}) |
-        (.pipeline.reviewer_findings //= {}) |
-        .pipeline.reviewer_findings[$r] = $rf
-    ' "$job_file") \
+    _with_lock "$job_file" _review_slot_write "$job_file" "$tagged_findings" "$reviewer" \
         || _die "review-phase: jq update for reviewer_findings failed"
-    _atomic_write "$job_file" "$merged_job"
 
     # Emit reviewed event.
     _append_event "$id" "reviewed" \
@@ -3486,6 +3483,18 @@ EOF
 
     echo "$id: perri:$lens review: $finding_count findings ($decision)"
     return 0
+}
+
+# _review_slot_write <job_file> <findings-json> <reviewer>: set .pipeline.reviewer_findings.<reviewer>.
+# Call under _with_lock "<job_file>" (it re-reads the file).
+_review_slot_write() {
+    local jf="$1" rf="$2" r="$3" merged
+    merged=$(jq --argjson rf "$rf" --arg r "$r" '
+        (.pipeline //= {}) |
+        (.pipeline.reviewer_findings //= {}) |
+        .pipeline.reviewer_findings[$r] = $rf
+    ' "$jf") || return 1
+    _atomic_write "$jf" "$merged"
 }
 
 # ---------- _merge_reviewer_findings ----------
@@ -5870,7 +5879,6 @@ cmd_priority() {
     case "$want" in raise|lower|normal) ;; *) _die "priority: expected raise, lower or normal (got: $want)" ;; esac
     _job_exists "$id" || _die "no such job: $id"
     [ "$want" != "raise" ] || _priority_raise_guard "priority"
-    local job_file; job_file=$(_job_path "$id")
     # Resetting a raised job to normal is owner-only too (checked on the value read under the lock).
     _job_locked "$id" _priority_apply "$id" "$want" || exit $?
     echo "$id: priority $want"
