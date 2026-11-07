@@ -85,6 +85,9 @@ MOTHER_PROGRESS_TIMEOUT="${MOTHER_PROGRESS_TIMEOUT:-60}"     # seconds before a 
 MOTHER_LIMITER_INTERVAL="${MOTHER_LIMITER_INTERVAL:-10}"     # seconds between backpressure-limiter ticks (observe-only)
 MOTHER_LIMITER_TIMEOUT="${MOTHER_LIMITER_TIMEOUT:-20}"       # seconds before a stuck limiter tick is killed
 MOTHER_MIN_FREE_GB="${MOTHER_MIN_FREE_GB:-20}"               # pause dispatch below this much free disk (0 disables)
+MOTHER_SNAPSHOT_THIN_BELOW_GB="${MOTHER_SNAPSHOT_THIN_BELOW_GB:-40}" # thin Time Machine local snapshots below this much free disk (0 disables)
+MOTHER_SNAPSHOT_THIN_INTERVAL="${MOTHER_SNAPSHOT_THIN_INTERVAL:-1800}" # min seconds between snapshot-thin attempts
+MOTHER_SNAPSHOT_THIN_TIMEOUT="${MOTHER_SNAPSHOT_THIN_TIMEOUT:-120}"  # seconds before a stuck tmutil thin is killed
 MOTHER_LOWDISK_GC_INTERVAL="${MOTHER_LOWDISK_GC_INTERVAL:-600}" # min seconds between low-disk-triggered `mother gc` sweeps
 MOTHER_GC_ENABLED="${MOTHER_GC_ENABLED:-1}"                   # run `mother gc` hourly and on low disk (0 to disable)
 MOTHER_GC_TIMEOUT="${MOTHER_GC_TIMEOUT:-300}"                 # seconds before a stuck `mother gc` is killed
@@ -440,6 +443,64 @@ _lowdisk_gc() {
     fi
 }
 
+# _snapshot_thin_run <free_kb_before> <repo_path> — runs (backgrounded by the
+# caller) `tmutil thinlocalsnapshots / 999999999999 4` under a watchdog and records
+# the outcome in $RUNNER_DIR/snapshot-thin.json (read by `mother status`).
+# Thin only: never deletelocalsnapshots.
+_snapshot_thin_run() {
+    local before_kb="$1" repo_path="$2" out="$RUNNER_DIR/snapshot-thin.out.$$"
+    local n_before n_after tm_pid wd_pid rc=0 after_kb freed_gb
+    n_before=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c . || true)
+    tmutil thinlocalsnapshots / 999999999999 4 >"$out" 2>&1 &
+    tm_pid=$!
+    ( trap 'kill "$sp" 2>/dev/null; exit 0' TERM
+      sleep "$MOTHER_SNAPSHOT_THIN_TIMEOUT" & sp=$!
+      wait "$sp"; kill -9 "$tm_pid" 2>/dev/null ) >/dev/null 2>&1 3>&- &
+    wd_pid=$!
+    wait "$tm_pid" 2>/dev/null || rc=$?
+    kill "$wd_pid" 2>/dev/null; wait "$wd_pid" 2>/dev/null
+    n_after=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c . || true)
+    after_kb=$(_free_kb_for "$repo_path") || after_kb="$before_kb"
+    freed_gb=$(( (after_kb - before_kb) / 1048576 ))
+    [ "$freed_gb" -ge 0 ] || freed_gb=0
+    local thinned=$(( n_before - n_after ))
+    [ "$thinned" -ge 0 ] || thinned=0
+    if [ "$rc" -ne 0 ]; then
+        _log "snapshot thin: tmutil failed (exit $rc): $(head -c 200 "$out" 2>/dev/null | tr '\n' ' ') — backing off ${MOTHER_SNAPSHOT_THIN_INTERVAL}s"
+    else
+        _log "snapshot thin: free $((before_kb / 1048576)) GB -> $((after_kb / 1048576)) GB, thinned $thinned snapshot(s)"
+    fi
+    rm -f "$out"
+    _atomic_write "$RUNNER_DIR/snapshot-thin.json" "$(jq -nc --arg at "$(_iso_now)" \
+        --argjson b "$((before_kb / 1048576))" --argjson a "$((after_kb / 1048576))" \
+        --argjson f "$freed_gb" --argjson t "$thinned" --argjson rc "$rc" \
+        '{at: $at, free_before_gb: $b, free_after_gb: $a, freed_gb: $f, thinned: $t, exit: $rc}')"
+}
+
+# _maybe_snapshot_thin <free_kb> <repo_path> — below MOTHER_SNAPSHOT_THIN_BELOW_GB
+# (earlier than the dispatch pause), at most once per MOTHER_SNAPSHOT_THIN_INTERVAL,
+# start a bounded background thin. Returns at once; never blocks dispatch.
+_maybe_snapshot_thin() {
+    local kb="$1" repo_path="$2"
+    local thr="${MOTHER_SNAPSHOT_THIN_BELOW_GB:-40}" interval="${MOTHER_SNAPSHOT_THIN_INTERVAL:-1800}"
+    case "$thr" in ''|*[!0-9]*) thr=40 ;; esac
+    case "$interval" in ''|*[!0-9]*) interval=1800 ;; esac
+    [ "$thr" -gt 0 ] || return 0
+    [ -n "$kb" ] || return 0
+    [ "$kb" -lt $((thr * 1048576)) ] || return 0
+    command -v tmutil >/dev/null 2>&1 || return 0
+    local marker="$RUNNER_DIR/last-snapshot-thin.ts" now last=0
+    now=$(date +%s)
+    [ -f "$marker" ] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ $((now - last)) -ge "$interval" ] || return 0
+    echo "$now" > "$marker"
+    _log "snapshot thin: $((kb / 1048576)) GB free (< ${thr} GB) — thinning Time Machine local snapshots in background"
+    ( _snapshot_thin_run "$kb" "$repo_path" ) >/dev/null 2>&1 </dev/null &
+    disown 2>/dev/null || true
+    return 0
+}
+
 # _disk_check <repo_path> -> 0 dispatch OK, 1 low disk (dispatch paused).
 # Maintains $RUNNER_DIR/low-disk.json (read by lib/attention.sh): written while
 # low, removed when space recovers. Only dispatch is gated — nothing here ever
@@ -451,9 +512,11 @@ _disk_check() {
     case "$min_gb" in ''|*[!0-9]*) min_gb=20 ;; esac
 
     local kb=""
-    if [ "$min_gb" -gt 0 ]; then
+    if [ "$min_gb" -gt 0 ] || [ "${MOTHER_SNAPSHOT_THIN_BELOW_GB:-40}" != "0" ]; then
         kb=$(_free_kb_for "$repo_path") || kb=""
     fi
+    _maybe_snapshot_thin "$kb" "$repo_path"
+    [ "$min_gb" -gt 0 ] || kb=""
     if [ -z "$kb" ] || [ "$kb" -ge $((min_gb * 1048576)) ]; then
         if [ -f "$state" ]; then
             rm -f "$state"
