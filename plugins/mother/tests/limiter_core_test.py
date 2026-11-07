@@ -970,5 +970,41 @@ class FleetRateTests(unittest.TestCase):
         self.assertAlmostEqual(st["budget"]["fleet_usd_per_min"], 3.0)
 
 
+class AdmitListTests(unittest.TestCase):
+    """L3: state["admit"] is the ordered, cumulative list enforcement may start."""
+
+    def test_admit_is_the_ordered_admitted_ids(self):
+        st = core.tick(make_inp(ready=[rjob("b", created="2026-01-02T00:00:00Z"),
+                                       rjob("a", created="2026-01-01T00:00:00Z")], ceiling=4), {}, T0, CFG)
+        self.assertEqual(st["admit"], ["a", "b"])
+
+    def test_admit_never_exceeds_allowed_minus_running(self):
+        ready = [rjob("r%d" % i, created="2026-01-01T00:00:0%dZ" % i) for i in range(5)]
+        st = core.tick(make_inp(ready=ready, running=[runjob("x")], ceiling=3), {}, T0, CFG)
+        self.assertEqual(len(st["admit"]), 2)
+
+    def test_each_admitted_burn_counts_before_the_next_is_judged(self):
+        # k = 0.2 %/USD; 150 minutes left at 40% used and a 15% reserve: sustainable 0.3 %/min.
+        prev = calibrated(T0, k5=0.2, fleet=0.0, pct5=40.0)
+        f = feed(u5=40.0, r5=T0 + 9000)
+        ready = [rjob("a", usd=0.8, created="2026-01-01T00:00:01Z"),
+                 rjob("b", usd=0.8, created="2026-01-01T00:00:02Z")]
+        st = core.tick(make_inp(f, ready=ready), prev, T0, CFG)
+        self.assertEqual(st["admit"], ["a"])
+        self.assertEqual(held(st), {"b": "budget_pace"})
+
+    def test_advisory_budget_holds_are_admitted_and_take_a_slot(self):
+        ready = [rjob("a", created="2026-01-01T00:00:01Z"), rjob("b", created="2026-01-01T00:00:02Z"),
+                 rjob("c", created="2026-01-01T00:00:03Z")]
+        st = core.tick(make_inp(feed(u5=90), ready=ready, ceiling=2, gate="off_until_reset"), {}, T0, CFG)
+        self.assertEqual(st["admit"], ["a", "b"])
+        self.assertEqual(held(st)["c"], "concurrency_full")
+        self.assertTrue(all(r["advisory"] for r in st["ready"][:2]))
+
+    def test_a_held_job_is_not_in_the_admit_list(self):
+        st = core.tick(make_inp(feed(u5=90), ready=[rjob("a")]), {}, T0, CFG)
+        self.assertEqual(st["admit"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

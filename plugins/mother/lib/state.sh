@@ -416,10 +416,15 @@ _quota_gate_write_locked() {
 # takeover renames the dir away first, so only one taker wins. Tries are 50ms
 # apart; the daemon passes a small count (a stuck lock must not stall a tick).
 _quota_with_lock() {
-    local tries_max="$1"; shift
-    local lockdir; lockdir="$(_quota_gate_file).lockdir"
+    _switch_with_lock "$(_quota_gate_file).lockdir" "quota-gate" "$@"
+}
+
+# _switch_with_lock <lockdir> <label> <tries> <cmd...>: the lock behind _quota_with_lock,
+# shared with the limiter-mode switch (lib/limiter.sh). <label> names the switch in messages.
+_switch_with_lock() {
+    local lockdir="$1" label="$2" tries_max="$3"; shift 3
     local tries=0 owner age stale
-    mkdir -p "$MOTHER_ROOT" 2>/dev/null
+    mkdir -p "$(dirname "$lockdir")" 2>/dev/null
     while ! mkdir "$lockdir" 2>/dev/null; do
         owner=$(cat "$lockdir/owner" 2>/dev/null)
         age=$(( $(date +%s) - $(_file_mtime "$lockdir") ))
@@ -432,7 +437,7 @@ _quota_with_lock() {
                 # rename: only discard it if it is still the one we judged stale.
                 if [ "$(cat "$lockdir.stale.$$/owner" 2>/dev/null)" = "$owner" ]; then
                     rm -f "$lockdir.stale.$$/owner"; rmdir "$lockdir.stale.$$" 2>/dev/null || true
-                    echo "mother: took over a stale quota-gate lock (owner ${owner:-unknown})" >&2
+                    echo "mother: took over a stale $label lock (owner ${owner:-unknown})" >&2
                 else
                     # Known, accepted window (theoretical): between the two renames the lock
                     # path is briefly free, so a third process can take it; the put-back then
@@ -441,12 +446,12 @@ _quota_with_lock() {
                 fi
             fi
             tries=$((tries + 1))
-            [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the quota-gate lock" >&2; return 1; }
+            [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the $label lock" >&2; return 1; }
             continue
         fi
         sleep 0.05
         tries=$((tries + 1))
-        [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the quota-gate lock" >&2; return 1; }
+        [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the $label lock" >&2; return 1; }
     done
     echo "$$" > "$lockdir/owner" 2>/dev/null || true
     "$@"

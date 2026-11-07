@@ -384,6 +384,7 @@ func TestClassify_unknownKindsMapsToActivity(t *testing.T) {
 		"escalated", "resumed", "retried", "cancel_requested",
 		"adherence_passed", "adherence_failed",
 		"resume_not_yet_acted_on",
+		"priority_changed",
 		"something_totally_unknown",
 	}
 	for _, kind := range activityKinds {

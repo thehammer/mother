@@ -540,8 +540,9 @@ checkout; plugin versions are bumped so `claude plugin update` refreshes it.
 
 ## Backpressure limiter
 
-Observe-only (L1; L2 added the surfaces below; enforcement and boundary holds are later slices). It computes what it *would* admit,
-hold or cut each tick and logs it next to what dispatch did. **It changes no dispatch behaviour.**
+Observe by default (L1; L2 added the surfaces below; L3 added enforcement of **admission of new work**; boundary holds on
+running jobs are L4). It computes what it admits, holds or cuts each tick and logs it next to what dispatch did. **In
+`observe` and `off` it changes no dispatch behaviour.** See "Enforcement (L3)" below.
 
 - **Pure core (bet B1).** `lib/limiter_core.py` is the control law: stdlib `math`/`re` only, no file, clock or
   process I/O, `now` is a parameter. Keep it that way (a unit test scans its imports) so the coordinator can host it
@@ -560,9 +561,10 @@ hold or cut each tick and logs it next to what dispatch did. **It changes no dis
   and writes only while the job is still `ready`/`queued`. A job new to the active set has its events file seeded at the
   end (no replay of old distress). `mother add` bounds its `mother-limiter` calls by `MOTHER_LIMITER_ADD_TIMEOUT` (5s).
   A repo with `crew.phi_sensitive: true` is `company`.
-- **Modes.** `$MOTHER_ROOT/limiter/mode.json` `{"mode": "observe"|"off"}`; missing/corrupt = `observe`.
-  `MOTHER_LIMITER_MODE=off` is a hard kill switch that wins over the file. Any other value (including `enforce`,
-  L3) runs observe with one stderr line.
+- **Modes.** `$MOTHER_ROOT/limiter/mode.json` `{mode: observe|enforce|off, changed_at, changed_by}`; missing/corrupt =
+  `observe`. `MOTHER_LIMITER_MODE=off` is a hard kill switch that wins over the file and returns everything to the
+  pre-limiter behaviour. Any other env value (including `enforce`) is ignored with one stderr line: enforcement is set
+  only by `mother limiter mode enforce`. Reader/writer: `lib/limiter.sh` (`mother_limiter_mode`, `mother_limiter_mode_set`).
 - **Files** (`$MOTHER_ROOT/limiter/`): `state.json` (atomic; components, budget per window, interactive, per-job
   would-decisions, log offsets, burn samples), `decisions.jsonl` (`{ts, mode, allowed, running, would, actual,
   divergence}` when the decision set changes and at least every 300s; rotated to `.1` past
@@ -619,6 +621,41 @@ hold or cut each tick and logs it next to what dispatch did. **It changes no dis
   `MOTHER_BROKER_LIMITER_SEC`, default 15) publishes a `limiter` event only when the block's content changes (it
   ignores `age_s`, `last_distress.ago_s`, `concurrency.detail` and waiting `reason`). No broker command changes the
   limiter mode: that stays CLI-only and human-only.
+
+### Enforcement (L3)
+
+`mother limiter mode [observe|enforce|off]` (`_limiter_cmd_mode`) is the only writer of `mode.json`. Human-only: it is
+refused when `_quota_in_worker` (MOTHER_JOB_ID set, or a `mother-run-job` ancestor), logged to `limiter/mode-refusals.jsonl`;
+changes append `limiter/mode-audit.jsonl`; a same-mode call writes nothing. The lock is `_switch_with_lock`
+(`lib/state.sh`, shared with the quota gate, stale takeover). No broker command sets the mode.
+
+- **Enforcing** (`mother_limiter_enforcing`, `lib/limiter.sh`) = mode `enforce`, `state.json` written under enforce and
+  fresher than 3 x `MOTHER_LIMITER_INTERVAL`, and no `runner/limiter-fault.json`. Anything else is the old path unchanged (B6).
+- **Admit list.** The core emits `state.json` `admit`: ordered ids, cumulative (each admitted job's estimate joins the projected
+  fleet burn before the next is judged), never more than `allowed - running`. Advisory budget holds (gate `off`/`off_until_reset`
+  or a stale feed, bet B3) are admitted and take a slot; backoff, ramp and retry-after always apply.
+- **Dispatch.** `_dispatch_ready_jobs` under enforcing: `_pick_next_limiter_ready` walks `admit` in order (skips `_DISPATCH_SKIP`,
+  non-`ready` jobs and a future `not_before`), loop bound `min(MOTHER_CONCURRENCY, allowed)`, the `ratelimit-until` dispatch pause
+  is skipped (the limiter's backoff and `admissions_paused_until` replace it). The quota-gate cap stays a backstop (over the cap only
+  `force_start` jobs, and only if admitted); `_disk_dispatch_ok` and `_supervisor_alive_for_job` are unchanged. `dispatch-last.json`
+  gains `enforcing`. `force_start` skips the budget terms only, never backoff, ramp or retry-after. No other bypass exists.
+- **Surfaces.** Held ready jobs get `limiter.wait` `{source: "limiter", code, reason, advisory}`; decision lines carry `mode: "enforce"`
+  and `divergence` is a bug signal (the running-job `would_hold_running_but_running` kind is not recorded under enforce: holding
+  running jobs is L4).
+- **`_rf_backoff` under enforce** (`mother_limiter_mode` = enforce): a `rate_limited`/`api_overloaded` job still returns to `ready`/`queued`
+  at the same tier with `backoff_count` +1, but `.not_before` is set only from a server retry-after (clamped by
+  `MOTHER_BACKOFF_RETRY_AFTER_MAX_S`), else null; the time-based give-up (`MOTHER_BACKOFF_MAX_S`) does not apply, the count-based one
+  (`MOTHER_BACKOFF_MAX_COUNT`) does. `ratelimit-until` is still written (reviewers wait on it). The `failure_routed` event gains
+  `limiter: "enforce"`. Observe/off: unchanged.
+- **Attention.** `limiter_fault` (mode enforce and state stale/missing or a fault file; reason "limiter not running; dispatch fell back to
+  fixed concurrency"; marker `limiter-fault-marker.json`; `mother ack limiter limiter_fault`, acks/_limiter.json, worker-refused) and info-level
+  `limiter_enforcing_gate_off` ("budget terms advisory (quota gate off)").
+- **Priority.** `priority_adjust` (+1 raise, -1 lower, 0) is read by the core (`effective_rank`): data class shifted by it, company first.
+  `mother add --priority` / `mother priority <id> raise|lower|normal` (queued/ready only), event `priority_changed {from, to, by}`.
+  Raise is refused from a worker, when `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT` is set, or when stdin is not a TTY (`MOTHER_TEST_FORCE_TTY=1`
+  stands in for the TTY only under `MOTHER_TEST_ROOT=1`). Lower/normal are open.
+
+New job field: `priority_adjust` (int, -1|0|1) — owner-set ordering shift, absent = 0.
 
 New job fields:
 

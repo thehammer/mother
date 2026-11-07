@@ -347,6 +347,51 @@ _attention_quota_gate_items() {
          hint: "the quota gate is switched off, so Mother will not pause near the limits; turn it back on with `mother quota on`"}'
 }
 
+# ---------- limiter enforcement health (L3) ----------
+
+# `limiter_fault` is raised while the limiter mode is enforce and the limiter cannot be relied on
+# (state.json stale or missing, or runner/limiter-fault.json present): dispatch has fallen back to
+# fixed concurrency. Same shape as quota_feed_stale: a marker keeps `since` stable across refreshes
+# (mother_attention_write, the daemon, maintains it); `mother ack limiter limiter_fault` acks it
+# (acks/_limiter.json) while the marker's `since` is unchanged.
+_limiter_fault_marker() { echo "$MOTHER_ROOT/limiter-fault-marker.json"; }
+
+_attention_limiter_sync() {
+    type mother_limiter_unhealthy >/dev/null 2>&1 || return 0
+    local marker; marker=$(_limiter_fault_marker)
+    if mother_limiter_unhealthy; then
+        [ -f "$marker" ] || _atomic_write "$marker" "$(jq -nc --arg s "$(_iso_now)" '{since: $s}')"
+    else
+        rm -f "$marker"
+    fi
+}
+
+_attention_limiter_items() {
+    type mother_limiter_mode >/dev/null 2>&1 || return 0
+    [ "$(mother_limiter_mode)" = "enforce" ] || return 0
+    if mother_limiter_unhealthy; then
+        local marker since acked=false
+        marker=$(_limiter_fault_marker)
+        since=$(jq -r '.since // ""' "$marker" 2>/dev/null) || since=""
+        [ -n "$since" ] || since=$(_iso_now)
+        if [ -f "$MOTHER_ROOT/acks/_limiter.json" ] \
+            && [ "$(jq -r '.limiter_fault.since // ""' "$MOTHER_ROOT/acks/_limiter.json" 2>/dev/null)" = "$since" ]; then
+            acked=true
+        fi
+        jq -nc --arg since "$since" --argjson acked "$acked" '
+            {kind: "limiter_fault", job_id: "", repo: "", branch: "",
+             reason: "limiter not running; dispatch fell back to fixed concurrency", since: $since,
+             detail: {acked: $acked, since: $since},
+             hint: "check `mother limiter status` and $MOTHER_ROOT/runner/limiter.err; `mother limiter mode observe` returns to observe-only; acknowledge with `mother ack limiter limiter_fault`"}'
+    fi
+    if [ -n "$(_quota_gate_off_since 2>/dev/null)" ]; then
+        jq -nc '{kind: "limiter_enforcing_gate_off", job_id: "", repo: "", branch: "",
+                 reason: "budget terms advisory (quota gate off)", since: "",
+                 detail: {level: "info"},
+                 hint: "the limiter enforces concurrency, backoff and ramp but not pace, reserve or interactive demand while the quota gate is off; `mother quota on` restores them"}'
+    fi
+}
+
 # ---------- public ----------
 
 # mother_attention_items — print the needs-attention list as a JSON array.
@@ -361,6 +406,7 @@ mother_attention_items() {
       _attention_plugin_cache_items
       _attention_quota_items
       _attention_quota_gate_items
+      _attention_limiter_items
     } | jq -cs '.' 2>/dev/null || echo '[]'
 }
 
@@ -369,6 +415,7 @@ mother_attention_items() {
 mother_attention_write() {
     local items
     _attention_quota_sync 2>/dev/null || true
+    _attention_limiter_sync 2>/dev/null || true
     items=$(mother_attention_items)
     printf '%s' "$items" | jq -e 'type == "array"' >/dev/null 2>&1 || items='[]'
     _atomic_write "$MOTHER_ROOT/attention.json" "$items"

@@ -51,6 +51,8 @@ source "$MOTHER_LIB_DIR/state.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/backoff.sh" ]       && source "$MOTHER_LIB_DIR/backoff.sh"
 # shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/limiter.sh" ]      && source "$MOTHER_LIB_DIR/limiter.sh"
+# shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/criteria.sh" ] && source "$MOTHER_LIB_DIR/criteria.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/findings.sh" ]      && source "$MOTHER_LIB_DIR/findings.sh"
@@ -625,7 +627,7 @@ cmd_add() {
     local format="text" title=""
     local origin_label="" origin_project_override="" origin_session=""
     local origin_focus="" origin_focus_name=""
-    local expect_branch_mismatch_flag=0
+    local expect_branch_mismatch_flag=0 priority_flag=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -646,9 +648,15 @@ cmd_add() {
             --origin-focus)     origin_focus="$2"; shift 2 ;;
             --origin-focus-name) origin_focus_name="$2"; shift 2 ;;
             --expect-branch-mismatch) expect_branch_mismatch_flag=1; shift ;;
+            --priority)         [ $# -ge 2 ] || _die "add: --priority needs a value"; priority_flag="$2"; shift 2 ;;
             *) _die "unknown flag for add: $1" ;;
         esac
     done
+
+    if [ -n "$priority_flag" ]; then
+        case "$priority_flag" in raise|lower|normal) ;; *) _die "add: --priority must be raise, lower or normal (got: $priority_flag)" ;; esac
+        [ "$priority_flag" != "raise" ] || _priority_raise_guard "add"
+    fi
 
     [ -n "$plan_file" ] || _die "add: --plan-file required"
     [ -f "$plan_file" ] || _die "add: plan file not found: $plan_file"
@@ -905,6 +913,10 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
             }')
     fi
 
+    if [ -n "$priority_flag" ]; then
+        job_json=$(printf '%s' "$job_json" | jq --argjson p "$(_priority_value "$priority_flag")" '. + {priority_adjust: $p}')
+    fi
+
     # Backpressure limiter annotations (MC-38): data class and expected burn. Best-effort:
     # a failure leaves the fields absent and never fails the add.
     if [ "${MOTHER_LIMITER_MODE:-observe}" != "off" ] && [ -x "$MOTHER_BIN_DIR/mother-limiter" ]; then
@@ -928,6 +940,9 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
 
     _atomic_write "$(_job_path "$id")" "$job_json"
     _append_event "$id" "queued" "$(jq -nc --arg title "$title" '{title: $title}')"
+    if [ -n "$priority_flag" ] && [ "$priority_flag" != "normal" ]; then
+        _append_event "$id" "priority_changed" "$(jq -nc --arg to "$priority_flag" '{from: "normal", to: $to, by: "add"}')"
+    fi
 
     if [ "$format" = "json" ]; then
         jq -n --arg id "$id" '{id: $id}'
@@ -2714,10 +2729,14 @@ _rf_backoff() {
     count=$(_backoff_int "$(jq -r '.backoff_count // 0' "$job_file")" 0)
     first=$(_backoff_int "$(jq -r '.backoff_first_at // 0' "$job_file")" 0)
     max=$(_backoff_int "${MOTHER_BACKOFF_MAX_S:-}" 900)
+    # Under limiter enforcement the limiter's cut governs the pace: no time-based give-up, and
+    # `.not_before` is set only from a server retry-after.
+    local enforce=0
+    [ "$(mother_limiter_mode)" = "enforce" ] && enforce=1
     # Lifetime cap on consecutive backoffs (the counter only resets after a run
     # that really got going), so a job that keeps hitting the limit can't loop.
     local max_count; max_count=$(_backoff_int "${MOTHER_BACKOFF_MAX_COUNT:-}" 10)
-    if { [ "$first" -gt 0 ] && [ $((now - first)) -gt "$max" ]; } \
+    if { [ "$enforce" -eq 0 ] && [ "$first" -gt 0 ] && [ $((now - first)) -gt "$max" ]; } \
         || { [ "$max_count" -gt 0 ] && [ "$count" -ge "$max_count" ]; }; then
         local waited=0
         [ "$first" -le 0 ] || waited=$(((now - first) / 60))
@@ -2739,22 +2758,23 @@ _rf_backoff() {
     not_before=$((now + delay))
     new_state=$(_rf_ready_or_queued "$job_file")
     local merged
-    merged=$(jq --arg s "$new_state" --argjson nb "$not_before" --argjson now "$now" '
+    merged=$(jq --arg s "$new_state" --argjson nb "$not_before" --argjson now "$now" \
+        --argjson no_nb "$([ "$enforce" -eq 1 ] && [ "$ra" -le 0 ] && echo true || echo false)" '
         .state = $s
         | .finished_at = null
         | .worker_pid = null
         | .cancel_requested = null
         | .pause_requested = null
         | .final_result_at = null
-        | .not_before = $nb
+        | .not_before = (if $no_nb then null else $nb end)
         | .backoff_count = ((.backoff_count // 0) + 1)
         | .backoff_first_at = (.backoff_first_at // $now)
     ' "$job_file") || _die "route-failure: jq update failed"
     _atomic_write "$job_file" "$merged"
     [ "$reason" != "rate_limited" ] || [ -z "$api_status" ] || mother_ratelimit_extend "$not_before"
     _append_event "$id" "failure_routed" \
-        "$(jq -nc --arg r "$reason" --argjson d "$delay" --argjson n "$((count + 1))" \
-            '{action: "backed_off", reason: $r, delay_s: $d, backoff_count: $n}')"
+        "$(jq -nc --arg r "$reason" --argjson d "$delay" --argjson n "$((count + 1))" --argjson enf "$enforce" \
+            '{action: "backed_off", reason: $r, delay_s: $d, backoff_count: $n} + (if $enf == 1 then {limiter: "enforce"} else {} end)')"
     echo "$id: backed off ${delay}s ($reason) -> $new_state"
 }
 
@@ -5241,6 +5261,9 @@ mother — background work for Claude Code
 
 Usage:
   mother add --plan-file PATH --repo NAME --branch BRANCH [options]
+                                              (--priority raise|lower|normal: raise is owner-only, at a terminal)
+  mother priority ID raise|lower|normal       (queued/ready job; the limiter orders by data class shifted by this.
+                                              raise is refused from a worker, an agent session or a non-TTY stdin)
   mother list [--state STATE] [--repo REPO] [--project NAME] [--label LABEL] [--format json|table]
   mother status [ID] [--format json|text]     (no ID: queue overview, awaiting jobs, needs-attention list)
   mother logs ID [--follow]
@@ -5254,11 +5277,14 @@ Usage:
                                               acked until the condition clears and returns. Operator-only)
   mother quota status [--json]               (quota gate: state, feed source/age, per-window used %/cap/reset)
   mother quota on|off|off-until-reset        (off passes everything; off-until-reset until the first 5h/7d reset)
-  mother limiter [status] [--json]           (backpressure limiter, observe-only: allowed vs effective concurrency, burn vs
+  mother limiter mode [observe|enforce|off] [--source cli]   (no argument prints it; setting is human-only and audited.
+                                              enforce lets the limiter control admission of NEW work)
+  mother limiter [status] [--json]           (backpressure limiter: allowed vs effective concurrency, burn vs
                                               sustainable, reserve, last distress, ramp/backoff state, why each job waits)
   mother limiter signals [--json]            (raw values per window: used %, reset, pace, sustainable/projected, k, fleet burn)
   mother limiter report [--since 24h|ISO] [--json]   (would vs actual, distress per 10 job-hours, verdicts vs the MC-41 targets)
   mother ack quota quota_feed_stale          (acknowledge the stale quota feed item)
+  mother ack limiter limiter_fault           (acknowledge "limiter not running" while the mode is enforce)
   mother force-start ID [--yes] [--ignore-deps]  (override quota cap; --ignore-deps also skips dependency gates)
   mother retry ID [--yes]
   mother escalate ID [--yes]                 (bump failed job to next model tier)
@@ -5517,10 +5543,12 @@ attention item; `mother quota` switches the gate on/off):
                            interactive use; e.g. cap=70 reserves the
                            top 30% for non-Mother work.
 
-Backpressure limiter env vars (observe-only: it logs what it WOULD admit, hold or cut
-next to what dispatch did, and changes no dispatch behaviour; state in $MOTHER_ROOT/limiter/):
-  MOTHER_LIMITER_MODE          off = hard kill switch (default: observe; $MOTHER_ROOT/limiter/mode.json
-                               may also say off). Any other value runs observe-only.
+Backpressure limiter env vars (observe, the default: it logs what it WOULD admit, hold or cut
+next to what dispatch did and changes no dispatch behaviour; enforce: it controls admission of new
+work, set at a terminal with `mother limiter mode enforce`; state in $MOTHER_ROOT/limiter/):
+  MOTHER_LIMITER_MODE          off = hard kill switch, back to the pre-limiter behaviour (default: observe;
+                               $MOTHER_ROOT/limiter/mode.json holds observe|enforce|off). enforce is never
+                               read from the environment.
   MOTHER_LIMITER_INTERVAL      (default: 10)   seconds between limiter ticks
   MOTHER_LIMITER_TIMEOUT       (default: 20)   watchdog on one tick; a hung tick writes limiter-fault.json
   MOTHER_LIMITER_RESERVE_PCT   (default: 15)   share of the 5h window kept for interactive sessions
@@ -5669,10 +5697,45 @@ _limiter_signals_text() {
     printf '%s' "$sig" | jq -r "$_LIMITER_JQ_DEFS"'"fleet burn: \(.fleet_usd_per_min | num) $/min\nreserve: \(.reserve_pct)% of 5h (\(if .reserve_holding then "holding" else "not holding" end))\ninteractive: \(.interactive.state) (\(.interactive.pct_per_hour | num) %/h)\noverage in use: \(.overage_in_use)\nquota gate: \(.gate)\ndistress: \(.distress.h1) in 1h, \(.distress.h24) in 24h"'
 }
 
+# _limiter_refuse <requested> <reason> <source>: audit-log a refused limiter-mode change
+# (limiter/mode-refusals.jsonl, separate from the change audit) and exit non-zero.
+_limiter_refuse() {
+    mkdir -p "$MOTHER_ROOT/limiter" 2>/dev/null
+    jq -nc --arg at "$(_iso_now)" --arg req "$1" --arg why "$2" --arg src "$3" \
+        '{ts: $at, requested: $req, reason: $why, source: $src}' >> "$MOTHER_ROOT/limiter/mode-refusals.jsonl" 2>/dev/null || true
+    echo "mother: limiter mode change to $1 refused: $2" >&2
+    _die "limiter: refused: the limiter mode is operator-controlled ($2)"
+}
+
+# mother limiter mode [observe|enforce|off] [--source cli]
+# No argument prints the mode. Setting it is human-only: refused from a worker (same check as
+# `mother quota`). Only the owner turns enforcement on; MOTHER_LIMITER_MODE=off still overrides the file.
+_limiter_cmd_mode() {
+    local want="" by="cli"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --source) [ $# -ge 2 ] || _die "limiter: --source needs a value"; by="$2"; shift 2 ;;
+            observe|enforce|off) [ -z "$want" ] || _die "limiter: mode given twice"; want="$1"; shift ;;
+            *) _die "usage: mother limiter mode [observe|enforce|off] [--source cli]" ;;
+        esac
+    done
+    if [ -z "$want" ]; then
+        local m; m=$(mother_limiter_mode)
+        if [ "${MOTHER_LIMITER_MODE:-}" = "off" ]; then echo "$m  (MOTHER_LIMITER_MODE=off overrides the mode file)"; else echo "$m"; fi
+        return 0
+    fi
+    if _quota_in_worker; then
+        _limiter_refuse "$want" "$_QUOTA_WORKER_WHY" "$(printf '%s' "$by" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+    fi
+    [ "$by" = "cli" ] || _die "limiter: bad --source: only 'cli' is accepted"
+    mother_limiter_mode_set "$want" "$by" || return $?
+}
+
 # mother limiter [status] [--json] | signals [--json] | report [--since 24h|ISO] [--json]
 # Read-only views of the backpressure limiter (observe-only). The broker calls `limiter status --json`.
 cmd_limiter() {
     local sub="status" json=0 since="24h"
+    if [ "${1:-}" = "mode" ]; then shift; _limiter_cmd_mode "$@"; return $?; fi
     case "${1:-}" in status|signals|report) sub="$1"; shift ;; esac
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -5685,7 +5748,11 @@ cmd_limiter() {
         status)
             local block; block=$(_limiter_block_json)
             if [ "$json" -eq 1 ]; then printf '%s\n' "$block"; return 0; fi
-            [ "$(printf '%s' "$block" | jq -r '.mode')" = "off" ] || echo "mode: $(printf '%s' "$block" | jq -r '.mode')  (enforcement off)"
+            case "$(printf '%s' "$block" | jq -r '.mode')" in
+                off) ;;
+                enforce) echo "mode: enforce  (the limiter controls admission of new work; running jobs are untouched)" ;;
+                *) echo "mode: $(printf '%s' "$block" | jq -r '.mode')  (enforcement off)" ;;
+            esac
             _limiter_text "$block"
             ;;
         signals)
@@ -5700,6 +5767,46 @@ cmd_limiter() {
                 || _die "limiter: report failed"
             ;;
     esac
+}
+
+# ---------- priority ----------
+
+_priority_value() { case "$1" in raise) echo 1 ;; lower) echo -1 ;; *) echo 0 ;; esac; }
+_priority_name() { case "$1" in 1) echo raise ;; -1) echo lower ;; *) echo normal ;; esac; }
+
+# _priority_raise_guard <by>: raising a job's priority is the owner's call, at a terminal. Refuses (exit)
+# from a worker, from an agent session (CLAUDECODE / CLAUDE_CODE_ENTRYPOINT) and when stdin is not a TTY.
+# MOTHER_TEST_FORCE_TTY=1 stands in for the TTY only under MOTHER_TEST_ROOT=1 (the test harness); the
+# worker and agent-session checks are never bypassed.
+_priority_raise_guard() {
+    local why=""
+    if _quota_in_worker; then why="$_QUOTA_WORKER_WHY"
+    elif [ -n "${CLAUDECODE:-}" ] || [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]; then why="caller is an agent session"
+    elif [ ! -t 0 ] && ! { [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ "${MOTHER_TEST_FORCE_TTY:-}" = "1" ]; }; then why="stdin is not a terminal"
+    fi
+    [ -z "$why" ] || _die "$1: raising priority is refused ($why): only the owner, at a terminal, can raise priority"
+}
+
+# mother priority <id> raise|lower|normal
+# Sets .priority_adjust (+1|-1|0) on a queued or ready job; the limiter orders ready jobs by data class
+# shifted by it. Lower and normal are open to anyone; raise is guarded (_priority_raise_guard).
+cmd_priority() {
+    local id="${1:-}" want="${2:-}"
+    [ -n "$id" ] && [ -n "$want" ] && [ $# -eq 2 ] || _die "usage: mother priority <id> raise|lower|normal"
+    case "$want" in raise|lower|normal) ;; *) _die "priority: expected raise, lower or normal (got: $want)" ;; esac
+    _job_exists "$id" || _die "no such job: $id"
+    [ "$want" != "raise" ] || _priority_raise_guard "priority"
+    local job_file state from to
+    job_file=$(_job_path "$id")
+    state=$(jq -r '.state // ""' "$job_file")
+    case "$state" in queued|ready) ;; *) _die "priority: $id is in state $state (only queued or ready jobs can change priority)" ;; esac
+    from=$(_priority_name "$(jq -r '.priority_adjust // 0' "$job_file")")
+    to="$want"
+    if [ "$from" != "$to" ]; then
+        _job_update "$id" ".priority_adjust = $(_priority_value "$to")"
+        _append_event "$id" "priority_changed" "$(jq -nc --arg f "$from" --arg t "$to" '{from: $f, to: $t, by: "cli"}')"
+    fi
+    echo "$id: priority $to"
 }
 
 # ---------- quota gate ----------
@@ -5846,6 +5953,23 @@ cmd_ack() {
         echo "quota: acknowledged $reason"
         return 0
     fi
+    if [ "$id" = "limiter" ] && [ "$reason" = "limiter_fault" ]; then
+        # Not tied to a job: `mother ack limiter limiter_fault`. Same worker guard as the mode switch.
+        if _quota_in_worker; then
+            _limiter_refuse "ack:$reason" "$_QUOTA_WORKER_WHY" "$(printf '%s' "$source" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+        fi
+        local lmarker="$MOTHER_ROOT/limiter-fault-marker.json" lsince
+        mother_limiter_unhealthy || _die "ack: limiter_fault is not raised (the limiter is healthy or not enforcing)"
+        lsince=$(jq -r '.since // ""' "$lmarker" 2>/dev/null)
+        [ -n "$lsince" ] || { mother_attention_write 2>/dev/null || true; lsince=$(jq -r '.since // ""' "$lmarker" 2>/dev/null); }
+        [ -n "$lsince" ] || _die "ack: limiter_fault has no recorded start; try again"
+        mkdir -p "$MOTHER_ROOT/acks"
+        _with_lock "$MOTHER_ROOT/acks/_limiter.json" _ack_write "$MOTHER_ROOT/acks/_limiter.json" "$reason" "$lsince" "$source" \
+            || _die "ack: could not write acks/_limiter.json"
+        mother_attention_write 2>/dev/null || true
+        echo "limiter: acknowledged $reason"
+        return 0
+    fi
     case " $MOTHER_ATTENTION_REASONS " in
         *" $reason "*) ;;
         *) _die "ack: unknown reason: $reason (expected one of: $MOTHER_ATTENTION_REASONS)" ;;
@@ -5886,6 +6010,7 @@ main() {
         ack)               cmd_ack "$@" ;;
         quota)             cmd_quota "$@" ;;
         limiter)           cmd_limiter "$@" ;;
+        priority)          cmd_priority "$@" ;;
         force-start)       cmd_force_start "$@" ;;
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;

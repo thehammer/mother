@@ -96,18 +96,19 @@ def load_cfg(root):
 
 
 def resolve_mode(root):
-    """env off wins; mode.json 'off' next; everything else (incl. enforce, L3) is observe."""
+    """env off wins; then mode.json (observe|enforce|off); default observe. Env `enforce` is never
+    honoured: enforcement is switched on by a human with `mother limiter mode enforce`."""
     env = os.environ.get("MOTHER_LIMITER_MODE", "")
     if env == "off":
         return "off"
     if env and env != "observe":
-        warn("MOTHER_LIMITER_MODE=%r is not available in this slice; running observe-only" % env)
+        warn("MOTHER_LIMITER_MODE=%r is not honoured (only off); use `mother limiter mode`" % env)
     try:
         with open(os.path.join(root, "limiter", "mode.json")) as fh:
             m = json.load(fh).get("mode")
     except (OSError, ValueError, AttributeError):
         m = None
-    return "off" if m == "off" else "observe"
+    return m if m in ("off", "enforce") else "observe"
 
 
 # ---------- small helpers ----------
@@ -473,8 +474,10 @@ def _fmt_wait(left):
     return "%ds" % left if left < 60 else "%dm" % ((left + 59) // 60)
 
 
-def actual_wait(job, now, dl, feed, cfg, n_running, root):
-    """(code, reason): what actually holds a ready/queued job today, in dispatch's own order (MC-39)."""
+def actual_wait(job, now, dl, feed, cfg, n_running, root, enforce=False):
+    """(code, reason): what actually holds a ready/queued job today, in dispatch's own order (MC-39).
+    Under enforce the fixed rate-limit pause is gone (the limiter's backoff replaces it) and a slot or
+    budget hold is the limiter's: the caller overlays it."""
     dw = job.get("dep_wait") if isinstance(job.get("dep_wait"), dict) else None
     if job.get("state") == "queued":
         reason = (dw or {}).get("reason") or "waiting on dependencies"
@@ -482,7 +485,7 @@ def actual_wait(job, now, dl, feed, cfg, n_running, root):
     nb = job.get("not_before")
     if is_num(nb) and nb > now:
         return "backoff", "rate-limit backoff, starts in %s" % _fmt_wait(nb - now)
-    if dl.get("ratelimit_paused"):
+    if dl.get("ratelimit_paused") and not enforce:
         return "ratelimit_paused", "rate-limit pause: nothing new starts"
     if dl.get("quota_over_cap") and job.get("force_start") is not True:
         for label, key, env in (("5h", "five_hour", "MOTHER_QUOTA_CAP_5H_PCT"), ("7d", "seven_day", "MOTHER_QUOTA_CAP_7D_PCT")):
@@ -502,6 +505,7 @@ def cmd_tick(args):
     mode = resolve_mode(root)
     if mode == "off":
         return 0
+    enforcing = mode == "enforce"
     now = int(time.time())
     cfg = load_cfg(root)
     ldir = os.path.join(root, "limiter")
@@ -627,6 +631,9 @@ def cmd_tick(args):
                                          "status": e.get("status")}, separators=(",", ":")) + "\n")
         except OSError:
             pass
+    # A job dispatch started since the last tick is judged as it was before dispatch (so it counts against
+    # `allowed` and keeps divergence honest) but is no longer startable: drop it from the admit list.
+    st["admit"] = [i for i in st.get("admit", []) if i not in spawned_hint]
     st.update(mode=mode, offsets=offsets, job_costs=seen, mother_cum_usd=cum, class_cache=class_cache,
               dispatch_ts=max(dl_ts, prev.get("dispatch_ts") or 0))
     st["budget"].update(source=feed["source"], feed_age_s=feed["feed_age_s"])
@@ -645,18 +652,25 @@ def cmd_tick(args):
                 w["at"] = iso(now)
                 ann["would"] = w
         if a["_state"] in ("ready", "queued"):
-            code, reason = actual_wait(a["_job"], now, dl, feed, cfg, n_running_jobs, root)
+            code, reason = actual_wait(a["_job"], now, dl, feed, cfg, n_running_jobs, root, enforce=enforcing)
+            source, w_advisory = "dispatch", False
+            if enforcing and r and a["_state"] == "ready" and code in ("concurrency_full", "next") \
+                    and (r["decision"] == "hold" or r["advisory"]):
+                # enforcement: the limiter's own hold (slots, backoff, ramp, budget terms) is what
+                # keeps this job waiting; an advisory budget term (bet B3) is shown but admitted.
+                code, reason, source, w_advisory = r["code"], r["reason"], "limiter", bool(r["advisory"])
             would = None
             if r and r["decision"] == "hold" and r["code"] != code:
                 would = {"code": r["code"], "reason": r["reason"]}
             old_w = a["_lim"].get("wait") if isinstance(a["_lim"].get("wait"), dict) else {}
-            same = old_w.get("code") == code and isinstance(old_w.get("since"), str)
+            same = old_w.get("code") == code and old_w.get("source") == source \
+                and bool(old_w.get("advisory")) == w_advisory and isinstance(old_w.get("since"), str)
             since = old_w["since"] if same else iso(now)
-            waiting.append({"id": a["id"], "code": code, "reason": reason, "source": "dispatch",
-                            "advisory": False, "would": would, "since": since,
+            waiting.append({"id": a["id"], "code": code, "reason": reason, "source": source,
+                            "advisory": w_advisory, "would": would, "since": since,
                             "_created": a["created_at"]})
             if not same:  # rewritten only when the code changes
-                ann["wait"] = {"code": code, "reason": reason, "source": "dispatch", "advisory": False,
+                ann["wait"] = {"code": code, "reason": reason, "source": source, "advisory": w_advisory,
                                "would": would, "since": since}
         if len(ann) > 1:
             out_ann.append(ann)
@@ -679,10 +693,11 @@ def write_decision(root, ldir, st, dl, spawned_hint, now):
     for jid in sorted(spawned_hint):
         if jid in held:
             div.append({"id": jid, "kind": "would_hold_but_spawned", "code": held[jid]})
+    # Holding a RUNNING job is L4: under enforce this slice does not act on it, so it is not a divergence.
     for r in st["running"]:
-        if r["would_hold"]:
+        if r["would_hold"] and st.get("mode") != "enforce":
             div.append({"id": r["id"], "kind": "would_hold_running_but_running"})
-    line = {"ts": iso(now), "mode": "observe", "allowed": st["allowed"], "running": len(st["running"]),
+    line = {"ts": iso(now), "mode": st.get("mode") or "observe", "allowed": st["allowed"], "running": len(st["running"]),
             "would": would, "actual": actual, "divergence": div,
             "window": {"used_pct_5h": st["budget"]["five_hour"].get("used_pct"), "gate": st["budget"].get("gate")}}
     sig = json.dumps([would, div, st["allowed"], actual["spawned"]], sort_keys=True)

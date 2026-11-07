@@ -6,6 +6,14 @@ All notable changes to Mother are documented here. Format based on
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-06
+
+- **Limiter enforcement (L3).** `mother limiter mode [observe|enforce|off]` (human-only: refused from a worker, audited in `limiter/mode-audit.jsonl`, refusals in `mode-refusals.jsonl`) lets the backpressure limiter control admission of NEW work. Default stays `observe`; `MOTHER_LIMITER_MODE=off` is still the kill switch and `enforce` is never read from the environment. Under enforce, `_dispatch_ready_jobs` starts jobs from the limiter's ordered `admit` list (`state.json`), bounded by `min(MOTHER_CONCURRENCY, allowed)`, and the fixed rate-limit pause is replaced by the limiter's backoff. The quota-gate cap, low-disk guard and supervisor check are unchanged. A stale or faulted limiter falls back to today's dispatch and raises `limiter_fault`. Running jobs are not touched (L4).
+- The core's `admit` list is cumulative (each admitted job adds its burn before the next is judged, never more than `allowed - running`); advisory budget holds (gate off / stale feed) are admitted and take a slot. Ready jobs the limiter holds get `limiter.wait` with `source: "limiter"`; decision lines carry `mode: "enforce"`.
+- `mother add --priority raise|lower|normal` and `mother priority <id> ...` set `priority_adjust`; raising is owner-only (refused from workers, agent sessions and non-TTY stdin). Event `priority_changed {from, to, by}`.
+- Under enforce, a `rate_limited`/`api_overloaded` failure still backs off at the same tier but sets `not_before` only from a server retry-after, and the time-based give-up does not apply (the count-based one does); the event carries `limiter: "enforce"`. Observe/off unchanged.
+- Attention: `limiter_fault` (enforce and limiter stale/faulted; `mother ack limiter limiter_fault`) and info-level `limiter_enforcing_gate_off`.
+
 ## [0.5.0] - 2026-11-06
 
 - **Limiter surfaces (L2).** The observe-only limiter is now visible. `mother limiter [status] [--json]` prints the limiter block (mode, allowed vs effective concurrency with the backoff/ramp state, fleet burn vs the sustainable rate, the reserve, interactive demand, the last distress and how long ago, and one line per waiting job); `mother limiter signals [--json]` prints the raw per-window values (used %, reset in Central with UTC, pace, sustainable and projected %/min, `k` and samples, fleet burn, reserve, interactive %/h, overage, 1h/24h distress); `mother limiter report [--since 24h|ISO] [--json]` compares would with actual from `decisions.jsonl` (and the `.1` rotation): divergences by type and code, distress per 10 job-hours, 5h exhaustion while admitting, calibration and PASS/FAIL verdicts against the MC-41 targets. `mother status` adds a 2-line summary under `Concurrency:` (and `limiter` in `--format json`); a stale `state.json` or a `limiter-fault.json` reads "limiter: not running (...) — dispatch uses fixed concurrency".
