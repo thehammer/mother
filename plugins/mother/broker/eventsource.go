@@ -36,6 +36,8 @@ type rawEvent struct {
 //   - the seven state names           → state
 //   - awaiting_input                  → await
 //   - pause_requested / auto_resumed / paused_for_quota → quota
+//   - held / hold_released / paused_for_limiter / hold_giveup_deferred (L4
+//     limiter boundary holds) → activity (the default bucket), so clients see them
 //   - progress_updated / progress_half → progress (HC-09; opt-in, so clients
 //     that don't subscribe see no added volume)
 //   - everything else                 → activity

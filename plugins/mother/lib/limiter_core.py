@@ -435,9 +435,18 @@ def tick(inp, prev, now, cfg):
     running_out = []
     for j in run_sorted:
         pre = preempt_on and j.get("data_class") != "company" and effective_rank(j) == 1
-        running_out.append({"id": j["id"], "class": "company" if effective_rank(j) == 0 else "personal",
-                            "would_hold": j["id"] in hold_ids, "would_preempt": bool(pre),
-                            "advisory": bool(pre and advisory)})
+        held_now = j["id"] in hold_ids
+        row = {"id": j["id"], "class": "company" if effective_rank(j) == 0 else "personal",
+               "would_hold": held_now, "would_preempt": bool(pre),
+               "advisory": bool(pre and advisory)}
+        # L4: the code and reason a boundary hold carries (a distress hold wins over pre-emption).
+        if held_now:
+            row["hold"] = {"code": "backoff",
+                           "reason": "provider rate limit: concurrency cut to %d" % min(ceiling, bo_lv)}
+        elif pre:
+            row["hold"] = {"code": "interactive_personal",
+                           "reason": "interactive demand is high and the reserve would be breached"}
+        running_out.append(row)
 
     # ready jobs in priority order
     taken = 0

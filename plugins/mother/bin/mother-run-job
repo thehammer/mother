@@ -1429,6 +1429,10 @@ _wave_cycle() {
     local wave_dir out_dir
     _wave_decision=stopped
     _wave_adherence=""
+    # Reviewer boundary (L4): reviewers are Claude spawns; wait out a limiter hold before starting any.
+    # Parked (awaiting) or cancelled: nothing was launched, the wave stops here.
+    _hold_wait_before_spawn || return 0
+    [ "${cancel_requested:-0}" -eq 0 ] || return 0
     wave_dir="$MOTHER_ROOT/crew/$id/wave/c$n"
     out_dir="$MOTHER_ROOT/crew/$id/wave-runs/c$n"
     mkdir -p "$wave_dir" "$out_dir" 2>/dev/null
@@ -2313,6 +2317,182 @@ _log_mtime() {
         || echo 0
 }
 
+# ---------------------------------------------------------------------------
+# Limiter boundary holds (L4). The runner writes $RUNNER_DIR/<id>.hold when the limiter wants this
+# job held (enforce only). The worker stops at its next tool call (hooks/mother-limiter-hold.sh writes
+# <id>.held); a phase or reviewer spawn waits here instead. Nothing is cut off mid-request: only a hold
+# that outlasts the grace period, with a quiet log, gives up the worker.
+# ---------------------------------------------------------------------------
+
+_hold_num() {   # _hold_num <value> <default>
+    case "${1:-}" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac
+}
+_hold_grace_s() { _hold_num "${MOTHER_LIMITER_HOLD_GRACE_S:-}" 600; }
+_hold_quiet_s() { _hold_num "${MOTHER_LIMITER_QUIET_S:-}" 30; }
+
+# Supervisor-local hold bookkeeping for the current spawn (script globals).
+_hold_cancelled=0
+_hold_active=0          # a .hold has been seen and .limiter_hold set
+_hold_boundary_epoch=0  # when the worker reached the boundary (.held appeared); 0 = not yet
+_hold_deferred_epoch=0  # last hold_giveup_deferred event
+
+_hold_reset_state() { _hold_active=0; _hold_boundary_epoch=0; _hold_deferred_epoch=0; }
+
+# _hold_mark_active <boundary-reached: true|false> — set .limiter_hold from the .hold file, once.
+_hold_mark_active() {
+    local at_boundary="${1:-false}" hold="$RUNNER_DIR/$id.hold" code reason since
+    code=$(jq -r '.code // "limiter_hold"' "$hold" 2>/dev/null) || code=limiter_hold
+    reason=$(jq -r '.reason // ""' "$hold" 2>/dev/null) || reason=""
+    [ -n "$code" ] || code=limiter_hold
+    since=$(date +%s)
+    _hold_merged=$(jq --arg c "$code" --arg r "$reason" --arg s "$(iso_now)" --argjson b "$at_boundary" \
+        '.limiter_hold = {code: $c, reason: $r, since: $s, at_boundary: $b}' "$job_file" 2>/dev/null) \
+        && _atomic_write "$job_file" "$_hold_merged"
+    _hold_active=1
+}
+
+# _hold_event <kind> <extra-json> — an event carrying the current hold's code and reason.
+_hold_event() {
+    local kind="$1" extra="${2:-}"
+    [ -n "$extra" ] || extra='{}'
+    _append_event "$kind" "$(jq -nc --argjson cur "$(jq -c '.limiter_hold // {}' "$job_file" 2>/dev/null || echo '{}')" \
+        --argjson x "$extra" '{code: ($cur.code // null), reason: ($cur.reason // null)} + $x')"
+}
+
+# _hold_release <held_s> — the flag is gone: hold_released, and .limiter_hold cleared.
+_hold_release() {
+    _append_event "hold_released" "$(jq -nc --argjson h "${1:-0}" '{held_s: $h}')"
+    _job_update '.limiter_hold = null'
+    rm -f "$RUNNER_DIR/$id.held"
+    _hold_reset_state
+}
+
+# _hold_park <held_s> <boundary: tool|phase> — give the hold up: transition to awaiting first, then the
+# event; the caller stops the worker (when there is one) after this returns. A quota_* hold code parks as
+# that quota reason (the existing auto-resume handles it); anything else as limiter_hold.
+_hold_park() {
+    local held_s="${1:-0}" boundary="${2:-tool}" code reason preason q resume_at
+    code=$(jq -r '.limiter_hold.code // "limiter_hold"' "$job_file" 2>/dev/null) || code=limiter_hold
+    reason=$(jq -r '.limiter_hold.reason // ""' "$job_file" 2>/dev/null) || reason=""
+    case "$code" in
+        quota_*)
+            preason="$code"
+            q="Mother paused this job because the quota cap was reached. Auto-resumes when the blocking window resets." ;;
+        *)
+            preason="limiter_hold"
+            q="Held by the limiter: ${reason:-no reason given}. Mother resumes it automatically when the limiter admits it." ;;
+    esac
+    resume_at=$(jq -r '.auto_resume_at // 0' "$job_file" 2>/dev/null); : "${resume_at:=0}"
+    _hold_merged=$(jq --arg q "$q" --arg p "$preason" --arg ts "$(iso_now)" \
+        '.state = "awaiting" | .question = $q | .paused_reason = $p | .paused_at = $ts
+         | .pause_requested = null | .limiter_hold = null' "$job_file" 2>/dev/null) \
+        && _atomic_write "$job_file" "$_hold_merged"
+    case "$code" in
+        quota_*) _append_event "paused_for_quota" \
+                    "$(jq -nc --arg r "$preason" --argjson ts "${resume_at:-0}" '{paused_reason: $r, auto_resume_at: $ts}')" ;;
+        *)       _append_event "paused_for_limiter" \
+                    "$(jq -nc --arg c "$code" --arg r "$reason" --argjson h "$held_s" --arg b "$boundary" \
+                        --arg q "$q" '{code: $c, reason: $r, held_s: $h, boundary: $b,
+                                       paused_reason: "limiter_hold", question: $q}')" ;;
+    esac
+    rm -f "$RUNNER_DIR/$id.held"
+    _hold_reset_state
+}
+
+# _limiter_hold_tick — one poll-loop pass for the tool boundary. Returns 1 when the job was parked
+# (the caller then stops the worker and leaves the loop), else 0.
+_limiter_hold_tick() {
+    local hold="$RUNNER_DIR/$id.hold" held="$RUNNER_DIR/$id.held" now at mtime
+    now=$(date +%s)
+    if [ ! -f "$hold" ]; then
+        if [ "$_hold_active" -eq 1 ]; then
+            local held_s=0
+            [ "$_hold_boundary_epoch" -gt 0 ] && held_s=$((now - _hold_boundary_epoch))
+            _hold_release "$held_s"
+        fi
+        return 0
+    fi
+    [ "$_hold_active" -eq 1 ] || _hold_mark_active false
+    if [ "$_hold_boundary_epoch" -eq 0 ] && [ -f "$held" ]; then
+        at=$(jq -r '.at // empty' "$held" 2>/dev/null)
+        case "$at" in ''|*[!0-9]*) at=$now ;; esac
+        _hold_boundary_epoch=$at
+        _job_update ".limiter_hold.at_boundary = true | .limiter_hold.boundary_since = \"$(iso_now)\""
+        _hold_event "held" '{"boundary":"tool"}'
+    fi
+    [ "$_hold_boundary_epoch" -gt 0 ] || return 0
+    local held_s=$((now - _hold_boundary_epoch))
+    [ "$held_s" -ge "$(_hold_grace_s)" ] || return 0
+    mtime=$(_log_mtime)
+    if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -lt "$(_hold_quiet_s)" ]; then
+        if [ $((now - _hold_deferred_epoch)) -ge 60 ]; then
+            _hold_deferred_epoch=$now
+            _hold_event "hold_giveup_deferred" "$(jq -nc --argjson h "$held_s" --argjson q "$((now - mtime))" \
+                '{held_s: $h, log_quiet_s: $q}')"
+        fi
+        return 0
+    fi
+    _hold_park "$held_s" tool
+    return 1
+}
+
+# _hold_wait_before_spawn — the phase/reviewer boundary: called before this supervisor starts any claude
+# process. With no .hold it returns at once. Otherwise it waits (poll 2 s) and appends held
+# {boundary: phase}. Returns 0 to go ahead (released, or cancelled: cancel_requested is set), 1 when the
+# grace period passed and the job was parked as awaiting (there is no worker to stop).
+_hold_wait_before_spawn() {
+    local hold="$RUNNER_DIR/$id.hold" start now
+    _hold_cancelled=0
+    [ -f "$hold" ] || return 0
+    _hold_reset_state
+    _hold_mark_active true
+    _hold_event "held" '{"boundary":"phase"}'
+    start=$(date +%s)
+    while [ -f "$hold" ]; do
+        if [ "$(jq -r '.cancel_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
+            cancel_requested=1; _hold_cancelled=1
+            _job_update '.limiter_hold = null'
+            _hold_reset_state
+            return 0
+        fi
+        now=$(date +%s)
+        if [ $((now - start)) -ge "$(_hold_grace_s)" ]; then
+            _hold_park "$((now - start))" phase
+            return 1
+        fi
+        sleep 2
+    done
+    _hold_release "$(( $(date +%s) - start ))"
+    return 0
+}
+
+# _hold_settings_file — write the job-scoped Claude settings file when it is needed (the limiter mode is
+# not off, or the job has a cost cap) and set settings_args_quoted. The cost gate keeps its behaviour.
+_hold_settings_file() {
+    settings_args_quoted=""
+    local settings_file="$RUNNER_DIR/$id.settings.json" mode hooks='[]' grace
+    # (lib/limiter.sh is sourced below the SOURCE_ONLY guard: bats drivers that skip it still honour the env switch.)
+    if type mother_limiter_mode >/dev/null 2>&1; then
+        mode=$(mother_limiter_mode 2>/dev/null) || mode=observe
+    else
+        mode=observe
+        [ "${MOTHER_LIMITER_MODE:-}" != "off" ] || mode=off
+    fi
+    if [ -n "${max_cost_usd:-}" ]; then
+        hooks=$(jq -nc --argjson h "$hooks" --arg cmd "$MOTHER_LIB_DIR/../hooks/mother-cost-gate.sh" \
+            '$h + [{type: "command", command: $cmd}]')
+    fi
+    if [ "$mode" != "off" ]; then
+        grace=$(_hold_grace_s)
+        hooks=$(jq -nc --argjson h "$hooks" \
+            --arg cmd "MOTHER_LIMITER_HOOK_MAX_S=$((grace + 240)) $(printf '%q' "$MOTHER_LIB_DIR/../hooks/mother-limiter-hold.sh")" \
+            --argjson t "$((grace + 300))" '$h + [{type: "command", command: $cmd, timeout: $t}]')
+    fi
+    [ "$hooks" != "[]" ] || return 0
+    jq -n --argjson h "$hooks" '{hooks: {PreToolUse: [{matcher: "*", hooks: $h}]}}' > "$settings_file" 2>/dev/null || return 0
+    settings_args_quoted=" $(printf '%q' --settings) $(printf '%q' "$settings_file")"
+}
+
 # _spawn_and_wait <mode> [prompt_file] — spawn one claude worker for this job
 # and block until it exits (or is cancelled / paused / reaped). Everything it
 # sets (worker_pid, log_offset_at_spawn, marker_file, exit_code, session_id,
@@ -2344,6 +2524,28 @@ _spawn_and_wait() {
             return 2
             ;;
     esac
+
+    # Phase boundary (L4): never start a claude process while the limiter holds this job. A hold that
+    # outlasts the grace period parks the job as awaiting; there is no worker to stop, so report the
+    # "run" as completed cleanly and let the callers' awaiting checks take over.
+    if ! _hold_wait_before_spawn; then
+        exit_code=0; reaped_reason=""; cancel_requested=0
+        # A same-session turn that never started (gate fix, review rework) is replayed on resume.
+        if [ "$mode" = "resume" ] && [ -r "$resume_prompt" ]; then
+            _hold_merged=$(jq --rawfile p "$resume_prompt" '.limiter_resume_prompt = $p' "$job_file" 2>/dev/null) \
+                && _atomic_write "$job_file" "$_hold_merged"
+        fi
+        # The post-exit awaiting path reads these; no worker ran, so the run's log range is empty.
+        log_offset_at_spawn=$(stat -f %z "$log_path" 2>/dev/null || stat -c %s "$log_path" 2>/dev/null || echo 0)
+        : "${usage_main_actor:=${phase_agent:-cody}-main}" "${marker_file:=}" "${wrapper:=}" "${usage_state_file:=}"
+        return 0
+    fi
+    # Cancelled while waiting: start nothing; the callers' cancel_requested checks take over.
+    if [ "${_hold_cancelled:-0}" -eq 1 ]; then
+        exit_code=1
+        return 0
+    fi
+    _hold_reset_state
 
     if [ "$mode" = "resume" ]; then
         # Resume: re-enter the job's existing claude session (same session id,
@@ -2539,15 +2741,9 @@ _spawn_and_wait() {
     max_cost_usd=$(jq -r '.max_cost_usd // empty' "$job_file" 2>/dev/null)
     cost_cap_flag="$RUNNER_DIR/$id.cost-cap"
     rm -f "$cost_cap_flag"
-    settings_args_quoted=""
-    if [ -n "$max_cost_usd" ]; then
-        settings_file="$RUNNER_DIR/$id.settings.json"
-        cost_gate_hook="$MOTHER_LIB_DIR/../hooks/mother-cost-gate.sh"
-        jq -n --arg cmd "$cost_gate_hook" \
-            '{hooks: {PreToolUse: [{matcher: "*", hooks: [{type: "command", command: $cmd}]}]}}' \
-            > "$settings_file" 2>/dev/null
-        settings_args_quoted=" $(printf '%q' --settings) $(printf '%q' "$settings_file")"
-    fi
+    # Stale limiter-hold flags from an earlier run must not park this one.
+    rm -f "$RUNNER_DIR/$id.held"
+    _hold_settings_file
 
     cat > "$wrapper" <<WRAP
 #!/usr/bin/env bash
@@ -2711,6 +2907,14 @@ WRAP
             _append_event "paused_for_quota" \
                 "$(jq -nc --arg r "$_pause_reason" --argjson ts "${_pause_resume_at:-0}" \
                     '{paused_reason: $r, auto_resume_at: $ts}')"
+            _terminate_worker
+            break
+        fi
+
+        # Limiter boundary hold (L4): .hold present -> the worker parks in its PreToolUse hook at the
+        # next tool call; past the grace period with a quiet log the worker is given up (state first,
+        # then the kill, as for the quota pause above).
+        if ! _limiter_hold_tick; then
             _terminate_worker
             break
         fi
@@ -2980,6 +3184,9 @@ source "$MOTHER_LIB_DIR/request-types.sh"
 [ -r "$MOTHER_LIB_DIR/phase-prompt.sh" ] && source "$MOTHER_LIB_DIR/phase-prompt.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/usage.sh" ] && source "$MOTHER_LIB_DIR/usage.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/limiter.sh" ] && source "$MOTHER_LIB_DIR/limiter.sh"
+type mother_limiter_mode >/dev/null 2>&1 || mother_limiter_mode() { echo observe; }
 type mother_claude_extra_args >/dev/null 2>&1 || mother_claude_extra_args() { MOTHER_CLAUDE_ARGS=(); }
 type mother_usage_available   >/dev/null 2>&1 || mother_usage_available()   { return 1; }
 type mother_record_run_usage  >/dev/null 2>&1 || mother_record_run_usage() { :; }
@@ -3423,11 +3630,20 @@ fi
 resume_sid=$(jq -r '.resume_session_id // empty' "$job_file" 2>/dev/null)
 resume_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null)
 if [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ]; then
-    gates_budget_reset_by="resume"
+    resume_kind=$(jq -r '.resume_kind // empty' "$job_file" 2>/dev/null)
+    # A limiter release is a continuation, not an operator answer: the gate budget keeps counting.
+    [ "$resume_kind" = "limiter_hold" ] || gates_budget_reset_by="resume"
     resume_question=$(jq -r '.question // empty' "$job_file" 2>/dev/null)
     resume_prompt_file="$RUNNER_DIR/$id.resume.md"
     resume_hold_kind=$(jq -r '.decision.kind // "gate_hold"' "$job_file" 2>/dev/null)
-    {
+    if [ "$resume_kind" = "limiter_hold" ]; then
+        {
+            printf '# Mother released your limiter hold\n\n%s\n' "$resume_answer"
+            _lh_turn=$(jq -r '.limiter_resume_prompt // empty' "$job_file" 2>/dev/null)
+            [ -z "$_lh_turn" ] || printf '\n---\n\nThe turn you were about to start:\n\n%s\n' "$_lh_turn"
+            printf '\nKeep working on branch `%s`. Do not open a second PR.\n' "$branch"
+        } >"$resume_prompt_file"
+    else {
         if [ "$resume_hold_kind" = "review_hold" ]; then
             printf '# The operator answered your review hold\n\n'
             printf 'Mother held this job because the review wave raised findings that needed a human. The operator replied:\n\n'
@@ -3443,9 +3659,10 @@ if [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ];
         else
             printf 'Once you have pushed, stop: Mother re-runs the gates with a fresh attempt budget.\n'
         fi
-    } >"$resume_prompt_file"
+    } >"$resume_prompt_file"; fi
     _resume_merged=$(jq --arg s "$resume_sid" \
-        '.session_id = $s | .resume_session_id = null | .pending_answer = null | .question = null' "$job_file") \
+        '.session_id = $s | .resume_session_id = null | .pending_answer = null | .question = null
+         | .resume_kind = null | .limiter_resume_prompt = null' "$job_file") \
         && _atomic_write "$job_file" "$_resume_merged"
     _append_event "resumed_from_input" "$(jq -nc --arg q "$resume_question" --arg a "$resume_answer" \
         --arg p "$resume_prompt_file" '{question: $q, answer: $a, resume_prompt: $p, mode: "resume"}')"
@@ -3461,6 +3678,8 @@ if [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ];
     fi
 else
     [ -z "$resume_sid" ] || _job_update '.resume_session_id = null'
+    [ -z "$(jq -r '.resume_kind // empty' "$job_file" 2>/dev/null)" ] \
+        || _job_update '.resume_kind = null | .limiter_resume_prompt = null'
     _spawn_and_wait fresh
 fi
 

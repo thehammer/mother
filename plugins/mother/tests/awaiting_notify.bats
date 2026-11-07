@@ -274,6 +274,14 @@ _event_count() {
     assert_job_field "job-a" '.awaiting_notify // "null"' "null"
 }
 
+@test "limiter_hold-parked jobs are never announced (they auto-resume when the limiter admits them)" {
+    _make_awaiting "job-l" "limiter hold" '.paused_reason = "limiter_hold"'
+    _tick
+    _tick
+    [ "$(_call_count)" -eq 0 ]
+    assert_job_field "job-l" '.awaiting_notify // "null"' "null"
+}
+
 @test "quota-paused jobs are never announced (they auto-resume)" {
     _make_awaiting "job-q" "quota pause" '.paused_reason = "quota_5h" | .auto_resume_at = "2099-01-01T00:00:00Z"'
     _tick

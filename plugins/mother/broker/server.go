@@ -139,7 +139,7 @@ func (h *hub) applyOverlayLocked(ev rawEvent) {
 
 	// Entering awaiting carries the question/paused_reason for the snapshot.
 	switch ev.kind {
-	case "awaiting_input", "paused_for_quota":
+	case "awaiting_input", "paused_for_quota", "paused_for_limiter":
 		var d struct {
 			Question     string `json:"question"`
 			PausedReason string `json:"paused_reason"`
@@ -165,14 +165,14 @@ func (h *hub) applyOverlayLocked(ev rawEvent) {
 // foldState is the canonical event→state vocabulary (B7). It returns the
 // state implied by an event and whether the event is state-affecting. The
 // awaiting transition has no dedicated state-kind event in the bash layer —
-// it is implied by awaiting_input / paused_for_quota — and the return from
+// it is implied by awaiting_input / paused_for_quota / paused_for_limiter — and the return from
 // awaiting is implied by resumed / auto_resumed, so those are folded here.
 // retried / escalated carry the resulting state in detail.to_state.
 func foldState(kind string, detail json.RawMessage) (string, bool) {
 	switch kind {
 	case "queued", "ready", "running", "succeeded", "failed", "cancelled":
 		return kind, true
-	case "awaiting_input", "paused_for_quota":
+	case "awaiting_input", "paused_for_quota", "paused_for_limiter":
 		return "awaiting", true
 	case "resumed", "auto_resumed":
 		return "ready", true
