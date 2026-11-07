@@ -554,6 +554,12 @@ hold or cut each tick and logs it next to what dispatch did. **It changes no dis
   spawned, skipped}`); nothing in dispatch reads it. Annotations go through `_job_update` only when a value
   changed, and only `data_class`, `limiter.estimate` and `limiter.would` are ever written. Test entry:
   `mother-runner --limiter-tick`.
+- **Fault backoff.** After a fault the runner skips limiter ticks: `MOTHER_LIMITER_BACKOFF_BASE_S` (20) doubling per
+  consecutive fault up to `MOTHER_LIMITER_BACKOFF_MAX_S` (600), state in `$RUNNER_DIR/limiter-backoff.json`
+  `{faults, skip_until}`; a clean tick clears it. Annotation apply (`_limiter_apply_one`) runs under the job-file lock
+  and writes only while the job is still `ready`/`queued`. A job new to the active set has its events file seeded at the
+  end (no replay of old distress). `mother add` bounds its `mother-limiter` calls by `MOTHER_LIMITER_ADD_TIMEOUT` (5s).
+  A repo with `crew.phi_sensitive: true` is `company`.
 - **Modes.** `$MOTHER_ROOT/limiter/mode.json` `{"mode": "observe"|"off"}`; missing/corrupt = `observe`.
   `MOTHER_LIMITER_MODE=off` is a hard kill switch that wins over the file. Any other value (including `enforce`,
   L3) runs observe with one stderr line.
@@ -567,7 +573,7 @@ hold or cut each tick and logs it next to what dispatch did. **It changes no dis
   `_RAMP_START` 2, `_RAMP_STEP_S` 300, `_INTERACTIVE_PCT_H` 10, `_INTERACTIVE_SUSTAIN_S` 600, `_K_MIN_SAMPLES` 12,
   `_DECISIONS_MAX_MB` 20; `MOTHER_COMPANY_REPOS` (space-separated repo names forced to `company`).
 - **Rules.** `allowed = min(MOTHER_CONCURRENCY, backoff_level, ramp_level)`. Distress (429/503/529 `api_retry`,
-  `result` with `api_error_status` 429/503/529, a non-overage rejected `rate_limit_event`, a `failure_routed` event
+  `result` with `api_error_status` 429/503/529 (503 is deliberately an overload signal and cuts, like 529), a non-overage rejected `rate_limit_event`, a `failure_routed` event
   with `rate_limited`/`api_overloaded`) halves `allowed` (events within `COALESCE_S` are one cut); calm raises the
   level one step per `CALM_S`. Overage-only rejections and `api_retry` with `error_status: null` are not distress.
   A window reset (`resets_at` forward by more than half the window, or `used_pct` down 20+) restarts a ramp at

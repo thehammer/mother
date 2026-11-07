@@ -604,6 +604,21 @@ _tier_num() {
 
 # ---------- add ----------
 
+# _limiter_bounded <cmd...> — run a limiter helper with a watchdog (MOTHER_LIMITER_ADD_TIMEOUT, 5s) and
+# print its stdout; a hang, crash or non-zero exit prints nothing. `mother add` must never wait on it.
+_limiter_bounded() {
+    local out pid wd
+    out=$(mktemp "${TMPDIR:-/tmp}/mother-limiter-out.XXXXXX" 2>/dev/null) || return 0
+    "$@" >"$out" 2>/dev/null </dev/null &
+    pid=$!
+    ( sleep "${MOTHER_LIMITER_ADD_TIMEOUT:-5}"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 3>&- &
+    wd=$!
+    if wait "$pid" 2>/dev/null; then cat "$out" 2>/dev/null; fi
+    kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    rm -f "$out"
+    return 0
+}
+
 cmd_add() {
     local plan_file="" repo="" repo_path="" branch="" base_ref="origin/main"
     local isolation="worktree" executor="local-tmux" max_cost="" depends_on=""
@@ -894,12 +909,16 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
     # a failure leaves the fields absent and never fails the add.
     if [ "${MOTHER_LIMITER_MODE:-observe}" != "off" ] && [ -x "$MOTHER_BIN_DIR/mother-limiter" ]; then
         local lim_class lim_est lim_tmp
-        lim_class=$("$MOTHER_BIN_DIR/mother-limiter" classify --work-dir "$repo_path" --repo "$repo" 2>/dev/null || true)
+        lim_class=$(_limiter_bounded "$MOTHER_BIN_DIR/mother-limiter" classify --work-dir "$repo_path" --repo "$repo")
+        # a PHI-sensitive crew config is never "personal"
+        if [ "$lim_class" = "personal" ] && [ "$(printf '%s' "$job_json" | jq -r '.crew.phi_sensitive // false' 2>/dev/null)" = "true" ]; then
+            lim_class=company
+        fi
         case "$lim_class" in company|personal) job_json=$(printf '%s' "$job_json" | jq --arg c "$lim_class" '. + {data_class: $c}') ;; esac
         lim_tmp=$(mktemp "${TMPDIR:-/tmp}/mother-limiter-job.XXXXXX" 2>/dev/null) || lim_tmp=""
         if [ -n "$lim_tmp" ]; then
             printf '%s' "$job_json" > "$lim_tmp"
-            lim_est=$("$MOTHER_BIN_DIR/mother-limiter" estimate --root "$MOTHER_ROOT" --job "$lim_tmp" 2>/dev/null || true)
+            lim_est=$(_limiter_bounded "$MOTHER_BIN_DIR/mother-limiter" estimate --root "$MOTHER_ROOT" --job "$lim_tmp")
             rm -f "$lim_tmp"
             if printf '%s' "$lim_est" | jq -e 'type == "object" and has("usd_per_min")' >/dev/null 2>&1; then
                 job_json=$(printf '%s' "$job_json" | jq --argjson e "$lim_est" '. + {limiter: {estimate: $e}}')

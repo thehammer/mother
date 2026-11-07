@@ -976,7 +976,28 @@ _limiter_fault() {
     _log "limiter: $1"
     jq -nc --argjson at "$(date +%s)" --arg why "$1" '{at: $at, why: $why}' \
         > "$RUNNER_DIR/limiter-fault.json.tmp.$$" 2>/dev/null \
-        && mv "$RUNNER_DIR/limiter-fault.json.tmp.$$" "$RUNNER_DIR/limiter-fault.json"
+        && mv "$RUNNER_DIR/limiter-fault.json.tmp.$$" "$RUNNER_DIR/limiter-fault.json" \
+        || rm -f "$RUNNER_DIR/limiter-fault.json.tmp.$$"
+    _limiter_backoff_arm
+}
+
+# After a fault, skip the next limiter ticks: MOTHER_LIMITER_BACKOFF_BASE_S (20) doubling per
+# consecutive fault up to MOTHER_LIMITER_BACKOFF_MAX_S (600). A clean tick resets it. Keeps a
+# wedged limiter from costing the single-threaded loop a full watchdog timeout every interval.
+_limiter_backoff_arm() {
+    local file="$RUNNER_DIR/limiter-backoff.json" n=0 delay base cap now
+    n=$(jq -r '.faults // 0' "$file" 2>/dev/null); case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    n=$((n + 1))
+    base="${MOTHER_LIMITER_BACKOFF_BASE_S:-20}"; cap="${MOTHER_LIMITER_BACKOFF_MAX_S:-600}"
+    case "$base" in ''|*[!0-9]*) base=20 ;; esac
+    case "$cap" in ''|*[!0-9]*) cap=600 ;; esac
+    delay=$base; local i=1
+    while [ "$i" -lt "$n" ] && [ "$delay" -lt "$cap" ]; do delay=$((delay * 2)); i=$((i + 1)); done
+    [ "$delay" -gt "$cap" ] && delay=$cap
+    now=$(date +%s)
+    jq -nc --argjson f "$n" --argjson u "$((now + delay))" '{faults: $f, skip_until: $u}' \
+        > "$file.tmp.$$" 2>/dev/null && mv "$file.tmp.$$" "$file" || rm -f "$file.tmp.$$"
+    _log "limiter: backing off ${delay}s after $n consecutive fault(s)"
 }
 
 # _limiter_apply <annotations json> — write the limiter's job annotations. Each one was already
@@ -986,11 +1007,25 @@ _limiter_apply() {
     local ann id
     printf '%s' "$1" | jq -c '.annotations[]?' 2>/dev/null | while read -r ann; do
         id=$(printf '%s' "$ann" | jq -r '.id')
-        _job_update "$id" '
-            (if $a.data_class then .data_class = $a.data_class else . end)
-            | (if $a.estimate then .limiter.estimate = $a.estimate else . end)
-            | (if $a.would then .limiter.would = $a.would else . end)' --argjson a "$ann" 2>/dev/null || true
+        [ -n "$id" ] || continue
+        _with_lock "$(_job_path "$id")" _limiter_apply_one "$id" "$ann" 2>/dev/null || true
     done
+}
+
+# One annotation, under the job-file lock. Observe-only must never change a job's state, so the
+# write happens only if the job is still ready/queued when the lock is held (a `cancel`/`retry`
+# that landed since the tick wins); otherwise nothing is written.
+_limiter_apply_one() {
+    local id="$1" ann="$2" file merged
+    file=$(_job_path "$id")
+    [ -f "$file" ] || return 0
+    merged=$(jq --argjson a "$ann" '
+        select(.state == "ready" or .state == "queued")
+        | (if $a.data_class then .data_class = $a.data_class else . end)
+        | (if $a.estimate then .limiter.estimate = $a.estimate else . end)
+        | (if $a.would then .limiter.would = $a.would else . end)' "$file" 2>/dev/null) || return 0
+    [ -n "$merged" ] || return 0
+    _atomic_write "$file" "$merged"
 }
 
 # One limiter tick under a watchdog (the loop is single-threaded; a wedged python must not stall
@@ -1011,7 +1046,7 @@ _run_limiter_bounded() {
     elif [ "$rc" -ne 0 ]; then
         _limiter_fault "tick exited $rc"
     else
-        rm -f "$RUNNER_DIR/limiter-fault.json"
+        rm -f "$RUNNER_DIR/limiter-fault.json" "$RUNNER_DIR/limiter-backoff.json"
         _limiter_apply "$(cat "$out" 2>/dev/null)"
     fi
     rm -f "$out"
@@ -1023,6 +1058,10 @@ _maybe_limiter_tick() {
     now=$(date +%s)
     last=$(_read_epoch_marker "$marker")
     [ $((now - last)) -ge "$MOTHER_LIMITER_INTERVAL" ] || return 0
+    local skip_until
+    skip_until=$(jq -r '.skip_until // 0' "$RUNNER_DIR/limiter-backoff.json" 2>/dev/null)
+    case "$skip_until" in ''|*[!0-9]*) skip_until=0 ;; esac
+    [ "$now" -ge "$skip_until" ] || return 0
     echo "$now" > "$marker"
     _run_limiter_bounded
 }
@@ -2010,7 +2049,8 @@ _write_dispatch_last() {
           low_disk: $low, spawned: ($spawned | split(" ") | map(select(length > 0))),
           skipped: ($skipped | split(" ") | map(select(length > 0)))}' \
         > "$RUNNER_DIR/dispatch-last.json.tmp.$$" 2>/dev/null \
-        && mv "$RUNNER_DIR/dispatch-last.json.tmp.$$" "$RUNNER_DIR/dispatch-last.json"
+        && mv "$RUNNER_DIR/dispatch-last.json.tmp.$$" "$RUNNER_DIR/dispatch-last.json" \
+        || rm -f "$RUNNER_DIR/dispatch-last.json.tmp.$$"
 }
 
 _dispatch_ready_jobs() {

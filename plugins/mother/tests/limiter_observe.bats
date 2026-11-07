@@ -552,6 +552,7 @@ _scenario() {
     MOTHER_LIMITER_INTERVAL=0 MOTHER_LIMITER_TIMEOUT=2 MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --limiter-tick 3>&- >/dev/null 2>&1
     [ -f "$RUNNER_DIR/limiter-fault.json" ]
 
+    rm -f "$RUNNER_DIR/limiter-backoff.json"   # the fault backoff has elapsed
     _real_limiter_wrapper
     MOTHER_LIMITER_INTERVAL=0 MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --limiter-tick 3>&- >/dev/null 2>&1
     [ ! -e "$RUNNER_DIR/limiter-fault.json" ]
@@ -1040,4 +1041,101 @@ _append_log() { cat "$FIXTURES/$1" >> "$LOGS_DIR/$2.log"; }
     # dispatch has a free slot (1 of 4 running) and uses it, limiter or not
     MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --dispatch-tick 2>/dev/null 3>&-
     [ "$(jq -r .state "$JOBS_DIR/d-wait.json")" = "running" ]
+}
+
+# ===========================================================================
+# PR #109 review fix-ups
+# ===========================================================================
+
+@test "fixup-1: a job cancelled between tick and apply stays cancelled with no limiter fields" {
+    _fake_run_job
+    make_job race-1 ready ".repo_path = \"$MOTHER_ROOT\""
+    # the tick reads the job as ready, then it is cancelled before the annotations are applied
+    printf '#!/usr/bin/env bash\ncat <<JSON\n{"annotations":[{"id":"race-1","data_class":"company","would":{"code":"admit","reason":"x","advisory":false,"at":"2026-11-06T00:00:00Z"}}]}\nJSON\njq ".state = \\"cancelled\\"" "%s/race-1.json" > "%s/race-1.json.x" && mv "%s/race-1.json.x" "%s/race-1.json"\n' \
+        "$JOBS_DIR" "$JOBS_DIR" "$JOBS_DIR" "$JOBS_DIR" > "$FAKE_BIN/mother-limiter"
+    chmod +x "$FAKE_BIN/mother-limiter"
+    MOTHER_LIMITER_INTERVAL=0 MOTHER_LIMITER_TIMEOUT=5 MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --limiter-tick 3>&- >/dev/null 2>&1
+    [ "$(jq -r .state "$JOBS_DIR/race-1.json")" = "cancelled" ]
+    [ "$(jq -r 'has("limiter") or has("data_class")' "$JOBS_DIR/race-1.json")" = "false" ]
+}
+
+@test "fixup-2: a retried job's old rate-limit event is not replayed as fresh distress" {
+    _bishop 10 10
+    export MOTHER_CONCURRENCY=4
+    make_job old-1 ready ".repo_path = \"$MOTHER_ROOT\""
+    : > "$EVENTS_DIR/old-1.jsonl"
+    _tick
+    # the job fails terminally (its offset is pruned), having once been rate limited
+    jq -nc '{ts: "2026-11-06T00:00:00Z", kind: "failure_routed", detail: {action: "backed_off", reason: "rate_limited", delay_s: 30}}' \
+        >> "$EVENTS_DIR/old-1.jsonl"
+    jq '.state = "failed"' "$JOBS_DIR/old-1.json" > "$JOBS_DIR/old-1.tmp" && mv "$JOBS_DIR/old-1.tmp" "$JOBS_DIR/old-1.json"
+    _tick
+    # retried: back to ready
+    jq '.state = "ready"' "$JOBS_DIR/old-1.json" > "$JOBS_DIR/old-1.tmp" && mv "$JOBS_DIR/old-1.tmp" "$JOBS_DIR/old-1.json"
+    _tick
+    [ "$(_lstate '.components.distress_24h')" = "0" ]
+    [ "$(_lstate '.allowed')" = "4" ]
+}
+
+@test "fixup-3: a limiter that always hangs is invoked a bounded number of times over many iterations" {
+    _fake_run_job
+    printf '#!/usr/bin/env bash\necho x >> "%s/limiter-calls"\nexec sleep 30\n' "$MOTHER_ROOT" > "$FAKE_BIN/mother-limiter"
+    chmod +x "$FAKE_BIN/mother-limiter"
+    make_job hang-b ready ".repo_path = \"$MOTHER_ROOT\""
+    local i
+    for i in 1 2 3 4 5; do
+        MOTHER_LIMITER_INTERVAL=0 MOTHER_LIMITER_TIMEOUT=1 MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --limiter-tick 3>&- >/dev/null 2>&1
+    done
+    [ "$(wc -l < "$MOTHER_ROOT/limiter-calls" | tr -d ' ')" = "1" ]
+    # dispatch cadence is untouched
+    MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --dispatch-tick 2>/dev/null 3>&-
+    [ "$(jq -r .state "$JOBS_DIR/hang-b.json")" = "running" ]
+}
+
+@test "fixup-3: a clean tick resets the backoff" {
+    _fake_run_job
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$FAKE_BIN/mother-limiter"
+    chmod +x "$FAKE_BIN/mother-limiter"
+    _bishop 5 10
+    MOTHER_LIMITER_INTERVAL=0 MOTHER_LIMITER_TIMEOUT=2 MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --limiter-tick 3>&- >/dev/null 2>&1
+    [ -f "$RUNNER_DIR/limiter-backoff.json" ]
+    # backoff expires
+    jq '.skip_until = 0' "$RUNNER_DIR/limiter-backoff.json" > "$RUNNER_DIR/b.tmp" && mv "$RUNNER_DIR/b.tmp" "$RUNNER_DIR/limiter-backoff.json"
+    _real_limiter_wrapper
+    MOTHER_LIMITER_INTERVAL=0 MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --limiter-tick 3>&- >/dev/null 2>&1
+    [ ! -e "$RUNNER_DIR/limiter-backoff.json" ]
+}
+
+@test "fixup-4: mother add succeeds quickly when the limiter hangs" {
+    printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$MOTHER_ROOT/hang-limiter"
+    mkdir -p "$MOTHER_ROOT/fb"; cp "$MOTHER_ROOT/hang-limiter" "$MOTHER_ROOT/fb/mother-limiter"; chmod +x "$MOTHER_ROOT/fb/mother-limiter"
+    local t0 id; t0=$(_now)
+    id=$(MOTHER_BIN_DIR="$MOTHER_ROOT/fb" MOTHER_LIMITER_ADD_TIMEOUT=1 _add testrepo 3>&-)
+    [ -n "$id" ]
+    [ $(( $(_now) - t0 )) -lt 10 ]
+    [ -f "$JOBS_DIR/$id.json" ]
+}
+
+@test "fixup-5: a repo whose crew config is phi_sensitive is company, never personal" {
+    mkdir -p "$FAKE_REPO/.mother"
+    printf 'version: 1\nphi_sensitive: true\ngates:\n  checks: []\n' > "$FAKE_REPO/.mother/crew.yml"
+    run _classify "$FAKE_REPO" some-fork
+    [ "$output" = "company" ]
+}
+
+@test "fixup-5: the tick treats a job whose crew snapshot is phi_sensitive as company" {
+    _bishop 5 10
+    _fake_run_job
+    make_job phi-1 ready ".repo_path = \"$MOTHER_ROOT\" | .repo = \"some-fork\" | .crew = {phi_sensitive: true}"
+    _real_limiter_wrapper
+    MOTHER_LIMITER_INTERVAL=0 MOTHER_BIN_DIR="$FAKE_BIN" mother-runner --limiter-tick 3>&- >/dev/null 2>&1
+    [ "$(jq -r .data_class "$JOBS_DIR/phi-1.json")" = "company" ]
+}
+
+@test "fixup: stale limiter tmp files of dead pids are swept at tick start" {
+    _bishop 5 10
+    mkdir -p "$MOTHER_ROOT/limiter"
+    : > "$MOTHER_ROOT/limiter/state.json.tmp.999999"
+    _tick
+    [ ! -e "$MOTHER_ROOT/limiter/state.json.tmp.999999" ]
 }

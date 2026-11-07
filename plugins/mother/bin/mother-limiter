@@ -121,10 +121,43 @@ def read_json(path):
 def write_json_atomic(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = "%s.tmp.%d" % (path, os.getpid())
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, ensure_ascii=False, separators=(",", ":"))
-        fh.write("\n")
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, separators=(",", ":"))
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def sweep_stale_tmp(ldir):
+    """Remove limiter/*.tmp.<pid> files whose writer is dead (a killed tick leaves them behind)."""
+    try:
+        names = os.listdir(ldir)
+    except OSError:
+        return
+    for name in names:
+        m = re.search(r"\.tmp\.(\d+)$", name)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 0)
+            continue  # writer still alive
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        try:
+            os.unlink(os.path.join(ldir, name))
+        except OSError:
+            pass
 
 
 def iso(ts):
@@ -233,17 +266,46 @@ def origin_owner(url):
     return m.group(1).lower() if m else None
 
 
+def origin_url(work_dir):
+    """The repo's origin URL ('' if none): part of the class cache key so a changed origin is re-read."""
+    try:
+        if work_dir and os.path.isdir(work_dir):
+            r = subprocess.run(["git", "-C", work_dir, "remote", "get-url", "origin"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def crew_phi_sensitive(work_dir):
+    """True when the repo's .mother/crew.yml (working copy) declares phi_sensitive: true. Best effort."""
+    try:
+        if not (work_dir and os.path.isdir(work_dir)):
+            return False
+        path = os.path.join(work_dir, ".mother", "crew.yml")
+        if not os.path.isfile(path):
+            return False
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if re.match(r"^\s*phi_sensitive\s*:\s*true\s*(#.*)?$", line, re.I):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def classify(root, work_dir, repo):
     try:
         if repo in _list_setting(root, "MOTHER_PHI_REPOS", "admin-portal referral-monitor"):
             return "company"
         if repo in _list_setting(root, "MOTHER_COMPANY_REPOS", ""):
             return "company"
-        if work_dir and os.path.isdir(work_dir):
-            r = subprocess.run(["git", "-C", work_dir, "remote", "get-url", "origin"],
-                               capture_output=True, text=True, timeout=10)
-            if r.returncode == 0 and origin_owner(r.stdout) == "carefeed":
-                return "company"
+        if crew_phi_sensitive(work_dir):
+            return "company"
+        if origin_owner(origin_url(work_dir)) == "carefeed":
+            return "company"
     except Exception:
         pass
     return "personal"
@@ -400,6 +462,7 @@ def cmd_tick(args):
     now = int(time.time())
     cfg = load_cfg(root)
     ldir = os.path.join(root, "limiter")
+    sweep_stale_tmp(ldir)
     prev = read_json(os.path.join(ldir, "state.json")) or {}
     if not isinstance(prev, dict) or prev.get("v") != 1:
         prev = {}
@@ -413,7 +476,9 @@ def cmd_tick(args):
     class_cache = dict(prev.get("class_cache") or {})
 
     def class_of(j):
-        key = "%s|%s" % (j.get("repo") or "", j.get("repo_path") or "")
+        key = "%s|%s|%s" % (j.get("repo") or "", j.get("repo_path") or "", origin_url(j.get("repo_path")))
+        if (j.get("crew") or {}).get("phi_sensitive") is True:
+            return "company"
         if key not in class_cache:
             class_cache[key] = classify(root, j.get("repo_path"), j.get("repo") or "")
         return class_cache[key]
@@ -470,8 +535,8 @@ def cmd_tick(args):
 
     # distress scan: new bytes of each live job's log, plus failure_routed events (a
     # rate-limited job is back in `ready`, so events are read for every non-terminal job).
-    # A job first seen after the first tick is read from its run's start; on the very
-    # first tick everything starts at the end so old history is not replayed.
+    # A running job's log first seen after the first tick is read from its run's start; an events
+    # file (and everything on the very first tick) is seeded at its end so old history is not replayed.
     offsets = dict(prev.get("offsets") or {})
     events, overage_in_use, live = [], False, set()
     for j in active:
@@ -483,9 +548,12 @@ def cmd_tick(args):
             key = "%s:%s" % (kind, jid)
             live.add(key)
             off = offsets.get(key)
-            if off is None and prev:
+            if off is None and prev and kind == "log":
                 cur = (j.get("current_run") or {}).get("log_offset")
-                off = cur if kind == "log" and isinstance(cur, int) else 0
+                off = cur if isinstance(cur, int) else 0
+            # An events file a job is new to the active set with is seeded at its end (off stays
+            # None): a retried/resumed job's offset was pruned when it went terminal, and re-reading
+            # from byte 0 would replay an old rate_limited/api_overloaded event as fresh distress.
             new, offsets[key] = tail_events(path, off)
             for ev in new:
                 d = core.classify_log_event(ev) if kind == "log" else core.classify_mother_event(ev)
@@ -587,7 +655,7 @@ def cmd_estimate(args):
         print("mother-limiter: cannot read job file", file=sys.stderr)
         return 1
     cfg = load_cfg(root)
-    est = core.estimate_burn(job.get("repo") or "unknown", actor_of(job), finished_burns(root), cfg, iso(int(time.time())))
+    est = core.estimate_burn(job.get("repo") or "unknown", actor_of(job), burn_table(root, cfg, int(time.time())), cfg, iso(int(time.time())))
     print(json.dumps(est, separators=(",", ":")))
     return 0
 
