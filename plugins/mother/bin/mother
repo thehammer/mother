@@ -1976,11 +1976,27 @@ cmd_plan() {
 
 # ---------- cancel ----------
 
+# _job_locked <id> <cmd...>: run <cmd> under the job file's lockdir (the one the runner's limiter apply
+# takes), so a read-modify-write here can't interleave with it. <cmd> runs in a subshell: a `_die`
+# (exit) inside it ends only that subshell, so the lock is always released. Don't nest it for the
+# same job, and don't call it from inside another `_with_lock "$(_job_path <id>)"`.
+_job_locked() {
+    local id="$1"; shift
+    _with_lock "$(_job_path "$id")" _in_subshell "$@"
+}
+_in_subshell() { ( "$@" ); }
+
 cmd_cancel() {
     local id="${1:-}"
     [ -n "$id" ] || _die "cancel: <id> required"
     _job_exists "$id" || _die "no such job: $id"
-    local state; state=$(jq -r .state "$(_job_path "$id")")
+    _job_locked "$id" _cancel_locked "$id" || exit $?
+}
+
+# _cancel_locked <id>: body of cmd_cancel; runs under the job lock (state is read inside it).
+_cancel_locked() {
+    local id="$1" state
+    state=$(jq -r .state "$(_job_path "$id")")
     case "$state" in
         queued|ready)   _job_transition "$id" cancelled '{"reason":"user"}' ;;
         awaiting)       # No live worker to signal — the job paused itself and
@@ -2253,6 +2269,15 @@ cmd_retry() {
     # who want a clean retry should `mother cancel` and `mother add`
     # afresh instead.
     #
+    _job_locked "$id" _retry_locked "$id" "$state" "$was_hold" || exit $?
+}
+
+# _retry_locked <id> <state> <was_hold>: the read-modify-write half of cmd_retry; runs under the job lock.
+_retry_locked() {
+    local id="$1" state="$2" was_hold="$3" job_file
+    job_file=$(_job_path "$id")
+    local cur; cur=$(jq -r .state "$job_file")
+    [ "$cur" = "$state" ] || _die "retry: job changed state while retrying ($state -> $cur)"
     # State target: `ready` if all dependencies are succeeded, otherwise
     # `queued` so _promote_ready handles them.
     local deps; deps=$(jq -c '.depends_on // []' "$job_file")
@@ -2732,7 +2757,8 @@ _rf_backoff() {
     # Under limiter enforcement the limiter's cut governs the pace: no time-based give-up, and
     # `.not_before` is set only from a server retry-after.
     local enforce=0
-    [ "$(mother_limiter_mode)" = "enforce" ] && enforce=1
+    # Same gate as dispatch: a stale or faulted limiter falls back to the time-based path.
+    ! mother_limiter_enforcing || enforce=1
     # Lifetime cap on consecutive backoffs (the counter only resets after a run
     # that really got going), so a job that keeps hitting the limit can't loop.
     local max_count; max_count=$(_backoff_int "${MOTHER_BACKOFF_MAX_COUNT:-}" 10)
@@ -4090,9 +4116,8 @@ cmd_resume() {
 
     if [ "$max_cost_given" -eq 1 ]; then
         local old_max_cost; old_max_cost=$(jq -r '.max_cost_usd // "none"' "$job_file" 2>/dev/null)
-        local _mmerged
-        _mmerged=$(jq --argjson m "$new_max_cost_json" '.max_cost_usd = $m' "$job_file") \
-            && _atomic_write "$job_file" "$_mmerged"
+        _with_lock "$job_file" mother_job_update "$id" '.max_cost_usd = $m' --argjson m "$new_max_cost_json" \
+            || _die "resume: could not update max_cost_usd"
         rm -f "${RUNNER_DIR}/${id}.cost-cap"
         _append_event "$id" "max_cost_raised" \
             "$(jq -nc --arg from "$old_max_cost" --arg to "${new_max_cost_json}" '{from: $from, to: $to}')"
@@ -4111,7 +4136,6 @@ cmd_resume() {
     # failed retry budget, so the as-is auto-retry the failure router may
     # grant on the next failure shouldn't be foreclosed by a budget spent
     # before the operator stepped in.
-    local merged
     local resume_jq decision_kind
     decision_kind=$(jq -r 'if .decision != null and .decision.resolved_at == null then .decision.kind // "" else "" end' "$job_file")
     resume_jq='
@@ -4128,10 +4152,8 @@ cmd_resume() {
         | .state = "ready"
         | '"$(_decision_resume_jq "$decision_kind")"'
         | '"$MOTHER_DECISION_RESOLVE_JQ"
-    merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" \
-        --arg opt "$option" --arg src "$source" --arg sess "$session" --arg agent "$agent" \
-        "$resume_jq" "$job_file") || _die "resume: jq update failed"
-    _atomic_write "$job_file" "$merged"
+    _job_locked "$id" _resume_write_locked "$id" "$resume_jq" "$answer" "$option" "$source" "$session" "$agent" \
+        || _die "resume: jq update failed"
     if [ -n "$option" ]; then
         _append_event "$id" "decision_resolved" "$(jq -nc --arg d "$(jq -r '.decision.id' "$job_file")" --arg o "$option" --arg s "$source" '{decision_id: $d, option: $o, source: $s}')"
     fi
@@ -4139,6 +4161,18 @@ cmd_resume() {
         "$(jq -nc --arg a "$answer" --arg o "$option" --arg s "$source" \
             '{answer: $a, option: (if $o == "" then null else $o end), source: $s}')"
     echo "$id: awaiting -> ready (worker will spawn on next daemon tick)"
+}
+
+# _resume_write_locked <id> <jq> <answer> <option> <source> <session> <agent>: the single atomic write of
+# cmd_resume; runs under the job lock.
+_resume_write_locked() {
+    local id="$1" resume_jq="$2" answer="$3" option="$4" source="$5" session="$6" agent="$7"
+    local job_file merged
+    job_file=$(_job_path "$id")
+    merged=$(jq --arg a "$answer" --arg ts "$(_iso_now)" \
+        --arg opt "$option" --arg src "$source" --arg sess "$session" --arg agent "$agent" \
+        "$resume_jq" "$job_file") || return 1
+    _atomic_write "$job_file" "$merged"
 }
 
 # ---------- events (for the hook) ----------
@@ -5709,7 +5743,7 @@ _limiter_refuse() {
 
 # mother limiter mode [observe|enforce|off] [--source cli]
 # No argument prints the mode. Setting it is human-only: refused from a worker (same check as
-# `mother quota`). Only the owner turns enforcement on; MOTHER_LIMITER_MODE=off still overrides the file.
+# `mother quota`), an agent session or a non-TTY stdin. Only the owner turns enforcement on; MOTHER_LIMITER_MODE=off still overrides the file.
 _limiter_cmd_mode() {
     local want="" by="cli"
     while [ $# -gt 0 ]; do
@@ -5724,8 +5758,8 @@ _limiter_cmd_mode() {
         if [ "${MOTHER_LIMITER_MODE:-}" = "off" ]; then echo "$m  (MOTHER_LIMITER_MODE=off overrides the mode file)"; else echo "$m"; fi
         return 0
     fi
-    if _quota_in_worker; then
-        _limiter_refuse "$want" "$_QUOTA_WORKER_WHY" "$(printf '%s' "$by" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+    if _owner_only_refusal; then
+        _limiter_refuse "$want" "$_OWNER_ONLY_WHY" "$(printf '%s' "$by" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
     fi
     [ "$by" = "cli" ] || _die "limiter: bad --source: only 'cli' is accepted"
     mother_limiter_mode_set "$want" "$by" || return $?
@@ -5774,17 +5808,25 @@ cmd_limiter() {
 _priority_value() { case "$1" in raise) echo 1 ;; lower) echo -1 ;; *) echo 0 ;; esac; }
 _priority_name() { case "$1" in 1) echo raise ;; -1) echo lower ;; *) echo normal ;; esac; }
 
-# _priority_raise_guard <by>: raising a job's priority is the owner's call, at a terminal. Refuses (exit)
-# from a worker, from an agent session (CLAUDECODE / CLAUDE_CODE_ENTRYPOINT) and when stdin is not a TTY.
-# MOTHER_TEST_FORCE_TTY=1 stands in for the TTY only under MOTHER_TEST_ROOT=1 (the test harness); the
-# worker and agent-session checks are never bypassed.
-_priority_raise_guard() {
-    local why=""
-    if _quota_in_worker; then why="$_QUOTA_WORKER_WHY"
-    elif [ -n "${CLAUDECODE:-}" ] || [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]; then why="caller is an agent session"
-    elif [ ! -t 0 ] && ! { [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ "${MOTHER_TEST_FORCE_TTY:-}" = "1" ]; }; then why="stdin is not a terminal"
+# _owner_only_refusal: sets _OWNER_ONLY_WHY and returns 0 when the caller is not the owner at a terminal:
+# a Mother worker, an agent session (CLAUDECODE / CLAUDE_CODE_ENTRYPOINT) or stdin that is not a TTY.
+# Returns 1 for the owner. MOTHER_TEST_FORCE_TTY=1 stands in for the TTY only under MOTHER_TEST_ROOT=1
+# (the test harness); the worker and agent-session checks are never bypassed.
+_OWNER_ONLY_WHY=""
+_owner_only_refusal() {
+    _OWNER_ONLY_WHY=""
+    if _quota_in_worker; then _OWNER_ONLY_WHY="$_QUOTA_WORKER_WHY"
+    elif [ -n "${CLAUDECODE:-}" ] || [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]; then _OWNER_ONLY_WHY="caller is an agent session"
+    elif [ ! -t 0 ] && ! { [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ "${MOTHER_TEST_FORCE_TTY:-}" = "1" ]; }; then _OWNER_ONLY_WHY="stdin is not a terminal"
     fi
-    [ -z "$why" ] || _die "$1: raising priority is refused ($why): only the owner, at a terminal, can raise priority"
+    [ -n "$_OWNER_ONLY_WHY" ]
+}
+
+# _priority_raise_guard <by>: raising (or resetting a raised) priority is the owner's call, at a terminal.
+_priority_raise_guard() {
+    if _owner_only_refusal; then
+        _die "$1: changing a raised priority is refused ($_OWNER_ONLY_WHY): only the owner, at a terminal, can raise priority"
+    fi
 }
 
 # mother priority <id> raise|lower|normal
@@ -5796,17 +5838,24 @@ cmd_priority() {
     case "$want" in raise|lower|normal) ;; *) _die "priority: expected raise, lower or normal (got: $want)" ;; esac
     _job_exists "$id" || _die "no such job: $id"
     [ "$want" != "raise" ] || _priority_raise_guard "priority"
-    local job_file state from to
+    local job_file; job_file=$(_job_path "$id")
+    # Resetting a raised job to normal is owner-only too (checked on the value read under the lock).
+    _job_locked "$id" _priority_apply "$id" "$want" || exit $?
+    echo "$id: priority $want"
+}
+
+# _priority_apply <id> <want>: read-modify-write body of cmd_priority; runs under the job lock.
+_priority_apply() {
+    local id="$1" to="$2" job_file state from
     job_file=$(_job_path "$id")
     state=$(jq -r '.state // ""' "$job_file")
     case "$state" in queued|ready) ;; *) _die "priority: $id is in state $state (only queued or ready jobs can change priority)" ;; esac
     from=$(_priority_name "$(jq -r '.priority_adjust // 0' "$job_file")")
-    to="$want"
+    [ "$from" != "raise" ] || [ "$to" != "normal" ] || _priority_raise_guard "priority"
     if [ "$from" != "$to" ]; then
         _job_update "$id" ".priority_adjust = $(_priority_value "$to")"
         _append_event "$id" "priority_changed" "$(jq -nc --arg f "$from" --arg t "$to" '{from: $f, to: $t, by: "cli"}')"
     fi
-    echo "$id: priority $to"
 }
 
 # ---------- quota gate ----------
@@ -5955,8 +6004,8 @@ cmd_ack() {
     fi
     if [ "$id" = "limiter" ] && [ "$reason" = "limiter_fault" ]; then
         # Not tied to a job: `mother ack limiter limiter_fault`. Same worker guard as the mode switch.
-        if _quota_in_worker; then
-            _limiter_refuse "ack:$reason" "$_QUOTA_WORKER_WHY" "$(printf '%s' "$source" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
+        if _owner_only_refusal; then
+            _limiter_refuse "ack:$reason" "$_OWNER_ONLY_WHY" "$(printf '%s' "$source" | tr -cd '[:alnum:]._:-' | cut -c1-70)"
         fi
         local lmarker="$MOTHER_ROOT/limiter-fault-marker.json" lsince
         mother_limiter_unhealthy || _die "ack: limiter_fault is not raised (the limiter is healthy or not enforcing)"

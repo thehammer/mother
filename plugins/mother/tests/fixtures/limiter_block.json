@@ -1,5 +1,5 @@
 {
-  "_doc": "Golden fixture for the backpressure limiter wire shape (L2). Nostromo vendors this file: keep it stable, additive changes only. limiter_block is the `limiter` key of every broker subscribe snapshot (data: {sub, jobs, quota, limiter}; the key is omitted when the CLI cannot produce it) and the `limiter` key of every `limiter` event (category `limiter`, published only when the block's content changes: age_s, last_distress.ago_s, concurrency.detail and waiting[].reason are ignored for that comparison); it is the output of `mother limiter status --json`. With the limiter switched off the block is exactly {\"v\":1,\"mode\":\"off\"} and nothing else. v: block version, 1. mode: observe (L2 always shows observe-only values: nothing here changes dispatch; label them as 'would', not 'is') | off. age_s: seconds since the limiter last ticked (state.json mtime), null when it never has. stale: true when state.json is missing or older than 3 x MOTHER_LIMITER_INTERVAL; show 'limiter not running, dispatch uses fixed concurrency'. fault: the runner's limiter-fault.json ({at, why}) or null; a fault also means dispatch uses fixed concurrency. When stale is true and no tick ever ran, concurrency, burn, reserve and interactive are null. concurrency: ceiling (MOTHER_CONCURRENCY), allowed (what the limiter would allow, <= ceiling), effective (running jobs now), state (steady | backoff | ramp | uncalibrated), detail (human text such as 'cut 6m ago after 429; +1 in 9m', may be empty). burn: fleet_usd_per_min (measured spend rate, null when unknown), sustainable_usd_per_min (what the tighter window can carry, null when unknown), pace (projected / sustainable, 1.0 = exactly sustainable, null when unknown), window (five_hour | seven_day: the window pace is for), calibrated (k, the %-of-window per USD factor, has enough samples). reserve: pct (share of the 5h window kept for interactive sessions), holding (the reserve is what is blocking admissions now), enforceable (false while the quota gate is off or the feed is stale: the reserve is advisory). interactive: state (ok | high | unknown) and pct_per_hour (window use not explained by Mother's own spend, null when unknown). overage_in_use: the account is running on overage. gate: the quota gate (on | off | off_until_reset). last_distress: null or {at (ISO UTC), ago_s, kind (api_retry | result_error | rate_limit_rejected | failure_routed), status (HTTP code such as 429, or a reason string), job_id}. distress_24h: distress events in the last 24h. waiting: one row per ready or queued job (an awaiting job is not waiting in this sense): id; code (dep_wait | backoff | ratelimit_paused | quota_over_cap | low_disk | concurrency_full | next); reason (human text); source (dispatch = what actually holds the job today | limiter = the limiter's own reason; in observe mode the limiter's view appears only as `would`); advisory (the reason is not enforced); would: null, or {code, reason} the limiter's own decision when it differs (codes retry_after | backoff | ramp | concurrency_full | budget_pace | reserve | interactive_personal); since (ISO UTC; changes only when code changes).",
+  "_doc": "Golden fixture for the backpressure limiter wire shape (L2). Nostromo vendors this file: keep it stable, additive changes only. limiter_block is the `limiter` key of every broker subscribe snapshot (data: {sub, jobs, quota, limiter}; the key is omitted when the CLI cannot produce it) and the `limiter` key of every `limiter` event (category `limiter`, published only when the block's content changes: age_s, last_distress.ago_s, concurrency.detail and waiting[].reason are ignored for that comparison); it is the output of `mother limiter status --json`. With the limiter switched off the block is exactly {\"v\":1,\"mode\":\"off\"} and nothing else. v: block version, 1. mode: observe | enforce | off. In observe (the default) the values are observe-only and change nothing in dispatch: label them as 'would', not 'is'. In enforce (set only by the owner with `mother limiter mode enforce`) the limiter controls admission of NEW work (running jobs are never touched) while it is healthy: waiting rows carry the limiter's own reason as `source: limiter`; when it is stale or faulted dispatch falls back to fixed concurrency (see stale and fault) and the rows are dispatch's again. age_s: seconds since the limiter last ticked (state.json mtime), null when it never has. stale: true when state.json is missing or older than 3 x MOTHER_LIMITER_INTERVAL; show 'limiter not running, dispatch uses fixed concurrency'. fault: the runner's limiter-fault.json ({at, why}) or null; a fault also means dispatch uses fixed concurrency. When stale is true and no tick ever ran, concurrency, burn, reserve and interactive are null. concurrency: ceiling (MOTHER_CONCURRENCY), allowed (what the limiter would allow, <= ceiling), effective (running jobs now), state (steady | backoff | ramp | uncalibrated), detail (human text such as 'cut 6m ago after 429; +1 in 9m', may be empty). burn: fleet_usd_per_min (measured spend rate, null when unknown), sustainable_usd_per_min (what the tighter window can carry, null when unknown), pace (projected / sustainable, 1.0 = exactly sustainable, null when unknown), window (five_hour | seven_day: the window pace is for), calibrated (k, the %-of-window per USD factor, has enough samples). reserve: pct (share of the 5h window kept for interactive sessions), holding (the reserve is what is blocking admissions now), enforceable (false while the quota gate is off or the feed is stale: the reserve is advisory). interactive: state (ok | high | unknown) and pct_per_hour (window use not explained by Mother's own spend, null when unknown). overage_in_use: the account is running on overage. gate: the quota gate (on | off | off_until_reset). last_distress: null or {at (ISO UTC), ago_s, kind (api_retry | result_error | rate_limit_rejected | failure_routed), status (HTTP code such as 429, or a reason string), job_id}. distress_24h: distress events in the last 24h. waiting: one row per ready or queued job (an awaiting job is not waiting in this sense): id; code (dep_wait | backoff | ratelimit_paused | quota_over_cap | low_disk | concurrency_full | next); reason (human text); source (dispatch = what actually holds the job today | limiter = the limiter's own reason, only under enforce; in observe mode the limiter's view appears only as `would`); advisory (the reason is not enforced: under enforce a budget hold while the quota gate is off or the feed is stale, which the limiter admits anyway); would: null, or {code, reason} the limiter's own decision when it differs (codes retry_after | backoff | ramp | concurrency_full | budget_pace | reserve | interactive_personal); under enforce `code` itself may also be any of retry_after | ramp | budget_pace | reserve | interactive_personal | backoff (the limiter's reason) as well as the dispatch codes; since (ISO UTC; changes only when code changes). Needs-attention kinds a client may see in `attention.json` / `mother status --format json` from the limiter (L3, enforce only): `limiter_fault` (mode enforce and the limiter is stale or faulted; dispatch fell back to fixed concurrency; acknowledge with `mother ack limiter limiter_fault`, owner-only) and `limiter_enforcing_gate_off` (informational: budget terms are advisory because the quota gate is off). `limiter_block_enforce` below is an example block under enforce.",
   "limiter_block": {
     "v": 1,
     "mode": "observe",
@@ -51,6 +51,72 @@
           "reason": "reserve held for interactive work"
         },
         "since": "2026-11-06T22:12:00Z"
+      }
+    ]
+  },
+  "limiter_block_enforce": {
+    "v": 1,
+    "mode": "enforce",
+    "age_s": 4,
+    "stale": false,
+    "fault": null,
+    "concurrency": {
+      "ceiling": 5,
+      "allowed": 3,
+      "effective": 3,
+      "state": "backoff",
+      "detail": "cut 6m ago after 429; +1 in 9m"
+    },
+    "burn": {
+      "fleet_usd_per_min": 0.84,
+      "sustainable_usd_per_min": 0.61,
+      "pace": 1.38,
+      "window": "five_hour",
+      "calibrated": true
+    },
+    "reserve": {
+      "pct": 15,
+      "holding": false,
+      "enforceable": true
+    },
+    "interactive": {
+      "state": "ok",
+      "pct_per_hour": 4.2
+    },
+    "overage_in_use": false,
+    "gate": "on",
+    "last_distress": {
+      "at": "2026-11-06T22:10:03Z",
+      "ago_s": 360,
+      "kind": "api_retry",
+      "status": 429,
+      "job_id": "20261106-221000-example"
+    },
+    "distress_24h": 1,
+    "waiting": [
+      {
+        "id": "20261106-221200-example",
+        "code": "concurrency_full",
+        "reason": "limiter allows 3 at a time; 3 running",
+        "source": "limiter",
+        "advisory": false,
+        "would": {
+          "code": "reserve",
+          "reason": "reserve held for interactive work"
+        },
+        "since": "2026-11-06T22:12:00Z"
+      },
+      {
+        "id": "20261106-221300-example",
+        "code": "budget_pace",
+        "reason": "projected spend exceeds the sustainable rate (quota gate off: advisory)",
+        "source": "limiter",
+        "advisory": true,
+        "would": {
+          "code": "budget_pace",
+          "reason": "projected spend exceeds the sustainable rate"
+        },
+        "since": "2026-11-06T22:13:00Z"
       }
     ]
   },

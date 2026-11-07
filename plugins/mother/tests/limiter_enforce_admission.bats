@@ -18,6 +18,13 @@
 #   L3-9   a dead limiter degrades enforce to observe-style dispatch, loudly (limiter_fault attention).
 #   L3-10  force_start skips budget holds, never backoff / ramp.
 #   L3-11  no divergence between what the limiter admitted and what dispatch did.
+#   L3-12  the owner-only switches (`limiter mode <x>`, `ack limiter limiter_fault`, raising or undoing a raised
+#          priority) also refuse an agent session (CLAUDECODE / CLAUDE_CODE_ENTRYPOINT) and a non-terminal stdin;
+#          the happy paths here use MOTHER_TEST_FORCE_TTY=1 (honoured only under MOTHER_TEST_ROOT=1).
+#   L3-13  cancel / retry / resume / priority take the job-file lock the limiter's apply uses, so neither side's
+#          write is lost; a failing command never leaks the lock.
+#   L3-8b  route-failure takes the enforce path only while the limiter is really enforcing (fresh enforce-mode
+#          state.json, no limiter-fault.json); otherwise it behaves exactly as in observe mode.
 
 load 'test_helper'
 load 'gh_mock'
@@ -144,6 +151,7 @@ _needs() { mother status --format json | jq -c '.needs_attention'; }
 }
 
 @test "L3-1: setting enforce writes mode.json {mode, changed_at, changed_by} and one audit line" {
+    export MOTHER_TEST_FORCE_TTY=1
     run mother limiter mode enforce --source cli
     [ "$status" -eq 0 ]
     jq -e '.mode == "enforce" and (.changed_at | length > 0) and (.changed_by | length > 0)' "$MOTHER_ROOT/limiter/mode.json" >/dev/null
@@ -154,6 +162,7 @@ _needs() { mother status --format json | jq -c '.needs_attention'; }
 }
 
 @test "L3-1: the same mode again writes nothing: file and audit trail are untouched" {
+    export MOTHER_TEST_FORCE_TTY=1
     mother limiter mode enforce --source cli
     local before_file before_audit
     before_file=$(cat "$MOTHER_ROOT/limiter/mode.json"); before_audit=$(cat "$MOTHER_ROOT/limiter/mode-audit.jsonl")
@@ -165,6 +174,7 @@ _needs() { mother status --format json | jq -c '.needs_attention'; }
 }
 
 @test "L3-1: changing the mode again appends a second audit line" {
+    export MOTHER_TEST_FORCE_TTY=1
     mother limiter mode enforce --source cli
     mother limiter mode observe --source cli
     [ "$(wc -l < "$MOTHER_ROOT/limiter/mode-audit.jsonl" | tr -d ' ')" = "2" ]
@@ -172,7 +182,7 @@ _needs() { mother status --format json | jq -c '.needs_attention'; }
 }
 
 @test "L3-1: a worker (MOTHER_JOB_ID set) is refused, the refusal is logged and the mode is unchanged" {
-    run env MOTHER_JOB_ID=job-w mother limiter mode enforce --source cli
+    run env MOTHER_TEST_FORCE_TTY=1 MOTHER_JOB_ID=job-w mother limiter mode enforce --source cli
     [ "$status" -ne 0 ]
     [ -s "$MOTHER_ROOT/limiter/mode-refusals.jsonl" ]
     [ ! -e "$MOTHER_ROOT/limiter/mode.json" ] || [ "$(jq -r .mode "$MOTHER_ROOT/limiter/mode.json")" = "observe" ]
@@ -181,13 +191,14 @@ _needs() { mother status --format json | jq -c '.needs_attention'; }
 }
 
 @test "L3-1: a set-but-empty MOTHER_JOB_ID is still a worker" {
-    run env MOTHER_JOB_ID= mother limiter mode enforce --source cli
+    run env MOTHER_TEST_FORCE_TTY=1 MOTHER_JOB_ID= mother limiter mode enforce --source cli
     [ "$status" -ne 0 ]
     [ -s "$MOTHER_ROOT/limiter/mode-refusals.jsonl" ]
     [ ! -e "$MOTHER_ROOT/limiter/mode.json" ] || [ "$(jq -r .mode "$MOTHER_ROOT/limiter/mode.json")" = "observe" ]
 }
 
 @test "L3-1: a refused worker cannot turn enforce off either" {
+    export MOTHER_TEST_FORCE_TTY=1
     mother limiter mode enforce --source cli
     run env MOTHER_JOB_ID=job-w mother limiter mode observe --source cli
     [ "$status" -ne 0 ]
@@ -198,6 +209,7 @@ _needs() { mother status --format json | jq -c '.needs_attention'; }
     mkdir -p "$MOTHER_ROOT/anc"
     printf '#!/usr/bin/env bash\nmother limiter mode enforce --source cli\necho $? > "%s/anc/rc"\n' "$MOTHER_ROOT" > "$MOTHER_ROOT/anc/mother-run-job"
     chmod +x "$MOTHER_ROOT/anc/mother-run-job"
+    export MOTHER_TEST_FORCE_TTY=1
     run bash "$MOTHER_ROOT/anc/mother-run-job"
     [ "$(cat "$MOTHER_ROOT/anc/rc")" != "0" ]
     [ -s "$MOTHER_ROOT/limiter/mode-refusals.jsonl" ]
@@ -277,13 +289,13 @@ _padd() {
     jq -e 'has("by")' <<<"$d" >/dev/null
 }
 
-@test "L3-7: lower and normal are always allowed, even from a worker, and a queued job can be changed" {
-    make_job p-1 queued ".priority_adjust = 1"
+@test "L3-7: lower and normal are allowed from a worker when the job is not raised, and a queued job can be changed" {
+    make_job p-1 queued
     run env MOTHER_JOB_ID=job-w mother priority p-1 lower
     [ "$status" -eq 0 ]
     [ "$(_jf p-1 '.priority_adjust')" = "-1" ]
     local d; d=$(_ev p-1 priority_changed)
-    [ "$(jq -r .from <<<"$d")" = "raise" ]
+    [ "$(jq -r .from <<<"$d")" = "normal" ]
     [ "$(jq -r .to <<<"$d")" = "lower" ]
     run env CLAUDECODE=1 mother priority p-1 normal
     [ "$status" -eq 0 ]
@@ -742,7 +754,7 @@ _padd() {
     _mode enforce; _bishop 10 10
     _hand_state 4
     _age "$MOTHER_ROOT/limiter/state.json" -120
-    run mother ack limiter limiter_fault
+    run env MOTHER_TEST_FORCE_TTY=1 mother ack limiter limiter_fault
     [ "$status" -eq 0 ]
     [ -s "$MOTHER_ROOT/acks/_limiter.json" ]
     run _needs
@@ -753,7 +765,7 @@ _padd() {
     _mode enforce; _bishop 10 10
     _hand_state 4
     _age "$MOTHER_ROOT/limiter/state.json" -120
-    run env MOTHER_JOB_ID=job-w mother ack limiter limiter_fault
+    run env MOTHER_TEST_FORCE_TTY=1 MOTHER_JOB_ID=job-w mother ack limiter limiter_fault
     [ "$status" -ne 0 ]
     [ ! -s "$MOTHER_ROOT/acks/_limiter.json" ]
 }
@@ -761,8 +773,9 @@ _padd() {
 @test "L3-9: acking limiter_fault when it is not raised is refused" {
     _mode enforce; _bishop 10 10
     _hand_state 4
-    run mother ack limiter limiter_fault
+    run env MOTHER_TEST_FORCE_TTY=1 mother ack limiter limiter_fault
     [ "$status" -ne 0 ]
+    [[ "$output" == *"not raised"* ]]
     [ ! -s "$MOTHER_ROOT/acks/_limiter.json" ]
 }
 
@@ -802,7 +815,7 @@ _rl_job() {
 }
 
 @test "L3-8: under enforce a rate-limited job goes back to ready with no not_before when the server gave no retry-after" {
-    _mode enforce
+    _mode enforce; _hand_state 4     # a fresh enforce-mode tick: the limiter is really enforcing
     _rl_job rl-1 . '{"api_error_status":429}'
     run mother route-failure rl-1
     [ "$status" -eq 0 ]
@@ -817,7 +830,7 @@ _rl_job() {
 }
 
 @test "L3-8: under enforce a server-given retry-after is honoured as now + retry_after_s, and the shared pause is still written" {
-    _mode enforce
+    _mode enforce; _hand_state 4     # a fresh enforce-mode tick: the limiter is really enforcing
     _rl_job rl-2 . '{"api_error_status":429,"retry_after_s":90}'
     local t0 t1; t0=$(_now)
     run mother route-failure rl-2
@@ -830,7 +843,7 @@ _rl_job() {
 }
 
 @test "L3-8: under enforce an absurd retry-after is clamped to the one hour maximum" {
-    _mode enforce
+    _mode enforce; _hand_state 4     # a fresh enforce-mode tick: the limiter is really enforcing
     _rl_job rl-3 . '{"api_error_status":429,"retry_after_s":86400}'
     local t1
     run mother route-failure rl-3
@@ -841,7 +854,7 @@ _rl_job() {
 }
 
 @test "L3-8: under enforce elapsed time alone never gives up: a first back-off a day ago is still a back-off" {
-    _mode enforce
+    _mode enforce; _hand_state 4     # a fresh enforce-mode tick: the limiter is really enforcing
     _rl_job rl-4 ".backoff_count = 2 | .backoff_first_at = $(( $(_now) - 100000 ))" '{"api_error_status":429}'
     run mother route-failure rl-4
     [ "$status" -eq 0 ]
@@ -851,7 +864,7 @@ _rl_job() {
 }
 
 @test "L3-8: under enforce the lifetime backoff count still holds the job backoff_exhausted" {
-    _mode enforce
+    _mode enforce; _hand_state 4     # a fresh enforce-mode tick: the limiter is really enforcing
     _rl_job rl-5 ".backoff_count = 10 | .backoff_first_at = $(( $(_now) - 60 ))" '{"api_error_status":429}'
     run mother route-failure rl-5
     [ "$status" -eq 0 ]
@@ -876,7 +889,62 @@ _rl_job() {
     [ "$(_jf rl-7 .operator_hold.sub_reason)" = "backoff_exhausted" ]
 }
 
+@test "L3-8: with mode enforce but a stale state.json a rate-limited job takes the observe path: delay from the exponential schedule, no limiter marker" {
+    _mode enforce
+    _hand_state 4
+    _age "$MOTHER_ROOT/limiter/state.json" -120
+    _rl_job rl-8 . '{"api_error_status":429}'
+    local t0; t0=$(_now)
+    run mother route-failure rl-8
+    [ "$status" -eq 0 ]
+    [ "$(_jf rl-8 .state)" = "ready" ]
+    [ "$(_jf rl-8 .not_before)" -ge $((t0 + 30)) ]
+    [ "$(jq -r .action <<<"$(_ev rl-8 failure_routed)")" = "backed_off" ]
+    [ "$(jq -r '.limiter // "none"' <<<"$(_ev rl-8 failure_routed)")" != "enforce" ]
+}
+
+@test "L3-8: with mode enforce but a stale state.json the time-based give-up still applies" {
+    _mode enforce
+    _hand_state 4
+    _age "$MOTHER_ROOT/limiter/state.json" -120
+    _rl_job rl-9 ".backoff_count = 2 | .backoff_first_at = $(( $(_now) - 100000 ))" '{"api_error_status":429}'
+    run mother route-failure rl-9
+    [ "$status" -eq 0 ]
+    [ "$(_jf rl-9 .state)" = "awaiting" ]
+    [ "$(_jf rl-9 .operator_hold.sub_reason)" = "backoff_exhausted" ]
+}
+
+@test "L3-8: with mode enforce and a limiter-fault.json (state.json fresh) a rate-limited job takes the observe path" {
+    _mode enforce
+    _hand_state 4
+    jq -nc '{at: "2026-11-06T00:00:00Z", why: "exit 1"}' > "$RUNNER_DIR/limiter-fault.json"
+    _rl_job rl-10 . '{"api_error_status":429}'
+    local t0; t0=$(_now)
+    run mother route-failure rl-10
+    [ "$status" -eq 0 ]
+    [ "$(_jf rl-10 .state)" = "ready" ]
+    [ "$(_jf rl-10 .not_before)" -ge $((t0 + 30)) ]
+    [ "$(jq -r '.limiter // "none"' <<<"$(_ev rl-10 failure_routed)")" != "enforce" ]
+
+    _rl_job rl-11 ".backoff_count = 2 | .backoff_first_at = $(( $(_now) - 100000 ))" '{"api_error_status":429}'
+    run mother route-failure rl-11
+    [ "$(_jf rl-11 .state)" = "awaiting" ]
+    [ "$(_jf rl-11 .operator_hold.sub_reason)" = "backoff_exhausted" ]
+}
+
+@test "L3-8: mode enforce with a state.json written in observe mode is not enforcing either" {
+    _mode enforce
+    _hand_state 4
+    jq '.mode = "observe"' "$MOTHER_ROOT/limiter/state.json" > "$MOTHER_ROOT/s.tmp" && mv "$MOTHER_ROOT/s.tmp" "$MOTHER_ROOT/limiter/state.json"
+    _rl_job rl-12 . '{"api_error_status":429}'
+    local t0; t0=$(_now)
+    run mother route-failure rl-12
+    [ "$(_jf rl-12 .not_before)" -ge $((t0 + 30)) ]
+    [ "$(jq -r '.limiter // "none"' <<<"$(_ev rl-12 failure_routed)")" != "enforce" ]
+}
+
 # ===========================================================================
+
 # L3-11  the limiter and dispatch agree
 # ===========================================================================
 
@@ -921,4 +989,289 @@ _no_divergence() {
     [ "$SPAWNED" = "b,a" ]
     _tick
     _no_divergence
+}
+
+# ===========================================================================
+# L3-12  the owner-only switches also refuse an agent session and a non-terminal stdin
+#        (a Claude Code session is not "the owner at a terminal", whatever its env says)
+# ===========================================================================
+
+# Asserts a refused `limiter mode` call: non-zero, mode file byte-identical to <before>, no audit line, refusal logged.
+_assert_mode_untouched() {   # <before-content>
+    [ "$(cat "$MOTHER_ROOT/limiter/mode.json")" = "$1" ]
+    [ "$(mother limiter mode)" = "observe" ]
+    [ ! -s "$MOTHER_ROOT/limiter/mode-audit.jsonl" ]
+    [ "$(wc -l < "$MOTHER_ROOT/limiter/mode-refusals.jsonl" | tr -d ' ')" = "1" ]
+    grep -q enforce "$MOTHER_ROOT/limiter/mode-refusals.jsonl"
+}
+
+@test "L3-12: limiter mode enforce is refused when CLAUDECODE is set, even with a terminal; nothing changes and the refusal is logged" {
+    _mode observe
+    local before; before=$(cat "$MOTHER_ROOT/limiter/mode.json")
+    run env MOTHER_TEST_FORCE_TTY=1 CLAUDECODE=1 mother limiter mode enforce --source cli
+    [ "$status" -ne 0 ]
+    _assert_mode_untouched "$before"
+}
+
+@test "L3-12: limiter mode enforce is refused when CLAUDE_CODE_ENTRYPOINT is set, even with a terminal; nothing changes and the refusal is logged" {
+    _mode observe
+    local before; before=$(cat "$MOTHER_ROOT/limiter/mode.json")
+    run env MOTHER_TEST_FORCE_TTY=1 CLAUDE_CODE_ENTRYPOINT=cli mother limiter mode enforce --source cli
+    [ "$status" -ne 0 ]
+    _assert_mode_untouched "$before"
+}
+
+@test "L3-12: limiter mode enforce is refused when stdin is not a terminal (the bats default); nothing changes and the refusal is logged" {
+    _mode observe
+    local before; before=$(cat "$MOTHER_ROOT/limiter/mode.json")
+    run mother limiter mode enforce --source cli
+    [ "$status" -ne 0 ]
+    _assert_mode_untouched "$before"
+}
+
+@test "L3-12: limiter mode enforce works for the owner at a terminal (no agent environment)" {
+    _mode observe
+    run env MOTHER_TEST_FORCE_TTY=1 mother limiter mode enforce --source cli
+    [ "$status" -eq 0 ]
+    [ "$(jq -r .mode "$MOTHER_ROOT/limiter/mode.json")" = "enforce" ]
+    [ "$(wc -l < "$MOTHER_ROOT/limiter/mode-audit.jsonl" | tr -d ' ')" = "1" ]
+    [ ! -s "$MOTHER_ROOT/limiter/mode-refusals.jsonl" ]
+}
+
+@test "L3-12: an agent session cannot switch enforcement off either" {
+    _mode enforce
+    run env MOTHER_TEST_FORCE_TTY=1 CLAUDECODE=1 mother limiter mode observe --source cli
+    [ "$status" -ne 0 ]
+    [ "$(jq -r .mode "$MOTHER_ROOT/limiter/mode.json")" = "enforce" ]
+    run mother limiter mode observe --source cli
+    [ "$status" -ne 0 ]
+    [ "$(jq -r .mode "$MOTHER_ROOT/limiter/mode.json")" = "enforce" ]
+}
+
+@test "L3-12: reading the mode stays open to an agent session and to a non-terminal stdin" {
+    _mode enforce
+    run env CLAUDECODE=1 mother limiter mode
+    [ "$status" -eq 0 ]
+    [[ "$output" == *enforce* ]]
+    run env CLAUDE_CODE_ENTRYPOINT=cli mother limiter mode
+    [ "$status" -eq 0 ]
+    [[ "$output" == *enforce* ]]
+    run mother limiter mode
+    [ "$status" -eq 0 ]
+    [[ "$output" == *enforce* ]]
+    [ ! -s "$MOTHER_ROOT/limiter/mode-refusals.jsonl" ]
+}
+
+# A raised limiter_fault: enforce mode, a stale state.json.
+_raise_limiter_fault() {
+    _mode enforce; _bishop 10 10
+    _hand_state 4
+    _age "$MOTHER_ROOT/limiter/state.json" -120
+}
+
+_assert_ack_refused() {
+    [ ! -s "$MOTHER_ROOT/acks/_limiter.json" ]
+    [ "$(wc -l < "$MOTHER_ROOT/limiter/mode-refusals.jsonl" | tr -d ' ')" = "1" ]
+    grep -q "limiter_fault" "$MOTHER_ROOT/limiter/mode-refusals.jsonl"
+    run _needs
+    [ "$(jq -r '[.[] | select(.kind == "limiter_fault")][0].detail.acked' <<<"$output")" = "false" ]
+}
+
+@test "L3-12: acking limiter_fault is refused when CLAUDECODE is set, even with a terminal; no ack is written" {
+    _raise_limiter_fault
+    run env MOTHER_TEST_FORCE_TTY=1 CLAUDECODE=1 mother ack limiter limiter_fault
+    [ "$status" -ne 0 ]
+    _assert_ack_refused
+}
+
+@test "L3-12: acking limiter_fault is refused when CLAUDE_CODE_ENTRYPOINT is set, even with a terminal; no ack is written" {
+    _raise_limiter_fault
+    run env MOTHER_TEST_FORCE_TTY=1 CLAUDE_CODE_ENTRYPOINT=cli mother ack limiter limiter_fault
+    [ "$status" -ne 0 ]
+    _assert_ack_refused
+}
+
+@test "L3-12: acking limiter_fault is refused when stdin is not a terminal; no ack is written" {
+    _raise_limiter_fault
+    run mother ack limiter limiter_fault
+    [ "$status" -ne 0 ]
+    _assert_ack_refused
+}
+
+@test "L3-12: acking limiter_fault works for the owner at a terminal (no agent environment)" {
+    _raise_limiter_fault
+    run env MOTHER_TEST_FORCE_TTY=1 mother ack limiter limiter_fault
+    [ "$status" -eq 0 ]
+    [ -s "$MOTHER_ROOT/acks/_limiter.json" ]
+    run _needs
+    [ "$(jq -r '[.[] | select(.kind == "limiter_fault")][0].detail.acked' <<<"$output")" = "true" ]
+}
+
+# --- priority: undoing an owner's raise is owner-only as well ---------------
+
+@test "L3-12: resetting a raised job to normal is refused for an agent session, a non-terminal stdin and a worker; priority and events are untouched" {
+    make_job p-1 ready ".priority_adjust = 1"
+    run env MOTHER_TEST_FORCE_TTY=1 CLAUDECODE=1 mother priority p-1 normal
+    [ "$status" -ne 0 ]
+    run env MOTHER_TEST_FORCE_TTY=1 CLAUDE_CODE_ENTRYPOINT=cli mother priority p-1 normal
+    [ "$status" -ne 0 ]
+    run env MOTHER_TEST_FORCE_TTY=1 MOTHER_JOB_ID=job-w mother priority p-1 normal
+    [ "$status" -ne 0 ]
+    run mother priority p-1 normal      # no terminal
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"only the owner, at a terminal"* ]]
+    [ "$(_jf p-1 '.priority_adjust')" = "1" ]
+    [ -z "$(_ev p-1 priority_changed)" ]
+}
+
+@test "L3-12: the owner at a terminal can reset a raised job to normal" {
+    make_job p-1 ready ".priority_adjust = 1"
+    run env MOTHER_TEST_FORCE_TTY=1 mother priority p-1 normal
+    [ "$status" -eq 0 ]
+    [ "$(_jf p-1 '.priority_adjust')" = "0" ]
+    local d; d=$(_ev p-1 priority_changed)
+    [ "$(jq -r .from <<<"$d")" = "raise" ]
+    [ "$(jq -r .to <<<"$d")" = "normal" ]
+}
+
+@test "L3-12: lower stays open without a terminal even on a raised job (only normal is the owner's)" {
+    make_job p-1 ready ".priority_adjust = 1"
+    run env CLAUDECODE=1 mother priority p-1 lower
+    [ "$status" -eq 0 ]
+    [ "$(_jf p-1 '.priority_adjust')" = "-1" ]
+}
+
+@test "L3-12: lower stays open without a terminal for a job that is not raised, and so does normal on a lowered or plain job" {
+    make_job p-1 ready
+    run env CLAUDECODE=1 mother priority p-1 lower
+    [ "$status" -eq 0 ]
+    [ "$(_jf p-1 '.priority_adjust')" = "-1" ]
+    run mother priority p-1 normal
+    [ "$status" -eq 0 ]
+    [ "$(_jf p-1 '.priority_adjust')" = "0" ]
+    run mother priority p-1 normal      # no-op on a plain job
+    [ "$status" -eq 0 ]
+}
+
+@test "L3-12: raising is still refused without a terminal and changes nothing" {
+    make_job p-1 ready
+    run env CLAUDECODE=1 mother priority p-1 raise
+    [ "$status" -ne 0 ]
+    run mother priority p-1 raise
+    [ "$status" -ne 0 ]
+    [ "$(_jf p-1 '.priority_adjust // 0')" = "0" ]
+}
+
+# ===========================================================================
+# L3-13  operator commands and the limiter's apply share the job-file lock
+#        (the runner's _limiter_apply_one rewrites a ready/queued job under <job>.json.lockdir; an
+#         unlocked read-modify-write from the CLI could be overwritten by it, or overwrite it)
+# ===========================================================================
+
+# Take <id>'s job-file lock the way the limiter apply does: read the job now, and ~1s later write that
+# (stale) copy back with a limiter.wait marker and release the lock. A command that ignores the lock
+# finishes first and is then overwritten by the stale write; one that honours it waits and sees the result.
+# Sets LOCK_BG to the background pid; call `wait "$LOCK_BG"` when done.
+_stale_apply() {
+    local id="$1" jf="$JOBS_DIR/$1.json" snap
+    mkdir "$jf.lockdir"
+    snap=$(jq -c '.limiter = ((.limiter // {}) + {wait: {code: "next", source: "dispatch"}})' "$jf")
+    ( sleep 1
+      printf '%s\n' "$snap" > "$jf.tmp.apply" && mv "$jf.tmp.apply" "$jf"
+      rmdir "$jf.lockdir" ) 3>&- >/dev/null 2>&1 &
+    LOCK_BG=$!
+}
+
+_lock_gone() { [ ! -e "$JOBS_DIR/$1.json.lockdir" ]; }
+
+@test "L3-13: mother cancel waits for the job lock; the cancel is not overwritten by an in-flight limiter apply" {
+    make_job c-1 ready
+    _stale_apply c-1
+    run mother cancel c-1
+    wait "$LOCK_BG"
+    [ "$status" -eq 0 ]
+    [ "$(_jf c-1 .state)" = "cancelled" ]
+    [ "$(_jf c-1 '.limiter.wait.code')" = "next" ]     # the apply's write landed first, and was kept
+    _lock_gone c-1
+}
+
+@test "L3-13: mother retry waits for the job lock; the retry is not overwritten by an in-flight limiter apply" {
+    make_job r-1 failed ".failure_reason = \"unspecified\" | .finished_at = \"2026-09-01T00:00:00Z\""
+    _stale_apply r-1
+    run mother retry r-1 --yes
+    wait "$LOCK_BG"
+    [ "$status" -eq 0 ]
+    [ "$(_jf r-1 .state)" = "ready" ]
+    [ "$(_jf r-1 .retry_count)" = "1" ]
+    [ "$(_jf r-1 '.limiter.wait.code')" = "next" ]
+    _lock_gone r-1
+}
+
+@test "L3-13: mother resume waits for the job lock; the answer is not overwritten by an in-flight limiter apply" {
+    make_job w-1 awaiting '.question = "which way?" | .paused_reason = "question"'
+    _stale_apply w-1
+    run mother resume w-1 "go left"
+    wait "$LOCK_BG"
+    [ "$status" -eq 0 ]
+    [ "$(_jf w-1 .state)" = "ready" ]
+    [ "$(_jf w-1 .pending_answer)" = "go left" ]
+    [ "$(_jf w-1 '.limiter.wait.code')" = "next" ]
+    _lock_gone w-1
+}
+
+@test "L3-13: mother priority waits for the job lock; the change is not lost to an in-flight limiter apply" {
+    make_job q-1 ready
+    _stale_apply q-1
+    run mother priority q-1 lower
+    wait "$LOCK_BG"
+    [ "$status" -eq 0 ]
+    [ "$(_jf q-1 .priority_adjust)" = "-1" ]
+    [ "$(_jf q-1 '.limiter.wait.code')" = "next" ]
+    [ "$(jq -r .to <<<"$(_ev q-1 priority_changed)")" = "lower" ]
+    _lock_gone q-1
+}
+
+@test "L3-13: mother resume --max-cost waits for the job lock; neither the cap nor the answer is lost" {
+    make_job m-1 awaiting '.question = "more budget?" | .paused_reason = "question" | .max_cost_usd = 1'
+    _stale_apply m-1
+    run mother resume m-1 --max-cost 5 "carry on"
+    wait "$LOCK_BG"
+    [ "$status" -eq 0 ]
+    [ "$(_jf m-1 .state)" = "ready" ]
+    [ "$(_jf m-1 .max_cost_usd)" = "5" ]
+    [ "$(_jf m-1 .pending_answer)" = "carry on" ]
+    [ "$(_jf m-1 '.limiter.wait.code')" = "next" ]
+    _lock_gone m-1
+}
+
+@test "L3-13: a command that fails leaves no job lock behind (cancel of a succeeded job, priority of a running job)" {
+    make_job s-1 succeeded
+    run mother cancel s-1
+    [ "$status" -ne 0 ]
+    _lock_gone s-1
+    make_job s-2 running
+    run mother priority s-2 lower
+    [ "$status" -ne 0 ]
+    _lock_gone s-2
+    make_job s-3 succeeded
+    run mother retry s-3 --yes
+    [ "$status" -ne 0 ]
+    _lock_gone s-3
+    # and the job is still operable afterwards: a later command is not blocked by a leaked lock
+    make_job s-4 ready
+    local t0; t0=$(date +%s)
+    run mother cancel s-4
+    [ "$status" -eq 0 ]
+    [ "$(( $(date +%s) - t0 ))" -lt 5 ]
+    [ "$(_jf s-4 .state)" = "cancelled" ]
+}
+
+@test "L3-13: a failed cancel on a job whose lock is momentarily held still leaves no lock behind once it gives up its turn" {
+    make_job s-5 succeeded
+    _stale_apply s-5
+    run mother cancel s-5
+    wait "$LOCK_BG"
+    [ "$status" -ne 0 ]
+    [ "$(_jf s-5 .state)" = "succeeded" ]
+    _lock_gone s-5
 }

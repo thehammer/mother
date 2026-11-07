@@ -119,6 +119,11 @@ backstop; with the gate `off`/`off_until_reset` the budget terms are advisory (t
 item says so). If the limiter goes stale or faults, dispatch falls back to fixed concurrency and `mother status`
 shows `limiter_fault`. Watch `mother limiter report`: under enforce, `divergence` entries are a bug signal.
 
+Timing allowance: the limiter reacts on its tick (`MOTHER_LIMITER_INTERVAL`, 10 s). A job it had already admitted
+can therefore start up to about one tick (~10 s) after a 429 lands, before the cut shows in the admit list. That is
+within the plan's 30 s allowance and is not a failure of enforcement; count it only if it exceeds ~30 s. Running
+jobs are never interrupted.
+
 ## 5. Backing out
 
 - Observe-only mode changes no dispatch, so there is nothing to undo for that. To stop the limiter observing at

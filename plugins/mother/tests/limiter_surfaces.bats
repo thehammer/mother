@@ -522,7 +522,8 @@ _seed_decisions() {
         [[ "$doc" == *"$k"* ]] || { echo "_doc does not mention $k" >&2; false; }
     done
     for k in steady backoff ramp uncalibrated observe off dispatch limiter dep_wait ratelimit_paused quota_over_cap low_disk \
-             concurrency_full next budget_pace interactive_personal retry_after off_until_reset; do
+             concurrency_full next budget_pace interactive_personal retry_after off_until_reset enforce reserve \
+             limiter_fault limiter_enforcing_gate_off; do
         [[ "$doc" == *"$k"* ]] || { echo "_doc does not mention $k" >&2; false; }
     done
     jq -e '.snapshot_envelope.data | has("limiter") and has("quota") and has("jobs") and has("sub")' "$FIXTURE" >/dev/null
@@ -533,4 +534,21 @@ _seed_decisions() {
     jq -e '.limiter_block | .mode == "observe" and (.concurrency.state | IN("steady","backoff","ramp","uncalibrated"))
            and ([.waiting[].source] | all(IN("dispatch","limiter"))) and (.interactive.state | IN("ok","high","unknown"))
            and (.gate | IN("on","off","off_until_reset"))' "$FIXTURE" >/dev/null
+}
+
+@test "L3-fixture: limiter_block_enforce has the same key set as limiter_block and uses only contract enum values" {
+    # Booleans become strings first: `paths(scalars)` skips false, so advisory:true vs false would differ.
+    local norm='walk(if type == "boolean" then tostring else . end)'
+    [ "$(jq ".limiter_block_enforce | $norm" "$FIXTURE" | _keyset)" = "$(jq ".limiter_block | $norm" "$FIXTURE" | _keyset)" ]
+    jq -e '.limiter_block_enforce | .mode == "enforce" and (.concurrency.state | IN("steady","backoff","ramp","uncalibrated"))
+           and ([.waiting[].source] | all(IN("dispatch","limiter"))) and ([.waiting[].source] | any(. == "limiter"))
+           and ([.waiting[].code] | all(IN("dep_wait","backoff","ratelimit_paused","quota_over_cap","low_disk","concurrency_full","next","retry_after","ramp","budget_pace","reserve","interactive_personal")))
+           and ([.waiting[].advisory] | any(. == true))' "$FIXTURE" >/dev/null
+}
+
+@test "L3-fixture: the fixture's _doc no longer claims nothing here changes dispatch without scoping it to observe/off" {
+    local doc; doc=$(jq -r '._doc' "$FIXTURE")
+    [[ "$doc" != *"nothing here changes dispatch;"* ]]
+    [[ "$doc" == *"change nothing in dispatch"* ]]
+    [[ "$doc" == *"mode: observe | enforce | off"* ]]
 }

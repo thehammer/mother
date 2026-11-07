@@ -456,7 +456,7 @@ Kinds: `teardown_stalled`, `pr_open_stale`, `dependency_blocked`,
 longer running/ready/awaiting — display only, nothing is ever popped),
 `job_flagged` (a job carrying the `needs_attention` field), `adherence_loop`
 (more than 5 adherence reviews on one job in the last hour), and
-`plugin_cache_stale`. `mother_attention_write` publishes the list atomically to
+`plugin_cache_stale`, and (limiter, enforce only) `limiter_fault` and the informational `limiter_enforcing_gate_off`. `mother_attention_write` publishes the list atomically to
 `$MOTHER_ROOT/attention.json` (always valid JSON). Renderers: `mother status`
 with no id (queue overview, awaiting jobs, needs-attention section;
 `--format json` emits `{counts, awaiting, needs_attention}`), a one-line
@@ -625,7 +625,7 @@ running jobs are L4). It computes what it admits, holds or cuts each tick and lo
 ### Enforcement (L3)
 
 `mother limiter mode [observe|enforce|off]` (`_limiter_cmd_mode`) is the only writer of `mode.json`. Human-only: it is
-refused when `_quota_in_worker` (MOTHER_JOB_ID set, or a `mother-run-job` ancestor), logged to `limiter/mode-refusals.jsonl`;
+owner-only, stricter than the quota gate: `_owner_only_refusal` refuses a worker (`_quota_in_worker`), an agent session (`CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`) and a non-TTY stdin (same guard for the `limiter_fault` ack and for raising or un-raising `mother priority`; reading the mode is open); refusals are logged to `limiter/mode-refusals.jsonl`;
 changes append `limiter/mode-audit.jsonl`; a same-mode call writes nothing. The lock is `_switch_with_lock`
 (`lib/state.sh`, shared with the quota gate, stale takeover). No broker command sets the mode.
 
