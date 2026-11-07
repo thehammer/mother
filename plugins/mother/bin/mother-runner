@@ -1036,7 +1036,7 @@ _limiter_apply() {
     printf '%s' "$1" | jq -c '.annotations[]?' 2>/dev/null | while read -r ann; do
         id=$(printf '%s' "$ann" | jq -r '.id')
         [ -n "$id" ] || continue
-        _with_lock "$(_job_path "$id")" _limiter_apply_one "$id" "$ann" 2>/dev/null || true
+        _switch_with_lock "$(_job_path "$id").lockdir" "job" 200 _limiter_apply_one "$id" "$ann" 2>/dev/null || true
     done
 }
 

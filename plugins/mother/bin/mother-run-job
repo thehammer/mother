@@ -2418,7 +2418,7 @@ _hold_park() {
             return 1
         fi
         if ! _hold_held_valid "$(date +%s)" || ! _hold_calls_safe "$(date +%s)"; then rm -f "$park_file"; return 1; fi
-        # Test-only widening of the window between the last check and the state write.
+        # TEST-ONLY (gated on MOTHER_TEST_ROOT=1): widening of the window between the last check and the state write.
         if [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ -n "${MOTHER_TEST_PARK_DELAY_S:-}" ]; then
             sleep "$MOTHER_TEST_PARK_DELAY_S"
             # a call that started in the window aborts the park
@@ -2495,12 +2495,15 @@ _hold_call_stale_s() { _hold_num "${MOTHER_LIMITER_CALL_STALE_S:-}" 21600; }
 # this worker and no call is running. Records live in $RUNNER_DIR/<id>.calls/<tool_use_id>.json (written by
 # hooks/mother-limiter-hold.sh). A record whose hook is dead counts as running (that is a tool executing
 # after its hook passed) until it is older than MOTHER_LIMITER_CALL_STALE_S, when it is discarded as a
-# lost PostToolUse. An unreadable record counts as running. No records at all = not safe (nothing proves a
-# boundary).
+# lost PostToolUse. An unreadable record counts as running, and so does an `_unidentified` marker (enforce
+# mode: a call whose hook got no tool_use_id or could not write its record). No records at all = not safe
+# (nothing proves a boundary).
 _hold_calls_safe() {
     local now="$1" dir="$RUNNER_DIR/$id.calls" f state pid at blocked=0 hmax stale
     hmax=$(_hold_hook_max_s); stale=$(_hold_call_stale_s)
     [ -d "$dir" ] || return 1
+    # A call the hook could not identify or record may be executing: never park (cleared at next spawn).
+    [ ! -e "$dir/_unidentified" ] || return 1
     for f in "$dir"/*.json; do
         [ -f "$f" ] || continue
         state=$(jq -r '.state // empty' "$f" 2>/dev/null) || state=""

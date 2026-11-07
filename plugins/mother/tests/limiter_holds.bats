@@ -980,3 +980,79 @@ _tool_json() { printf '{"tool_name":"Bash","tool_use_id":"%s","tool_input":{"com
     [ "$(jq -r '.hooks.PostToolUse // "none"' "$f")" = "none" ]
     [ "$(jq -r '.hooks.PostToolUseFailure // "none"' "$f")" = "none" ]
 }
+
+# ===========================================================================
+# unidentified calls: input with no tool_use_id (or an unwritable record) cannot be tracked, so under
+# enforce it leaves $RUNNER_DIR/<job>.calls/_unidentified and the supervisor never parks while it exists.
+# ===========================================================================
+
+_set_mode() { printf '{"mode":"%s"}\n' "$1" > "$MOTHER_ROOT/limiter/mode.json"; }
+_unid() { echo "$RUNNER_DIR/$1.calls/_unidentified"; }
+_load_run_job() {
+    SOURCE_ONLY=1 source "$_BIN_DIR/mother-run-job" 2>/dev/null || true
+    type _hold_calls_safe >/dev/null 2>&1
+}
+# a call blocked in a live hook that is a child of this shell (worker_pid)
+_put_live_blocked() {   # <job> <tool_use_id>
+    sleep 60 & local hp=$!; BG_PIDS="$BG_PIDS $hp"
+    mkdir -p "$RUNNER_DIR/$1.calls"
+    printf '{"state": "blocked", "pid": %s, "at": %s}\n' "$hp" "$(_now)" > "$(_call_file "$1" "$2")"
+}
+
+@test "unid-1: in enforce mode, input without a tool_use_id leaves the _unidentified marker" {
+    export MOTHER_JOB_ID=uj; _set_mode enforce
+    printf '%s' '{"tool_name":"Bash"}' | "$HOOK"
+    [ -e "$(_unid uj)" ]
+}
+
+@test "unid-2: in enforce mode, empty stdin also leaves the marker" {
+    export MOTHER_JOB_ID=uj; _set_mode enforce
+    "$HOOK" </dev/null
+    [ -e "$(_unid uj)" ]
+}
+
+@test "unid-3: in observe mode (or with no mode file) no marker is created" {
+    export MOTHER_JOB_ID=uj
+    _set_mode observe
+    printf '%s' '{"tool_name":"Bash"}' | "$HOOK"
+    [ ! -e "$(_unid uj)" ]
+    rm -f "$MOTHER_ROOT/limiter/mode.json"
+    printf '%s' '{"tool_name":"Bash"}' | "$HOOK"
+    [ ! -e "$(_unid uj)" ]
+}
+
+@test "unid-4: a call with a tool_use_id does not create the marker in enforce mode" {
+    export MOTHER_JOB_ID=uj; _set_mode enforce
+    _tool_json toolu_ok | "$HOOK"
+    [ ! -e "$(_unid uj)" ]
+}
+
+@test "unid-5: post mode never removes the marker" {
+    export MOTHER_JOB_ID=uj; _set_mode enforce
+    printf '%s' '{"tool_name":"Bash"}' | "$HOOK"
+    [ -e "$(_unid uj)" ]
+    _tool_json toolu_x | "$HOOK" post
+    printf '%s' '{"tool_name":"Bash"}' | "$HOOK" post
+    [ -e "$(_unid uj)" ]
+}
+
+@test "unid-6: _hold_calls_safe is false while the marker exists even with another call blocked in a live hook, and true without it" {
+    _load_run_job
+    id=uj; worker_pid=$$
+    _put_live_blocked uj toolu_b
+    _hold_calls_safe "$(_now)"                       # baseline: one live blocked call, nothing running
+    : > "$(_unid uj)"
+    run _hold_calls_safe "$(_now)"
+    [ "$status" -eq 1 ]
+    rm -f "$(_unid uj)"
+    _hold_calls_safe "$(_now)"
+}
+
+@test "unid-7: spawn cleanup clears the marker" {
+    export MOCK_CLAUDE_TURNS=2 MOCK_CLAUDE_TURN_SLEEP=1
+    _make_job uw
+    mkdir -p "$RUNNER_DIR/uw.calls"; : > "$(_unid uw)"
+    _start_job uw
+    _wait_for 10 _marker_present
+    [ ! -e "$(_unid uw)" ]
+}

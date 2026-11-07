@@ -19,3 +19,10 @@ load 'test_helper'
     [ -f "$real/keep" ]
     rm -rf "$real"
 }
+
+@test "setup_mother_env turns the limiter off by default (MOTHER_LIMITER_MODE=off)" {
+    export MOTHER_LIMITER_MODE=enforce
+    setup_mother_env
+    [ "$MOTHER_LIMITER_MODE" = "off" ]
+    teardown_mother_env
+}

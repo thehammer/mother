@@ -2012,7 +2012,9 @@ cmd_plan() {
 # same job, and don't call it from inside another `_with_lock "$(_job_path <id>)"`.
 _job_locked() {
     local id="$1"; shift
-    _with_lock "$(_job_path "$id")" _in_subshell "$@"
+    # _switch_with_lock records the owner pid and takes over a lockdir whose owner is dead, so a
+    # command killed inside its lock window can't wedge later cancel/retry/resume/priority calls.
+    _switch_with_lock "$(_job_path "$id").lockdir" "job" 200 _in_subshell "$@"
 }
 _in_subshell() { ( "$@" ); }
 
@@ -5868,7 +5870,6 @@ cmd_priority() {
     case "$want" in raise|lower|normal) ;; *) _die "priority: expected raise, lower or normal (got: $want)" ;; esac
     _job_exists "$id" || _die "no such job: $id"
     [ "$want" != "raise" ] || _priority_raise_guard "priority"
-    local job_file; job_file=$(_job_path "$id")
     # Resetting a raised job to normal is owner-only too (checked on the value read under the lock).
     _job_locked "$id" _priority_apply "$id" "$want" || exit $?
     echo "$id: priority $want"

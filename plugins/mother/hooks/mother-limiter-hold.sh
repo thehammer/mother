@@ -27,7 +27,12 @@
 #     PostToolUseFailure). While this hook blocks it marks its call `blocked`; on release it goes back to
 #     `running` (the tool then executes). The supervisor parks a worker only when at least one call is
 #     blocked in a live hook and no call is running, so a parallel or subagent tool call that passed its
-#     hook earlier is never killed mid-request. Input without a tool_use_id is not recorded.
+#     hook earlier is never killed mid-request. Input without a tool_use_id, or a failed record write, is not
+#     recorded; in enforce mode (limiter/mode.json) it drops $root/runner/<job>.calls/_unidentified instead,
+#     which stops the supervisor parking the worker until the next spawn.
+#
+#   - Observe mode runs this hook (and `post`) on every tool call: one stdin read, one date, one small
+#     atomic write. No behaviour change: with no .hold it exits 0 straight after the record.
 #
 # Mother stops a worker parked here by terminating the worker process (the supervisor's give-up);
 # the TERM trap just removes the .held marker.
@@ -50,13 +55,24 @@ if IFS= read -r -d '' -t 5 _input; then :; fi
 if [[ "${_input:-}" =~ \"tool_use_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]+)\" ]]; then call_id="${BASH_REMATCH[1]}"; fi
 unset _input
 
-# _call_write <state> <at> — atomic; failure is silent (fail open: an unrecorded call just never parks).
-_call_write() {
-    [ -n "$call_id" ] || return 0
+# _mark_unidentified — enforce mode only: this call could not be recorded (no tool_use_id, or the record write
+# failed), so the supervisor can't know it is not running. Drop $calls_dir/_unidentified; _hold_calls_safe then
+# refuses to park until the next spawn clears the directory. Silent on failure (fail open). Runs only on the
+# failure path, so the mode file is never read on the normal hot path.
+_mark_unidentified() {
+    grep -q '"mode": *"enforce"' "$mother_root/limiter/mode.json" 2>/dev/null || return 0
     { [ -d "$calls_dir" ] || mkdir -p "$calls_dir"; } 2>/dev/null || return 0
+    : > "$calls_dir/_unidentified" 2>/dev/null
+    return 0
+}
+
+# _call_write <state> <at> — atomic; failure leaves the call unrecorded (marked unidentified in enforce mode).
+_call_write() {
+    [ -n "$call_id" ] || { _mark_unidentified; return 0; }
+    { [ -d "$calls_dir" ] || mkdir -p "$calls_dir"; } 2>/dev/null || { _mark_unidentified; return 0; }
     { printf '{"state": "%s", "pid": %s, "at": %s}\n' "$1" "$$" "$2" > "$calls_dir/$call_id.tmp.$$" \
         && mv "$calls_dir/$call_id.tmp.$$" "$calls_dir/$call_id.json"; } 2>/dev/null \
-        || rm -f "$calls_dir/$call_id.tmp.$$" 2>/dev/null
+        || { rm -f "$calls_dir/$call_id.tmp.$$" 2>/dev/null; _mark_unidentified; }
     return 0
 }
 
