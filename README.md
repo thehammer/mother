@@ -358,6 +358,12 @@ gate still decide). Read `$MOTHER_ROOT/limiter/state.json` and `limiter/decision
 `divergence` list), or `mother-limiter status --json --root ~/.mother`. `MOTHER_LIMITER_MODE=off` turns it off.
 Each job also gets a `data_class` (`company`/`personal`) and an expected burn (`limiter.estimate`) at `mother add`.
 
+See it with `mother limiter` (allowed vs effective concurrency, burn vs the sustainable rate, the reserve, the last
+distress, and why each waiting job waits; also summarised under `mother status`), `mother limiter signals` (raw
+window/pace/`k`/burn values) and `mother limiter report --since 24h` (would vs actual, distress per 10 job-hours,
+PASS/FAIL against the validation targets). `mother list` marks a waiting job `[WAIT <code>]`. The validation ramp is in
+[`docs/runbooks/limiter-validation.md`](docs/runbooks/limiter-validation.md).
+
 ## Quota awareness
 
 Mother can read the user's true rolling 5h / 7d quota state from the

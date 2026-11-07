@@ -1095,9 +1095,10 @@ cmd_list() {
                 (.adherence_status // ""),
                 (if (.state == "running" or .state == "awaiting") then ($pm[.id].label // "") else "" end),
                 (if (.state == "running" or .state == "awaiting") then ([($pm[.id].flags // [])[]?.reason] | join(",")) else "" end),
-                (if .state == "ready" then (.not_before // "") else "" end)
+                (if .state == "ready" then (.not_before // "") else "" end),
+                (if (.state == "ready" or .state == "queued") then ((.limiter.wait.code // "") | tostring) else "" end)
             ] | map((. // "") | tostring | gsub("[\n\r\t]"; " ")) | join($us)' | \
-            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel pflags notbefore; do
+            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel pflags notbefore lwait; do
                 cost_display="-"
                 if [ -n "$max_cost" ]; then
                     if [ "$st" = "running" ] && [ -n "$live_cost" ]; then
@@ -1148,6 +1149,11 @@ cmd_list() {
                     tier_3) state_display="$state_display tier:3" ;;
                 esac
                 [ -n "${plabel:-}" ] && state_display="$state_display $plabel"
+                # Limiter wait reason (L2): why a ready/queued job has not started. A rate-limit
+                # backoff already shows [BACKOFF …] above, so it is not repeated.
+                if [ -n "${lwait:-}" ] && [ "$lwait" != "backoff" ]; then
+                    state_display="$state_display [WAIT $lwait]"
+                fi
                 if [ -n "${pflags:-}" ]; then
                     # Flag markers show even when acked (an ack hides the
                     # needs-attention item, not the fact).
@@ -1244,19 +1250,21 @@ _status_overview() {
                auto_resumes: ((.paused_reason // "") | startswith("quota_"))})')
 
     local conc; conc=$(_effective_concurrency)
+    local limiter; limiter=$(_limiter_block_json)
     # Rust build-dir inventory written by `mother gc` (lib/gc.sh); null when absent.
     local rust_dirs
     rust_dirs=$(jq -c 'select(type == "object")' "$RUNNER_DIR/cargo-targets.json" 2>/dev/null) || rust_dirs=""
     [ -n "$rust_dirs" ] || rust_dirs="null"
     if [ "$format" = "json" ]; then
         jq -nc --argjson counts "$counts" --argjson awaiting "$awaiting" --argjson na "$items" \
-            --argjson conc "$conc" --argjson rust "$rust_dirs" \
-            '{counts: $counts, awaiting: $awaiting, needs_attention: $na, concurrency: $conc, rust_build_dirs: $rust}'
+            --argjson conc "$conc" --argjson rust "$rust_dirs" --argjson lim "$limiter" \
+            '{counts: $counts, awaiting: $awaiting, needs_attention: $na, concurrency: $conc, limiter: $lim, rust_build_dirs: $rust}'
         return 0
     fi
 
     echo "Concurrency: $(printf '%s' "$conc" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
     _status_rust_dirs_line "$rust_dirs"
+    _limiter_text "$limiter" compact
     echo "Queue: $(printf '%s' "$counts" | jq -r 'to_entries | if length == 0 then "(no jobs)" else map("\(.key)=\(.value)") | join("  ") end')"
     echo ""
     echo "=== awaiting operator ==="
@@ -1410,6 +1418,8 @@ cmd_status() {
             echo "⏳ [BACKOFF $_bo_label] Rate limited (backoff #$(jq -r '.backoff_count // 0' "$job_file")): Mother starts it again at the same tier when the wait ends."
             echo ""
         fi
+        local _lw; _lw=$(jq -r 'if (.state == "ready" or .state == "queued") and (.limiter.wait.reason // "") != "" then .limiter.wait.reason else empty end' "$job_file" 2>/dev/null) || _lw=""
+        [ -z "$_lw" ] || echo "Waiting: $_lw"
         if [ "$activity" = "adherence_blocked" ]; then
             echo ""
             echo "⚠️  [ADHERENCE-BLOCKED] This job requires human review."
@@ -5244,6 +5254,10 @@ Usage:
                                               acked until the condition clears and returns. Operator-only)
   mother quota status [--json]               (quota gate: state, feed source/age, per-window used %/cap/reset)
   mother quota on|off|off-until-reset        (off passes everything; off-until-reset until the first 5h/7d reset)
+  mother limiter [status] [--json]           (backpressure limiter, observe-only: allowed vs effective concurrency, burn vs
+                                              sustainable, reserve, last distress, ramp/backoff state, why each job waits)
+  mother limiter signals [--json]            (raw values per window: used %, reset, pace, sustainable/projected, k, fleet burn)
+  mother limiter report [--since 24h|ISO] [--json]   (would vs actual, distress per 10 job-hours, verdicts vs the MC-41 targets)
   mother ack quota quota_feed_stale          (acknowledge the stale quota feed item)
   mother force-start ID [--yes] [--ignore-deps]  (override quota cap; --ignore-deps also skips dependency gates)
   mother retry ID [--yes]
@@ -5597,6 +5611,97 @@ _ack_write() {
         --arg at "$(_iso_now)" --arg src "$source" '.[$r] = {since: $s, at: $at, source: $src}')"
 }
 
+# ---------- backpressure limiter surfaces (L2) ----------
+
+# _limiter_block_json: the limiter block (`mother-limiter status --json`) or a stand-in saying the limiter
+# is not running. Never fails: callers (status, list, the broker) must not die on a broken limiter.
+_limiter_block_json() {
+    local out
+    out=$(MOTHER_ROOT="$MOTHER_ROOT" "$MOTHER_BIN_DIR/mother-limiter" status --json --root "$MOTHER_ROOT" 2>/dev/null </dev/null) || out=""
+    printf '%s' "$out" | jq -e 'type == "object" and .v == 1' >/dev/null 2>&1 \
+        || out='{"v":1,"mode":"observe","age_s":null,"stale":true,"fault":null,"concurrency":null,"burn":null,"reserve":null,"interactive":null,"overage_in_use":false,"gate":"on","last_distress":null,"distress_24h":0,"waiting":[]}'
+    printf '%s' "$out"
+}
+
+# jq helpers shared by the limiter text renderers.
+_LIMITER_JQ_DEFS='
+def ago: (. // 0) as $s | if $s < 60 then "\($s | floor)s" elif $s < 3600 then "\(($s / 60) | floor)m" elif $s < 86400 then "\(($s / 3600) | floor)h" else "\(($s / 86400) | floor)d" end;
+def num: if . == null then "?" else (. * 100 | round / 100 | tostring) end;
+def notrunning: "limiter: not running (" + (if .fault then "last tick failed" + (if .fault.why then ": " + (.fault.why | tostring) else "" end) elif .age_s == null then "no tick yet" else "last tick \(.age_s | ago) ago" end) + ") — dispatch uses fixed concurrency";
+def waitline: "  waiting: \(.id)  [\(.code)] \(.reason)" + (if .would then "  (limiter would: \(.would.code))" else "" end);
+'
+
+# _limiter_text <block json> [compact]: the human rendering of the limiter block.
+_limiter_text() {
+    local block="$1" compact="${2:-}"
+    printf '%s' "$block" | jq -r --arg compact "$compact" "$_LIMITER_JQ_DEFS"'
+        if .mode == "off" then "limiter: off (dispatch uses fixed concurrency)"
+        elif (.stale or .fault) then notrunning
+        else
+          (.concurrency) as $c | (.burn) as $b | (.reserve) as $r | (.interactive) as $i | (.last_distress) as $d
+          | ("concurrency: allowed \($c.allowed) of \($c.ceiling), effective \($c.effective) — \($c.state)" + (if ($c.detail // "") != "" then ": \($c.detail)" else "" end)),
+            (if $compact == "compact" then
+               ("  burn \($b.fleet_usd_per_min | num) $/min vs sustainable \($b.sustainable_usd_per_min | num) $/min, reserve \($r.pct)%\(if $r.holding then " (holding)" else "" end)"
+                + ", last distress " + (if $d then "\($d.ago_s | ago) ago" else "none" end)
+                + (if (.waiting | length) > 0 then ", \(.waiting | length) waiting" else "" end))
+             else
+               ("burn: \($b.fleet_usd_per_min | num) $/min vs sustainable \($b.sustainable_usd_per_min | num) $/min (\(if $b.window == "seven_day" then "7d" else "5h" end) pace \(if $b.pace == null then "?" else ($b.pace | num) end)×)"
+                + (if $b.calibrated then "" else " [k not calibrated]" end)),
+               "reserve: \($r.pct)% of 5h (\(if $r.holding then "holding" else "not holding" end)\(if $r.enforceable then "" else ", advisory" end))",
+               "interactive: \($i.state)\(if $i.pct_per_hour != null then " (\($i.pct_per_hour) %/h)" else "" end)",
+               "last distress: " + (if $d then "\($d.ago_s | ago) ago (\($d.status // $d.kind) on \($d.job_id // "?")) — \(.distress_24h) in 24h" else "none in 24h" end),
+               (.waiting[] | waitline)
+             end)
+        end'
+}
+
+# _limiter_signals_text <signals json>: raw per-window values, resets in Central time with UTC.
+_limiter_signals_text() {
+    local sig="$1" w reset
+    if [ "$(printf '%s' "$sig" | jq -r '.mode')" = "off" ]; then echo "limiter: off"; return 0; fi
+    printf '%s' "$sig" | jq -r "$_LIMITER_JQ_DEFS"'if (.stale or .fault) then notrunning else empty end'
+    for w in five_hour seven_day; do
+        reset=$(printf '%s' "$sig" | jq -r --arg w "$w" '.windows[$w].resets_at // "null"')
+        printf '%s' "$sig" | jq -r --arg w "$w" "$_LIMITER_JQ_DEFS"'.windows[$w] as $x
+            | "\($w):\n  used: \($x.used_pct // "?")%\n  pace: \($x.pace | num)\n  sustainable: \($x.sustainable_pct_per_min // "?") %/min   projected: \($x.projected_pct_per_min // "?") %/min\n  k: \($x.k // "?") %/USD   samples: \($x.k_samples)\(if $x.calibrated then " (calibrated)" else " (uncalibrated)" end)"'
+        echo "  resets: $(_quota_fmt_time "$reset")"
+    done
+    printf '%s' "$sig" | jq -r "$_LIMITER_JQ_DEFS"'"fleet burn: \(.fleet_usd_per_min | num) $/min\nreserve: \(.reserve_pct)% of 5h (\(if .reserve_holding then "holding" else "not holding" end))\ninteractive: \(.interactive.state) (\(.interactive.pct_per_hour | num) %/h)\noverage in use: \(.overage_in_use)\nquota gate: \(.gate)\ndistress: \(.distress.h1) in 1h, \(.distress.h24) in 24h"'
+}
+
+# mother limiter [status] [--json] | signals [--json] | report [--since 24h|ISO] [--json]
+# Read-only views of the backpressure limiter (observe-only). The broker calls `limiter status --json`.
+cmd_limiter() {
+    local sub="status" json=0 since="24h"
+    case "${1:-}" in status|signals|report) sub="$1"; shift ;; esac
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            --since) [ $# -ge 2 ] || _die "limiter: --since needs a value"; since="$2"; shift 2 ;;
+            *) _die "limiter: unexpected argument: $1 (usage: mother limiter [status|signals|report] [--json] [--since 24h])" ;;
+        esac
+    done
+    case "$sub" in
+        status)
+            local block; block=$(_limiter_block_json)
+            if [ "$json" -eq 1 ]; then printf '%s\n' "$block"; return 0; fi
+            [ "$(printf '%s' "$block" | jq -r '.mode')" = "off" ] || echo "mode: $(printf '%s' "$block" | jq -r '.mode')  (enforcement off)"
+            _limiter_text "$block"
+            ;;
+        signals)
+            local sig
+            sig=$("$MOTHER_BIN_DIR/mother-limiter" signals --json --root "$MOTHER_ROOT" 2>/dev/null </dev/null) \
+                || _die "limiter: could not read limiter signals"
+            if [ "$json" -eq 1 ]; then printf '%s\n' "$sig"; return 0; fi
+            _limiter_signals_text "$sig"
+            ;;
+        report)
+            "$MOTHER_BIN_DIR/mother-limiter" report --since "$since" $([ "$json" -eq 1 ] && echo --json) --root "$MOTHER_ROOT" </dev/null \
+                || _die "limiter: report failed"
+            ;;
+    esac
+}
+
 # ---------- quota gate ----------
 
 # _quota_fmt_time <epoch|null>: "Mon 2026-11-02 3:10 PM CST (2026-11-02 21:10 UTC)".
@@ -5780,6 +5885,7 @@ main() {
         cancel)            cmd_cancel "$@" ;;
         ack)               cmd_ack "$@" ;;
         quota)             cmd_quota "$@" ;;
+        limiter)           cmd_limiter "$@" ;;
         force-start)       cmd_force_start "$@" ;;
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;

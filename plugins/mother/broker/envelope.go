@@ -80,13 +80,14 @@ const (
 	CatQuota           = "quota"
 	CatOutput          = "output"   // W2 — advertised as absent in W1's hello
 	CatProgress        = "progress" // HC-09 — progress_updated / progress_half
+	CatLimiter         = "limiter"  // L2 — backpressure limiter block changes
 )
 
 // w1Categories is the full set of categories this broker knows about,
 // including CatOutput (added in W2). The runtime-active set may be a subset
 // when MOTHER_BROKER_OUTPUT_ENABLED=0; see liveCategories.
 var w1Categories = []string{
-	CatState, CatActivity, CatAwait, CatCurrentActivity, CatQuota, CatOutput, CatProgress,
+	CatState, CatActivity, CatAwait, CatCurrentActivity, CatQuota, CatOutput, CatProgress, CatLimiter,
 }
 
 // liveCategories is the runtime-active subset of w1Categories. Populated by
