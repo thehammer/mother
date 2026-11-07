@@ -1383,12 +1383,21 @@ _auto_resume_check() {
 # `mother resume` takes the ordinary answer path instead. The caller has already checked that no
 # supervisor of the job is alive.
 _resume_limiter_hold() {
-    local f="$1" id="$2" reason="$3" why=limiter_admitted merged
+    local f="$1" id="$2" reason="$3" why=limiter_admitted
     if mother_limiter_enforcing; then
         mother_limiter_admit_list | grep -qxF -- "$id" || return 0
     else
         why=limiter_not_enforcing
     fi
+    _with_lock "$f" _resume_limiter_hold_locked "$f" "$id" "$reason" "$why"
+}
+
+# Runs under the job-file lock (so a `mother cancel` taken meanwhile wins): re-checks the state inside it
+# and writes nothing unless the job is still awaiting/limiter_hold.
+_resume_limiter_hold_locked() {
+    local f="$1" id="$2" reason="$3" why="$4" merged
+    [ "$(jq -r '.state' "$f" 2>/dev/null)" = "awaiting" ] || return 0
+    [ "$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)" = "limiter_hold" ] || return 0
     _log "auto-resuming $id (paused_reason=$reason; $why)"
     merged=$(jq --arg ts "$(_iso_now)" --arg answer "The limiter released this job — continue from where you left off." '
         .state = "ready"
@@ -1400,7 +1409,7 @@ _resume_limiter_hold() {
         | .paused_reason = null
         | .pause_requested = null
         | .limiter_hold = null
-    ' "$f") && _atomic_write "$f" "$merged"
+    ' "$f") && _atomic_write "$f" "$merged" || return 0
     _append_event "$id" "auto_resumed" \
         "$(jq -nc --arg r "$reason" --arg why "$why" '{from_paused_reason: $r, reason: $why}')"
 }

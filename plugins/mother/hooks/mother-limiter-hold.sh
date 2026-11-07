@@ -32,17 +32,29 @@ case "$max_s" in ''|*[!0-9]*) max_s=840 ;; esac
 poll_s="${MOTHER_LIMITER_HOOK_POLL_S:-2}"
 case "$poll_s" in ''|*[!0-9.]*) poll_s=2 ;; esac
 
-_cleanup() { rm -f "$held_file" 2>/dev/null; }
+sleep_pid=""
+# Remove .held only while it is still ours (a later worker's hook may have written its own), and stop the
+# sleep child we started so nothing outlives us. Never signal the process group: it holds the worker.
+_cleanup() {
+    [ -z "$sleep_pid" ] || kill "$sleep_pid" 2>/dev/null
+    if [ "$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$held_file" 2>/dev/null)" = "$$" ]; then
+        rm -f "$held_file" 2>/dev/null
+    fi
+}
 trap '_cleanup; exit 0' TERM INT HUP
 
 start=$(date +%s 2>/dev/null) || exit 0
-printf '{"at": %s, "pid": %s}\n' "$start" "$$" > "$held_file.tmp.$$" 2>/dev/null \
-    && mv "$held_file.tmp.$$" "$held_file" 2>/dev/null || { rm -f "$held_file.tmp.$$" 2>/dev/null; exit 0; }
+# (the braces keep the shell's own "Permission denied" for a failed redirect off stderr: never print)
+{ printf '{"at": %s, "pid": %s}\n' "$start" "$$" > "$held_file.tmp.$$" \
+    && mv "$held_file.tmp.$$" "$held_file"; } 2>/dev/null || { rm -f "$held_file.tmp.$$" 2>/dev/null; exit 0; }
 
 while [ -f "$hold_file" ]; do
     now=$(date +%s 2>/dev/null) || break
     [ $((now - start)) -lt "$max_s" ] || break
-    sleep "$poll_s" 2>/dev/null || sleep 2
+    sleep "$poll_s" 2>/dev/null &
+    sleep_pid=$!
+    wait "$sleep_pid" 2>/dev/null
+    sleep_pid=""
 done
 _cleanup
 exit 0

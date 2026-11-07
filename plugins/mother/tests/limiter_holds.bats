@@ -246,7 +246,7 @@ _register_child() { printf '{"job_id":"%s"}\n' "$1" > "$RUNNER_DIR/children/$2.j
     [ "$(_jf hj3 .paused_reason)" = "limiter_hold" ]
     [ "$(_jf hj3 .question)" = "Held by the limiter: provider rate limit. Mother resumes it automatically when the limiter admits it." ]
     [ "$(_jf hj3 '.limiter_hold // "null"')" = "null" ]
-    _has_event hj3 paused_for_limiter
+    _wait_for 10 _has_event hj3 paused_for_limiter
     [ "$(_ev hj3 paused_for_limiter | jq -r .code)" = "backoff" ]
     [ "$(_ev hj3 paused_for_limiter | jq -r '.held_s >= 2')" = "true" ]
     _wait_for 20 _supervisor_gone
@@ -575,4 +575,134 @@ _rows() { jq -nc "$1"; }
     _parked sh3
     run mother status
     [[ "$output" == *"sh3"*"limiter_hold (auto-resumes)"* ]]
+}
+
+# ===========================================================================
+# PR #113 review fix-ups: never terminate a worker mid-request
+# ===========================================================================
+
+_held_exists() { [ -f "$RUNNER_DIR/$1.held" ]; }
+_held_pid() { jq -r .pid "$RUNNER_DIR/$1.held"; }
+_in_turn_terms() { grep -c '^term in_turn=yes' "$MOCK_CLAUDE_TURN_LOG" 2>/dev/null || true; }
+
+@test "fix1: the hook expires before the supervisor's grace: no termination, the job keeps running" {
+    # hook max (2 s) < grace (3 s): the worker is released by the hook, so the supervisor must not park it
+    export MOCK_CLAUDE_TURNS=3 MOCK_CLAUDE_TURN_SLEEP=3 MOTHER_LIMITER_HOLD_GRACE_S=3 MOTHER_LIMITER_QUIET_S=1 MOTHER_LIMITER_HOOK_MAX_S=2
+    _make_job fx1
+    _start_job fx1
+    _wait_for 10 _marker_present
+    _hold_flag fx1 backoff "cut"
+    _wait_for 30 _supervisor_gone
+    [ "$(_in_turn_terms)" = "0" ]
+    ! _turn_log_has "^term"
+    [ "$(grep -c '^turn_end' "$MOCK_CLAUDE_TURN_LOG")" = "3" ]
+    ! _has_event fx1 paused_for_limiter
+}
+
+@test "fix1: .held removed (hook stopped) while the supervisor waits: no termination mid-turn; the next boundary parks" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=5 MOTHER_LIMITER_HOLD_GRACE_S=4 MOTHER_LIMITER_QUIET_S=1
+    _make_job fx2
+    _start_job fx2
+    _wait_for 10 _marker_present
+    _hold_flag fx2 backoff "cut"
+    _wait_for 20 _held_exists fx2
+    local hp; hp=$(_held_pid fx2)
+    kill "$hp"                                   # the hook stops holding; .held goes with it
+    _wait_for 5 bash -c "! [ -f '$RUNNER_DIR/fx2.held' ]"
+    # the worker is now in a turn; the supervisor must not give it up here
+    sleep 6
+    [ "$(_in_turn_terms)" = "0" ]
+    # the next real boundary (a fresh .held) parks the job at a boundary
+    _wait_for 40 _job_state_is fx2 awaiting
+    _wait_for 10 _turn_log_has "^term in_turn=no"
+    [ "$(_in_turn_terms)" = "0" ]
+}
+
+@test "fix1: .hold removed and re-written within one poll with a dead hook: no park until a fresh .held" {
+    export MOCK_CLAUDE_TURNS=4 MOCK_CLAUDE_TURN_SLEEP=5 MOTHER_LIMITER_HOLD_GRACE_S=4 MOTHER_LIMITER_QUIET_S=1
+    _make_job fx3
+    _start_job fx3
+    _wait_for 10 _marker_present
+    _hold_flag fx3 backoff "cut"
+    _wait_for 20 _held_exists fx3
+    local hp; hp=$(_held_pid fx3)
+    kill -9 "$hp"                                # leaves a stale .held behind
+    rm -f "$RUNNER_DIR/fx3.hold"; _hold_flag fx3 backoff "cut"   # flap, faster than the supervisor's poll
+    sleep 6
+    [ "$(_in_turn_terms)" = "0" ]
+    [ "$(_jf fx3 .state)" = "running" ]
+    _wait_for 40 _job_state_is fx3 awaiting
+    [ "$(_in_turn_terms)" = "0" ]
+}
+
+@test "fix3: a hold that changed from backoff to quota_* before the park parks as a quota pause" {
+    export MOCK_CLAUDE_TURNS=3 MOCK_CLAUDE_TURN_SLEEP=2 MOTHER_LIMITER_HOLD_GRACE_S=4 MOTHER_LIMITER_QUIET_S=1
+    _make_job fx4
+    _start_job fx4
+    _wait_for 10 _marker_present
+    _hold_flag fx4 backoff "cut"
+    _wait_for 20 _has_event fx4 held
+    _hold_flag fx4 quota_5h "quota cap reached"
+    _wait_for 40 _job_state_is fx4 awaiting
+    [ "$(_jf fx4 .paused_reason)" = "quota_5h" ]
+    _wait_for 10 _has_event fx4 paused_for_quota
+    ! _has_event fx4 paused_for_limiter
+}
+
+@test "fix2: a cancel taken under the job lock while a limiter resume is pending leaves the job cancelled" {
+    _parked fx5
+    _enforcing_state '[]' '["fx5"]'
+    mkdir "$JOBS_DIR/fx5.json.lockdir"           # the lock the cancel holds
+    mother-runner --auto-resume-tick 3>&- >/dev/null 2>&1 &
+    local rp=$!
+    BG_PIDS="$BG_PIDS $rp"
+    sleep 0.5
+    jq '.state = "cancelled" | .paused_reason = null' "$JOBS_DIR/fx5.json" > "$JOBS_DIR/fx5.json.new" && mv "$JOBS_DIR/fx5.json.new" "$JOBS_DIR/fx5.json"
+    rmdir "$JOBS_DIR/fx5.json.lockdir"
+    wait "$rp" || true
+    [ "$(_jf fx5 .state)" = "cancelled" ]
+    ! _has_event fx5 auto_resumed
+}
+
+@test "fix5: a runner restart while a job is held resumes it exactly once, with its session" {
+    _parked fx6
+    _enforcing_state '[]' '["fx6"]'
+    mother-runner --auto-resume-tick 3>&- >/dev/null 2>&1
+    mother-runner --auto-resume-tick 3>&- >/dev/null 2>&1   # a restarted runner's first pass
+    [ "$(_jf fx6 .state)" = "ready" ]
+    [ "$(_jf fx6 .resume_session_id)" = "sess-1234" ]
+    [ "$(_jf fx6 .resume_count)" = "1" ]
+    [ "$(grep -c '"auto_resumed"' "$EVENTS_DIR/fx6.jsonl")" = "1" ]
+}
+
+@test "fix5: mother cancel of a held awaiting job cancels it, and the runner never resumes it" {
+    _parked fx7
+    run mother cancel fx7
+    [ "$status" -eq 0 ]
+    [ "$(_jf fx7 .state)" = "cancelled" ]
+    _enforcing_state '[]' '["fx7"]'
+    mother-runner --auto-resume-tick 3>&- >/dev/null 2>&1
+    [ "$(_jf fx7 .state)" = "cancelled" ]
+}
+
+@test "fix4: a failing hold hook never blocks a tool call (unwritable .held, missing root, unwritable dir), in any mode" {
+    export MOTHER_JOB_ID=hj
+    _hold_flag hj
+    chmod 500 "$RUNNER_DIR"
+    run "$HOOK" </dev/null
+    chmod 700 "$RUNNER_DIR"
+    [ "$status" -eq 0 ]; [ -z "$output" ]
+    MOTHER_ROOT=/nonexistent-guard-x run "$HOOK" </dev/null
+    [ "$status" -eq 0 ]; [ -z "$output" ]
+}
+
+@test "hook: TERM removes only its own .held and leaves nothing behind" {
+    export MOTHER_JOB_ID=hj
+    _hold_flag hj
+    "$HOOK" </dev/null >/dev/null 2>&1 &
+    local hp=$!; BG_PIDS="$BG_PIDS $hp"
+    _wait_for 5 test -f "$RUNNER_DIR/hj.held"
+    printf '{"at": 1, "pid": 999999}\n' > "$RUNNER_DIR/hj.held"      # a later worker's hook took the marker over
+    kill "$hp"; wait "$hp" 2>/dev/null || true
+    [ -f "$RUNNER_DIR/hj.held" ]
 }

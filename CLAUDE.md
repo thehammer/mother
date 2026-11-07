@@ -684,6 +684,15 @@ mid-request. Nothing is held in observe/off.
   `MOTHER_LIMITER_QUIET_S` → `awaiting` (`paused_reason: limiter_hold`, or the `quota_*` code for a quota hold), then
   `paused_for_limiter {code, reason, held_s, boundary, paused_reason, question}` (`paused_for_quota` for quota codes), then
   `_terminate_worker`; grace passed but log busy → `hold_giveup_deferred` at most once a minute.
+- **Observe installs the hook too.** Whenever the mode is not `off`, the settings file carries the PreToolUse hold hook, so a mode flip
+  reaches workers already running. Cost: one no-op hook process per tool call in observe (it exits 0 at once when there is no `.hold`).
+  The hook fails open: any write failure, missing root or garbled input exits 0 silently, and it never outlives `MOTHER_LIMITER_HOOK_MAX_S`.
+- **Never stop a worker on a stale boundary (MC-37).** Before parking, `_hold_boundary_check` requires `.held` to exist, its pid to be
+  alive and under the worker, and the hook's max wait (`_hold_hook_max_s`, also what the settings file passes the hook) not to have passed;
+  otherwise the latch resets and the next fresh `.held` re-latches. `_hold_park` takes the job-file lock for its state write and uses the
+  `.hold` flag's current code; the runner's `_resume_limiter_hold` re-checks `awaiting`/`limiter_hold` under the same lock.
+- **Quota holds when the limiter turns unhealthy.** If the limiter stops enforcing while a quota `.hold` exists, the old quota mid-run
+  pause/kill path takes over (pre-existing behaviour).
 - **Phase boundary.** `_hold_wait_before_spawn` (top of `_spawn_and_wait`, and `_wave_cycle` before the adherence/lens spawns) waits
   while `.hold` exists (`held {boundary: "phase"}`, poll 2 s); past the grace period it parks the job without spawning (no worker to
   stop; a same-session prompt that never started is kept in `.limiter_resume_prompt` and replayed on resume). Reviewers already
