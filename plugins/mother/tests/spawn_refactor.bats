@@ -137,6 +137,7 @@ _make_golden_job() {
 
 @test "golden: a fresh spawn runs claude with exactly the established argv and the job's own --session-id" {
     local id="gold-argv"
+    export MOTHER_LIMITER_MODE=off   # limiter on (default) writes the hold hook settings file for every job (L4)
     _make_golden_job "$id"
 
     run mother-run-job "$id"
@@ -162,6 +163,7 @@ _make_golden_job() {
 }
 
 @test "golden: a job with max_cost_usd gets --settings (pointing at the cost gate) just before --session-id; an uncapped job gets none" {
+    export MOTHER_LIMITER_MODE=off   # limiter on (default) writes the hold hook settings file for every job (L4)
     local capped="gold-capped" uncapped="gold-uncapped"
     _make_golden_job "$capped" 5.00
     run mother-run-job "$capped"
@@ -351,6 +353,7 @@ DRV
 }
 
 @test "resume: claude is invoked with --resume <job session_id> and no --session-id" {
+    export MOTHER_LIMITER_MODE=off   # limiter on (default) writes the hold hook settings file for every job (L4)
     _rs_make_job
     _rs_run '_spawn_and_wait resume "'"$RS_PROMPT"'"; echo "rc=$?"'
     [ "$status" -eq 0 ]

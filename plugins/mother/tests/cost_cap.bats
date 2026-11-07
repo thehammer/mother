@@ -142,6 +142,8 @@ _argv_has_flag() {
 
 @test "uncapped job: no --settings flag, and no cost_cap_* events ever recorded" {
     local id="uncap-settings"
+    # With the limiter on (the default), every job gets the hold hook's settings file (L4); off = none.
+    export MOTHER_LIMITER_MODE=off
     _make_uncapped_job "$id"
 
     rm -f "$MOCK_CLAUDE_ARGS_FILE"

@@ -431,6 +431,27 @@ class BackoffTests(unittest.TestCase):
         st = core.tick(make_inp(feed(), running=running, ceiling=4, distress=[dist()]), {}, T0, CFG)
         self.assertEqual(sorted(core.would_summary(st)["hold_running"]), ["p-new", "p-old"])
 
+    def test_cut_from_four_to_two_with_two_personal_two_company_holds_exactly_the_personal_pair(self):
+        running = [runjob("c1", "company", "2026-01-01T00:00:01Z"), runjob("c2", "company", "2026-01-01T00:00:02Z"),
+                   runjob("p1", "personal", "2026-01-01T00:00:03Z"), runjob("p2", "personal", "2026-01-01T00:00:04Z")]
+        st = core.tick(make_inp(feed(), running=running, ceiling=4, distress=[dist()]), {}, T0, CFG)
+        self.assertEqual(st["allowed"], 2)
+        self.assertEqual(sorted(core.would_summary(st)["hold_running"]), ["p1", "p2"])
+
+    def test_four_company_jobs_cut_to_two_hold_the_two_newest(self):
+        running = [runjob("c%d" % i, "company", "2026-01-01T00:00:0%dZ" % i) for i in range(1, 5)]
+        st = core.tick(make_inp(feed(), running=running, ceiling=4, distress=[dist()]), {}, T0, CFG)
+        self.assertEqual(sorted(core.would_summary(st)["hold_running"]), ["c3", "c4"])
+
+    def test_held_running_rows_carry_a_code_and_reason(self):
+        running = [runjob("p1", "personal"), runjob("p2", "personal", "2026-01-01T00:00:02Z")]
+        st = core.tick(make_inp(feed(), running=running, ceiling=2, distress=[dist()]), {}, T0, CFG)
+        row = by_id(st["running"])["p2"]
+        self.assertTrue(row["would_hold"])
+        self.assertEqual(row["hold"]["code"], "backoff")
+        self.assertTrue(row["hold"]["reason"])
+        self.assertNotIn("hold", by_id(st["running"])["p1"])
+
     def test_no_distress_means_no_running_job_is_held(self):
         running = [runjob("a"), runjob("b")]
         st = core.tick(make_inp(feed(), running=running, ceiling=2), {}, T0, CFG)

@@ -34,6 +34,18 @@
 #                              $TMPDIR is an existing directory at worker start —,
 #                              MOTHER_JOB_ID, PWD). Opt-in; used by job_tmpdir.bats.
 
+#   MOCK_CLAUDE_TURNS          opt-in turn mode (L4 boundary holds): the mock runs N scripted "turns".
+#                              Before each turn it runs every PreToolUse hook command found in the
+#                              `--settings` file (when argv has one) with a minimal JSON payload on
+#                              stdin (with tool_use_id toolu_t<n>), as Claude Code would, and waits for it (a held hook parks the
+#                              mock right there). A turn is then "in flight" for
+#                              MOCK_CLAUDE_TURN_SLEEP seconds (default 1; fractions ok), during which
+#                              the file MOCK_CLAUDE_TURN_MARKER (if set) exists. After the turn the
+#                              PostToolUse hook commands of the settings file run for the same id. Unset or 0 = off.
+#   MOCK_CLAUDE_PID_FILE       if set, the mock's pid is written here at start (proves "same process").
+#   MOCK_CLAUDE_TURN_LOG       if set, one line per step is appended: "hook_start <n>", "hook_done <n>",
+#                              "turn_start <n>", "turn_end <n>", "term in_turn=<yes|no>" (SIGTERM seen).
+
 args_file="${MOCK_CLAUDE_ARGS_FILE:-/tmp/mock-claude-args}"
 exit_code="${MOCK_CLAUDE_EXIT:-0}"
 
@@ -59,6 +71,58 @@ fi
 # Record the full argument list.
 printf '%s\n' "$@" >> "$args_file"
 echo "---" >> "$args_file"
+
+# Turn mode (opt-in): see MOCK_CLAUDE_TURNS above.
+_turn_log() { [ -n "${MOCK_CLAUDE_TURN_LOG:-}" ] && printf '%s\n' "$*" >> "$MOCK_CLAUDE_TURN_LOG"; return 0; }
+[ -n "${MOCK_CLAUDE_PID_FILE:-}" ] && echo "$$" >> "$MOCK_CLAUDE_PID_FILE"
+case "${MOCK_CLAUDE_TURNS:-0}" in ''|*[!0-9]*) MOCK_CLAUDE_TURNS=0 ;; esac
+if [ "$MOCK_CLAUDE_TURNS" -gt 0 ]; then
+    in_turn=no; hook_pid=""
+    trap '[ -n "$hook_pid" ] && kill "$hook_pid" 2>/dev/null; _turn_log "term in_turn=$in_turn"; exit 143' TERM
+    settings_file=""; prev_arg=""
+    for arg in "$@"; do
+        [ "$prev_arg" = "--settings" ] && settings_file="$arg"
+        prev_arg="$arg"
+    done
+    hook_cmds=""
+    if [ -n "$settings_file" ] && [ -f "$settings_file" ]; then
+        hook_cmds=$(jq -r '(.hooks.PreToolUse // [])[] | .hooks[]? | select(.type == "command") | .command' "$settings_file" 2>/dev/null)
+    fi
+    t=1
+    while [ "$t" -le "$MOCK_CLAUDE_TURNS" ]; do
+        while IFS= read -r hook_cmd; do
+            [ -n "$hook_cmd" ] || continue
+            _turn_log "hook_start $t"
+            printf '%s' "{\"tool_name\":\"Bash\",\"tool_use_id\":\"toolu_t$t\",\"tool_input\":{\"command\":\"true\"}}" | bash -c "$hook_cmd" >/dev/null 2>&1 &
+            hook_pid=$!
+            wait "$hook_pid" 2>/dev/null
+            hook_pid=""
+            _turn_log "hook_done $t"
+        done <<HOOKS
+$hook_cmds
+HOOKS
+        _turn_log "turn_start $t"
+        in_turn=yes
+        [ -n "${MOCK_CLAUDE_TURN_MARKER:-}" ] && echo "$t" > "$MOCK_CLAUDE_TURN_MARKER"
+        sleep "${MOCK_CLAUDE_TURN_SLEEP:-1}" &
+        sleep_pid=$!; hook_pid=$sleep_pid
+        wait "$sleep_pid" 2>/dev/null
+        hook_pid=""
+        [ -n "${MOCK_CLAUDE_TURN_MARKER:-}" ] && rm -f "$MOCK_CLAUDE_TURN_MARKER"
+        in_turn=no
+        _turn_log "turn_end $t"
+        post_cmds=""
+        [ -n "$settings_file" ] && [ -f "$settings_file" ] && post_cmds=$(jq -r '(.hooks.PostToolUse // [])[] | .hooks[]? | select(.type == "command") | .command' "$settings_file" 2>/dev/null)
+        while IFS= read -r hook_cmd; do
+            [ -n "$hook_cmd" ] || continue
+            printf '%s' "{\"tool_name\":\"Bash\",\"tool_use_id\":\"toolu_t$t\"}" | bash -c "$hook_cmd" >/dev/null 2>&1
+        done <<POSTHOOKS
+$post_cmds
+POSTHOOKS
+        t=$((t + 1))
+    done
+    trap - TERM
+fi
 
 # Per-agent canned reply (opt-in): see MOCK_CLAUDE_STDOUT_BY_AGENT_DIR above.
 agent_reply=""

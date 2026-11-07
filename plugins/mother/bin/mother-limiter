@@ -554,7 +554,10 @@ def cmd_tick(args):
         est = lim.get("estimate") if isinstance(lim.get("estimate"), dict) else None
         dclass = j.get("data_class")
         changed = {}
-        if state in ("ready", "queued"):
+        # L4: a job parked as awaiting/limiter_hold competes for admission like a ready job; the runner's
+        # auto-resume releases it once it is on the admit list. Nothing is annotated on it.
+        parked = state == "awaiting" and j.get("paused_reason") == "limiter_hold"
+        if state in ("ready", "queued") or parked:
             if dclass not in ("company", "personal"):
                 dclass = class_of(j)
                 changed["data_class"] = dclass
@@ -562,6 +565,8 @@ def cmd_tick(args):
             if est is None or age >= 3600:
                 est = core.estimate_burn(j.get("repo") or "unknown", actor_of(j), burns, cfg, iso(now))
                 changed["estimate"] = est
+            if parked:
+                changed = {}
         elif dclass not in ("company", "personal"):
             dclass = class_of(j)
         info = {"id": j["id"], "data_class": dclass, "priority_adjust": j.get("priority_adjust"),
@@ -572,6 +577,8 @@ def cmd_tick(args):
         if state == "running":
             # a job the runner started since the last tick is judged as it was before dispatch
             (ready if j["id"] in spawned_hint else running).append(info)
+        elif parked:
+            ready.append(info)
         elif state == "ready":
             nb = j.get("not_before")
             if not (is_num(nb) and nb > now):

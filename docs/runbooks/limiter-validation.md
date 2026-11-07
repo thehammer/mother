@@ -114,7 +114,7 @@ honoured (only `off` is): enforcement lives in `limiter/mode.json`.
 
 Under enforce the limiter decides which ready jobs start (budget pace, reserve, backoff after distress, ramp after
 a reset, interactive demand for personal work; company work first, `--priority raise|lower`), bounded by
-`min(MOTHER_CONCURRENCY, allowed)`. Running jobs are never touched in this slice. The quota-gate 90% cap stays as a
+`min(MOTHER_CONCURRENCY, allowed)`. Running jobs are held only at a boundary (see "Boundary holds" below). The quota-gate 90% cap stays as a
 backstop; with the gate `off`/`off_until_reset` the budget terms are advisory (the `limiter_enforcing_gate_off`
 item says so). If the limiter goes stale or faults, dispatch falls back to fixed concurrency and `mother status`
 shows `limiter_fault`. Watch `mother limiter report`: under enforce, `divergence` entries are a bug signal.
@@ -122,7 +122,23 @@ shows `limiter_fault`. Watch `mother limiter report`: under enforce, `divergence
 Timing allowance: the limiter reacts on its tick (`MOTHER_LIMITER_INTERVAL`, 10 s). A job it had already admitted
 can therefore start up to about one tick (~10 s) after a 429 lands, before the cut shows in the admit list. That is
 within the plan's 30 s allowance and is not a failure of enforcement; count it only if it exceeds ~30 s. Running
-jobs are never interrupted.
+jobs are never interrupted mid-request.
+
+**Boundary holds (L4).** Under enforce, a running job the limiter wants to yield (the excess `running - allowed` after
+a distress cut, personal before company and newest first; personal jobs only, when interactive demand is high and the
+reserve would be breached) gets `$MOTHER_ROOT/runner/<id>.hold`. Check, with enforce on and a job running:
+
+1. `mother limiter report` / `limiter/state.json` lists the job under `running[].would_hold` or `would_preempt`,
+   and `runner/<id>.hold` appears within one runner tick (~10 s, 30 s allowance after the distress line).
+2. The job's events show `held {code, reason, boundary}` at its next tool call (`boundary: tool`) or before its next
+   phase/reviewer spawn (`boundary: phase`); `mother status <id>` shows `⏸ [HELD <code>] ...` and `mother list` `[HELD]`.
+   A turn already in flight is never cut: the worker stops only at the next PreToolUse hook.
+3. When the limiter lets go (or you `mother limiter mode observe`), the `.hold` file is removed within one tick, the
+   event stream shows `hold_released {held_s}` and the same worker process carries on.
+4. A hold longer than `MOTHER_LIMITER_HOLD_GRACE_S` (600 s), once the log has been quiet for `MOTHER_LIMITER_QUIET_S`
+   (30 s), parks the job as `awaiting` / `limiter_hold` (`paused_for_limiter`) and stops the worker; Mother resumes it
+   with its session when the limiter admits it again (`auto_resumed {reason: limiter_admitted}`), no operator action
+   and no push notification. A quota-gate trip under enforce takes the same route and parks as `quota_*`.
 
 ## 5. Backing out
 

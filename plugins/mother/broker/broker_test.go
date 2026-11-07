@@ -2662,3 +2662,83 @@ func TestAttentionReasons_unionsProgressFlagsWithJobAttention(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// L4 — limiter boundary holds
+// =============================================================================
+
+func TestFoldState_pausedForLimiterFoldsToAwaiting(t *testing.T) {
+	state, affecting := foldState("paused_for_limiter", nil)
+	if !affecting || state != "awaiting" {
+		t.Errorf("foldState(paused_for_limiter) = (%q, %v), want (\"awaiting\", true)", state, affecting)
+	}
+}
+
+func TestClassify_limiterHoldKindsMapToActivity(t *testing.T) {
+	for _, kind := range []string{"held", "hold_released", "paused_for_limiter", "hold_giveup_deferred"} {
+		if got := classify(kind); got != CatActivity {
+			t.Errorf("classify(%q) = %q, want %q", kind, got, CatActivity)
+		}
+	}
+}
+
+func TestSnapshot_pausedForLimiterSetsAwaitingWithPausedReason(t *testing.T) {
+	th := newTestHub(t, 1024)
+	th.injectJob(t, "job-lim-1", map[string]any{"state": "running"})
+	th.hub.ingest(rawEvent{category: CatState, jobID: "job-lim-1", kind: "running", ts: isoNow(), detail: json.RawMessage(`{}`)})
+	detail, _ := json.Marshal(map[string]any{
+		"code": "backoff", "reason": "provider rate limit", "held_s": 610,
+		"paused_reason": "limiter_hold", "question": "Held by the limiter: provider rate limit.",
+	})
+	th.hub.ingest(rawEvent{category: CatActivity, jobID: "job-lim-1", kind: "paused_for_limiter", ts: isoNow(), detail: detail})
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	snap := subscribeSimple(t, conn, "lim-sub", []string{"all"}, []string{CatState, CatActivity})
+	jobs := mustDecodeData(t, snap)["jobs"].([]any)
+	if len(jobs) == 0 {
+		t.Fatal("snapshot has no jobs")
+	}
+	job0 := jobs[0].(map[string]any)
+	if got := job0["state"]; got != "awaiting" {
+		t.Errorf("snapshot job state = %v, want \"awaiting\"", got)
+	}
+	if got := job0["paused_reason"]; got != "limiter_hold" {
+		t.Errorf("snapshot job paused_reason = %v, want \"limiter_hold\"", got)
+	}
+
+	// Leaving awaiting clears it again.
+	th.hub.ingest(rawEvent{category: CatQuota, jobID: "job-lim-1", kind: "auto_resumed", ts: isoNow(), detail: json.RawMessage(`{}`)})
+	conn2 := th.connect(t)
+	_, _ = readNext(t, conn2)
+	snap2 := subscribeSimple(t, conn2, "lim-sub2", []string{"all"}, []string{CatState})
+	job1 := mustDecodeData(t, snap2)["jobs"].([]any)[0].(map[string]any)
+	if got := job1["state"]; got != "ready" {
+		t.Errorf("after auto_resumed state = %v, want \"ready\"", got)
+	}
+}
+
+func TestLimiterHold_heldAndHoldReleasedReachActivitySubscribers(t *testing.T) {
+	th := newTestHub(t, 1024)
+	id := "job-lim-live"
+	th.injectJob(t, id, map[string]any{"state": "running"})
+	es := newEventSource(th.eventsDir, th.hub.ingest)
+
+	conn := th.connect(t)
+	_, _ = readNext(t, conn) // hello
+	subscribeSimple(t, conn, "act", []string{"all"}, []string{CatActivity})
+
+	th.injectEvent(t, id, "held", map[string]any{"code": "backoff", "reason": "r", "boundary": "tool"})
+	th.injectEvent(t, id, "hold_released", map[string]any{"held_s": 12})
+	th.drainEvents(es, id)
+
+	for _, want := range []string{"held", "hold_released"} {
+		m, err := readNext(t, conn)
+		if err != nil {
+			t.Fatalf("reading %s: %v", want, err)
+		}
+		if m.T != want {
+			t.Errorf("event = %q, want %q", m.T, want)
+		}
+	}
+}

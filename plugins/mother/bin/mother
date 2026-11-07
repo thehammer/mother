@@ -1111,9 +1111,10 @@ cmd_list() {
                 (if (.state == "running" or .state == "awaiting") then ($pm[.id].label // "") else "" end),
                 (if (.state == "running" or .state == "awaiting") then ([($pm[.id].flags // [])[]?.reason] | join(",")) else "" end),
                 (if .state == "ready" then (.not_before // "") else "" end),
-                (if (.state == "ready" or .state == "queued") then ((.limiter.wait.code // "") | tostring) else "" end)
+                (if (.state == "ready" or .state == "queued") then ((.limiter.wait.code // "") | tostring) else "" end),
+                (if .state == "running" then ((.limiter_hold.code // "") | tostring) else "" end)
             ] | map((. // "") | tostring | gsub("[\n\r\t]"; " ")) | join($us)' | \
-            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel pflags notbefore lwait; do
+            while IFS="$_us" read -r id st activity current_tier repo iso origin actual_cost live_cost max_cost title kind adherence plabel pflags notbefore lwait lhold; do
                 cost_display="-"
                 if [ -n "$max_cost" ]; then
                     if [ "$st" = "running" ] && [ -n "$live_cost" ]; then
@@ -1169,6 +1170,8 @@ cmd_list() {
                 if [ -n "${lwait:-}" ] && [ "$lwait" != "backoff" ]; then
                     state_display="$state_display [WAIT $lwait]"
                 fi
+                # Limiter boundary hold (L4): the job is held (or about to be) at its next boundary.
+                [ -z "${lhold:-}" ] || state_display="$state_display [HELD]"
                 if [ -n "${pflags:-}" ]; then
                     # Flag markers show even when acked (an ack hides the
                     # needs-attention item, not the fact).
@@ -1241,6 +1244,32 @@ _status_rust_dirs_line() {
 # `mother status` with no id: queue overview + the needs-attention list.
 # Recomputes live (no gh — see lib/attention.sh) and refreshes attention.json
 # as a side effect so the statusline / `mother list` footer stay in step.
+# _status_limiter_hold <job_file> — the limiter boundary-hold line (L4) for a running job:
+#   ⏸ [HELD <code>] <reason> (at boundary since 3m; gives up worker after 10m)
+# or, before the worker has reached its next boundary, "(waiting for the next boundary)".
+_status_limiter_hold() {
+    local job_file="$1" code reason since at_boundary held_epoch="" now grace line
+    [ "$(jq -r '.state // ""' "$job_file" 2>/dev/null)" = "running" ] || return 0
+    code=$(jq -r '.limiter_hold.code // empty' "$job_file" 2>/dev/null)
+    [ -n "$code" ] || return 0
+    reason=$(jq -r '.limiter_hold.reason // ""' "$job_file" 2>/dev/null)
+    since=$(jq -r '.limiter_hold.boundary_since // .limiter_hold.since // ""' "$job_file" 2>/dev/null)
+    at_boundary=$(jq -r '.limiter_hold.at_boundary // false' "$job_file" 2>/dev/null)
+    now=$(date +%s)
+    grace=$(printf '%s' "${MOTHER_LIMITER_HOLD_GRACE_S:-600}" | grep -E '^[0-9]+$' || echo 600)
+    line="⏸ [HELD $code] $reason"
+    if [ "$at_boundary" = "true" ]; then
+        held_epoch=$(_iso_to_epoch "$since" 2>/dev/null || echo 0)
+        [ "${held_epoch:-0}" -gt 0 ] && line="$line (at boundary since $(( (now - held_epoch) / 60 ))m; gives up worker after $(( grace / 60 ))m)" \
+            || line="$line (at boundary; gives up worker after $(( grace / 60 ))m)"
+    else
+        line="$line (waiting for the next boundary; gives up worker $(( grace / 60 ))m after reaching it)"
+    fi
+    echo ""
+    echo "$line"
+    echo ""
+}
+
 _status_overview() {
     local format="$1"
     local items counts awaiting
@@ -1262,7 +1291,7 @@ _status_overview() {
                paused_at: (.paused_at // null),
                age_seconds: (if (.paused_at // "") != "" then ($now - (.paused_at | try epoch catch $now)) else null end),
                question: ((.question // "") | .[0:100]),
-               auto_resumes: ((.paused_reason // "") | startswith("quota_"))})')
+               auto_resumes: ((.paused_reason // "") | (startswith("quota_") or . == "limiter_hold"))})')
 
     local conc; conc=$(_effective_concurrency)
     local limiter; limiter=$(_limiter_block_json)
@@ -1435,6 +1464,7 @@ cmd_status() {
         fi
         local _lw; _lw=$(jq -r 'if (.state == "ready" or .state == "queued") and (.limiter.wait.reason // "") != "" then .limiter.wait.reason else empty end' "$job_file" 2>/dev/null) || _lw=""
         [ -z "$_lw" ] || echo "Waiting: $_lw"
+        _status_limiter_hold "$job_file"
         if [ "$activity" = "adherence_blocked" ]; then
             echo ""
             echo "⚠️  [ADHERENCE-BLOCKED] This job requires human review."

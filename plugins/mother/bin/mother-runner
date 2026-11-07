@@ -1143,7 +1143,7 @@ _notify_client_connected() {
 # it is waiting. (The one daemon-side resume that exists — _auto_resume_check —
 # is limited to quota_* system pauses and is untouched by this.)
 #
-# Eligible: state == awaiting and paused_reason NOT quota_* (quota pauses are
+# Eligible: state == awaiting and paused_reason NOT quota_* / limiter_hold (both are
 # system pauses _auto_resume_check clears on its own). Episode key: paused_at
 # (fallback: awaiting_notify.first_seen_at, stamped the first time it is seen).
 #   * new episode      -> INITIAL push
@@ -1186,7 +1186,7 @@ _notify_awaiting() {
 
         local eligible=1
         [ "$state" = "awaiting" ] || eligible=0
-        case "$reason" in quota_*) eligible=0 ;; esac
+        case "$reason" in quota_*|limiter_hold) eligible=0 ;; esac
         if [ "$eligible" -eq 0 ]; then
             [ "$has_an" = "1" ] && _job_update "$id" 'del(.awaiting_notify)'
             continue
@@ -1290,18 +1290,29 @@ EOF
 # _withdraw_quota_pause <job_file>: runs under the job lock (the supervisor and
 # other writers take it too), re-reading the file so a change made since the
 # caller looked is not overwritten. Returns 1 when there was nothing to withdraw.
+# Covers both forms of the request: `pause_requested` (kill path) and, under an
+# enforcing limiter, a quota_* `.hold` flag (boundary-hold path, L4).
 _withdraw_quota_pause() {
-    local f="$1" merged
+    local f="$1" merged id hold
     [ "$(jq -r '.state // ""' "$f" 2>/dev/null)" = "running" ] || return 1
-    [ "$(jq -r '.pause_requested // false' "$f" 2>/dev/null)" = "true" ] || return 1
-    case "$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)" in quota_*) ;; *) return 1 ;; esac
-    merged=$(jq '.pause_requested = null | .paused_reason = null | .auto_resume_at = null' "$f") \
-        && _atomic_write "$f" "$merged"
+    case "$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)" in
+        quota_*)
+            [ "$(jq -r '.pause_requested // false' "$f" 2>/dev/null)" = "true" ] || return 1
+            merged=$(jq '.pause_requested = null | .paused_reason = null | .auto_resume_at = null' "$f") \
+                && _atomic_write "$f" "$merged"
+            return $? ;;
+    esac
+    id=$(jq -r '.id // ""' "$f" 2>/dev/null)
+    hold="$RUNNER_DIR/$id.hold"
+    [ -n "$id" ] && [ -f "$hold" ] || return 1
+    case "$(jq -r '.code // ""' "$hold" 2>/dev/null)" in quota_*) ;; *) return 1 ;; esac
+    rm -f "$hold"
+    merged=$(jq '.auto_resume_at = null' "$f") && _atomic_write "$f" "$merged"
 }
 
 _auto_resume_check() {
     local now; now=$(date +%s)
-    local f state reason resume_at id merged released=0 why
+    local f state reason resume_at id merged released=0 why hold_resume=0
     # An open gate (switch off, or off_until_reset still in force) releases every
     # quota-parked job on this tick, as an elapsed auto_resume_at would.
     _quota_gate_open && released=1
@@ -1311,21 +1322,32 @@ _auto_resume_check() {
         reason=$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)
         # Gate open: withdraw a pause the daemon asked for but the supervisor has
         # not acted on yet, so the worker is never paused after the switch flips.
-        if [ "$released" -eq 1 ] && [ "$state" = "running" ] && [ "$(jq -r '.pause_requested // false' "$f" 2>/dev/null)" = "true" ]; then
-            case "$reason" in quota_*)
-                if _with_lock "$f" _withdraw_quota_pause "$f"; then
-                    _log "withdrew pause request of $(jq -r '.id' "$f") (quota gate is open)"
-                fi ;;
-            esac
+        # (A running job's pause is either `pause_requested` or a quota_* .hold flag.)
+        if [ "$released" -eq 1 ] && [ "$state" = "running" ]; then
+            if [ "$(jq -r '.pause_requested // false' "$f" 2>/dev/null)" = "true" ]; then
+                case "$reason" in quota_*)
+                    if _with_lock "$f" _withdraw_quota_pause "$f"; then
+                        _log "withdrew pause request of $(jq -r '.id' "$f") (quota gate is open)"
+                    fi ;;
+                esac
+                continue
+            fi
+            if [ -n "$(ls "$RUNNER_DIR"/*.hold 2>/dev/null)" ] && _with_lock "$f" _withdraw_quota_pause "$f"; then
+                _log "withdrew quota hold of $(jq -r '.id' "$f") (quota gate is open)"
+            fi
             continue
         fi
         [ "$state" = "awaiting" ] || continue
-        case "$reason" in quota_*) ;; *) continue ;; esac
+        case "$reason" in quota_*|limiter_hold) ;; *) continue ;; esac
         id=$(jq -r '.id' "$f")
         # The pause is marked `awaiting` before the old supervisor has killed its
         # worker (up to 10s): releasing now would start a second supervisor on the
         # same worktree. Wait until the old one is gone.
         if _supervisor_alive_for_job "$id"; then _note_waiting_on_supervisor "$id"; continue; fi
+        if [ "$reason" = "limiter_hold" ]; then
+            _resume_limiter_hold "$f" "$id" "$reason"
+            continue
+        fi
         why=window_reset
         if [ "$released" -eq 1 ]; then why=gate_off; fi
         if [ "$released" -eq 0 ]; then
@@ -1354,17 +1376,148 @@ _auto_resume_check() {
     done
 }
 
+# _resume_limiter_hold <job_file> <id> <paused_reason> — release a job parked as awaiting/limiter_hold
+# (L4) once the limiter admits it (its id is on the admit list), or at once when the limiter is no longer
+# enforcing (bet B6: the hold's basis is gone). The job goes to `ready` carrying its session id, so the
+# next worker re-enters the same session (`--resume`) with the release note as its prompt. A hand-made
+# `mother resume` takes the ordinary answer path instead. The caller has already checked that no
+# supervisor of the job is alive.
+_resume_limiter_hold() {
+    local f="$1" id="$2" reason="$3" why=limiter_admitted
+    if mother_limiter_enforcing; then
+        mother_limiter_admit_list | grep -qxF -- "$id" || return 0
+    else
+        why=limiter_not_enforcing
+    fi
+    _with_lock "$f" _resume_limiter_hold_locked "$f" "$id" "$reason" "$why"
+}
+
+# Runs under the job-file lock (so a `mother cancel` taken meanwhile wins): re-checks the state inside it
+# and writes nothing unless the job is still awaiting/limiter_hold.
+_resume_limiter_hold_locked() {
+    local f="$1" id="$2" reason="$3" why="$4" merged
+    [ "$(jq -r '.state' "$f" 2>/dev/null)" = "awaiting" ] || return 0
+    [ "$(jq -r '.paused_reason // ""' "$f" 2>/dev/null)" = "limiter_hold" ] || return 0
+    _log "auto-resuming $id (paused_reason=$reason; $why)"
+    merged=$(jq --arg ts "$(_iso_now)" --arg answer "The limiter released this job — continue from where you left off." '
+        .state = "ready"
+        | .pending_answer = $answer
+        | .resume_session_id = (.session_id // null)
+        | .resume_kind = "limiter_hold"
+        | .resumed_at = $ts
+        | .resume_count = ((.resume_count // 0) + 1)
+        | .paused_reason = null
+        | .pause_requested = null
+        | .limiter_hold = null
+    ' "$f") && _atomic_write "$f" "$merged" || return 0
+    _append_event "$id" "auto_resumed" \
+        "$(jq -nc --arg r "$reason" --arg why "$why" '{from_paused_reason: $r, reason: $why}')"
+}
+
+# ---------- limiter boundary holds (L4) ----------
+#
+# Under an enforcing limiter, a running job the limiter wants held gets $RUNNER_DIR/<id>.hold
+# ({code, reason, since}). The supervisor (mother-run-job) and the PreToolUse hook
+# (hooks/mother-limiter-hold.sh) do the rest at the job's next boundary; the runner never touches
+# the worker. Anything that is not enforcing removes every flag within one tick, so held workers
+# simply continue (bet B6).
+
+# _hold_flag_code <file> — the code in a .hold flag (empty when unreadable).
+_hold_flag_code() { jq -r '.code // ""' "$1" 2>/dev/null; }
+
+# _write_hold_flag <id> <code> <reason> — atomically, and only when code/reason changed.
+_write_hold_flag() {
+    local id="$1" code="$2" reason="$3" f since cur
+    f="$RUNNER_DIR/$id.hold"
+    since=$(_iso_now)
+    if [ -f "$f" ]; then
+        cur=$(jq -c --arg c "$code" --arg r "$reason" 'select(.code == $c and .reason == $r) | .since' "$f" 2>/dev/null)
+        [ -z "$cur" ] || return 0
+    fi
+    _atomic_write "$f" "$(jq -nc --arg c "$code" --arg r "$reason" --arg s "$since" '{code: $c, reason: $r, since: $s}')"
+}
+
+# _hold_job_eligible <job_file> — a job a hold may be written for: running, not cancelled, no final result.
+_hold_job_eligible() {
+    local jf="$1"
+    [ -f "$jf" ] || return 1
+    [ "$(jq -r '.state // ""' "$jf" 2>/dev/null)" = "running" ] || return 1
+    [ "$(jq -r '.cancel_requested // false' "$jf" 2>/dev/null)" != "true" ] || return 1
+    [ -z "$(jq -r '.final_result_at // ""' "$jf" 2>/dev/null)" ] || return 1
+    return 0
+}
+
+# _apply_limiter_holds — enforce only. Hold every running job in the state's would_hold plus the
+# non-advisory would_preempt set; remove the flag of running jobs no longer listed (quota_* flags are
+# the quota gate's and stay while the quota is still over its cap).
+_apply_limiter_holds() {
+    local state_file; state_file="$(_limiter_state_file)"
+    local us; us=$(printf '\037')
+    local wanted="" id code reason jf f fs
+    while IFS="$us" read -r id code reason; do
+        [ -n "$id" ] || continue
+        jf="$JOBS_DIR/$id.json"
+        _hold_job_eligible "$jf" || continue
+        fs=$(jq -r '.force_start // false' "$jf" 2>/dev/null)
+        # force_start is exempt from interactive pre-emption, never from a distress hold.
+        [ "$code" = "interactive_personal" ] && [ "$fs" = "true" ] && continue
+        wanted="$wanted $id "
+        # A quota hold (carries the resume time) is never replaced by a limiter hold.
+        if [ -f "$RUNNER_DIR/$id.hold" ]; then
+            case "$(_hold_flag_code "$RUNNER_DIR/$id.hold")" in quota_*) continue ;; esac
+        fi
+        _write_hold_flag "$id" "$code" "$reason"
+    done < <(jq -r --arg us "$us" '(.running // [])[]
+        | select(.hold != null and (.would_hold or (.would_preempt and (.advisory | not))))
+        | [.id, .hold.code, .hold.reason] | join($us)' "$state_file" 2>/dev/null)
+
+    for f in "$RUNNER_DIR"/*.hold; do
+        [ -f "$f" ] || continue
+        id=$(basename "$f" .hold)
+        case "$wanted" in *" $id "*) continue ;; esac
+        if _hold_job_eligible "$JOBS_DIR/$id.json"; then
+            case "$(_hold_flag_code "$f")" in
+                quota_*) _quota_check || continue ;;   # still over cap: keep it
+            esac
+        fi
+        rm -f "$f"
+    done
+}
+
+# _clear_limiter_holds — not enforcing (mode left enforce, limiter stale or faulted): remove every flag.
+_clear_limiter_holds() {
+    local f
+    for f in "$RUNNER_DIR"/*.hold; do
+        [ -f "$f" ] || continue
+        rm -f "$f"
+        _log "removed limiter hold $(basename "$f") (limiter is not enforcing)"
+    done
+}
+
+_sync_limiter_holds() {
+    if mother_limiter_enforcing; then
+        _apply_limiter_holds
+    else
+        _clear_limiter_holds
+    fi
+}
+
 _maybe_pause_running() {
     # Caller has already verified quota is over cap. Walk currently-tracked
     # children, find their job json, set `pause_requested` + paused_reason
     # + auto_resume_at on the eligible ones. mother-run-job's poll loop
     # picks up `pause_requested` on its next tick and handles the rest
     # (terminate worker, transition state to `awaiting`).
-    local reason resume_at
+    #
+    # Under an enforcing limiter (L4) nothing is killed mid-request: the job gets a quota_* `.hold`
+    # flag and keeps `auto_resume_at`; it stops at its next boundary, and after the grace period the
+    # supervisor parks it with paused_reason = that quota_* code, which _auto_resume_check handles.
+    local reason resume_at holding=0
     reason=$(_quota_offending_window)
     [ -n "$reason" ] || return 0
     resume_at=$(_quota_resume_at_for "$reason")
     [ "$(_quota_int "${resume_at:-0}")" -gt 0 ] || return 0
+    mother_limiter_enforcing && holding=1
 
     local f pid job_id job_file fr ar cr pr merged
     for f in "$CHILDREN_DIR"/*.json; do
@@ -1388,6 +1541,15 @@ _maybe_pause_running() {
 
         # The operator may have flipped the switch since this pass started.
         _quota_gate_open && return 0
+        if [ "$holding" -eq 1 ]; then
+            # Already holding for this window: nothing to do.
+            [ "$(_hold_flag_code "$RUNNER_DIR/$job_id.hold")" = "$reason" ] && continue
+            merged=$(jq --argjson ts "$resume_at" '.auto_resume_at = $ts' "$job_file") \
+                && _atomic_write "$job_file" "$merged"
+            _write_hold_flag "$job_id" "$reason" "quota cap reached ($reason)"
+            _log "requested boundary hold of $job_id (reason=$reason, resume_at=$resume_at)"
+            continue
+        fi
         merged=$(jq --arg r "$reason" --argjson ts "$resume_at" '
             .pause_requested = true
             | .paused_reason = $r
@@ -2160,6 +2322,7 @@ _loop() {
 
         _dispatch_ready_jobs
         _maybe_limiter_tick
+        _sync_limiter_holds
 
         _maybe_backup
         _maybe_archive
@@ -2262,6 +2425,12 @@ case "${1:-}" in
         # controlled via MOTHER_LIMITER_INTERVAL (0 = always) / $RUNNER_DIR/last-limiter.ts.
         # Usage: mother-runner --limiter-tick
         _maybe_limiter_tick
+        exit 0
+        ;;
+    --holds-tick)
+        # Test entry point: run one _sync_limiter_holds pass (write or clear the .hold flags) and exit.
+        # Usage: mother-runner --holds-tick
+        _sync_limiter_holds
         exit 0
         ;;
     --pause-tick)

@@ -121,6 +121,7 @@ for display and routing.
 | `ready` | — | runnable, waiting for daemon slot |
 | `ready` | `cody_rework` | re-queued for a second Cody attempt after an adherence fail (the daemon sets this; the worker has not started yet) |
 | `running` | (none) | Cody running (first attempt) |
+| `running` | (`limiter_hold` field) | L4: Cody is running but the limiter wants the job held; it stops at its next boundary (see "Boundary holds"). `activity` is unchanged; `mother list` shows `[HELD]` |
 | `running` | `cody_rework` | Cody running (second attempt, after adherence fail) |
 | `running` | `continuation` | Cody re-running after idle_timeout (auto-continuation) |
 | `awaiting` | (none) | Cody asked a question; answer with `mother resume` |
@@ -131,6 +132,7 @@ for display and routing.
 | `running` | `review_rework` | HC-14: the worker's same session (`--resume`) is addressing blocking wave findings (cycle n of `cycle_cap`) |
 | `awaiting` | `review_hold` | HC-14: a human-blocking finding, a lens error, a second adherence fail or the wave cycle cap; `paused_reason: review_hold`, a `review_hold` decision (`resume_with_guidance`, `override_open`, `cancel`) and `decision_awaiting` attention |
 | `awaiting` | `gate_hold` | enforce mode: blocking gates still red after `max_attempts`; `paused_reason: gate_hold`, a `gate_hold` decision and `decision_awaiting` attention. Answer with `mother resume <id> "<guidance>"` or `--option escalate\|override_open\|cancel`; `mother status` shows `[GATES-HELD]` |
+| `awaiting` | `limiter_hold` | L4: the job's boundary hold outlasted `MOTHER_LIMITER_HOLD_GRACE_S` with a quiet log (or at a phase boundary) and the worker was stopped; `paused_reason: limiter_hold`. Mother resumes it by itself (with its session) once the limiter admits it; no push notification. `mother resume` works too |
 | `awaiting` | `operator_hold` | Mother held a failed job instead of escalating it (see "Failure routing"); `.question` names the next commands. Act with `resume`, `retry`, `reconcile`, or `cancel` |
 | `running` | `pipeline_phase` | pipeline job: a build agent (redd/cody/marty) is actively running |
 | `ready` | `pipeline_phase` | pipeline job: next build agent queued (driver just advanced the phase) |
@@ -540,8 +542,8 @@ checkout; plugin versions are bumped so `claude plugin update` refreshes it.
 
 ## Backpressure limiter
 
-Observe by default (L1; L2 added the surfaces below; L3 added enforcement of **admission of new work**; boundary holds on
-running jobs are L4). It computes what it admits, holds or cuts each tick and logs it next to what dispatch did. **In
+Observe by default (L1; L2 added the surfaces below; L3 added enforcement of **admission of new work**; L4 added boundary
+holds on running jobs, see "Boundary holds (L4)"). It computes what it admits, holds or cuts each tick and logs it next to what dispatch did. **In
 `observe` and `off` it changes no dispatch behaviour.** See "Enforcement (L3)" below.
 
 - **Pure core (bet B1).** `lib/limiter_core.py` is the control law: stdlib `math`/`re` only, no file, clock or
@@ -573,7 +575,7 @@ running jobs are L4). It computes what it admits, holds or cuts each tick and lo
   `MOTHER_LIMITER_INTERVAL` 10, `_TIMEOUT` 20, `_RESERVE_PCT` 15, `_BURN_WINDOW_S` 600,
   `_DEFAULT_BURN_USD_PER_MIN` 0.5, `_HISTORY_N` 20, `_HISTORY_MIN` 3, `_CALM_S` 900, `_COALESCE_S` 120,
   `_RAMP_START` 2, `_RAMP_STEP_S` 300, `_INTERACTIVE_PCT_H` 10, `_INTERACTIVE_SUSTAIN_S` 600, `_K_MIN_SAMPLES` 12,
-  `_DECISIONS_MAX_MB` 20; `MOTHER_COMPANY_REPOS` (space-separated repo names forced to `company`).
+  `_DECISIONS_MAX_MB` 20, `_HOLD_GRACE_S` 600, `_QUIET_S` 30 (L4); `MOTHER_COMPANY_REPOS` (space-separated repo names forced to `company`).
 - **Rules.** `allowed = min(MOTHER_CONCURRENCY, backoff_level, ramp_level)`. Distress (429/503/529 `api_retry`,
   `result` with `api_error_status` 429/503/529 (503 is deliberately an overload signal and cuts, like 529), a non-overage rejected `rate_limit_event`, a `failure_routed` event
   with `rate_limited`/`api_overloaded`) halves `allowed` (events within `COALESCE_S` are one cut); calm raises the
@@ -656,6 +658,84 @@ changes append `limiter/mode-audit.jsonl`; a same-mode call writes nothing. The 
   stands in for the TTY only under `MOTHER_TEST_ROOT=1`). Lower/normal are open.
 
 New job field: `priority_adjust` (int, -1|0|1) — owner-set ordering shift, absent = 0.
+
+### Boundary holds (L4)
+
+Under `enforce` (`mother_limiter_enforcing`), a running job the limiter wants to yield stops at its next **boundary**, never
+mid-request. Nothing is held in observe/off.
+
+- **Selection** (`lib/limiter_core.py`). `would_hold` = the excess `running - min(ceiling, backoff_level)` after a distress cut,
+  personal before company, newest before oldest (company jobs only when the personal ones cannot cover the excess).
+  `would_preempt` = personal jobs only, when interactive demand is high **and** the 5h reserve is projected to be breached; it is
+  advisory (never held) while the quota gate is off or the feed is stale (bet B3). Each running row in `state.json` carries
+  `hold {code: backoff|interactive_personal, reason}` when it is in either set.
+- **Flag.** `mother-runner`'s `_sync_limiter_holds` (after `_maybe_limiter_tick`) writes `runner/<id>.hold` = `{code, reason,
+  since}` atomically and only when code/reason changed, for each running job in `would_hold ∪ non-advisory would_preempt`. Never for a
+  job with `cancel_requested`, a `final_result_at`, or not `running`; `force_start` is exempt from `interactive_personal`, not from
+  distress holds. When not enforcing (mode left enforce, state stale/faulted: bet B6) every `.hold` is removed within one tick.
+  Test entry: `mother-runner --holds-tick`.
+- **Tool boundary.** Unless the limiter mode is `off`, every job's settings file (`runner/<id>.settings.json`) has a PreToolUse
+  hook `hooks/mother-limiter-hold.sh` (`MOTHER_LIMITER_HOOK_MAX_S=grace+240`, hook `timeout` grace+300), plus the cost gate when
+  `max_cost_usd` is set. With no `.hold` it exits 0 at once (no `jq`, no stdin). With one it writes `runner/<id>.held`
+  (`{at, pid}`), polls every 2 s, and exits 0 when the flag is gone or at `MOTHER_LIMITER_HOOK_MAX_S` (fail open; garbage in = exit 0).
+- **Supervisor** (`mother-run-job` poll loop, `_limiter_hold_tick`): `.hold` seen → `.limiter_hold = {code, reason, since,
+  at_boundary: false}`; `.held` appears → event `held {code, reason, boundary: "tool"}`, `at_boundary: true`; `.hold` gone →
+  `hold_released {held_s}` and `.limiter_hold` cleared; `.held` older than `MOTHER_LIMITER_HOLD_GRACE_S` **and** the log quiet for
+  `MOTHER_LIMITER_QUIET_S` → `awaiting` (`paused_reason: limiter_hold`, or the `quota_*` code for a quota hold), then
+  `paused_for_limiter {code, reason, held_s, boundary, paused_reason, question}` (`paused_for_quota` for quota codes), then
+  `_terminate_worker`; grace passed but log busy → `hold_giveup_deferred` at most once a minute.
+- **Observe installs the hook too.** Whenever the mode is not `off`, the settings file carries the PreToolUse hold hook, so a mode flip
+  reaches workers already running. Cost: one no-op hook process per tool call in observe (it exits 0 at once when there is no `.hold`).
+  The hook fails open: any write failure, missing root or garbled input exits 0 silently, and it never outlives `MOTHER_LIMITER_HOOK_MAX_S`.
+- **Never stop a worker on a stale boundary (MC-37).** Before parking, `_hold_boundary_check` requires `.held` to exist, its pid to be
+  alive and under the worker, and the hook's max wait (`_hold_hook_max_s`, also what the settings file passes the hook) not to have passed;
+  otherwise the latch resets and the next fresh `.held` re-latches. `_hold_park` takes the job-file lock for its state write and uses the
+  `.hold` flag's current code; the runner's `_resume_limiter_hold` re-checks `awaiting`/`limiter_hold` under the same lock.
+- **Quota holds when the limiter turns unhealthy.** If the limiter stops enforcing while a quota `.hold` exists, the old quota mid-run
+  pause/kill path takes over (pre-existing behaviour).
+- **Park protocol (never kill unless parked).** `_hold_park` (tool boundary) writes `runner/<id>.park` (`{pid, at}` of the
+  supervisor), re-validates `.held`, writes the awaiting state, then re-reads the job and requires its own `awaiting` +
+  `paused_reason` + `paused_at`; any failure (including `_with_lock` timing out) removes `.park`, returns 1 and the tick
+  keeps waiting: no event, no kill. Only after a landed park does the caller `_terminate_worker`, then remove `.park`. While
+  `.park` exists and its pid is alive the hook keeps blocking even if `.hold` is gone or `MOTHER_LIMITER_HOOK_MAX_S` passed,
+  bounded by `MAX_S + MOTHER_LIMITER_HOOK_PARK_CAP_S` (120); a `.park` with a dead pid is ignored (fail open).
+- **In-flight tool calls (park only when every call is blocked).** Claude Code issues parallel tool calls (and subagents run
+  their own), so "the last hook is blocked" does not prove nothing is executing. The hook records every call in
+  `runner/<id>.calls/<tool_use_id>.json` = `{state: running|blocked, pid, at}` at PreToolUse (even with no `.hold`; input
+  without a `tool_use_id` is not recorded), marks it `blocked` while it blocks and `running` on release; `mother-limiter-hold.sh
+  post`, wired as `PostToolUse` and `PostToolUseFailure` in the same settings file, removes it. `_hold_calls_safe` allows a park
+  only when at least one call is blocked in a live hook under the worker and none is `running`; a record whose hook is dead
+  counts as running (the tool is executing) until older than `MOTHER_LIMITER_CALL_STALE_S` (21600, a lost PostToolUse), when it
+  is discarded; an unreadable record counts as running. It is checked before `.park` is written, after it, and (test delay
+  only) again before the state write; the hook records a call before it looks at `.hold`/`.park`, so a call starting in the
+  window is either seen or blocked by `.park`. A deferral emits `hold_giveup_deferred {reason: tool_call_in_flight}` (at most
+  once a minute). Spawn removes `<id>.park` and `<id>.calls/`. After `_terminate_worker` the supervisor stops the blocked hook
+  pids it recorded at park time (by exact pid, never the process group). Verified against a real session: `claude -p` with two
+  parallel Bash calls fires `PreToolUse` x2 then `PostToolUse` x2 with distinct `tool_use_id`s, and `PostToolUseFailure` for a
+  failing call.
+- **Gated test hooks.** `MOTHER_TEST_PARK_DELAY_S` (seconds slept inside `_hold_park` between the last check and the state
+  write) only takes effect under `MOTHER_TEST_ROOT=1`; it widens the window the park-sequence tests probe. Never set either in production.
+- **Phase boundary.** `_hold_wait_before_spawn` (top of `_spawn_and_wait`, and `_wave_cycle` before the adherence/lens spawns) waits
+  while `.hold` exists (`held {boundary: "phase"}`, poll 2 s); past the grace period it parks the job without spawning (no worker to
+  stop; a same-session prompt that never started is kept in `.limiter_resume_prompt` and replayed on resume). Reviewers already
+  running are never held.
+- **Quota under enforce.** `_maybe_pause_running` writes a `quota_*` `.hold` and keeps `auto_resume_at` on the job instead of
+  setting `pause_requested`; the supervisor's give-up parks it as that `quota_*` reason and `_auto_resume_check` is unchanged. The
+  runner removes a quota hold when the quota is back under cap or the gate is open (`_withdraw_quota_pause` also handles it).
+- **Resume.** `_auto_resume_check` releases `paused_reason == limiter_hold` to `ready` (`pending_answer` "The limiter released this
+  job — continue from where you left off.", `resume_session_id = session_id`, `resume_kind: limiter_hold`, `limiter_hold` cleared)
+  once the job id is in the limiter's `admit` list (parked jobs are candidates in `mother-limiter`'s tick), or at once when the
+  limiter is not enforcing; never while `_supervisor_alive_for_job`. Event `auto_resumed {from_paused_reason: "limiter_hold",
+  reason: "limiter_admitted"|"limiter_not_enforcing"}`. The next worker re-enters the same session (`--resume`). `mother resume`
+  by hand takes the ordinary answer path. `limiter_hold` awaiting jobs get no push notification and show as auto-resuming.
+- **Knobs:** `MOTHER_LIMITER_HOLD_GRACE_S` (600), `MOTHER_LIMITER_QUIET_S` (30), `MOTHER_LIMITER_CALL_STALE_S` (21600); tests only: `MOTHER_LIMITER_HOOK_POLL_S` (2).
+- **Surfaces.** `mother status <id>`: `⏸ [HELD <code>] <reason> (at boundary since 3m; gives up worker after 10m)`; `mother list`:
+  `[HELD]`. Broker: `paused_for_limiter` folds to `awaiting` with `paused_reason`; `held`/`hold_released` are `activity` events.
+
+| Field | Type | Description |
+|---|---|---|
+| `limiter_hold` | object\|null | `{code, reason, since, at_boundary, boundary_since?}` while a running job is held (or about to be); cleared on release or park. Written only by the supervisor. |
+| `resume_kind` / `limiter_resume_prompt` | string / string | Set by the limiter auto-resume / a phase-boundary park; consumed (cleared) by the next worker start. |
 
 New job fields:
 
