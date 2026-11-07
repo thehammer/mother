@@ -2195,6 +2195,12 @@ CAND_EOF
 # Delegates to _iso_now (sourced from state.sh) so worker-written timestamps
 # match the millisecond RFC 3339 format used everywhere else in job JSON.
 _install_core_job_helpers() {
+    # _switch_with_lock lives in lib/state.sh; SOURCE_ONLY=1 sourcing returns before the main
+    # source of it, so make sure it exists in both modes (before _with_lock is defined).
+    if ! type _switch_with_lock >/dev/null 2>&1; then
+        # shellcheck source=/dev/null
+        source "$MOTHER_LIB_DIR/state.sh"
+    fi
     iso_now() { _iso_now; }
     _atomic_write() {
         # NB: `path` collides with zsh's special array for PATH — use _target.
@@ -2204,6 +2210,10 @@ _install_core_job_helpers() {
     _with_lock() {
         # state.sh's _switch_with_lock records the owner pid and never takes over a live owner.
         local target="$1"; shift
+        if ! type _switch_with_lock >/dev/null 2>&1; then
+            echo "mother-run-job: _switch_with_lock is undefined (lib/state.sh not sourced); refusing to run unlocked" >&2
+            return 1
+        fi
         _switch_with_lock "${target}.lockdir" "$target" 200 "$@"
     }
     _append_line() { printf '%s\n' "$2" >> "$1"; }

@@ -60,24 +60,36 @@ _usage_job_update_unlocked() {
 }
 
 # _usage_with_lock <lockable-file> <cmd> [args...]
-# Acquires a sibling "<lockable-file>.lockdir" mkdir-based lock (best-effort:
-# gives up and proceeds unlocked after ~10s of retries rather than hanging
-# forever), runs <cmd> with the remaining args, then releases the lock.
+# Acquires a sibling "<lockable-file>.lockdir" mkdir-based lock (owner pid recorded; a
+# live owner is never displaced; after ~10s without the lock nothing runs and it returns 1), runs <cmd> with the remaining args, then releases the lock.
 # Shared by every append-under-lock call site in this file (today:
 # _usage_append_event and mother_record_run_usage) so there is one
 # acquire/retry/release implementation instead of hand-copied ones that could
 # drift apart.
 _usage_with_lock() {
     local lockable="$1"; shift
-    local lockdir="${lockable}.lockdir"
-    local tries=0
+    # Same lock as every other taker of <file>.lockdir: _switch_with_lock records the owner pid,
+    # never displaces a live owner and takes over a dead one. A caller that doesn't have state.sh
+    # sourced gets the minimal owner-honouring equivalent below. On failure to acquire nothing runs.
+    if type _switch_with_lock >/dev/null 2>&1; then
+        _switch_with_lock "${lockable}.lockdir" "usage" 200 "$@"
+        return $?
+    fi
+    local lockdir="${lockable}.lockdir" tries=0 o
     while ! mkdir "$lockdir" 2>/dev/null; do
+        o=$(cat "$lockdir/owner" 2>/dev/null)
+        if [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null; then
+            rm -f "$lockdir/owner"; rmdir "$lockdir" 2>/dev/null || true; continue
+        fi
         sleep 0.05
         tries=$((tries + 1))
-        [ "$tries" -gt 200 ] && break
+        [ "$tries" -gt 200 ] && { echo "mother: could not acquire the usage lock for $lockable" >&2; return 1; }
     done
+    echo "$$" > "$lockdir/owner" 2>/dev/null || true
     "$@"
-    rmdir "$lockdir" 2>/dev/null || true
+    local rc=$?
+    rm -f "$lockdir/owner"; rmdir "$lockdir" 2>/dev/null || true
+    return $rc
 }
 
 _usage_append_line() { printf '%s\n' "$2" >> "$1"; }

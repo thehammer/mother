@@ -2642,6 +2642,9 @@ def _append_event_locked(root, jid, kind, detail, now_s):
     path = os.path.join(root, "events", jid + ".jsonl")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lockdir = path + ".lockdir"
+    # Same protocol as lib/state.sh _switch_with_lock: the holder writes its pid to <lockdir>/owner,
+    # a live owner is never displaced. Reaping a dead owner's lock is left to the shell takers
+    # (serialized behind the takeover mutex); Python only waits, and never writes without the lock.
     for _ in range(200):
         try:
             os.mkdir(lockdir)
@@ -2651,11 +2654,20 @@ def _append_event_locked(root, jid, kind, detail, now_s):
     else:
         return False
     try:
+        with open(os.path.join(lockdir, "owner"), "w") as fh:
+            fh.write("%d\n" % os.getpid())
+    except OSError:
+        pass
+    try:
         line = json.dumps({"ts": _iso_ms(now_s), "kind": kind, "detail": detail},
                           ensure_ascii=False, separators=(",", ":"))
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     finally:
+        try:
+            os.unlink(os.path.join(lockdir, "owner"))
+        except OSError:
+            pass
         try:
             os.rmdir(lockdir)
         except OSError:

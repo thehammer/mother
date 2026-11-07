@@ -411,6 +411,50 @@ _quota_with_lock() {
     _switch_with_lock "$(_quota_gate_file).lockdir" "quota-gate" "$@"
 }
 
+# _takeover_mutex_acquire <lockdir>: short-lived mkdir mutex (<lockdir>.takeover) that serializes
+# stale-lock takeovers. Its own owner is recorded; a dead owner (or an owner-less dir older than 5s)
+# is removed. Gives up after ~2s (returns 1); the caller just retries its main loop.
+_takeover_mutex_acquire() {
+    local m="$1.takeover" n=0 o
+    while ! mkdir "$m" 2>/dev/null; do
+        o=$(cat "$m/owner" 2>/dev/null)
+        if [ -n "$o" ]; then
+            kill -0 "$o" 2>/dev/null || { rm -f "$m/owner"; rmdir "$m" 2>/dev/null || true; continue; }
+        elif [ -d "$m" ] && [ $(( $(date +%s) - $(_file_mtime "$m") )) -gt 5 ]; then
+            rmdir "$m" 2>/dev/null || true; continue
+        fi
+        n=$((n + 1)); [ "$n" -gt 40 ] && return 1
+        sleep 0.05
+    done
+    echo "$$" > "$m/owner" 2>/dev/null || true
+    return 0
+}
+
+_takeover_mutex_release() { rm -f "$1.takeover/owner"; rmdir "$1.takeover" 2>/dev/null || true; }
+
+# _takeover_stale_lockdir <lockdir> <label>: called with the takeover mutex held. Re-reads the lock's
+# identity and removes it only if it is still stale (dead recorded owner, or owner-less and old).
+_takeover_stale_lockdir() {
+    local lockdir="$1" label="$2" ino owner mtime
+    ino=$(ls -di "$lockdir" 2>/dev/null | awk '{print $1}')
+    [ -n "$ino" ] || return 0
+    owner=$(cat "$lockdir/owner" 2>/dev/null)
+    mtime=$(_file_mtime "$lockdir")
+    # Test hook (gated): widen the window between judging and removing.
+    [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ -n "${MOTHER_TEST_TAKEOVER_DELAY_S:-}" ] && sleep "$MOTHER_TEST_TAKEOVER_DELAY_S"
+    if [ -n "$owner" ]; then
+        kill -0 "$owner" 2>/dev/null && return 0
+    elif [ $(( $(date +%s) - mtime )) -le "${MOTHER_QUOTA_LOCK_STALE_S:-30}" ]; then
+        return 0
+    fi
+    # Mutex held: nobody else renames. A live owner that took the path during the hook is caught here.
+    if [ "$(ls -di "$lockdir" 2>/dev/null | awk '{print $1}')" = "$ino" ] \
+       && [ "$(cat "$lockdir/owner" 2>/dev/null)" = "$owner" ]; then
+        rm -f "$lockdir/owner"; rmdir "$lockdir" 2>/dev/null || true
+        echo "mother: took over a stale $label lock (owner ${owner:-unknown})" >&2
+    fi
+}
+
 # _switch_with_lock <lockdir> <label> <tries> <cmd...>: the lock behind _quota_with_lock,
 # shared with the limiter-mode switch (lib/limiter.sh). <label> names the switch in messages.
 _switch_with_lock() {
@@ -418,7 +462,8 @@ _switch_with_lock() {
     local tries=0 owner ino mtime stale
     # Re-entrant within one shell (and its subshells): a nested call for a lockdir this shell already
     # holds (e.g. a job transition's usage recompute under `mother cancel`) just runs. A plain shell
-    # variable, never exported, so child processes still contend normally.
+    # variable, never exported, so child processes (exec'd commands, `mother ... &`) still contend
+    # normally; a backgrounded *function* subshell would inherit it, and none takes locks.
     case "${_MOTHER_HELD_LOCKDIRS:-}" in *"|$lockdir|"*) "$@"; return $? ;; esac
     mkdir -p "$(dirname "$lockdir")" 2>/dev/null
     while ! mkdir "$lockdir" 2>/dev/null; do
@@ -436,20 +481,13 @@ _switch_with_lock() {
             stale=1   # no owner recorded (crash before the owner write, or an old holder): age rule only
         fi
         if [ "$stale" -eq 1 ]; then
-            if mv "$lockdir" "$lockdir.stale.$$" 2>/dev/null; then
-                # Another taker may have replaced the dir between our read and the rename: only
-                # discard it if it is still exactly the one we judged stale (same inode, owner, mtime).
-                if [ "$(ls -di "$lockdir.stale.$$" 2>/dev/null | awk '{print $1}')" = "$ino" ] \
-                   && [ "$(cat "$lockdir.stale.$$/owner" 2>/dev/null)" = "$owner" ] \
-                   && [ "$(_file_mtime "$lockdir.stale.$$")" = "$mtime" ]; then
-                    rm -f "$lockdir.stale.$$/owner"; rmdir "$lockdir.stale.$$" 2>/dev/null || true
-                    echo "mother: took over a stale $label lock (owner ${owner:-unknown})" >&2
-                else
-                    # Known, accepted window (theoretical): between the two renames the lock
-                    # path is briefly free, so a third process can take it; the put-back then
-                    # fails quietly and that process's lock stands.
-                    mv "$lockdir.stale.$$" "$lockdir" 2>/dev/null || true
-                fi
+            # Only one taker at a time may judge and rename: under the takeover mutex the lockdir is
+            # re-judged from scratch, so a live owner that acquired the path in the meantime is seen
+            # as live and left alone. No rename-then-put-back, hence no window where the path is free
+            # while a live owner holds it.
+            if _takeover_mutex_acquire "$lockdir"; then
+                _takeover_stale_lockdir "$lockdir" "$label"
+                _takeover_mutex_release "$lockdir"
             fi
             tries=$((tries + 1))
             [ "$tries" -gt "$tries_max" ] && { echo "mother: could not acquire the $label lock" >&2; return 1; }

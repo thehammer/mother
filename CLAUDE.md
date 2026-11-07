@@ -727,8 +727,12 @@ mid-request. Nothing is held in observe/off.
 - **Job lock takeover.** Every `<file>.lockdir` taker (`_with_lock` in `lib/state.sh` and `mother-run-job`, `_job_locked`, the runner's
   limiter apply, the quota/limiter switches) goes through `_switch_with_lock`, which records the owner pid. A recorded owner that is
   alive is never displaced, however long it holds; a dead one is taken over; an owner-less lockdir is taken over only past
-  `MOTHER_QUOTA_LOCK_STALE_S` (30s). The takeover renames the dir aside and discards it only if its inode, owner and mtime still match what
-  was judged stale, otherwise it puts it back.
+  `MOTHER_QUOTA_LOCK_STALE_S` (30s). Takeovers are serialized by a short-lived `<lockdir>.takeover` mkdir mutex (own owner
+  file, dead owner reaped, ~2s timeout): the taker re-judges the lockdir under the mutex and removes it only if it is still stale, so there is no
+  rename-and-put-back and a live owner that took the path meanwhile is left alone. Residual heuristic: the owner-less age rule (30s) cannot
+  distinguish a crashed owner-less holder from a live one that has not written its pid. `lib/usage.sh` `_usage_with_lock` and the Python
+  events append in `bin/mother-usage` use the same lockdir and owner file (Python waits for, never reaps, a dead owner; neither writes unlocked).
+  `mother-run-job`'s `_with_lock` fails loudly if `_switch_with_lock` is undefined (`_install_core_job_helpers` sources `lib/state.sh` first).
 - **Phase boundary.** `_hold_wait_before_spawn` (top of `_spawn_and_wait`, and `_wave_cycle` before the adherence/lens spawns) waits
   while `.hold` exists (`held {boundary: "phase"}`, poll 2 s); past the grace period it parks the job without spawning (no worker to
   stop; a same-session prompt that never started is kept in `.limiter_resume_prompt` and replayed on resume). Reviewers already
