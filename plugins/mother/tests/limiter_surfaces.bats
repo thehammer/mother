@@ -167,7 +167,7 @@ _keyset() { jq -r '[paths(scalars) | map(select(type == "string")) | join(".")] 
     [[ "$output" == *"burn 0.84 \$/min vs sustainable 0.61 \$/min"* ]]
     [[ "$output" == *"reserve 15%"* ]]
     [[ "$output" == *"last distress 6m ago"* ]]
-    # the limiter lines sit under Concurrency:, before Queue:
+    # the limiter lines sit under Concurrency: (after the Rust build dirs line), before Queue:
     local c l q
     c=$(grep -n '^Concurrency:' <<<"$output" | head -1 | cut -d: -f1)
     l=$(grep -n 'allowed 3 of 5' <<<"$output" | head -1 | cut -d: -f1)

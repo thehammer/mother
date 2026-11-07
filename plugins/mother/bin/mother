@@ -1263,8 +1263,8 @@ _status_overview() {
     fi
 
     echo "Concurrency: $(printf '%s' "$conc" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
-    _limiter_text "$limiter" compact
     _status_rust_dirs_line "$rust_dirs"
+    _limiter_text "$limiter" compact
     echo "Queue: $(printf '%s' "$counts" | jq -r 'to_entries | if length == 0 then "(no jobs)" else map("\(.key)=\(.value)") | join("  ") end')"
     echo ""
     echo "=== awaiting operator ==="

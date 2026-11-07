@@ -66,7 +66,7 @@ Raise concurrency in steps, never skipping one. Edit `~/.mother/config.env`:
 MOTHER_CONCURRENCY=3
 ```
 
-then restart the daemon so it reads it (`mother daemon restart`; `mother status` shows the new value and
+then restart the daemon so it reads it (`mother daemon stop && mother daemon start`; `mother status` shows the new value and
 `source: config file`). The limiter picks up the same value on its next tick.
 
 Each step runs for **at least one full 5-hour window** (watch `mother limiter signals` for the 5h `resets:`
@@ -114,10 +114,11 @@ any value other than `observe` or `off` just runs observe with a warning.
 ## 5. Backing out
 
 - Observe-only mode changes no dispatch, so there is nothing to undo for that. To stop the limiter observing at
-  all: `MOTHER_LIMITER_MODE=off` (a hard kill switch, wins over everything; put it in the daemon's environment or
-  `~/.mother/config.env`) or write `{"mode":"off"}` to `$MOTHER_ROOT/limiter/mode.json`. `mother limiter --json`
+  all: write `{"mode":"off"}` to `$MOTHER_ROOT/limiter/mode.json` (preferred: the daemon and the `mother limiter`
+  CLI both read it), or set `MOTHER_LIMITER_MODE=off` in the daemon's environment (a hard kill switch that wins over
+  everything; note a `mother limiter` run from your own shell may not see it, so the CLI can disagree with the daemon). `mother limiter --json`
   then prints `{"v":1,"mode":"off"}`.
 - Once enforcement exists: `mother limiter mode observe` returns to observe-only, and `MOTHER_LIMITER_MODE=off`
   still turns it off completely.
 - To undo a concurrency step: set the previous `MOTHER_CONCURRENCY` in `~/.mother/config.env` and
-  `mother daemon restart`.
+  `mother daemon stop && mother daemon start`.
