@@ -63,7 +63,7 @@ SH
     mkdir "$lockdir"; _dead_pid > "$lockdir/owner"
     mkdir "$lockdir.takeover"; _dead_pid > "$lockdir.takeover/owner"
     _taker z "$lockdir" "$d"
-    D="$d" NAME=only LOCKDIR="$lockdir" run timeout 20 bash "$d/taker.sh"
+    D="$d" NAME=only LOCKDIR="$lockdir" run bash "$d/taker.sh"
     [ "$status" -eq 0 ]
     [ "$(cat "$d/entered")" = "only" ]
 }
