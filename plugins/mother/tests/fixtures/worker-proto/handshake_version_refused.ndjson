@@ -1,0 +1,2 @@
+{"v":1,"t":"hello","id":"00000000-0000-4000-8000-000000000003","ts":"2026-11-08T15:04:05.001Z","job":null,"lease":null,"epoch":null,"seq":null,"ack":null,"data":{"proto_min":2,"proto_max":3,"caps":[],"worker_id":"sendai-1","instance_id":"inst-9","kind":"sendai","auth":{"method":"peercred"}}}
+{"v":1,"t":"refuse","id":"00000000-0000-4000-8000-000000000004","ts":"2026-11-08T15:04:05.004Z","job":null,"lease":null,"epoch":null,"seq":null,"ack":null,"data":{"code":"version","msg":"no common protocol version"}}
