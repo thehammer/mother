@@ -33,6 +33,14 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 
 set -u
 
+# Worker mode is validated once, before any path is used or created (lib/outbox.sh): no explicit root,
+# the live tree, or an unwritable outbox is a loud refusal that touches nothing.
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/outbox.sh" ] && source "$MOTHER_LIB_DIR/outbox.sh"
+if type mother_worker_mode_validate >/dev/null 2>&1; then
+    mother_worker_mode_validate || { echo "mother-run-job: refusing to run in worker mode" >&2; exit 1; }
+fi
+
 MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
 JOBS_DIR="$MOTHER_ROOT/jobs"
 EVENTS_DIR="$MOTHER_ROOT/events"
@@ -514,10 +522,9 @@ _validate_and_clear_pr_url() {
     [ -n "$_url" ] || return
     local _head; _head=$(gh pr view "$_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
     if [ -z "$_head" ] || [ "$_head" != "$_branch" ]; then
-        local _merged _tmp
+        local _merged
         _merged=$(jq '.pr_url = null' "$_jf" 2>/dev/null) || return
-        _tmp="${_jf}.tmp.$$"
-        printf '%s' "$_merged" > "$_tmp" && mv "$_tmp" "$_jf"
+        _job_write_doc "$_merged" "$_jf" "$_jid"
     fi
 }
 
@@ -993,6 +1000,8 @@ _gates_run_attempt() {
          unavailable: ([.results[] | select(.result == "unavailable")] | length),
          not_run}')" 2>/dev/null || true
 
+    # Worker mode: ship the attempt's logs and excerpts (artifact.put) before the result lands.
+    _outbox_on && mother_outbox_artifact_tree "$id" "crew/$id/gates/$attempt"
     _job_update ".gates = $gates_json | .activity = $restore_activity" 2>/dev/null || true
     _gates_status=$(printf '%s' "$gates_json" | jq -r '.status // "incomplete"')
     return 0
@@ -1275,7 +1284,7 @@ _gates_hold() {
     local merged
     merged=$(jq --arg q "$q" --arg ts "$(iso_now)" '
         .state = "awaiting" | .activity = "gate_hold" | .paused_reason = "gate_hold"
-        | .paused_at = $ts | .question = $q' "$job_file") && _atomic_write "$job_file" "$merged"
+        | .paused_at = $ts | .question = $q' "$job_file") && _job_write_doc "$merged"
     mother_decision_open "$id" gate_hold '["resume_with_guidance","escalate","override_open","cancel"]' >/dev/null \
         || echo "mother-run-job: $id: could not open the gate_hold decision" >&2
     mother_job_attention_add "$id" decision_awaiting
@@ -1390,7 +1399,7 @@ _wave_locked_update_inner() {
     local filter="$1" merged
     shift
     merged=$(jq "$@" "$filter" "$job_file") || return 1
-    _atomic_write "$job_file" "$merged"
+    _job_write_doc "$merged"
 }
 _wave_locked_update() {
     _with_lock "$job_file" _wave_locked_update_inner "$@"
@@ -1449,6 +1458,7 @@ _wave_lens_finished() {
         _atomic_write "$side" "$(jq -nc --argjson rc "$rc" \
             '{findings: [], examined: [], cost_usd: null, decision: "error", state: "error",
               error_reason: (if $rc == 2 then "invalid_findings" else "reviewer_failed" end)}')"
+        _outbox_on && mother_outbox_artifact "$id" "crew/$id/wave/c$n/$lens.json"
     fi
     row=$(jq -c '{state: (if .state == "error" or .decision == "error" then "error" else "done" end),
                   findings: {blocking: ([(.findings // [])[] | select(.severity == "blocking")] | length),
@@ -1628,6 +1638,7 @@ _wave_cycle() {
     local actionable summary cycle_cost
     actionable=$(env -u MOTHER_ROOT MOTHER_LIVE_ROOT="$MOTHER_ROOT" \
         "$MOTHER_BIN_DIR/mother" merge-findings "$id" --wave "$id" --cycle "$n" 2>"$out_dir/merge.err") || actionable=""
+    _outbox_on && mother_outbox_artifact_tree "$id" "crew/$id/wave-runs/c$n"
     _wave_merged="$wave_dir/merged.json"
     if ! printf '%s' "$actionable" | jq -e 'type == "array"' >/dev/null 2>&1; then
         # The merge failed: nothing was verified, so a human has to look.
@@ -1809,7 +1820,7 @@ _wave_hold() {
     merged=$(jq --arg q "$q" --arg ts "$(iso_now)" '
         .state = "awaiting" | .activity = "review_hold" | .paused_reason = "review_hold"
         | .paused_at = $ts | .question = $q | .review_wave.status = "held"' "$job_file") \
-        && _atomic_write "$job_file" "$merged"
+        && _job_write_doc "$merged"
     mother_decision_open "$id" review_hold '["resume_with_guidance","override_open","cancel"]' >/dev/null \
         || echo "mother-run-job: $id: could not open the review_hold decision" >&2
     mother_job_attention_add "$id" decision_awaiting
@@ -2409,6 +2420,7 @@ _install_core_job_helpers() {
         _switch_with_lock "${target}.lockdir" "$target" 200 "$@"
     }
     _append_line() { printf '%s\n' "$2" >> "$1"; }
+    _outbox_on() { type mother_outbox_enabled >/dev/null 2>&1 && mother_outbox_enabled; }
     _append_event() {
         local kind="$1" detail="${2:-}"
         [ -z "$detail" ] && detail='{}'
@@ -2416,16 +2428,34 @@ _install_core_job_helpers() {
         ev=$(jq -nc --arg ts "$(iso_now)" --arg kind "$kind" --argjson detail "$detail" \
             '{ts: $ts, kind: $kind, detail: $detail}')
         _eventpath="$EVENTS_DIR/$id.jsonl"
-        _with_lock "$_eventpath" _append_line "$_eventpath" "$ev"
+        _with_lock "$_eventpath" _append_line "$_eventpath" "$ev" || return 1
+        if _outbox_on; then mother_outbox_event "$id" "$ev" || return 1; fi
+        return 0
+    }
+    # The one way mother-run-job replaces its job document: atomic write, then (worker mode)
+    # the top-level diff goes to the outbox as job.set. Callers that hold the job-file lock keep
+    # holding it around this call.
+    # Usage: _job_write_doc <merged-json> [<job-file> <job-id>] (defaults: this job).
+    _job_write_doc() {
+        local _merged="$1" _jf="${2:-$job_file}" _jid="${3:-${id:-}}" _before=""
+        _outbox_on && _before=$(cat "$_jf" 2>/dev/null)
+        _atomic_write "$_jf" "$_merged" || return 1
+        if _outbox_on; then mother_outbox_job_set "$_jid" "$_before" "$_merged" || return 1; fi
+        return 0
     }
     _job_update() {
         local filter="$1"
         local merged; merged=$(jq "$filter" "$job_file") || return 1
-        _atomic_write "$job_file" "$merged"
+        _job_write_doc "$merged"
     }
     _transition() {
         local new="$1" detail="${2:-}"
         [ -z "$detail" ] && detail='{}'
+        # Worker mode with a broken outbox: never claim a state the coordinator cannot see; hold instead.
+        case "$new" in
+            running|succeeded|failed)
+                if _outbox_degraded_hold; then return 0; fi ;;
+        esac
         # D2 guard: a `failed` transition must always carry a .reason. A caller
         # that omitted one gets "unspecified" plus a failure_reason_missing
         # event naming the caller, so "no bare failed events" holds structurally
@@ -2549,6 +2579,23 @@ _hold_deferred_epoch=0  # last hold_giveup_deferred event
 
 _hold_reset_state() { _hold_active=0; _hold_boundary_epoch=0; _hold_deferred_epoch=0; }
 
+# _outbox_degraded_hold — worker mode: an op could not be shipped to the outbox (lib/outbox.sh set the
+# degraded flag), so the canonical side would silently miss state. Hold the job (awaiting, paused_reason
+# outbox_degraded) instead of carrying on. Writes the mirror only: the emits are the thing that is broken.
+# Idempotent; a no-op outside worker mode or without the flag. Returns 0 when it held the job.
+_outbox_degraded_hold() {
+    _outbox_on && mother_outbox_degraded "$id" || return 1
+    local _cur _q _why
+    _cur=$(jq -r '.state // ""' "$job_file" 2>/dev/null)
+    [ "$_cur" = "awaiting" ] && [ "$(jq -r '.paused_reason // ""' "$job_file" 2>/dev/null)" = "outbox_degraded" ] && return 0
+    _why=$(jq -r '"\(.op // "?"): \(.why // "?")"' "$(_outbox_degraded_file "$id")" 2>/dev/null)
+    _q="Worker outbox degraded ($_why). State changes can no longer be shipped to the coordinator, so the job is held. Fix the outbox, then resume it."
+    _job_update ".state = \"awaiting\" | .paused_reason = \"outbox_degraded\" | .paused_at = \"$(iso_now)\" | .question = $(jq -nc --arg q "$_q" '$q')" 2>/dev/null || true
+    _append_event "awaiting_input" "$(jq -nc --arg q "$_q" '{question: $q, paused_reason: "outbox_degraded"}')" 2>/dev/null || true
+    echo "mother-run-job: $id: held: $_q" >&2
+    return 0
+}
+
 # _hold_mark_active <boundary-reached: true|false> — set .limiter_hold from the .hold file, once.
 _hold_mark_active() {
     local at_boundary="${1:-false}" hold="$RUNNER_DIR/$id.hold" code reason since
@@ -2558,7 +2605,7 @@ _hold_mark_active() {
     since=$(date +%s)
     _hold_merged=$(jq --arg c "$code" --arg r "$reason" --arg s "$(iso_now)" --argjson b "$at_boundary" \
         '.limiter_hold = {code: $c, reason: $r, since: $s, at_boundary: $b}' "$job_file" 2>/dev/null) \
-        && _atomic_write "$job_file" "$_hold_merged"
+        && _job_write_doc "$_hold_merged"
     _hold_active=1
 }
 
@@ -2651,7 +2698,7 @@ _hold_park_write() {   # <question> <paused_reason> <paused_at> — runs under t
     _hold_merged=$(jq --arg q "$1" --arg p "$2" --arg ts "$3" \
         '.state = "awaiting" | .question = $q | .paused_reason = $p | .paused_at = $ts
          | .pause_requested = null | .limiter_hold = null' "$job_file" 2>/dev/null) \
-        && _atomic_write "$job_file" "$_hold_merged"
+        && _job_write_doc "$_hold_merged"
 }
 
 # _hold_boundary_check <now> — with a latched boundary, confirm it is still real. Resets the latch (so the
@@ -2894,7 +2941,7 @@ _spawn_and_wait() {
         # A same-session turn that never started (gate fix, review rework) is replayed on resume.
         if [ "$mode" = "resume" ] && [ -r "$resume_prompt" ]; then
             _hold_merged=$(jq --rawfile p "$resume_prompt" '.limiter_resume_prompt = $p' "$job_file" 2>/dev/null) \
-                && _atomic_write "$job_file" "$_hold_merged"
+                && _job_write_doc "$_hold_merged"
         fi
         # The post-exit awaiting path reads these; no worker ran, so the run's log range is empty.
         log_offset_at_spawn=$(stat -f %z "$log_path" 2>/dev/null || stat -c %s "$log_path" 2>/dev/null || echo 0)
@@ -3051,7 +3098,7 @@ _spawn_and_wait() {
             # Consume the answer + question so the next spawn (if any) starts clean.
             # Keep resumed_at / resume_count for the audit trail.
             merged=$(jq '.pending_answer = null | .question = null' "$job_file") \
-                && _atomic_write "$job_file" "$merged"
+                && _job_write_doc "$merged"
             _append_event "resumed_from_input" \
                 "$(jq -nc --arg q "$prev_question" --arg a "$pending_answer" --arg p "$spawn_prompt" \
                     '{question: $q, answer: $a, resume_prompt: $p}')"
@@ -3109,6 +3156,14 @@ _spawn_and_wait() {
     safe_rm_tree "$RUNNER_DIR/$id.calls"
     _hold_settings_file
 
+    # Worker mode (P1-2): in-agent mother await / gates run / review-lens mirror their writes into
+    # the same outbox this supervisor uses.
+    local worker_mode_export=""
+    if _outbox_on; then
+        worker_mode_export="export MOTHER_WORKER_MODE=1
+export MOTHER_WORKER_OUTBOX_DIR=$(printf '%q' "$MOTHER_WORKER_OUTBOX_DIR")"
+    fi
+
     cat > "$wrapper" <<WRAP
 #!/usr/bin/env bash
 cd "$work_dir"
@@ -3126,6 +3181,7 @@ export MOTHER_JOB_ID="$id"
 export MOTHER_LIVE_ROOT="$MOTHER_ROOT"
 # Drop any MOTHER_ROOT inherited from the daemon environment, too.
 unset MOTHER_ROOT
+$worker_mode_export
 # Docker Compose reads COMPOSE_PROJECT_NAME automatically, so any
 # `docker compose up` the worker runs lands in a job-scoped project with
 # zero convention-following required by the plan or the agent. Mother tears
@@ -3228,6 +3284,10 @@ WRAP
     prior_spend=$(jq -r '.actual_cost_usd // 0' "$job_file" 2>/dev/null); : "${prior_spend:=0}"
     prior_tokens=$(jq -r '.actual_tokens // 0' "$job_file" 2>/dev/null); : "${prior_tokens:=0}"
     case "$prior_tokens" in ''|*[!0-9]*) prior_tokens=0 ;; esac
+    if mother_worker_mode_active; then
+        # No actual_cost_* in a worker mirror (canonical side owns them): baseline = this root's rows.
+        read -r prior_spend prior_tokens <<< "$(mother_usage_rows_total "$id")"
+    fi
     last_usage_check_epoch=0
     cost_cap_breached=0
     usage_main_actor="${phase_agent:-cody}-main"
@@ -3285,6 +3345,10 @@ WRAP
         # Limiter boundary hold (L4): .hold present -> the worker parks in its PreToolUse hook at the
         # next tool call; past the grace period with a quiet log the worker is given up (state first,
         # then the kill, as for the quota pause above).
+        if _outbox_degraded_hold; then
+            _terminate_worker
+            break
+        fi
         if ! _limiter_hold_tick; then
             _terminate_worker
             _hold_kill_hooks
@@ -3405,7 +3469,7 @@ USAGE_EOF
                     _cap_summary=$(cat "$cost_cap_flag" 2>/dev/null || echo "Mother cost cap reached on job $id.")
                     _cc_merged=$(jq --arg q "$_cap_summary" --arg ts "$(iso_now)" \
                         '.state = "awaiting" | .question = $q | .paused_at = $ts | .paused_reason = "cost_cap"' \
-                        "$job_file") && _atomic_write "$job_file" "$_cc_merged"
+                        "$job_file") && _job_write_doc "$_cc_merged"
                     _append_event "cost_cap_forced_pause" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber)}')"
                     _append_event "awaiting_input" "$(jq -nc --arg q "$_cap_summary" '{question: $q, paused_reason: "cost_cap"}')"
                     _terminate_worker
@@ -4063,7 +4127,7 @@ if [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ];
     _resume_merged=$(jq --arg s "$resume_sid" \
         '.session_id = $s | .resume_session_id = null | .pending_answer = null | .question = null
          | .resume_kind = null | .limiter_resume_prompt = null' "$job_file") \
-        && _atomic_write "$job_file" "$_resume_merged"
+        && _job_write_doc "$_resume_merged"
     _append_event "resumed_from_input" "$(jq -nc --arg q "$resume_question" --arg a "$resume_answer" \
         --arg p "$resume_prompt_file" '{question: $q, answer: $a, resume_prompt: $p, mode: "resume"}')"
     _resume_spawned=0
@@ -4073,7 +4137,7 @@ if [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ];
         [ "$_resume_spawned" = "1" ] && _record_run_usage_for_last_spawn "failed" worker '{"resume_failed": true}'
         _resume_merged=$(jq --arg a "$resume_answer" --arg q "$resume_question" \
             '.pending_answer = $a | .question = (if $q == "" then null else $q end)' "$job_file") \
-            && _atomic_write "$job_file" "$_resume_merged"
+            && _job_write_doc "$_resume_merged"
         _spawn_and_wait fresh
     fi
 else
@@ -4211,7 +4275,7 @@ _attempt_continuation() {
         | .pause_requested = null
         | .final_result_at = null
         | .activity = "continuation"
-    ' "$job_file") && _atomic_write "$job_file" "$merged"
+    ' "$job_file") && _job_write_doc "$merged"
 
     _append_event "continuation_queued" \
         "$(jq -nc --arg reason "$reason" --argjson count "$new_count" --argjson max "$max_cont" \

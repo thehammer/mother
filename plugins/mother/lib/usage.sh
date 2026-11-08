@@ -15,6 +15,11 @@ if [ -z "$MOTHER_USAGE_BIN" ]; then
     MOTHER_USAGE_BIN="$_USAGE_LIB_DIR/../bin/mother-usage"
 fi
 
+# One worker-mode predicate (lib/outbox.sh) for every caller of this file, even when state.sh is not
+# loaded: a missing lib must not silently turn worker mode into the legacy path.
+type mother_worker_mode_active >/dev/null 2>&1 \
+    || { [ -r "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh" ] && source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh"; }
+
 # mother_usage_available: 0 if python3 + the mother-usage script are both
 # reachable. Every function below checks this first and degrades quietly.
 mother_usage_available() {
@@ -55,8 +60,20 @@ _usage_job_update_unlocked() {
     [ -f "$job_file" ] || return 1
     local merged; merged=$(jq "$filter" "$job_file" 2>/dev/null) || return 1
     [ -n "$merged" ] || return 1
-    local tmp="${job_file}.tmp.$$"
-    printf '%s' "$merged" > "$tmp" && mv "$tmp" "$job_file"
+    _usage_job_write "$job_file" "$merged"
+}
+
+# The one place this file writes a job document: atomic replace, then (worker mode) mirror the
+# top-level diff into the outbox as job.set.
+_usage_job_write() {
+    local job_file="$1" merged="$2" before="" tmp="${1}.tmp.$$" jid
+    type mother_outbox_enabled >/dev/null 2>&1 && mother_outbox_enabled && before=$(cat "$job_file" 2>/dev/null)
+    printf '%s' "$merged" > "$tmp" && mv "$tmp" "$job_file" || return 1
+    if type mother_outbox_enabled >/dev/null 2>&1 && mother_outbox_enabled; then
+        jid="${job_file##*/}"; jid="${jid%.json}"
+        mother_outbox_job_set "$jid" "$before" "$merged" || return 1
+    fi
+    return 0
 }
 
 # _usage_with_lock <lockable-file> <cmd> [args...]
@@ -104,7 +121,11 @@ _usage_append_event() {
     ev=$(jq -nc --arg ts "$(_usage_iso_now)" --arg kind "$kind" --argjson detail "$detail" \
         '{ts: $ts, kind: $kind, detail: $detail}' 2>/dev/null) || return 0
     [ -n "$ev" ] || return 0
-    _usage_with_lock "$events_file" _usage_append_line "$events_file" "$ev"
+    _usage_with_lock "$events_file" _usage_append_line "$events_file" "$ev" || return $?
+    if type mother_outbox_event >/dev/null 2>&1; then
+        mother_outbox_event "$job_id" "$ev" || return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -147,6 +168,23 @@ mother_claude_extra_args() {
 # usage rows + cost recompute
 # ---------------------------------------------------------------------------
 
+# mother_usage_rows_total <job_id>
+# Echoes "<cost_usd> <tokens>" summed over the runs.jsonl rows of this root for the job. Worker
+# mode uses it for the live-spend baseline: the mirror has no actual_cost_usd (the canonical side
+# owns it), so the baseline is the mirror's own rows (this lease's runs).
+mother_usage_rows_total() {
+    local job_id="$1" f agg cost=0 tokens=0
+    f="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/metrics/runs.jsonl"
+    if [ -f "$f" ]; then
+        agg=$(grep -F "\"job_id\":\"${job_id}\"" "$f" 2>/dev/null \
+            | jq -rs '[([.[] | (.cost_usd // 0)] | add // 0), ([.[] | ((.tokens_in // 0) + (.tokens_out // 0))] | add // 0)] | @tsv' 2>/dev/null)
+        [ -n "$agg" ] && { cost="${agg%%$'\t'*}"; tokens="${agg##*$'\t'}"; }
+    fi
+    case "$cost" in ''|*[!0-9.eE+-]*) cost=0 ;; esac
+    case "$tokens" in ''|*[!0-9]*) tokens=0 ;; esac
+    printf '%s %s\n' "$cost" "$tokens"
+}
+
 # mother_recompute_job_cost <job_id>
 # Sets .actual_cost_usd (sum of every runs.jsonl row's cost_usd for this job;
 # 0, never null, when there are no rows), .actual_tokens (sum of tokens_in +
@@ -155,6 +193,9 @@ mother_claude_extra_args() {
 # isn't fully parsed on every call.
 mother_recompute_job_cost() {
     local job_id="$1"
+    # Worker mode: the mirror only holds this lease's rows, so a recompute would ship a partial
+    # sum. The canonical side owns cost (coord_apply.sh recomputes when a terminal state lands).
+    mother_worker_mode_active && return 0
     local job_file="${JOBS_DIR:-${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/jobs}/${job_id}.json"
     [ -f "$job_file" ] || return 0
 
@@ -198,8 +239,7 @@ _usage_job_update_argjson_unlocked() {
         '.actual_cost_usd = $cost | .actual_tokens = $tokens | .actual_cost_complete = $complete' \
         "$job_file" 2>/dev/null) || return 1
     [ -n "$merged" ] || return 1
-    local tmp="${job_file}.tmp.$$"
-    printf '%s' "$merged" > "$tmp" && mv "$tmp" "$job_file"
+    _usage_job_write "$job_file" "$merged"
 }
 
 # mother_maybe_token_alert <job_id>
@@ -305,6 +345,9 @@ mother_record_run_usage() {
     fi
 
     _usage_with_lock "$metrics_file" _usage_append_line "$metrics_file" "$row"
+    if type mother_outbox_record >/dev/null 2>&1; then
+        mother_outbox_record "$job_id" "metrics/runs.jsonl" "$row" || echo "mother: usage row for $job_id not shipped (outbox degraded)" >&2
+    fi
 
     mother_recompute_job_cost "$job_id"
     mother_maybe_token_alert "$job_id"
