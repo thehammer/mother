@@ -80,6 +80,7 @@ source "$MOTHER_LIB_DIR/config.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/gates.sh" ]         && source "$MOTHER_LIB_DIR/gates.sh"
 [ -r "$MOTHER_LIB_DIR/backup.sh" ]        && source "$MOTHER_LIB_DIR/backup.sh"
+[ -r "$MOTHER_LIB_DIR/checkpoint.sh" ]    && source "$MOTHER_LIB_DIR/checkpoint.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/preview.sh" ]       && source "$MOTHER_LIB_DIR/preview.sh"
 type mother_preview_main >/dev/null 2>&1 || mother_preview_main() { echo "mother preview: lib/preview.sh is missing" >&2; return 1; }
@@ -5174,6 +5175,71 @@ cmd_gates() {
     esac
 }
 
+# cmd_checkpoint (internal; the worker cadence that calls it is P1-6):
+#   take <id> [--out DIR] [--final] [--salvage-epoch N]   exit 0 ok, 3 fenced, 1 error
+#   restore <id> --manifest F --transcript F --work-dir D  exit 0 restored, 4 not restorable
+cmd_checkpoint() {
+    local sub="${1:-}"
+    [ $# -gt 0 ] && shift
+    type mother_checkpoint_take >/dev/null 2>&1 || _die "checkpoint: lib/checkpoint.sh is missing"
+    trap '_ckpt_cleanup' EXIT
+    case "$sub" in
+        take)    _checkpoint_cmd_take "$@" ;;
+        restore) _checkpoint_cmd_restore "$@" ;;
+        *)       _die "checkpoint: usage: mother checkpoint take ID [--out DIR] [--final] [--salvage-epoch N] | mother checkpoint restore ID --manifest F --transcript F --work-dir D" ;;
+    esac
+}
+
+_checkpoint_cmd_take() {
+    local id="${1:-}" out="" final=() salvage=()
+    [ -n "$id" ] || _die "checkpoint take: <id> required"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --out)           out="${2:-}"; shift 2 ;;
+            --final)         final=(--final); shift ;;
+            --salvage-epoch) salvage=(--salvage-epoch "${2:-}"); shift 2 ;;
+            *) _die "unknown flag for checkpoint take: $1" ;;
+        esac
+    done
+    _job_exists "$id" || _die "no such job: $id"
+    local job_file; job_file=$(_job_path "$id")
+    local ckdir="$MOTHER_ROOT/checkpoints/$id"
+    if [ -z "$out" ]; then
+        # Default: checkpoints/<id>/<n>/ with n = the newest manifest's n + 1; that manifest is the
+        # "previous" one for the skip check and the transcript delta.
+        local last=0 d n
+        for d in "$ckdir"/*/; do
+            [ -s "${d}manifest.json" ] || continue
+            n=$(basename "$d")
+            case "$n" in ''|*[!0-9]*) continue ;; esac
+            [ "$n" -gt "$last" ] && last="$n"
+        done
+        [ "$last" -gt 0 ] && export MOTHER_CHECKPOINT_PREV_MANIFEST="$ckdir/$last/manifest.json"
+        out="$ckdir/$((last + 1))"
+    fi
+    mother_checkpoint_take "$job_file" "$out" ${salvage[@]+"${salvage[@]}"} ${final[@]+"${final[@]}"}
+}
+
+_checkpoint_cmd_restore() {
+    local id="${1:-}" manifest="" transcript="" workdir=""
+    [ -n "$id" ] || _die "checkpoint restore: <id> required"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --manifest)   manifest="${2:-}"; shift 2 ;;
+            --transcript) transcript="${2:-}"; shift 2 ;;
+            --work-dir)   workdir="${2:-}"; shift 2 ;;
+            *) _die "unknown flag for checkpoint restore: $1" ;;
+        esac
+    done
+    [ -n "$manifest" ] && [ -n "$transcript" ] && [ -n "$workdir" ] || _die "checkpoint restore: --manifest, --transcript and --work-dir are required"
+    _job_exists "$id" || _die "no such job: $id"
+    local repo; repo=$(jq -r '.repo_path // .work_dir // ""' "$(_job_path "$id")")
+    [ -n "$repo" ] || _die "checkpoint restore: no repo path on job $id"
+    mother_checkpoint_restore "$manifest" "$transcript" "$repo" "$workdir"
+}
+
 _gates_cmd_check() {
     local repo="" ref="" name=""
     while [ $# -gt 0 ]; do
@@ -5372,6 +5438,8 @@ Usage:
                                               (tick an acceptance criterion; job defaults to $MOTHER_JOB_ID)
   mother gates check [--repo PATH] [--ref REF]  (validate .mother/crew.yml at a ref)
   mother doctor                              (dependency checks + crew config check)
+  mother checkpoint take ID [--out DIR] [--final] [--salvage-epoch N]   (internal: WIP snapshot to a fenced wip ref)
+  mother checkpoint restore ID --manifest F --transcript F --work-dir D  (internal: rebuild a checkpoint elsewhere)
   mother review-phase ID --reviewer AGENT    (run one pipeline reviewer: ada|archie|perri)
   mother review-lens ID --lens NAME [--budget-usd N]
                                              (run one review lens: correctness|phi-security|tests|ops-infra)
@@ -6112,6 +6180,7 @@ main() {
         await)             cmd_await "$@" ;;
         preview)           cmd_preview "$@" ;;
         gates)             cmd_gates "$@" ;;
+        checkpoint)        cmd_checkpoint "$@" ;;
         check)             cmd_check "$@" ;;
         doctor)            cmd_doctor "$@" ;;
         resume)            cmd_resume "$@" ;;

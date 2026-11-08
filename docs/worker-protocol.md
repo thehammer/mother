@@ -171,7 +171,7 @@ The worker replies to each command with `cmd.ack{cmd_id, outcome: applied|duplic
   Applying `lease.release` (after commit) ends the lease; admitting it does not.
 - A requeued job gets a new lease with `epoch = previous + 1` (MC-15). Any frame whose (lease, epoch) is not the job's current
   **active** lease gets `refuse{code: fenced}` and an audit line.
-- A fenced worker must stop the job at once and salvage-push to `refs/mother/wip/<job>/lease-<epoch>` (B8).
+- A fenced worker must stop the job at once and salvage-push to `refs/mother/wip-salvage/<job>/lease-<epoch>` (B8).
 - A job with a live lease cannot be offered again (`busy`).
 
 ## 8. Ownership table (B10)
@@ -225,7 +225,12 @@ Validation (`ValidateManifest`) runs on receipt and refuses, before any `WipRef(
   sending: the coordinator stores and shows it verbatim.
 - `work_dir_at_capture` is **not on the wire** (it was in earlier drafts). It is the worker's own filesystem layout; keep it in worker-local state.
 
-- The wip ref is `refs/mother/wip/<job>`; the salvage ref is `refs/mother/wip/<job>/lease-<epoch>`.
+- The wip ref is `refs/mother/wip/<job>`; the salvage ref is `refs/mother/wip-salvage/<job>/lease-<epoch>`.
+  The salvage ref is in a different directory on purpose: git cannot hold `refs/mother/wip/<job>` and `refs/mother/wip/<job>/lease-<n>`
+  together (a ref cannot be both a file and a directory; the second push is rejected with a refname conflict).
+  `WipRef`/`SalvageRef` return `""` for a job id that is not a valid git ref component (`JobRefOK`: an id, no leading `.`, no trailing `.`
+  or `.lock`), and `ValidateManifest` refuses such a job.
+- Follow-up (not built): delete `refs/mother/wip/<job>` and `refs/mother/wip-salvage/<job>/*` when the job is archived.
 - **Interval 120 s** (refused above **240 s**), **final-on-exit timeout 30 s**, **per-checkpoint watchdog 60 s**.
 - **MC-14 mapping:** worst-case loss = interval + watchdog = 120 + 60 = **180 s**, under the 300 s bound (at the 240 s maximum it
   is 300 s, which is why the maximum is not raised).
