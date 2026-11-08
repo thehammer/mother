@@ -82,6 +82,10 @@ source "$MOTHER_LIB_DIR/config.sh"
 [ -r "$MOTHER_LIB_DIR/backup.sh" ]        && source "$MOTHER_LIB_DIR/backup.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/drain.sh" ]         && source "$MOTHER_LIB_DIR/drain.sh"
+# Fail CLOSED: if drain.sh is missing or lacks the predicate, every start path treats dispatch as drained.
+type mother_drain_active >/dev/null 2>&1 || mother_drain_active() {
+    echo "mother: lib/drain.sh is missing or broken; treating dispatch as DRAINED" >&2; return 0; }
+type mother_drain_status_line >/dev/null 2>&1 || mother_drain_status_line() { return 0; }
 [ -r "$MOTHER_LIB_DIR/checkpoint.sh" ]    && source "$MOTHER_LIB_DIR/checkpoint.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/preview.sh" ]       && source "$MOTHER_LIB_DIR/preview.sh"
@@ -2139,7 +2143,7 @@ cmd_force_start() {
     done
 
     [ -n "$id" ] || _die "force-start: <id> required"
-    if mother_drain_active 2>/dev/null; then
+    if mother_drain_active; then
         _die "force-start: dispatch is draining ($(jq -r '.reason // ""' "$RUNNER_DIR/drain.json" 2>/dev/null)); nothing starts until \`mother undrain\`"
     fi
     _job_exists "$id" || _die "no such job: $id"
@@ -4431,6 +4435,9 @@ cmd_run() {
         esac
     done
     [ "$once" -eq 1 ] || _die "run: only --once is supported in phase 1 (daemon comes in phase 2)"
+    if mother_drain_active; then
+        _die "run: dispatch is draining ($(jq -r '.reason // ""' "$RUNNER_DIR/drain.json" 2>/dev/null)); nothing starts until \`mother undrain\`"
+    fi
 
     # Promote queued jobs whose dependencies are all satisfied (each
     # succeeded AND its PR merged, or a no_pr job) to ready.

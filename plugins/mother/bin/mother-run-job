@@ -3183,7 +3183,7 @@ export MOTHER_LIVE_ROOT="$MOTHER_ROOT"
 unset MOTHER_ROOT
 $worker_mode_export
 # Docker Compose reads COMPOSE_PROJECT_NAME automatically, so any
-# `docker compose up` the worker runs lands in a job-scoped project with
+# "docker compose up" the worker runs lands in a job-scoped project with
 # zero convention-following required by the plan or the agent. Mother tears
 # this project down once the job's PR is merged/closed (see lib/teardown.sh).
 export COMPOSE_PROJECT_NAME="$compose_project"

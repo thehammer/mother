@@ -121,13 +121,22 @@ _attention_low_disk_items() {
                   + (if $cargo then "; `mother gc` reclaims idle worktree target/ dirs automatically" else "" end))}' "$f" 2>/dev/null
 }
 
-# drain_stuck (info): a drain that has been on for more than MOTHER_DRAIN_STUCK_S (default 3600).
+# drain_stuck (info): a drain that has been on for more than MOTHER_DRAIN_STUCK_S (default 3600), or a
+# drain flag that cannot be read (corrupt: its age is unknown, so say so instead of staying silent).
 _attention_drain_items() {
-    local f="$RUNNER_DIR/drain.json"
+    local f="$RUNNER_DIR/drain.json" t
     [ -f "$f" ] || return 0
-    jq -c --argjson now "$(date +%s)" --argjson lim "${MOTHER_DRAIN_STUCK_S:-3600}" '
-        ((.since // "") | (sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null)) as $t
-        | select($t != null and ($now - $t) > $lim)
+    t=$(jq -r '(.since // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch empty' "$f" 2>/dev/null)
+    if [ -z "$t" ]; then
+        jq -nc --arg since "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+            {kind: "drain_stuck", job_id: "", repo: "", branch: "",
+             reason: "drain flag unreadable: dispatch is drained but its age is unknown",
+             since: $since, detail: {level: "info", unreadable: true},
+             hint: "inspect the runner drain.json; `mother undrain` removes it and resumes dispatch"}'
+        return 0
+    fi
+    jq -c --argjson now "$(date +%s)" --argjson lim "${MOTHER_DRAIN_STUCK_S:-3600}" --argjson t "$t" '
+        select(($now - $t) > $lim)
         | {kind: "drain_stuck", job_id: "", repo: "", branch: "",
            reason: ("dispatch has been draining for " + ((($now - $t) / 60) | floor | tostring) + " min"
                     + (if (.reason // "") != "" then " (" + .reason + ")" else "" end)),
