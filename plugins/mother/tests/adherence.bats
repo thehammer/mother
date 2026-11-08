@@ -153,7 +153,7 @@ BISHOP
 # ---------------------------------------------------------------------------
 # Fail verdict — first attempt
 
-@test "adherence-review: fail on first attempt -> failed_first, attempts=1, notes stored, state left to the runner" {
+@test "adherence-review: fail on first attempt -> failed_first, attempts=1, notes stored, re-queued for rework" {
     _make_succeeded_job "job-fail1"
 
     export MOCK_CLAUDE_STDOUT="ADHERENCE: fail
@@ -168,18 +168,12 @@ The PR skipped the acceptance criterion about updating the README."
     run jq -r '.adherence_attempts' "$JOBS_DIR/job-fail1.json"
     [ "$output" = "1" ]
 
-    # cmd_adherence_review records the verdict only — it deliberately does
-    # not transition the job. The requeue (state=ready, activity=cody_rework)
-    # is the daemon's job: see _run_adherence_pending in mother-runner,
-    # covered by "adherence loop: marks a succeeded PR job pending, then
-    # reviews and requeues on fail" further down this file. An earlier design
-    # folded this into a single dedicated job `state` value for the rework
-    # case; it was superseded by today's state+activity split and never
-    # existed in shipped code.
+    # A failed review must never leave the job `succeeded`: cmd_adherence_review
+    # re-queues it for rework itself (the runner's pass is idempotent on top).
     run jq -r '.state' "$JOBS_DIR/job-fail1.json"
-    [ "$output" = "succeeded" ]
+    [ "$output" = "ready" ]
     run jq -r '.activity // ""' "$JOBS_DIR/job-fail1.json"
-    [ "$output" = "" ]
+    [ "$output" = "cody_rework" ]
 
     # Notes stored as pending_answer for next Cody run.
     run jq -r '.pending_answer // ""' "$JOBS_DIR/job-fail1.json"

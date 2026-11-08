@@ -664,6 +664,9 @@ case "\$*" in
     *"commits/$head_sha/pulls"*)
         printf '[{"state":"open","updated_at":"2026-01-01T00:00:00Z","html_url":"$pr"}]\n'
         ;;
+    *"pr view $pr --json state,headRefName"*)
+        printf 'OPEN\tfeature/fin-1\tfalse\t-\n'
+        ;;
     *"pr view $pr --json headRefName"*)
         echo "feature/fin-1"
         ;;
@@ -741,6 +744,9 @@ case "\$*" in
         ;;
     *"commits/$head_sha/pulls"*)
         printf '[{"state":"open","updated_at":"2026-01-01T00:00:00Z","html_url":"$pr"}]\n'
+        ;;
+    *"pr view $pr --json state,headRefName"*)
+        printf 'OPEN\tsome-other-branch\tfalse\t-\n'
         ;;
     *"pr view $pr --json headRefName"*)
         echo "some-other-branch"
@@ -825,7 +831,7 @@ GHEOF
     [[ "$output" =~ "\"job_branch\":\"feature/fin-4\"" ]]
 }
 
-@test "_finalize_pr_url clears a stored pr_url that never resolves at all (pr_url_unresolved), with detail fields intact" {
+@test "_finalize_pr_url keeps a stored pr_url when gh cannot resolve it (pr_url_unresolved, transient), with detail fields intact" {
     local repo="$MOTHER_ROOT/fin-repo-7"
     _fin_make_repo "$repo" "feature/fin-7" "main"
     local pr="https://github.com/thehammer/mother/pull/707"
@@ -856,8 +862,9 @@ GHEOF
     run _finalize_pr_url
     [ "$status" -eq 0 ]
 
+    # A transient gh failure never destroys a stored pointer.
     run jq -r '.pr_url // "null"' "$job_file"
-    [ "$output" = "null" ]
+    [ "$output" = "$pr" ]
 
     # Same jq-syntax regression as pr_url_branch_mismatch above, in the
     # sibling pr_url_unresolved event — assert fields, not just the kind.

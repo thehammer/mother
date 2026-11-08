@@ -1864,6 +1864,17 @@ _run_adherence_pending() {
                 local post_status; post_status=$(jq -r '.adherence_status // ""' "$JOBS_DIR/$id.json" 2>/dev/null)
                 case "$post_status" in
                     failed_first)
+                        # cmd_adherence_review already re-queued the job itself (a
+                        # failed review must never leave it `succeeded`); only
+                        # re-queue here if that did not land.
+                        if [ "$(jq -r '.state' "$JOBS_DIR/$id.json" 2>/dev/null)" = "ready" ] \
+                           && [ "$(jq -r '.activity // ""' "$JOBS_DIR/$id.json" 2>/dev/null)" = "cody_rework" ]; then
+                            _append_event "$id" "adherence_rework_kicked" \
+                                "$(jq -nc --arg id "$id" '{id: $id, note: "adherence failed first attempt; re-queued with activity=cody_rework"}')"
+                            _append_event "$id" "ready" "$(jq -nc '{reason: "adherence_rework"}')"
+                            _log "adherence failed for $id (first attempt) — re-queued (activity=cody_rework)"
+                            break
+                        fi
                         # Re-queue for a fresh Cody run. pending_answer already set by
                         # cmd_adherence_review. Mark activity=cody_rework so the list
                         # view shows it's a second attempt.

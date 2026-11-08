@@ -416,6 +416,16 @@ the job fails `rework_no_new_commit` (`.pr_url` is not cleared; an unreachable
 origin fails closed with `origin_check: "indeterminate"`). No-op for pipeline
 jobs, `no_pr` jobs, and runs that started without a pre-existing artifact.
 
+**PR adoption and `succeeded` (hardening).** A PR is adopted only on evidence it is the job's own: not a fork
+(`isCrossRepository`), head branch = the job's branch, or it contains the job's commits; an
+`--expect-branch-mismatch` job also accepts a PR created since the attempt began (`.attempt_run.started_at`, the
+first spawn of an escalation/retry attempt) or one that contains its own commits (fix-up jobs land on an existing PR).
+A stored `pr_url` is never cleared on a transient `gh` failure. `succeeded` requires the job's final commit in the
+live remote branch head (`mother_remote_contains_commit`, bounded by `MOTHER_GIT_REMOTE_TIMEOUT`, default 60s; a
+timeout is a hold), with or without a `pr_url`; otherwise `unpushed_commit` (cleared by retry/resume/reconcile/success;
+`mother reconcile` re-checks containment). **Known limitation:** two jobs on the same branch name in one repo cannot be
+told apart by branch name; adoption then relies on commit containment and creation time.
+
 **Auto-stash restore.** `lib/autostash.sh`'s `mother_autostash_restore` is the
 single implementation of putting a main-dir job's `mother:auto-stash:<id>` back.
 `_restore_auto_stash` (`mother-run-job`) runs it on the post-run path, on the
