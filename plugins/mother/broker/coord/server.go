@@ -812,8 +812,8 @@ func (s *Server) onCmdAck(w *workerConn, f workerproto.Frame) {
 		return // a sync.file ack: nothing is persisted for those
 	}
 	jl := s.jobs[*f.Job]
-	if jl == nil {
-		return
+	if jl == nil || jl.rec.WorkerID != w.id {
+		return // only the worker the command was sent to can acknowledge it
 	}
 	var typ string
 	for i, c := range jl.cmds {

@@ -201,7 +201,7 @@ func (s *Server) offer(job string, req dispatchReq, w *workerConn) error {
 	if err := s.persistTable(); err != nil {
 		return s.abandonOffer(job, l, err)
 	}
-	if old := s.jobs[job]; old != nil {
+	if old := s.jobs[job]; old != nil && old.rec.WorkerID == w.id {
 		for _, c := range old.cmds { // an unacked revoke of an earlier lease is still owed to its worker
 			if c.Type == workerproto.TypeLeaseRevoke {
 				jl.cmds = append(jl.cmds, c)

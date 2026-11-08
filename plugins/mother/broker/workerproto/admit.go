@@ -139,6 +139,10 @@ func (a *Admitter) Admit(worker string, line []byte, now time.Time) (Admission, 
 		// An ack of a lease.revoke is judged on the coordinator's own record too: the lease is already
 		// ended (so the fence below would refuse it), but the revoke must still be acknowledgeable.
 		if known && rec.typ == TypeLeaseRevoke && rec.forLease(f) {
+			// Only the worker that held the revoked lease may acknowledge it.
+			if l, ok := a.leases.Get(*f.Job); !ok || l.ID != *f.Lease || l.Worker != worker {
+				return adm, protoErr(CodeNotLeased, "lease %s is not held by this worker", *f.Lease)
+			}
 			break
 		}
 		if ack.For == TypeSyncFile || f.Job == nil {
