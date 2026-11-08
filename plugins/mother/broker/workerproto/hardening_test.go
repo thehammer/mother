@@ -536,8 +536,18 @@ func TestStaleWorkerCannotAckCommands(t *testing.T) {
 	if _, err := a.Admit("w1", ackFrame(t, "nope", "L", 1, OutcomeApplied, ""), t0); ErrorCode(err) != CodeUnknownJob {
 		t.Fatalf("unknown job: %v", err)
 	}
+	if _, err := a.Admit("w1", ackFrame(t, "", "", 0, OutcomeApplied, TypeSyncFile), t0); ErrorCode(err) != CodeInvalid {
+		t.Fatalf("a worker's own `for: sync.file` must not exempt an ack the coordinator never issued: %v", err)
+	}
+	a.Issued(mustFrame(t, TypeSyncFile, SyncFile{CmdID: "c1", Path: "ratelimit-until", Content: raw("null")}))
 	if _, err := a.Admit("w1", ackFrame(t, "", "", 0, OutcomeApplied, TypeSyncFile), t0); err != nil {
-		t.Fatalf("sync.file ack is exempt: %v", err)
+		t.Fatalf("an ack for an issued sync.file is exempt: %v", err)
+	}
+	// An issued non-sync.file command is fenced even if the worker labels the ack sync.file.
+	a.Issued(cmdFrame(t, TypeHold, Hold{CmdID: "c2", Code: "x", Reason: "y"}))
+	forged := mustFrame(t, TypeCmdAck, CmdAck{CmdID: "c2", Outcome: OutcomeApplied, For: TypeSyncFile})
+	if _, err := a.Admit("w1", mustEncode(t, forged), t0); ErrorCode(err) != CodeInvalid {
+		t.Fatalf("forged for: %v", err)
 	}
 }
 
@@ -1057,5 +1067,23 @@ func TestSurrogateEscapes(t *testing.T) {
 		if _, err := Decode(mk(bad)); err == nil {
 			t.Errorf("%s accepted", bad)
 		}
+	}
+}
+
+func TestTextOKRejectsControlAndBidi(t *testing.T) {
+	for _, s := range []string{"a\u0085b", "a\u009fb", "a\u202eb", "a\u2066b", "a\u200fb", "a\x1bb", "a\x7fb", "a\x00b", "a\rb"} {
+		if textOK(s, 100) {
+			t.Errorf("textOK(%q)", s)
+		}
+	}
+	if !textOK("why?\nline two\tok é 日本", 100) {
+		t.Fatal("ordinary text")
+	}
+	// Event lines carry arbitrary worker output: bidi and C1 are allowed there, NUL and ESC are not.
+	if !lineOK("a\u202eb\u0085", 100) || lineOK("a\x00b", 100) || lineOK("a\x1bb", 100) {
+		t.Fatal("lineOK is the lax C0-only filter")
+	}
+	if Validate(streamFrame(t, TypeJobSet, JobSet{Set: sets("question", `"a\u202eb"`)})) == nil {
+		t.Fatal("a bidi control in a displayed field must be refused")
 	}
 }

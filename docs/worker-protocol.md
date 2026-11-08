@@ -98,8 +98,10 @@ The worker replies to each command with `cmd.ack{cmd_id, outcome: applied|duplic
 
 - `cmd.ack` has the envelope `job`/`lease`/`epoch` of the command and is fence-checked and worker-checked exactly like a stream
   frame: a stale worker cannot ack commands for a job it no longer holds (`fenced`, `not_leased`).
-- **One exemption: `for: "sync.file"`.** `sync.file` is not job-scoped, so its ack has null job/lease/epoch and is bound only to the
-  authenticated connection.
+- **One exemption: `sync.file`.** It is not job-scoped, so its ack has null job/lease/epoch and is bound only to the authenticated
+  connection. The exemption rests on what the coordinator recorded, not on the worker's `for` field: the coordinator calls
+  `Admitter.Issued(frame)` for every command it sends, and `Admit` exempts an ack only when that `cmd_id` was issued as `sync.file`.
+  A worker labelling an ack `for: "sync.file"` for any other `cmd_id` gets `invalid`.
 - While a lease is `offered`, the only command that can be outstanding on it is `lease.offer` (the coordinator sends nothing else
   until the lease is active), so the first `cmd.ack{applied}` activates the lease. A `rejected` ack leaves it to lapse or be revoked.
 
@@ -183,7 +185,8 @@ The coordinator is the sole writer of job JSON; a worker's `job.set` is a reques
   `resume_session_id` are ids, `worker_pid`/`continuation_count`/`live_tokens` non-negative integers, `live_cost_usd` a non-negative number,
   `resume_not_yet_acted_on` a boolean, `gates`/`review_wave`/`limiter_hold`/`current_run`/`rwx_sandbox`/`decision` objects and `attention` an
   array (each at most 64 KiB), `question` and `limiter_resume_prompt` text of at most 8 KiB with no control characters other than newline and
-  tab. `null` clears a key. A wrong kind or size is `invalid`.
+  tab, and no C1 or bidirectional formatting controls (U+200E/F, U+202A-E, U+2066-9). `event.append`/`record.append` lines (arbitrary worker output)
+get only the laxer C0-control check. `null` clears a key. A wrong kind or size is `invalid`.
 - **Completion evidence is coordinator-derived, not worker-settable:** `pr_url`, `actual_branch`, `finished_at`, `exit_code`, `failure_reason`.
   A worker could claim any value, so `job.set` carrying one is refused `ownership`. The coordinator writes them itself, after its remote-commit
   check (P1-5), from the head the worker reports in `lease.release{final_sha}` and its own PR detection. (The alternative, accepting them only

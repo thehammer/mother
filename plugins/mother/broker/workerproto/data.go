@@ -220,9 +220,24 @@ func TimestampOK(s string) bool {
 	return err == nil
 }
 
-// textOK reports whether s is valid UTF-8 within max bytes with no control characters other than
-// \n and \t (so no NUL, ESC or CR).
+// textOK reports whether s is valid UTF-8 within max bytes and safe to store and display: no control
+// characters other than \n and \t (C0, DEL and C1), and none of the bidirectional formatting controls
+// (U+200E/F, U+202A-E, U+2066-9) that can make text render differently from what a parser saw.
 func textOK(s string, max int) bool {
+	if !lineOK(s, max) {
+		return false
+	}
+	for _, r := range s {
+		if r >= 0x80 && r <= 0x9f || r == 0x200e || r == 0x200f || r >= 0x202a && r <= 0x202e || r >= 0x2066 && r <= 0x2069 {
+			return false
+		}
+	}
+	return true
+}
+
+// lineOK is the laxer check for event and record lines, which carry arbitrary worker output as JSON
+// text: valid UTF-8 within max bytes and no C0 control characters other than \n and \t (and no DEL).
+func lineOK(s string, max int) bool {
 	if len(s) > max || !utf8.ValidString(s) {
 		return false
 	}
@@ -232,15 +247,6 @@ func textOK(s string, max int) bool {
 		}
 	}
 	return true
-}
-
-func contains(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 // parseData unmarshals f.Data into T; absent or null data is treated as an empty object.
@@ -479,7 +485,7 @@ func Validate(f Frame) error {
 		if err != nil {
 			return err
 		}
-		if e.Line == "" || strings.Contains(e.Line, "\n") || !textOK(e.Line, MaxFrameBytes) {
+		if e.Line == "" || strings.Contains(e.Line, "\n") || !lineOK(e.Line, MaxFrameBytes) {
 			return protoErr(CodeInvalid, "event.append: line must be a single non-empty line")
 		}
 	case TypeRecordAppend:
@@ -490,7 +496,7 @@ func Validate(f Frame) error {
 		if !contains(recordStreams, r.Stream) {
 			return protoErr(CodeInvalid, "record.append: stream %q not allowed", r.Stream)
 		}
-		if r.Line == "" || strings.Contains(r.Line, "\n") || !textOK(r.Line, MaxFrameBytes) {
+		if r.Line == "" || strings.Contains(r.Line, "\n") || !lineOK(r.Line, MaxFrameBytes) {
 			return protoErr(CodeInvalid, "record.append: line must be a single non-empty line")
 		}
 	case TypeLogAppend:
@@ -670,4 +676,13 @@ func needCmdID(t, id string) error {
 		return protoErr(CodeInvalid, "%s: cmd_id required", t)
 	}
 	return nil
+}
+
+func contains(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
