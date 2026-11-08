@@ -145,7 +145,11 @@ The worker replies to each command with `cmd.ack{cmd_id, outcome: applied|duplic
   resend from `resend_from`. One frame at a time per stream: do not `Accept` again before the previous `Apply` is committed.
 - Apply is idempotent per op type (B4):
   - `job.set` is a value set.
-  - `event.append` and `record.append` are skipped if the identical line is already the tail of that job's stream.
+  - `event.append` and `record.append` are skipped if the identical line is already the tail of that job's stream. (The P1-2 file
+    replay, `lib/coord_apply.sh`, does not use tail dedupe: it is seq-idempotent, requires contiguous seq, and applies a legitimately
+    repeated identical line. It also enforces section 8 and the `keyKinds` bounds itself, quarantines a structurally bad op instead of
+    stalling on it, and never mirrors `runner/` files, progress, the worker log, or the canonical-side `decision.sh` keys
+    `last_answer`, `resumed_at`, `escalation_count`: those are consciously not worker ops.)
   - `log.append` and `artifact.put` are offset-addressed: an overlapping or older offset is trimmed or dropped; a gap is refused.
 - Commands are deduped by `cmd_id` on the worker (bounded set, persisted). A command for an offline worker is redelivered on
   reconnect, or dropped and applied by the coordinator directly when the job's lease moves.

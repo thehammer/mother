@@ -907,21 +907,57 @@ failed/cancelled; target >= 50%).
 
 ## Worker mode: the state seam (cluster P1-2)
 
-With `MOTHER_WORKER_MODE=1` and `MOTHER_WORKER_OUTBOX_DIR` set (default: off, behaviour unchanged), `mother-run-job` and
-everything it calls run against a **worker root** (`MOTHER_ROOT` = a mirror holding the job; marker `.mother-worker-live`,
-which `safe_rm_tree` refuses like `.mother-live`). Every write still lands in the mirror, and `lib/outbox.sh` also appends it
-as a protocol op (`docs/worker-protocol.md` section 4: `job.set`, `event.append`, `record.append`, `artifact.put`) to
-`$MOTHER_WORKER_OUTBOX_DIR/<job>.ndjson`, seq from `<job>.seq`, both under `_switch_with_lock`. Lease/epoch are added later by
-the worker daemon. `lib/coord_apply.sh <canonical-root> <job> < ops.ndjson` replays an outbox onto a canonical tree (persisted
-applied seq under `runner/leases/applied/`, tail-line dedupe as backstop, ownership audit in `runner/leases/audit.jsonl`,
-canonical-side `mother_recompute_job_cost`). `mother_recompute_job_cost` is a no-op in worker mode.
+With `MOTHER_WORKER_MODE=1` (default: off, behaviour unchanged), `mother-run-job` and everything it calls run against a
+**worker root** (`MOTHER_ROOT` = a mirror holding the job; marker `.mother-worker-live`, which `safe_rm_tree` refuses like
+`.mother-live`). Every write still lands in the mirror, and `lib/outbox.sh` also appends it as a protocol op
+(`docs/worker-protocol.md` section 4: `job.set`, `event.append`, `record.append`, `artifact.put`) to
+`$MOTHER_WORKER_OUTBOX_DIR/<job>.ndjson`. Lease/epoch are added later by the worker daemon.
+
+**One predicate, validated once.** `mother_worker_mode_active` (`lib/outbox.sh`) is the only worker-mode test (the outbox,
+the cost recompute, the live-spend baseline, the marker all use it). `mother_worker_mode_validate` runs at startup, before any
+path is created (top of `lib/state.sh` and `bin/mother-run-job`): worker mode REQUIRES an explicit root (`MOTHER_ROOT`, or
+`MOTHER_LIVE_ROOT` as the in-agent view of the same mirror; if both are set they must agree) that is not `$HOME/.mother` and
+has no `.mother-live` marker, plus a writable `MOTHER_WORKER_OUTBOX_DIR`. Anything else prints why and exits non-zero having
+written nothing (no marker, no canonical write). The outbox dir alone, without the mode variable, changes nothing.
+
+**Emit is safe and loud.** The next seq is derived from the last complete, parseable line of the ndjson (the `<job>.seq` file
+is informational), a torn tail is terminated before appending, and `MOTHER_OUTBOX_MAX_OP_BYTES` (1 MiB) /
+`MOTHER_OUTBOX_MAX_BYTES` (512 MiB) cap what is written. Any emit failure (jq, lock, unwritable or full dir, empty previous
+document) logs to stderr, returns non-zero from `mother_job_write_doc` / `_job_write_doc` / `_usage_job_write` /
+`mother_job_update` / the event and record helpers, and persists `runner/<job>.outbox-degraded`. The supervisor then holds the
+job (`awaiting`, `paused_reason: outbox_degraded`) instead of reporting a state the coordinator cannot see; later emits fail
+fast until the flag is cleared.
+
+**The replay is the boundary.** `lib/coord_apply.sh <canonical-root> <job> < ops.ndjson` judges every op as strictly as the P1-1
+Go allowlist (`broker/workerproto` `WorkerKeys`, `CoordinatorDerivedKeys`, `SyncDownKeys`, `StateValues`, `keyKinds`): the bash
+tables are copies, and `tests/state_seam.bats` fails when they drift from `ownership.go`. A worker can never set `succeeded` or a
+coordinator-derived key (`pr_url`, `actual_branch`, `finished_at`, `exit_code`, `failure_reason`: the coordinator derives them,
+P1-5, or holds the job), never leave a terminal state or resume `running` after a cancel, and never touch `cancel_requested`,
+`pause_requested`, `force_start`, `max_cost_usd` (only `pending_answer: null` is allowed) or the P1-2 inventory keys
+(`work_dir`, `base_sha`, `not_before`, `current_tier`, ...), all of which are coordinator-side writes. Values are checked
+against the Go kinds and sizes. Keys apply one by one (refused keys are audited in `runner/leases/audit.jsonl`); a refused
+`state` refuses the whole op. The one bash-side extension is `pipeline`: only its `reviewer_findings` object is merged (typed,
+<= 64 KiB), because `_review_slot_write` writes it in worker mode; add it to the Go table in P1-3. seq must be contiguous
+(`seq <= applied` is a duplicate, a gap stops the replay); a structurally bad line or op is quarantined to
+`runner/leases/<job>.quarantine.ndjson` and skipped, a transient failure retries `MOTHER_APPLY_MAX_RETRIES` (3) times then is
+quarantined. Each call holds a per-job apply lock and stops after `MOTHER_APPLY_MAX_SECONDS` (120) / `MOTHER_APPLY_MAX_OPS`
+(exit 4: call again). Caps: `MOTHER_APPLY_MAX_LINE_BYTES`, `_EVENT_BYTES` (64 KiB), `_ROW_BYTES` (16 KiB), `_FILE_BYTES`,
+`_ARTIFACT_BYTES` (per job, 1 GiB); a `final` artifact chunk needs a sha256. Exit: 0 applied, 1 stopped, 3 done with quarantined
+ops, 4 budget. `mother_recompute_job_cost` is a no-op in worker mode (the canonical side recomputes on a terminal `failed` /
+`cancelled` state and on every usage row).
+
+**What worker mode does NOT mirror** (a deliberate exclusion, not an oversight): `runner/<job>.usage-state.json`, progress and
+every other `runner/` file (including the `.hold`/`.held`/`.park`/`.calls` limiter files), the worker log, and `limiter`/`quota`
+state. Those are runner-local; the coordinator observes the worker through the heartbeat and the log stream instead. The
+`decision.sh` writes `last_answer`, `resumed_at`, `escalation_count` (and the tier bump) happen when an operator answers on the
+canonical tree, never inside a worker, so a worker op carrying them is refused (consciously excluded). `.decision` itself is a
+worker key and is mirrored.
 
 Rules for new code: write a job document only through `mother_job_update`, `mother_job_write_doc` (lib/state.sh),
 `_job_update` / `_job_write_doc` (mother-run-job) or usage.sh's `_usage_job_write`; append events through
 `mother_event_append`/`_append_event`/`_usage_append_event`; call `mother_outbox_artifact` after finalising a file under
-`crew/<id>/`. `tests/state_seam_lint.bats` enforces this by function name. Applier ownership policy lives in
-`coord_apply.sh` (`_CA_*_KEYS`): the P1-1 worker keys plus the P1-2 inventory of what the supervisor writes; until P1-5 the
-replay also accepts completion evidence and `succeeded` (it is the stand-in for the coordinator's derivation).
+`crew/<id>/`. `tests/state_seam_lint.bats` enforces this by function name. Not verified yet: a real worker process against a
+real coordinator (P1-4).
 
 ## Internals reference (lazy-loaded)
 

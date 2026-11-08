@@ -429,6 +429,20 @@ _ss_assert_outbox_shape() {
         || { echo "$id.seq does not hold the last seq" >&2; return 1; }
 }
 
+# _ss_stand_in_coordinator <id> <worker-root> — what the coordinator itself does after a replay (P1-5 derives
+# it; until then this harness stands in): the replay refuses `succeeded`, the completion-evidence keys and every
+# other coordinator-side key from a worker, so copy those (every mirror key outside the worker allowlist except
+# the cost fields) from the worker's final document, then run the canonical cost recompute.
+_ss_stand_in_coordinator() {
+    local id="$1" wr="$2" wk merged
+    wk=$(_ss_in_world "$SS_C" 0 bash -c 'source "$1/coord_apply.sh"; _ca_words_json "$_CA_WORKER_KEYS"' _ "$_LIB_DIR")
+    merged=$(jq -n --argjson wk "$wk" 'input as $m | input
+        | . + ($m | with_entries(select((.key as $k | $wk | index($k) | not) and (.key | startswith("actual_") | not))))' \
+        "$wr/jobs/$id.json" "$SS_C/jobs/$id.json") || return 1
+    printf '%s' "$merged" > "$SS_C/jobs/$id.json"
+    _ss_in_world "$SS_C" 0 bash -c 'source "$1/state.sh"; source "$1/usage.sh"; mother_recompute_job_cost "$2"' _ "$_LIB_DIR" "$id"
+}
+
 # _ss_assert_equivalent <id> <legacy-root> <worker-root> <expected-state> — the whole equivalence contract
 # for one finished pair: both reach <expected-state>, the outbox is well formed, and C (seeded with the
 # worker's pre-run document and fed the outbox) matches the legacy root.
@@ -447,6 +461,7 @@ _ss_assert_equivalent() {
     [ "$(_ss_last_line)" = "$(tr -d '[:space:]' < "$wr/outbox/$id.seq")" ] \
         || { echo "replay printed '$output', wanted the last seq" >&2; return 1; }
 
+    _ss_stand_in_coordinator "$id" "$wr" || return 1
     _ss_compare_worlds "$id" "$lr" "$SS_C" || return 1
 
     # The cost is the canonical recompute: C's equals the legacy run's, which is a real number.
@@ -706,7 +721,7 @@ _ss_emit_artifact() {
     [ ! -e "$SS_C/$rel" ]
 }
 
-@test "artifacts: a path that escapes crew/<job>/ or checkpoints/<job>/ is rejected, the replay stops there and nothing is written" {
+@test "artifacts: a path that escapes crew/<job>/ or checkpoints/<job>/ is quarantined, nothing is written, and the ops around it still apply" {
     local id="art-4" bad ops i=0 b64
     b64=$(printf 'pwned' | base64 | tr -d '\n')
     for bad in \
@@ -730,11 +745,14 @@ _ss_emit_artifact() {
         cp "$SS_C/jobs/$id.json" "$BATS_TEST_TMPDIR/job-before-$i.json"
 
         _ss_replay_to "$SS_C" "$id" "$ops"
-        if [ "$status" -eq 0 ]; then echo "path '$bad' was accepted" >&2; return 1; fi
-        # The first op applied; the op after the rejected one did not.
-        [ "$(_ss_last_line)" = "1" ] || { echo "path '$bad': printed '$output'" >&2; return 1; }
+        # Done, but with a quarantined op (exit 3): the poison op does not stall the ones after it.
+        [ "$status" -eq 3 ] || { echo "path '$bad': status $status" >&2; return 1; }
+        [ "$(_ss_last_line)" = "3" ] || { echo "path '$bad': printed '$output'" >&2; return 1; }
         grep -q '"kind":"before"' "$SS_C/events/$id.jsonl"
-        if grep -q '"kind":"after"' "$SS_C/events/$id.jsonl"; then echo "path '$bad': a later op was applied" >&2; return 1; fi
+        grep -q '"kind":"after"' "$SS_C/events/$id.jsonl"
+        [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "1" ]
+        [ "$(jq -s -r '.[0].seq' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "2" ]
+        jq -s -e '[.[] | select(.code == "quarantined")] | length == 1' "$SS_C/runner/leases/audit.jsonl" >/dev/null
         cmp "$BATS_TEST_TMPDIR/job-before-$i.json" "$SS_C/jobs/$id.json"
     done
     # Nothing escaped anywhere under the test tree.
@@ -843,4 +861,587 @@ _srt() { run bash -c "source '$_LIB_DIR/safe-rm.sh'; safe_rm_tree \"\$1\"" _ "$1
     jq -n -e --argjson c "$ccost" --argjson l "$lcost" '$c == $l' >/dev/null
     # ...and so is the token total.
     [ "$(jq -c '.actual_tokens' "$SS_C/jobs/$id.json")" = "$(jq -c '.actual_tokens' "$SS_FL/jobs/$id.json")" ]
+}
+
+# ===========================================================================
+# 9. Review fix-ups (PR #119): the replay is the boundary
+#
+# A worker, or an agent inside it, can write straight into its outbox, so coord_apply.sh must judge every op
+# as strictly as the P1-1 Go allowlist, apply what is allowed key by key, never stall on a poison line, and
+# stay exactly-once. The emitter is safe and loud, and worker mode cannot be half-on or aimed at the real tree.
+
+SS_GO_OWNERSHIP="$(cd "$(dirname "${BATS_TEST_FILENAME}")/../broker/workerproto" && pwd -P)/ownership.go"
+SS_GO_DATA="$(cd "$(dirname "${BATS_TEST_FILENAME}")/../broker/workerproto" && pwd -P)/data.go"
+
+_ss_audit_keys() { # <croot> <code> — every key audited under <code>, one per line
+    jq -r --arg c "$2" 'select(.code == $c) | .keys[]' "$1/runner/leases/audit.jsonl" 2>/dev/null
+}
+
+# _ss_go_list <var> — the quoted strings of `var = []string{...}` in ownership.go, space-separated, in order.
+_ss_go_list() {
+    awk -v v="$1" '
+        $0 ~ "^[ \t]*" v " *= *\\[\\]string\\{" { on = 1 }
+        on { print }
+        on && /\}/ { exit }' "$SS_GO_OWNERSHIP" | grep -o '"[^"]*"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//'
+}
+
+@test "allowlist: the bash key tables equal the Go constants (WorkerKeys, CoordinatorDerivedKeys, SyncDownKeys, StateValues, keyKinds, limits)" {
+    run bash -c 'source "$1"; printf "%s\n%s\n%s\n%s\n%s\n%s %s %s %s\n" "$_CA_WORKER_KEYS" "$_CA_DERIVED_KEYS" "$_CA_SYNCDOWN_KEYS" "$_CA_STATE_VALUES" "$_CA_KEY_KINDS" "$_CA_MAX_TEXT" "$_CA_MAX_STRUCT" "$_CA_MAX_KEYS" "$_CA_MAX_CHUNK"' _ "$SS_COORD_APPLY"
+    [ "$status" -eq 0 ]
+    local lines=()
+    while IFS= read -r l; do lines+=("$l"); done <<< "$output"
+    [ "${lines[0]}" = "$(_ss_go_list WorkerKeys)" ]
+    [ "${lines[1]}" = "$(_ss_go_list CoordinatorDerivedKeys)" ]
+    [ "${lines[2]}" = "$(_ss_go_list SyncDownKeys)" ]
+    [ "${lines[3]}" = "$(_ss_go_list StateValues)" ]
+    # keyKinds: "key": kind pairs; Go's kText kToken kID kTS kUint kNum kBool kObject kArray -> text token id ts uint num bool object array.
+    local gk
+    gk=$(awk '/^var keyKinds = map/ { on = 1; next } on && /^\}/ { exit } on { print }' "$SS_GO_OWNERSHIP" \
+        | grep -o '"[a-z_]*": k[A-Za-z]*' | sed -e 's/"\([a-z_]*\)": k\(.*\)/\1:\2/' \
+        | awk -F: '{ k = tolower($2); print $1 ":" k }' | tr '\n' ' ' | sed 's/ $//')
+    [ "${lines[4]}" = "$gk" ]
+    # Limits.
+    local mt ms mk mc
+    mt=$(grep -E '^\s*MaxTextLen\s*=' "$SS_GO_DATA" | grep -o '[0-9]\+' | head -1)
+    mk=$(grep -E '^\s*MaxKeys\s*=' "$SS_GO_DATA" | grep -o '[0-9]\+' | head -1)
+    [ "${lines[5]}" = "$mt $((64 << 10)) $mk $((256 << 10))" ]
+}
+
+@test "ownership: a worker cannot claim success: succeeded, pr_url and exit_code in a crafted op are refused and audited" {
+    local id="own-succ" ops="$BATS_TEST_TMPDIR/succ.ndjson"
+    _ss_seed_hand "$id"
+    _ss_op 1 job.set '{"set":{"state":"succeeded","pr_url":"https://x","exit_code":0},"del":[]}' > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "running" ]
+    [ "$(jq -r '.pr_url' "$SS_C/jobs/$id.json")" = "null" ]
+    [ "$(jq -r '.exit_code // "absent"' "$SS_C/jobs/$id.json")" = "absent" ]
+    local k; k=$(_ss_audit_keys "$SS_C" ownership)
+    [[ "$k" == *state* && "$k" == *pr_url* && "$k" == *exit_code* ]]
+}
+
+@test "ownership: every coordinator-derived key is refused, with or without a state change; the allowed keys of the same op still apply" {
+    local id="own-derived" ops="$BATS_TEST_TMPDIR/derived.ndjson" k
+    _ss_seed_hand "$id"
+    _ss_op 1 job.set '{"set":{"state":"awaiting","activity":"waiting","pr_url":"https://x","actual_branch":"b","finished_at":"2026-11-08T12:00:00.000Z","exit_code":0,"failure_reason":"nope"},"del":[]}' > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    # Per-key apply: the allowed keys (state awaiting, activity) landed...
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "awaiting" ]
+    [ "$(jq -r '.activity' "$SS_C/jobs/$id.json")" = "waiting" ]
+    # ...and the derived ones did not.
+    for k in pr_url actual_branch finished_at exit_code failure_reason; do
+        [ "$(jq -r --arg k "$k" '.[$k] // "none"' "$SS_C/jobs/$id.json")" = "none" ] || { echo "$k applied" >&2; return 1; }
+        _ss_audit_keys "$SS_C" ownership | grep -qx "$k" || { echo "$k not audited" >&2; return 1; }
+    done
+}
+
+@test "ownership: inventory keys (work_dir, base_sha, not_before, force_ignore_deps, current_tier) are refused from a worker" {
+    local id="own-inv" ops="$BATS_TEST_TMPDIR/inv.ndjson" k
+    _ss_seed_hand "$id"
+    cp "$SS_C/jobs/$id.json" "$BATS_TEST_TMPDIR/before.json"
+    _ss_op 1 job.set '{"set":{"work_dir":"/evil","base_sha":"abc","not_before":1,"force_ignore_deps":true,"current_tier":"tier_3"},"del":[]}' > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    [ "$(jq -S . "$BATS_TEST_TMPDIR/before.json")" = "$(jq -S . "$SS_C/jobs/$id.json")" ]
+    for k in work_dir base_sha not_before force_ignore_deps current_tier; do
+        _ss_audit_keys "$SS_C" ownership | grep -qx "$k"
+    done
+}
+
+@test "ownership: cancel_requested, pause_requested and force_start cannot be nulled or deleted by a worker" {
+    local id="own-sync" ops="$BATS_TEST_TMPDIR/sync.ndjson" k
+    _ss_seed_hand "$id"
+    jq '.cancel_requested = true | .pause_requested = true | .force_start = true | .pending_answer = "a"' "$SS_C/jobs/$id.json" > "$SS_C/jobs/$id.tmp" \
+        && mv "$SS_C/jobs/$id.tmp" "$SS_C/jobs/$id.json"
+    {
+        _ss_op 1 job.set '{"set":{"cancel_requested":null,"pause_requested":null,"force_start":null},"del":[]}'
+        _ss_op 2 job.set '{"set":{},"del":["cancel_requested","pause_requested","force_start"]}'
+    } > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.cancel_requested' "$SS_C/jobs/$id.json")" = "true" ]
+    [ "$(jq -r '.pause_requested' "$SS_C/jobs/$id.json")" = "true" ]
+    [ "$(jq -r '.force_start' "$SS_C/jobs/$id.json")" = "true" ]
+    for k in cancel_requested pause_requested force_start; do _ss_audit_keys "$SS_C" ownership | grep -qx "$k"; done
+    # The one Go-allowed consumption: pending_answer -> null (set or delete).
+    _ss_op 3 job.set '{"set":{"pending_answer":null},"del":[]}' > "$BATS_TEST_TMPDIR/pa.ndjson"
+    _ss_replay_to "$SS_C" "$id" "$BATS_TEST_TMPDIR/pa.ndjson"
+    [ "$(jq -r '.pending_answer' "$SS_C/jobs/$id.json")" = "null" ]
+}
+
+@test "ownership: a terminal state is never left, running is refused after a cancel, and an unknown state value is refused" {
+    local id="own-term" ops="$BATS_TEST_TMPDIR/term.ndjson"
+    _ss_seed_hand "$id"
+    # succeeded -> failed
+    jq '.state = "succeeded"' "$SS_C/jobs/$id.json" > "$SS_C/jobs/$id.tmp" && mv "$SS_C/jobs/$id.tmp" "$SS_C/jobs/$id.json"
+    _ss_op 1 job.set '{"set":{"state":"failed","activity":"x"},"del":[]}' > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "succeeded" ]
+    # A refused state refuses the whole op: the activity in the same op is not applied either.
+    [ "$(jq -r '.activity // "none"' "$SS_C/jobs/$id.json")" = "none" ]
+    _ss_audit_keys "$SS_C" op_refused | grep -qx "activity"
+    # running after a cancel request
+    jq '.state = "running" | .cancel_requested = true' "$SS_C/jobs/$id.json" > "$SS_C/jobs/$id.tmp" && mv "$SS_C/jobs/$id.tmp" "$SS_C/jobs/$id.json"
+    _ss_op 1 job.set '{"set":{"state":"running"},"del":[]}' > "$ops"
+    rm -f "$SS_C/runner/leases/applied/$id.seq"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "running" ]
+    _ss_audit_keys "$SS_C" ownership | grep -qx "state"
+    # unknown state value, and a state delete
+    _ss_op 1 job.set '{"set":{"state":"bogus"},"del":["state"]}' > "$ops"
+    rm -f "$SS_C/runner/leases/applied/$id.seq"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "running" ]
+    # cancelled stays cancelled (and a worker may set it)
+    jq '.state = "cancelled"' "$SS_C/jobs/$id.json" > "$SS_C/jobs/$id.tmp" && mv "$SS_C/jobs/$id.tmp" "$SS_C/jobs/$id.json"
+    _ss_op 1 job.set '{"set":{"state":"running"},"del":[]}' > "$ops"
+    rm -f "$SS_C/runner/leases/applied/$id.seq"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "cancelled" ]
+}
+
+@test "kinds: wrongly typed or oversized values (worker_pid abc, attention x, gates 7, live_cost_usd -5, a 300 KB question) are refused; a valid op still applies" {
+    local id="kinds-1" ops="$BATS_TEST_TMPDIR/kinds.ndjson" big k
+    _ss_seed_hand "$id"
+    big=$(head -c 307200 /dev/zero | tr '\0' 'q')
+    {
+        _ss_op 1 job.set '{"set":{"worker_pid":"abc"},"del":[]}'
+        _ss_op 2 job.set '{"set":{"attention":"x"},"del":[]}'
+        _ss_op 3 job.set '{"set":{"gates":7},"del":[]}'
+        _ss_op 4 job.set '{"set":{"live_cost_usd":-5},"del":[]}'
+        _ss_op 5 job.set "$(jq -nc --arg q "$big" '{set: {question: $q}, del: []}')"
+        _ss_op 6 job.set '{"set":{"activity":"has space"},"del":[]}'
+        _ss_op 7 job.set '{"set":{"session_id":"a..b"},"del":[]}'
+        _ss_op 8 job.set '{"set":{"started_at":""},"del":[]}'
+        _ss_op 9 job.set '{"set":{"continuation_count":1.5,"resume_not_yet_acted_on":"yes"},"del":[]}'
+        _ss_op 10 job.set '{"set":{"worker_pid":4242,"attention":[{"reason":"progress_stalled"}],"question":"fine","live_cost_usd":1.25},"del":[]}'
+    } > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ] || { echo "status $status: $stderr" >&2; return 1; }
+    [ "$(_ss_last_line)" = "10" ]
+    jq -e '.worker_pid == 4242 and .question == "fine" and .live_cost_usd == 1.25 and (.attention | length) == 1' "$SS_C/jobs/$id.json" >/dev/null
+    [ "$(jq -r '.gates // "none"' "$SS_C/jobs/$id.json")" = "none" ]
+    [ "$(jq -r '.activity // "none"' "$SS_C/jobs/$id.json")" = "none" ]
+    for k in worker_pid attention gates live_cost_usd question activity session_id started_at continuation_count resume_not_yet_acted_on; do
+        _ss_audit_keys "$SS_C" invalid | grep -qx "$k" || { echo "$k not audited as invalid" >&2; return 1; }
+    done
+}
+
+@test "bounds: an oversized event line and an oversized usage row are quarantined, not appended" {
+    local id="bound-1" ops="$BATS_TEST_TMPDIR/bound.ndjson" big
+    _ss_seed_hand "$id"
+    big=$(head -c 70000 /dev/zero | tr '\0' 'e')
+    {
+        _ss_op 1 event.append "$(jq -nc --arg b "$big" '{line: ({ts:"2026-11-08T12:00:00.000Z",kind:"big",detail:{b:$b}} | tojson)}')"
+        _ss_op 2 record.append "$(jq -nc --arg b "$(head -c 20000 /dev/zero | tr '\0' 'r')" '{stream:"metrics/runs.jsonl", line: ({job_id:"bound-1",cost_usd:1,pad:$b} | tojson)}')"
+        _ss_op 3 event.append '{"line":"{\"ts\":\"2026-11-08T12:00:02.000Z\",\"kind\":\"small\",\"detail\":{}}"}'
+    } > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 3 ]
+    ! grep -q '"kind":"big"' "$SS_C/events/$id.jsonl"
+    grep -q '"kind":"small"' "$SS_C/events/$id.jsonl"
+    [ ! -s "$SS_C/metrics/runs.jsonl" ]
+    [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "2" ]
+}
+
+@test "per-key apply: a refused key does not drop the allowed keys of the same op, and the audit names only the refused ones" {
+    local id="perkey-1" ops="$BATS_TEST_TMPDIR/perkey.ndjson"
+    _ss_seed_hand "$id"
+    _ss_op 1 job.set '{"set":{"activity":"building","repo_path":"/evil","question":"q?","session_id":"s-1"},"del":["branch","paused_reason"]}' > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    jq -e '.activity == "building" and .question == "q?" and .session_id == "s-1" and .repo_path == "/tmp/testrepo" and .branch == "feature/test"' \
+        "$SS_C/jobs/$id.json" >/dev/null
+    [ "$(_ss_audit_keys "$SS_C" ownership | sort | tr '\n' ' ')" = "branch repo_path " ]
+}
+
+@test "pipeline: _review_slot_write in worker mode ships reviewer_findings, which reach the canonical job; the rest of pipeline stays coordinator-owned" {
+    local id="pipe-1" rf='{"decision":"pass","findings":[]}'
+    _ss_in_world "$SS_W" 0 make_job "$id" running '.kind = "pipeline" | .pipeline = {cycle_cap: 3, review_cycle: 0}'
+    _ss_in_world "$SS_W" 1 bash -c '
+        set -u
+        source "$1/state.sh"
+        eval "$(sed -n "/^_review_slot_write()/,/^}/p" "$2")"
+        _review_slot_write "$JOBS_DIR/$3.json" "$4" "perri:correctness"' _ "$_LIB_DIR" "$_BIN_DIR/mother" "$id" "$rf"
+    [ -s "$SS_W/outbox/$id.ndjson" ]
+    cp "$SS_W/jobs/$id.json" "$BATS_TEST_TMPDIR/mirror.json"
+    # Canonical: same job before the write, with its own coordinator-side pipeline state.
+    SS_C="$SS_C"; mkdir -p "$SS_C/jobs" "$SS_C/events" "$SS_C/metrics" "$SS_C/runner"
+    _ss_in_world "$SS_C" 0 make_job "$id" running '.kind = "pipeline" | .pipeline = {cycle_cap: 3, review_cycle: 2}'
+    _ss_replay_to "$SS_C" "$id" "$SS_W/outbox/$id.ndjson"
+    [ "$status" -eq 0 ]
+    jq -e --argjson rf "$rf" '.pipeline.reviewer_findings["perri:correctness"] == $rf and .pipeline.review_cycle == 2 and .pipeline.cycle_cap == 3' \
+        "$SS_C/jobs/$id.json" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# No poison line
+
+@test "poison: a corrupt middle line is quarantined and audited, the ops after it apply, and the job still reaches its terminal state" {
+    local id="poison-1" ops="$BATS_TEST_TMPDIR/poison.ndjson"
+    _ss_seed_hand "$id"
+    {
+        _ss_op 1 event.append '{"line":"{\"ts\":\"2026-11-08T12:00:00.000Z\",\"kind\":\"a\",\"detail\":{}}"}'
+        printf '%s\n' '{"seq":2,"t":"event.append","data":{"line":"{\"ts\":'
+        _ss_op 3 event.append '{"line":"{\"ts\":\"2026-11-08T12:00:02.000Z\",\"kind\":\"c\",\"detail\":{}}"}'
+        _ss_op 4 job.set '{"set":{"state":"cancelled"},"del":[]}'
+    } > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 3 ] || { echo "status $status / $stderr" >&2; return 1; }
+    [ "$(_ss_last_line)" = "4" ]
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "cancelled" ]
+    grep -q '"kind":"c"' "$SS_C/events/$id.jsonl"
+    [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "1" ]
+    jq -s -e '[.[] | select(.code == "quarantined")] | length == 1' "$SS_C/runner/leases/audit.jsonl" >/dev/null
+    # A retry changes nothing and quarantines nothing more.
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "1" ]
+    [ "$(grep -c '"kind":"c"' "$SS_C/events/$id.jsonl")" = "1" ]
+}
+
+@test "poison: an op that can never apply (no .data, bad type, escaping path) is skipped; a transient failure retries and is quarantined after the cap, not before" {
+    [ "$(id -u)" != "0" ] || skip "root ignores file permissions"
+    local id="poison-2" ops="$BATS_TEST_TMPDIR/poison2.ndjson"
+    _ss_seed_hand "$id"
+    {
+        _ss_op 1 bogus.type '{}'
+        _ss_op 2 job.set '"not an object"'
+        _ss_op 3 event.append '{"line":"{\"ts\":\"2026-11-08T12:00:00.000Z\",\"kind\":\"t\",\"detail\":{}}"}'
+        _ss_op 4 job.set '{"set":{"activity":"after"},"del":[]}'
+    } > "$ops"
+    : > "$SS_C/events/$id.jsonl"
+    chmod 444 "$SS_C/events/$id.jsonl"      # the event append fails transiently
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 1 ]                     # attempt 1: stopped at seq 3
+    [ "$(_ss_last_line)" = "2" ]
+    [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "2" ]
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 1 ]                     # attempt 2
+    [ "$(_ss_last_line)" = "2" ]
+    _ss_replay_to "$SS_C" "$id" "$ops"      # attempt 3: quarantined, moves on
+    [ "$status" -eq 3 ]
+    [ "$(_ss_last_line)" = "4" ]
+    [ "$(jq -r '.activity' "$SS_C/jobs/$id.json")" = "after" ]
+    [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "3" ]
+}
+
+# ---------------------------------------------------------------------------
+# Contiguous seq, safe emit
+
+@test "seq: a gap (1 then 3) stops the replay at 1 and says so; the missing op arriving later lets it continue" {
+    local id="seq-1" ops="$BATS_TEST_TMPDIR/gap.ndjson" full="$BATS_TEST_TMPDIR/gapfull.ndjson"
+    _ss_seed_hand "$id"
+    _ss_op 1 job.set '{"set":{"activity":"one"},"del":[]}' > "$ops"
+    _ss_op 3 job.set '{"set":{"activity":"three"},"del":[]}' >> "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 1 ]
+    [ "$(_ss_last_line)" = "1" ]
+    [[ "$stderr" == *gap* ]]
+    [ "$(jq -r '.activity' "$SS_C/jobs/$id.json")" = "one" ]
+    { _ss_op 1 job.set '{"set":{"activity":"one"},"del":[]}'; _ss_op 2 job.set '{"set":{"question":"two"},"del":[]}'
+      _ss_op 3 job.set '{"set":{"activity":"three"},"del":[]}'; } > "$full"
+    _ss_replay_to "$SS_C" "$id" "$full"
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.activity' "$SS_C/jobs/$id.json")" = "three" ]
+}
+
+@test "seq: a duplicate seq is skipped, but a legitimately repeated identical line (new seq) is applied" {
+    local id="seq-2" ops="$BATS_TEST_TMPDIR/dup.ndjson" ev
+    _ss_seed_hand "$id"
+    ev='{"line":"{\"ts\":\"2026-11-08T12:00:00.000Z\",\"kind\":\"same\",\"detail\":{}}"}'
+    { _ss_op 1 event.append "$ev"; _ss_op 2 event.append "$ev"; _ss_op 2 event.append "$ev"; _ss_op 1 event.append "$ev"; } > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    [ "$(grep -c '"kind":"same"' "$SS_C/events/$id.jsonl")" = "2" ]
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$(grep -c '"kind":"same"' "$SS_C/events/$id.jsonl")" = "2" ]
+}
+
+# _ss_emit <id> <n> — n event.append ops from the worker world.
+_ss_emit() {
+    local id="$1" n="$2"
+    _ss_in_world "$SS_W" 1 bash -c '
+        source "$1/state.sh"
+        i=0; while [ "$i" -lt "$3" ]; do i=$((i + 1)); mother_event_append "$2" probe "{\"n\":$i}" || exit 1; done' _ "$_LIB_DIR" "$id" "$n"
+}
+
+@test "emit: a seq file that cannot be written (or is stale) never causes a reused seq; the ndjson is the source of truth" {
+    local id="emit-1"
+    mkdir -p "$SS_W/outbox"
+    printf 'garbage' > "$SS_W/outbox/$id.seq"
+    _ss_emit "$id" 3
+    jq -s -e 'map(.seq) == [1,2,3]' "$SS_W/outbox/$id.ndjson" >/dev/null
+    printf '1' > "$SS_W/outbox/$id.seq"     # stale: behind the ndjson
+    _ss_emit "$id" 2
+    jq -s -e 'map(.seq) == [1,2,3,4,5]' "$SS_W/outbox/$id.ndjson" >/dev/null
+    rm -f "$SS_W/outbox/$id.seq"            # missing: the ndjson still decides
+    _ss_emit "$id" 1
+    jq -s -e 'map(.seq) == [1,2,3,4,5,6]' "$SS_W/outbox/$id.ndjson" >/dev/null
+}
+
+@test "emit: a torn last line is terminated before the next op, so two ops are never fused; the replay quarantines the torn one and applies the rest" {
+    local id="emit-2"
+    _ss_seed_hand "$id"
+    mkdir -p "$SS_W/outbox"
+    { _ss_op 1 event.append '{"line":"{\"ts\":\"2026-11-08T12:00:00.000Z\",\"kind\":\"one\",\"detail\":{}}"}'
+      printf '{"seq":2,"t":"event.append","ts":"x","data":{"line":"{\\"ts'; } > "$SS_W/outbox/$id.ndjson"
+    _ss_emit "$id" 1
+    [ "$(wc -l < "$SS_W/outbox/$id.ndjson" | tr -d ' ')" = "3" ]
+    [ "$(tail -n 1 "$SS_W/outbox/$id.ndjson" | jq -r '.seq')" = "2" ]
+    _ss_replay_to "$SS_C" "$id" "$SS_W/outbox/$id.ndjson"
+    [ "$status" -eq 3 ]
+    [ "$(_ss_last_line)" = "2" ]
+    grep -q '"kind":"one"' "$SS_C/events/$id.jsonl"
+    grep -q '"kind":"probe"' "$SS_C/events/$id.jsonl"
+}
+
+@test "replay: an unterminated last line that is not yet a whole op is left alone (not quarantined)" {
+    local id="seq-3" ops="$BATS_TEST_TMPDIR/torn.ndjson"
+    _ss_seed_hand "$id"
+    { _ss_op 1 event.append '{"line":"{\"ts\":\"2026-11-08T12:00:00.000Z\",\"kind\":\"one\",\"detail\":{}}"}'
+      printf '{"seq":2,"t":"event.append","data":{"li'; } > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 1 ]
+    [ "$(_ss_last_line)" = "1" ]
+    [ ! -e "$SS_C/runner/leases/$id.quarantine.ndjson" ]
+}
+
+# ---------------------------------------------------------------------------
+# Emit failures are loud and hold the job
+
+@test "emit failure: an unwritable outbox dir fails the write loudly, flags the outbox degraded, and the op is not silently dropped" {
+    [ "$(id -u)" != "0" ] || skip "root ignores file permissions"
+    local id="deg-1"
+    _ss_in_world "$SS_W" 0 make_job "$id" running
+    mkdir -p "$SS_W/outbox"
+    run --separate-stderr _ss_in_world "$SS_W" 1 bash -c '
+        source "$1/state.sh"
+        chmod a-w "$MOTHER_WORKER_OUTBOX_DIR"       # breaks after startup validation passed
+        mother_job_update "$2" ".question = \"lost?\""; echo "update rc=$?"
+        mother_event_append "$2" probe "{}"; echo "event rc=$?"' _ "$_LIB_DIR" "$id"
+    [[ "$output" == *"update rc=1"* ]]
+    [[ "$output" == *"event rc=1"* ]]
+    [[ "$stderr" == *"OUTBOX DEGRADED"* ]]
+    [ -f "$SS_W/runner/$id.outbox-degraded" ]
+    jq -e '.why | length > 0' "$SS_W/runner/$id.outbox-degraded" >/dev/null
+    [ ! -s "$SS_W/outbox/$id.ndjson" ]
+}
+
+@test "emit failure: an empty previous document is a failed emit, not a silent skip" {
+    local id="deg-2"
+    _ss_in_world "$SS_W" 0 make_job "$id" running
+    : > "$SS_W/jobs/$id.json.empty"
+    run --separate-stderr _ss_in_world "$SS_W" 1 bash -c '
+        source "$1/state.sh"
+        mother_job_write_doc "$JOBS_DIR/$2.missing.json" "{\"id\":\"x\"}"; echo "rc=$?"' _ "$_LIB_DIR" "$id"
+    [[ "$output" == *"rc=1"* ]]
+    [ -f "$SS_W/runner/$id.missing.outbox-degraded" ]
+}
+
+@test "emit failure: a job whose outbox breaks mid-run is held (awaiting, outbox_degraded) and never reaches succeeded" {
+    [ "$(id -u)" != "0" ] || skip "root ignores file permissions"
+    local id="deg-3"
+    mkdir -p "$SS_W"
+    _ss_in_world "$SS_W" 0 _ss_prepare plain "$id"
+    # The worker's run breaks the outbox (not writable any more) just before it exits.
+    _ss_in_world "$SS_W" 0 _ss_behave 1 'SLEEP=0; POST='"'"'chmod a-w "$ROOT/outbox"'"'"
+    run _ss_in_world "$SS_W" 1 _ss_run_job "$id"
+    [ "$(jq -r '.state' "$SS_W/jobs/$id.json")" = "awaiting" ] || { cat "$SS_W/run-job.out" >&2; return 1; }
+    [ "$(jq -r '.paused_reason' "$SS_W/jobs/$id.json")" = "outbox_degraded" ]
+    [ -f "$SS_W/runner/$id.outbox-degraded" ]
+    grep -q "OUTBOX DEGRADED" "$SS_W/run-job.out"
+}
+
+# ---------------------------------------------------------------------------
+# Worker mode cannot be half-on or aimed at the real tree
+
+@test "worker mode: MOTHER_WORKER_MODE=1 alone is refused and nothing is created under the real or default root" {
+    run --separate-stderr env -u MOTHER_ROOT -u MOTHER_LIVE_ROOT -u JOBS_DIR -u EVENTS_DIR -u LOGS_DIR -u DRAFTS_DIR \
+        -u CURSORS_DIR -u RUNNER_DIR -u ARCHIVE_DIR -u TEARDOWN_DIR -u MOTHER_TEST_ROOT -u MOTHER_WORKER_OUTBOX_DIR \
+        HOME="$SS_HOME" MOTHER_WORKER_MODE=1 bash -c 'source "$1/state.sh"; echo survived' _ "$_LIB_DIR"
+    [ "$status" -ne 0 ]
+    [[ "$output" != *survived* ]]
+    [[ "$stderr" == *"worker mode"* ]]
+    [ ! -e "$SS_HOME/.mother" ]
+    # mother-run-job refuses the same way.
+    run --separate-stderr env -u MOTHER_ROOT -u MOTHER_LIVE_ROOT -u MOTHER_TEST_ROOT HOME="$SS_HOME" MOTHER_WORKER_MODE=1 \
+        "$_BIN_DIR/mother-run-job" some-job
+    [ "$status" -ne 0 ]
+    [ ! -e "$SS_HOME/.mother" ]
+}
+
+@test "worker mode: an outbox with a canonical root (HOME/.mother, a .mother-live root, or a root disagreeing with MOTHER_LIVE_ROOT) is refused and drops no marker" {
+    local live="$SS_L/live-root" out="$SS_L/some-outbox" r
+    mkdir -p "$live" "$SS_HOME/.mother" "$out"
+    : > "$live/.mother-live"
+    for r in "$live" "$SS_HOME/.mother"; do
+        run --separate-stderr env -u MOTHER_LIVE_ROOT -u MOTHER_TEST_ROOT HOME="$SS_HOME" MOTHER_ROOT="$r" \
+            MOTHER_WORKER_MODE=1 MOTHER_WORKER_OUTBOX_DIR="$out" bash -c 'source "$1/state.sh"; echo survived' _ "$_LIB_DIR"
+        [ "$status" -ne 0 ] || { echo "root $r accepted" >&2; return 1; }
+        [ ! -e "$r/.mother-worker-live" ]
+        [ ! -d "$r/jobs" ] || [ "$r" = "$live" ] || true
+    done
+    run --separate-stderr env -u MOTHER_TEST_ROOT HOME="$SS_HOME" MOTHER_ROOT="$SS_W" MOTHER_LIVE_ROOT="$live" \
+        MOTHER_WORKER_MODE=1 MOTHER_WORKER_OUTBOX_DIR="$out" bash -c 'source "$1/state.sh"' _ "$_LIB_DIR"
+    [ "$status" -ne 0 ]
+    [ ! -e "$SS_W/jobs" ]
+    # An outbox that cannot be written is refused too.
+    chmod a-w "$out"
+    run --separate-stderr env -u MOTHER_LIVE_ROOT -u MOTHER_TEST_ROOT HOME="$SS_HOME" MOTHER_ROOT="$SS_W" \
+        MOTHER_WORKER_MODE=1 MOTHER_WORKER_OUTBOX_DIR="$out" bash -c 'source "$1/state.sh"' _ "$_LIB_DIR"
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"outbox"* ]]
+    chmod u+w "$out"
+}
+
+@test "worker mode: a properly configured worker root starts, gets its own marker (not the live one), and the in-agent view (MOTHER_LIVE_ROOT only) works too" {
+    local out="$SS_W/outbox"
+    run --separate-stderr env -u MOTHER_ROOT -u MOTHER_TEST_ROOT -u JOBS_DIR HOME="$SS_HOME" MOTHER_LIVE_ROOT="$SS_W" \
+        MOTHER_WORKER_MODE=1 MOTHER_WORKER_OUTBOX_DIR="$out" \
+        bash -c 'source "$1/state.sh"; mother_outbox_enabled && echo enabled' _ "$_LIB_DIR"
+    [ "$status" -eq 0 ] || { echo "$stderr" >&2; return 1; }
+    [[ "$output" == *enabled* ]]
+    [ -e "$SS_W/.mother-worker-live" ]
+    [ ! -e "$SS_W/.mother-live" ]
+}
+
+@test "legacy path: only MOTHER_WORKER_OUTBOX_DIR set (mode off) changes nothing: no outbox, no marker, cost recompute still runs" {
+    local id="leg-1"
+    _ss_in_world "$SS_L" 0 make_job "$id" running
+    _ss_in_world "$SS_L" 2 bash -c '
+        source "$1/state.sh"; source "$1/usage.sh"
+        mother_job_update "$2" ".question = \"q\""
+        mother_event_append "$2" probe "{}"
+        mother_recompute_job_cost "$2"' _ "$_LIB_DIR" "$id"
+    [ ! -e "$SS_L/outbox" ]
+    [ ! -e "$SS_L/.mother-worker-live" ]
+    [ "$(jq -r '.actual_cost_usd' "$SS_L/jobs/$id.json")" = "0" ]
+    [ "$(jq -r '.question' "$SS_L/jobs/$id.json")" = "q" ]
+}
+
+@test "worker mode: the cost recompute is a no-op in a validated worker root (the canonical side owns cost)" {
+    local id="cost-w"
+    _ss_in_world "$SS_W" 0 make_job "$id" running
+    _ss_in_world "$SS_W" 1 bash -c 'source "$1/state.sh"; source "$1/usage.sh"; mother_recompute_job_cost "$2"' _ "$_LIB_DIR" "$id"
+    [ "$(jq -r '.actual_cost_usd // "absent"' "$SS_W/jobs/$id.json")" = "absent" ]
+}
+
+# ---------------------------------------------------------------------------
+# Bounds
+
+@test "bounds: an op over MOTHER_OUTBOX_MAX_OP_BYTES and an outbox over MOTHER_OUTBOX_MAX_BYTES are refused loudly (degraded), never truncated" {
+    local id="cap-1" big
+    big=$(head -c 3000 /dev/zero | tr '\0' 'z')
+    run --separate-stderr _ss_in_world "$SS_W" 1 env MOTHER_OUTBOX_MAX_OP_BYTES=1000 bash -c '
+        source "$1/state.sh"; mother_event_append "$2" probe "{\"b\":\"$3\"}"; echo "rc=$?"' _ "$_LIB_DIR" "$id" "$big"
+    [[ "$output" == *"rc=1"* ]]
+    [ ! -s "$SS_W/outbox/$id.ndjson" ]
+    rm -f "$SS_W/runner/$id.outbox-degraded"
+    run --separate-stderr _ss_in_world "$SS_W" 1 env MOTHER_OUTBOX_MAX_BYTES=300 bash -c '
+        source "$1/state.sh"
+        mother_event_append "$2" probe "{\"n\":1}"; echo "first rc=$?"
+        mother_event_append "$2" probe "{\"n\":2}"; echo "second rc=$?"
+        mother_event_append "$2" probe "{\"n\":3}"; echo "third rc=$?"' _ "$_LIB_DIR" "$id"
+    [[ "$output" == *"first rc=0"* ]]
+    [[ "$output" == *"third rc=1"* ]]
+    [ "$(wc -l < "$SS_W/outbox/$id.ndjson" | tr -d ' ')" -lt 3 ]
+}
+
+@test "bounds: a replay stops after MOTHER_APPLY_MAX_OPS (exit 4) and a later call resumes where it stopped" {
+    local id="budget-1" ops="$BATS_TEST_TMPDIR/budget.ndjson" i
+    _ss_seed_hand "$id"
+    for i in 1 2 3 4 5; do
+        _ss_op "$i" event.append "$(jq -nc --argjson n "$i" '{line: ({ts:"2026-11-08T12:00:00.000Z",kind:"n",detail:{n:$n}} | tojson)}')"
+    done > "$ops"
+    run --separate-stderr env MOTHER_APPLY_MAX_OPS=2 bash -c '"$0" "$1" "$2" < "$3"' "$SS_COORD_APPLY" "$SS_C" "$id" "$ops"
+    [ "$status" -eq 4 ]
+    [ "$(printf '%s\n' "$output" | tail -1)" = "2" ]
+    [ "$(wc -l < "$SS_C/events/$id.jsonl" | tr -d ' ')" = "2" ]
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    [ "$(wc -l < "$SS_C/events/$id.jsonl" | tr -d ' ')" = "5" ]
+}
+
+@test "bounds: artifacts over the per-job byte cap are refused and their .part file is removed; a stale unfinished .part is swept" {
+    local id="art-cap" rel="crew/art-cap/big.bin" ops="$BATS_TEST_TMPDIR/cap.ndjson" b64
+    _ss_seed_hand "$id"
+    b64=$(head -c 600 /dev/zero | base64 | tr -d '\n')
+    _ss_op 1 artifact.put "$(jq -nc --arg p "$rel" --arg b "$b64" '{path:$p, offset:0, b64:$b, final:false}')" > "$ops"
+    mkdir -p "$SS_C/crew/$id"
+    : > "$SS_C/crew/$id/stale.bin.part"; touch -t 202001010000 "$SS_C/crew/$id/stale.bin.part"
+    run --separate-stderr env MOTHER_APPLY_MAX_ARTIFACT_BYTES=400 bash -c '"$0" "$1" "$2" < "$3"' "$SS_COORD_APPLY" "$SS_C" "$id" "$ops"
+    [ "$status" -eq 3 ]
+    [ ! -e "$SS_C/$rel.part" ]
+    [ ! -e "$SS_C/crew/$id/stale.bin.part" ]
+}
+
+# ---------------------------------------------------------------------------
+# Locking and artifact finality
+
+@test "artifacts: a final chunk with no sha256 is refused (quarantined), never stored unverified" {
+    local id="art-nosha" rel="crew/art-nosha/x.txt" ops="$BATS_TEST_TMPDIR/nosha.ndjson"
+    _ss_seed_hand "$id"
+    _ss_op 1 artifact.put "$(jq -nc --arg p "$rel" --arg b "$(printf 'hello' | base64)" '{path:$p, offset:0, b64:$b, final:true}')" > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 3 ]
+    [ ! -e "$SS_C/$rel" ]
+    [ ! -e "$SS_C/$rel.part" ]
+}
+
+@test "locking: two replays of the same outbox at once apply every op exactly once" {
+    local id="lock-1" ops="$BATS_TEST_TMPDIR/lock.ndjson" i p1 p2
+    _ss_seed_hand "$id"
+    for i in $(seq 1 25); do
+        _ss_op "$i" event.append "$(jq -nc --argjson n "$i" '{line: ({ts:"2026-11-08T12:00:00.000Z",kind:"n",detail:{n:$n}} | tojson)}')"
+    done > "$ops"
+    ( _ss_in_world "$SS_C" 0 bash -c '"$0" "$1" "$2" < "$3"' "$SS_COORD_APPLY" "$SS_C" "$id" "$ops" >/dev/null 2>&1 ) & p1=$!
+    ( _ss_in_world "$SS_C" 0 bash -c '"$0" "$1" "$2" < "$3"' "$SS_COORD_APPLY" "$SS_C" "$id" "$ops" >/dev/null 2>&1 ) & p2=$!
+    wait "$p1" || true; wait "$p2" || true
+    [ "$(wc -l < "$SS_C/events/$id.jsonl" | tr -d ' ')" = "25" ]
+    [ "$(jq -s 'map(.detail.n) | unique | length' "$SS_C/events/$id.jsonl")" = "25" ]
+}
+
+# ---------------------------------------------------------------------------
+# Nits and legacy equivalence
+
+@test "nits: job ids . and .. are rejected by the CLI, and _ca_words_json never glob-expands its argument" {
+    local id
+    for id in . .. ../x; do
+        run --separate-stderr bash -c '"$0" "$1" "$2" < /dev/null' "$SS_COORD_APPLY" "$SS_C" "$id"
+        [ "$status" -eq 2 ] || { echo "job id '$id' accepted ($status)" >&2; return 1; }
+    done
+    mkdir -p "$BATS_TEST_TMPDIR/globdir" && : > "$BATS_TEST_TMPDIR/globdir/aa" && : > "$BATS_TEST_TMPDIR/globdir/bb"
+    run bash -c 'cd "$2"; source "$1"; _ca_words_json "* ? b"' _ "$SS_COORD_APPLY" "$BATS_TEST_TMPDIR/globdir"
+    [ "$(printf '%s' "$output" | jq -c .)" = '["*","?","b"]' ]
+}
+
+@test "concurrent writers: two worker-mode writers on one job never revert each other, and the outbox replays to the mirror's final document" {
+    local id="conc-1" i
+    _ss_in_world "$SS_W" 0 make_job "$id" running
+    cp "$SS_W/jobs/$id.json" "$BATS_TEST_TMPDIR/seed.json"
+    ( _ss_in_world "$SS_W" 1 bash -c 'source "$1/state.sh"; for i in $(seq 1 15); do mother_job_update "$2" ".activity = \"a$i\""; done' _ "$_LIB_DIR" "$id" ) & local p1=$!
+    ( _ss_in_world "$SS_W" 1 bash -c 'source "$1/state.sh"; for i in $(seq 1 15); do mother_job_update "$2" ".question = \"q$i\""; done' _ "$_LIB_DIR" "$id" ) & local p2=$!
+    wait "$p1"; wait "$p2"
+    jq -e '.activity == "a15" and .question == "q15"' "$SS_W/jobs/$id.json" >/dev/null
+    _ss_seed_canonical "$SS_C" "$id" "$BATS_TEST_TMPDIR/seed.json"
+    _ss_replay_to "$SS_C" "$id" "$SS_W/outbox/$id.ndjson"
+    [ "$status" -eq 0 ]
+    jq -e '.activity == "a15" and .question == "q15"' "$SS_C/jobs/$id.json" >/dev/null
+}
+
+@test "legacy: _validate_and_clear_pr_url writes the same bytes as before (jq .pr_url = null, atomically) with no leftovers and no outbox" {
+    local id="val-1" branch="feature/x" jf expected
+    mkdir -p "$SS_L/mock-bin"
+    printf '#!/bin/bash\necho "feature/other"\n' > "$SS_L/mock-bin/gh"; chmod +x "$SS_L/mock-bin/gh"
+    _ss_in_world "$SS_L" 0 make_job "$id" running '.pr_url = "https://github.com/o/r/pull/9" | .branch = "'"$branch"'"'
+    jf="$SS_L/jobs/$id.json"
+    expected=$(jq '.pr_url = null' "$jf")
+    _ss_in_world "$SS_L" 0 env PATH="$SS_L/mock-bin:$PATH" bash -c '
+        SOURCE_ONLY=1 source "$1" 2>/dev/null
+        _validate_and_clear_pr_url "$2" "$3"' _ "$_BIN_DIR/mother-run-job" "$id" "$branch"
+    [ "$(cat "$jf")" = "$expected" ]
+    ! ls "$SS_L/jobs" | grep -q '\.tmp\.'
+    [ ! -e "$SS_L/outbox" ]
 }

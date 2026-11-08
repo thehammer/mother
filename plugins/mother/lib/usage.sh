@@ -15,6 +15,11 @@ if [ -z "$MOTHER_USAGE_BIN" ]; then
     MOTHER_USAGE_BIN="$_USAGE_LIB_DIR/../bin/mother-usage"
 fi
 
+# One worker-mode predicate (lib/outbox.sh) for every caller of this file, even when state.sh is not
+# loaded: a missing lib must not silently turn worker mode into the legacy path.
+type mother_worker_mode_active >/dev/null 2>&1 \
+    || { [ -r "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh" ] && source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh"; }
+
 # mother_usage_available: 0 if python3 + the mother-usage script are both
 # reachable. Every function below checks this first and degrades quietly.
 mother_usage_available() {
@@ -64,9 +69,9 @@ _usage_job_write() {
     local job_file="$1" merged="$2" before="" tmp="${1}.tmp.$$" jid
     type mother_outbox_enabled >/dev/null 2>&1 && mother_outbox_enabled && before=$(cat "$job_file" 2>/dev/null)
     printf '%s' "$merged" > "$tmp" && mv "$tmp" "$job_file" || return 1
-    if [ -n "$before" ]; then
+    if type mother_outbox_enabled >/dev/null 2>&1 && mother_outbox_enabled; then
         jid="${job_file##*/}"; jid="${jid%.json}"
-        mother_outbox_job_set "$jid" "$before" "$merged"
+        mother_outbox_job_set "$jid" "$before" "$merged" || return 1
     fi
     return 0
 }
@@ -117,8 +122,8 @@ _usage_append_event() {
         '{ts: $ts, kind: $kind, detail: $detail}' 2>/dev/null) || return 0
     [ -n "$ev" ] || return 0
     _usage_with_lock "$events_file" _usage_append_line "$events_file" "$ev" || return $?
-    if type mother_outbox_enabled >/dev/null 2>&1 && mother_outbox_enabled; then
-        mother_outbox_emit "$job_id" event.append "$(jq -nc --arg l "$ev" '{line: $l}')"
+    if type mother_outbox_event >/dev/null 2>&1; then
+        mother_outbox_event "$job_id" "$ev" || return 1
     fi
     return 0
 }
@@ -190,7 +195,7 @@ mother_recompute_job_cost() {
     local job_id="$1"
     # Worker mode: the mirror only holds this lease's rows, so a recompute would ship a partial
     # sum. The canonical side owns cost (coord_apply.sh recomputes when a terminal state lands).
-    [ "${MOTHER_WORKER_MODE:-0}" = "1" ] && return 0
+    mother_worker_mode_active && return 0
     local job_file="${JOBS_DIR:-${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}/jobs}/${job_id}.json"
     [ -f "$job_file" ] || return 0
 
@@ -340,9 +345,8 @@ mother_record_run_usage() {
     fi
 
     _usage_with_lock "$metrics_file" _usage_append_line "$metrics_file" "$row"
-    if type mother_outbox_enabled >/dev/null 2>&1 && mother_outbox_enabled; then
-        mother_outbox_emit "$job_id" record.append \
-            "$(jq -nc --arg l "$row" '{stream: "metrics/runs.jsonl", line: $l}')"
+    if type mother_outbox_record >/dev/null 2>&1; then
+        mother_outbox_record "$job_id" "metrics/runs.jsonl" "$row" || echo "mother: usage row for $job_id not shipped (outbox degraded)" >&2
     fi
 
     mother_recompute_job_cost "$job_id"

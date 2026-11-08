@@ -19,6 +19,8 @@
 # Idempotent: an existing marker is never rewritten.
 mother_ensure_live_marker() {
     [ "${MOTHER_TEST_ROOT:-0}" = "1" ] && return 0
+    # A worker root is not the live tree: it gets .mother-worker-live instead (below).
+    type mother_worker_mode_active >/dev/null 2>&1 && mother_worker_mode_active && return 0
     local root="${MOTHER_ROOT:-}"
     [ -n "$root" ] && [ -d "$root" ] || return 0
     local marker="$root/.mother-live"
@@ -38,8 +40,8 @@ mother_ensure_live_marker() {
 # No-op under MOTHER_TEST_ROOT=1, when the root doesn't exist, or outside worker mode.
 mother_ensure_worker_marker() {
     [ "${MOTHER_TEST_ROOT:-0}" = "1" ] && return 0
-    [ "${MOTHER_WORKER_MODE:-0}" = "1" ] || return 0
-    local root="${MOTHER_ROOT:-}"
+    type mother_worker_mode_active >/dev/null 2>&1 && mother_worker_mode_active || return 0
+    local root="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-}}"
     [ -n "$root" ] && [ -d "$root" ] || return 0
     local marker="$root/.mother-worker-live"
     [ -e "$marker" ] && return 0

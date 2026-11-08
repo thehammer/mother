@@ -7,6 +7,16 @@
 # truth for the on-disk state layout. The caller owns shell options (we
 # don't `set -u` here — leave that to the script that sources us).
 
+# ---------- worker mode (lib/outbox.sh) ----------
+# Validated BEFORE any path is resolved or created: worker mode with no explicit root, or aimed at the
+# live tree, must fail loudly and touch nothing (no mkdir, no marker file).
+# shellcheck source=/dev/null
+[ -r "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh" ] \
+    && source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh"
+if type mother_worker_mode_validate >/dev/null 2>&1; then
+    mother_worker_mode_validate || { echo "mother: refusing to start in worker mode" >&2; exit 1; }
+fi
+
 # ---------- state paths ----------
 
 : "${MOTHER_ROOT:=${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
@@ -30,11 +40,6 @@ mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" "$CURSORS_DIR" "$RU
     && source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/safe-rm.sh"
 type mother_ensure_live_marker >/dev/null 2>&1 && mother_ensure_live_marker
 
-# Worker-mode outbox (lib/outbox.sh): mirrors every state write as a protocol op. No-op unless
-# MOTHER_WORKER_MODE=1. A worker root carries .mother-worker-live (see mother_ensure_worker_marker).
-# shellcheck source=/dev/null
-[ -r "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh" ] \
-    && source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh"
 type mother_ensure_worker_marker >/dev/null 2>&1 && mother_ensure_worker_marker
 
 # ---------- primitives ----------
@@ -141,7 +146,7 @@ mother_event_append() {
         '{ts: $ts, kind: $kind, detail: $detail}') || return 1
     _eventpath=$(_events_path "$id")
     _with_lock "$_eventpath" _append_line "$_eventpath" "$ev" || return 1
-    mother_outbox_enabled && mother_outbox_emit "$id" event.append "$(jq -nc --arg l "$ev" '{line: $l}')"
+    mother_outbox_event "$id" "$ev" || return 1
     return 0
 }
 
@@ -173,26 +178,34 @@ mother_job_update() {
     local _jobpath merged
     _jobpath=$(_job_path "$id")
     [ -f "$_jobpath" ] || { echo "mother: no such job: $id" >&2; return 1; }
-    merged=$(jq "$@" "$filter" "$_jobpath") || return 1
     if mother_outbox_enabled; then
-        local _before; _before=$(cat "$_jobpath" 2>/dev/null)
-        _atomic_write "$_jobpath" "$merged" || return 1
-        mother_outbox_job_set "$id" "$_before" "$merged"
-        return 0
+        # Read, merge, write and diff under the job lock: the op shipped is the diff against what
+        # is really on disk, so a concurrent writer's change can neither be reverted nor lost.
+        _with_lock "$_jobpath" _mother_job_update_locked "$_jobpath" "$filter" "$@"
+        return $?
     fi
+    merged=$(jq "$@" "$filter" "$_jobpath") || return 1
     _atomic_write "$_jobpath" "$merged"
 }
 
+_mother_job_update_locked() {
+    local _jobpath="$1" filter="$2" merged
+    shift 2
+    merged=$(jq "$@" "$filter" "$_jobpath") || return 1
+    mother_job_write_doc "$_jobpath" "$merged"
+}
+
 # Replace a job document that the caller already merged (typically under the job-file lock):
-# atomic write, then (worker mode) the top-level diff goes to the outbox as job.set.
+# atomic write, then (worker mode) the top-level diff goes to the outbox as job.set. In worker mode
+# a failed emit (or an unreadable previous document) returns 1, logs, and flags the outbox degraded.
 # Usage: mother_job_write_doc <job-file> <merged-json>
 mother_job_write_doc() {
     local _jf="$1" _merged="$2" _before="" _jid
     mother_outbox_enabled && _before=$(cat "$_jf" 2>/dev/null)
     _atomic_write "$_jf" "$_merged" || return 1
-    if [ -n "$_before" ]; then
+    if mother_outbox_enabled; then
         _jid="${_jf##*/}"; _jid="${_jid%.json}"
-        mother_outbox_job_set "$_jid" "$_before" "$_merged"
+        mother_outbox_job_set "$_jid" "$_before" "$_merged" || return 1
     fi
     return 0
 }

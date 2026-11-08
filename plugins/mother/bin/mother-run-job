@@ -33,6 +33,14 @@ _MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
 
 set -u
 
+# Worker mode is validated once, before any path is used or created (lib/outbox.sh): no explicit root,
+# the live tree, or an unwritable outbox is a loud refusal that touches nothing.
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/outbox.sh" ] && source "$MOTHER_LIB_DIR/outbox.sh"
+if type mother_worker_mode_validate >/dev/null 2>&1; then
+    mother_worker_mode_validate || { echo "mother-run-job: refusing to run in worker mode" >&2; exit 1; }
+fi
+
 MOTHER_ROOT="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
 JOBS_DIR="$MOTHER_ROOT/jobs"
 EVENTS_DIR="$MOTHER_ROOT/events"
@@ -2229,9 +2237,7 @@ _install_core_job_helpers() {
             '{ts: $ts, kind: $kind, detail: $detail}')
         _eventpath="$EVENTS_DIR/$id.jsonl"
         _with_lock "$_eventpath" _append_line "$_eventpath" "$ev" || return 1
-        if _outbox_on; then
-            mother_outbox_emit "$id" event.append "$(jq -nc --arg l "$ev" '{line: $l}')"
-        fi
+        if _outbox_on; then mother_outbox_event "$id" "$ev" || return 1; fi
         return 0
     }
     # The one way mother-run-job replaces its job document: atomic write, then (worker mode)
@@ -2242,7 +2248,7 @@ _install_core_job_helpers() {
         local _merged="$1" _jf="${2:-$job_file}" _jid="${3:-${id:-}}" _before=""
         _outbox_on && _before=$(cat "$_jf" 2>/dev/null)
         _atomic_write "$_jf" "$_merged" || return 1
-        if [ -n "$_before" ]; then mother_outbox_job_set "$_jid" "$_before" "$_merged"; fi
+        if _outbox_on; then mother_outbox_job_set "$_jid" "$_before" "$_merged" || return 1; fi
         return 0
     }
     _job_update() {
@@ -2253,6 +2259,11 @@ _install_core_job_helpers() {
     _transition() {
         local new="$1" detail="${2:-}"
         [ -z "$detail" ] && detail='{}'
+        # Worker mode with a broken outbox: never claim a state the coordinator cannot see; hold instead.
+        case "$new" in
+            running|succeeded|failed)
+                if _outbox_degraded_hold; then return 0; fi ;;
+        esac
         # D2 guard: a `failed` transition must always carry a .reason. A caller
         # that omitted one gets "unspecified" plus a failure_reason_missing
         # event naming the caller, so "no bare failed events" holds structurally
@@ -2374,6 +2385,23 @@ _hold_boundary_epoch=0  # when the worker reached the boundary (.held appeared);
 _hold_deferred_epoch=0  # last hold_giveup_deferred event
 
 _hold_reset_state() { _hold_active=0; _hold_boundary_epoch=0; _hold_deferred_epoch=0; }
+
+# _outbox_degraded_hold — worker mode: an op could not be shipped to the outbox (lib/outbox.sh set the
+# degraded flag), so the canonical side would silently miss state. Hold the job (awaiting, paused_reason
+# outbox_degraded) instead of carrying on. Writes the mirror only: the emits are the thing that is broken.
+# Idempotent; a no-op outside worker mode or without the flag. Returns 0 when it held the job.
+_outbox_degraded_hold() {
+    _outbox_on && mother_outbox_degraded "$id" || return 1
+    local _cur _q _why
+    _cur=$(jq -r '.state // ""' "$job_file" 2>/dev/null)
+    [ "$_cur" = "awaiting" ] && [ "$(jq -r '.paused_reason // ""' "$job_file" 2>/dev/null)" = "outbox_degraded" ] && return 0
+    _why=$(jq -r '"\(.op // "?"): \(.why // "?")"' "$(_outbox_degraded_file "$id")" 2>/dev/null)
+    _q="Worker outbox degraded ($_why). State changes can no longer be shipped to the coordinator, so the job is held. Fix the outbox, then resume it."
+    _job_update ".state = \"awaiting\" | .paused_reason = \"outbox_degraded\" | .paused_at = \"$(iso_now)\" | .question = $(jq -nc --arg q "$_q" '$q')" 2>/dev/null || true
+    _append_event "awaiting_input" "$(jq -nc --arg q "$_q" '{question: $q, paused_reason: "outbox_degraded"}')" 2>/dev/null || true
+    echo "mother-run-job: $id: held: $_q" >&2
+    return 0
+}
 
 # _hold_mark_active <boundary-reached: true|false> — set .limiter_hold from the .hold file, once.
 _hold_mark_active() {
@@ -3056,7 +3084,7 @@ WRAP
     prior_spend=$(jq -r '.actual_cost_usd // 0' "$job_file" 2>/dev/null); : "${prior_spend:=0}"
     prior_tokens=$(jq -r '.actual_tokens // 0' "$job_file" 2>/dev/null); : "${prior_tokens:=0}"
     case "$prior_tokens" in ''|*[!0-9]*) prior_tokens=0 ;; esac
-    if [ "${MOTHER_WORKER_MODE:-0}" = "1" ]; then
+    if mother_worker_mode_active; then
         # No actual_cost_* in a worker mirror (canonical side owns them): baseline = this root's rows.
         read -r prior_spend prior_tokens <<< "$(mother_usage_rows_total "$id")"
     fi
@@ -3117,6 +3145,10 @@ WRAP
         # Limiter boundary hold (L4): .hold present -> the worker parks in its PreToolUse hook at the
         # next tool call; past the grace period with a quiet log the worker is given up (state first,
         # then the kill, as for the quota pause above).
+        if _outbox_degraded_hold; then
+            _terminate_worker
+            break
+        fi
         if ! _limiter_hold_tick; then
             _terminate_worker
             _hold_kill_hooks
