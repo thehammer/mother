@@ -121,6 +121,20 @@ _attention_low_disk_items() {
                   + (if $cargo then "; `mother gc` reclaims idle worktree target/ dirs automatically" else "" end))}' "$f" 2>/dev/null
 }
 
+# drain_stuck (info): a drain that has been on for more than MOTHER_DRAIN_STUCK_S (default 3600).
+_attention_drain_items() {
+    local f="$RUNNER_DIR/drain.json"
+    [ -f "$f" ] || return 0
+    jq -c --argjson now "$(date +%s)" --argjson lim "${MOTHER_DRAIN_STUCK_S:-3600}" '
+        ((.since // "") | (sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null)) as $t
+        | select($t != null and ($now - $t) > $lim)
+        | {kind: "drain_stuck", job_id: "", repo: "", branch: "",
+           reason: ("dispatch has been draining for " + ((($now - $t) / 60) | floor | tostring) + " min"
+                    + (if (.reason // "") != "" then " (" + .reason + ")" else "" end)),
+           since: .since, detail: {level: "info"},
+           hint: "no new job starts while draining; `mother undrain` resumes dispatch (or finish `mother upgrade`)"}' "$f" 2>/dev/null
+}
+
 _attention_job_items() {
     local f
     for f in "$JOBS_DIR"/*.json; do
@@ -399,6 +413,7 @@ mother_attention_items() {
     { _attention_teardown_items
       _attention_residue_items
       _attention_low_disk_items
+      _attention_drain_items
       _attention_job_items
       _attention_reason_items
       _attention_adherence_loop_items

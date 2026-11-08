@@ -155,6 +155,31 @@ mother resume <id> "Use option B (LRU). The traffic pattern is recency-skewed."
 Or, from inside tmux: hit your bound key (default `prefix Space`) and use the
 switcher.
 
+## Maintenance mode and upgrades (`mother drain` / `undrain` / `upgrade`)
+
+`mother drain [--reason TEXT]` writes `$MOTHER_ROOT/runner/drain.json` (0600: `since`, `by`, `reason`). While it
+exists the runner starts **no** new job: ready, promoted, retried, resumed and `force-start`ed jobs all wait
+(`force-start` refuses, saying "draining"). Running jobs, their supervisors and workers, adherence reviews already
+in flight, teardown and archive are not affected. The flag survives a runner restart (`mother daemon start` says so);
+only `mother undrain` (or the end of a successful `mother upgrade`) clears it.
+
+- `mother drain --wait [--timeout SECS]` blocks until no supervisor is running (default 900s), listing what is still
+  running every 30s. Exit 0 idle, exit 3 timeout (drain stays on). It never signals, pauses or kills a job.
+- `mother drain --status` and `mother status` (`dispatch: DRAINING since <time> (<reason>), N running, M waiting`) are
+  open to anyone. A drain on for more than 60 minutes raises an info-level `drain_stuck` attention item.
+- `drain`, `undrain` and `upgrade` are **owner-only**, the same refusal as `mother limiter mode`: refused from a
+  worker, an agent session (`CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT`) or a non-TTY stdin.
+- `mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running]` runs the safe sequence on the
+  checkout the runner runs from (`$MOTHER_CODE_ROOT/mother`; must be on `main`, clean, `git fetch` working): drain,
+  wait for idle, `git pull --ff-only`, rebuild the broker if Go/broker files changed, `mother daemon stop` / `start`
+  (verifies a new runner pid and that `mother status` answers), undrain, then prints old/new commit and the limiter
+  line. A timeout exits 3 with drain left ON and nothing pulled; it never proceeds with jobs running unless you pass
+  `--restart-with-running`. Any failure names the step and leaves drain ON. `--dry-run` prints the steps and changes
+  nothing (it skips the fetch).
+
+Safe manual sequence: `mother drain --wait`, `git pull --ff-only`, `mother daemon stop && mother daemon start`,
+`mother undrain`.
+
 ## Preview stacks (`mother preview`)
 
 A worker that has to check a *behavioural* acceptance criterion (something only a

@@ -556,6 +556,26 @@ hook also drops any event older than `MOTHER_EVENTS_MAX_AGE_HOURS` (default 6,
 checkout; plugin versions are bumped so `claude plugin update` refreshes it.
 
 
+## Maintenance mode: drain, undrain, upgrade
+
+`mother drain [--reason T]` writes `$RUNNER_DIR/drain.json` (0600, `{since, by, reason}`); `lib/drain.sh` holds the CLI side
+(`cmd_drain`, `cmd_undrain`, `cmd_upgrade`) and `_dispatch_drained` (`bin/mother-runner`) is the one gate: `_dispatch_ready_jobs`
+returns before starting anything while the file exists (ready, promoted, retried, resumed jobs wait; `mother force-start` refuses
+with "draining"). **Not touched:** running jobs/supervisors/workers, in-flight adherence reviews, teardown, archive. The flag
+survives a runner restart (`mother daemon start` notes it); only `undrain` or a finished `mother upgrade` removes it. No flag =
+unchanged behaviour (one `stat`).
+
+- `drain --wait [--timeout S]` (default 900) polls `$RUNNER_DIR/children` for live supervisors, prints what is running every 30s;
+  exit 0 idle, 3 timeout (drain stays on). Never signals a job. Test knobs: `MOTHER_DRAIN_POLL_S`, `MOTHER_DRAIN_PRINT_S`.
+- Owner-only via `_owner_only_refusal` (worker, agent session, non-TTY) for `drain`, `undrain`, `upgrade`; `drain --status` and
+  `mother status` (`dispatch: DRAINING since … , N running, M waiting`) are open.
+- `drain_stuck` attention item (info) when `since` is older than `MOTHER_DRAIN_STUCK_S` (3600); gone after undrain.
+- `mother upgrade [--timeout S] [--dry-run] [--resume] [--restart-with-running]` on `$MOTHER_CODE_ROOT/mother` (main, clean tree,
+  fetch ok): drain, wait, `git pull --ff-only`, `build-broker.sh` if Go/broker files changed, `daemon stop`/`start` (new pid + `status`
+  answers), undrain. Timeout exits 3 with drain ON; failures name the step and leave drain ON. `MOTHER_UPGRADE_CLI` overrides the
+  `mother` it calls for daemon/status (tests).
+- Safe manual sequence: `mother drain --wait`, `git pull --ff-only`, `mother daemon stop && mother daemon start`, `mother undrain`.
+
 ## Backpressure limiter
 
 Observe by default (L1; L2 added the surfaces below; L3 added enforcement of **admission of new work**; L4 added boundary
