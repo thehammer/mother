@@ -5176,7 +5176,8 @@ cmd_gates() {
 }
 
 # cmd_checkpoint (internal; the worker cadence that calls it is P1-6):
-#   take <id> [--out DIR] [--final] [--salvage-epoch N]   exit 0 ok, 3 fenced, 1 error
+#   take <id> [--out DIR] [--final] [--salvage-epoch N] [--expect-sha SHA]   exit 0 ok, 3 fenced, 1 error
+#        (needs MOTHER_LEASE_ID and, without --salvage-epoch, MOTHER_LEASE_EPOCH in the environment)
 #   restore <id> --manifest F --transcript F --work-dir D  exit 0 restored, 4 not restorable
 cmd_checkpoint() {
     local sub="${1:-}"
@@ -5186,12 +5187,12 @@ cmd_checkpoint() {
     case "$sub" in
         take)    _checkpoint_cmd_take "$@" ;;
         restore) _checkpoint_cmd_restore "$@" ;;
-        *)       _die "checkpoint: usage: mother checkpoint take ID [--out DIR] [--final] [--salvage-epoch N] | mother checkpoint restore ID --manifest F --transcript F --work-dir D" ;;
+        *)       _die "checkpoint: usage: mother checkpoint take ID [--out DIR] [--final] [--salvage-epoch N] [--expect-sha SHA] | mother checkpoint restore ID --manifest F --transcript F --work-dir D" ;;
     esac
 }
 
 _checkpoint_cmd_take() {
-    local id="${1:-}" out="" final=() salvage=()
+    local id="${1:-}" out="" final=() salvage=() expect=()
     [ -n "$id" ] || _die "checkpoint take: <id> required"
     shift
     while [ $# -gt 0 ]; do
@@ -5199,6 +5200,7 @@ _checkpoint_cmd_take() {
             --out)           out="${2:-}"; shift 2 ;;
             --final)         final=(--final); shift ;;
             --salvage-epoch) salvage=(--salvage-epoch "${2:-}"); shift 2 ;;
+            --expect-sha)    expect=(--expect-sha "${2:-}"); shift 2 ;;
             *) _die "unknown flag for checkpoint take: $1" ;;
         esac
     done
@@ -5218,7 +5220,7 @@ _checkpoint_cmd_take() {
         [ "$last" -gt 0 ] && export MOTHER_CHECKPOINT_PREV_MANIFEST="$ckdir/$last/manifest.json"
         out="$ckdir/$((last + 1))"
     fi
-    mother_checkpoint_take "$job_file" "$out" ${salvage[@]+"${salvage[@]}"} ${final[@]+"${final[@]}"}
+    mother_checkpoint_take "$job_file" "$out" ${salvage[@]+"${salvage[@]}"} ${final[@]+"${final[@]}"} ${expect[@]+"${expect[@]}"}
 }
 
 _checkpoint_cmd_restore() {

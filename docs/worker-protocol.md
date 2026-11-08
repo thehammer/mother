@@ -210,7 +210,8 @@ Manifest (`checkpoint.taken.data.manifest`; golden example `checkpoint_manifest.
 
 ```
 {v:1, job, lease, epoch, n, at, head_sha, branch, base_sha, wip_sha, wip_ref, pushed, push_error?, session_id,
- transcript:{path_rel, bytes, sha256}, untracked_skipped:[{path, bytes}]}
+ transcript:{path_rel, bytes, sha256, reset?, truncated?, subagents_skipped?}, untracked_skipped:[{path, bytes, reason}],
+ untracked_skipped_truncated?}
 ```
 
 Validation (`ValidateManifest`) runs on receipt and refuses, before any `WipRef(job)` or git command is built from a field:
@@ -221,10 +222,35 @@ Validation (`ValidateManifest`) runs on receipt and refuses, before any `WipRef(
   so it can never read as an option (`--upload-pack=x`) or climb a ref path (`refs/mother/wip/x/../..`);
 - `transcript.path_rel`: confined to the job exactly like `artifact.put` (`ArtifactPathOK`: relative, clean, no `..`, no NUL);
 - `untracked_skipped`: at most 1024 entries, each a relative clean path (no `..`, absolute, NUL or control character) with `bytes >= 0`;
+- `untracked_skipped[].reason`: `too_large`, `embedded_repo` or `special_file` (empty in older manifests). `untracked_skipped_truncated: true` means
+  more paths were skipped than are listed (the list is cut at 1024, and a path with a control character or backslash is never listed);
 - `push_error`: at most **512 bytes**, no control characters. **The worker redacts it** (tokens, credentials, userinfo in remote URLs) before
   sending: the coordinator stores and shows it verbatim.
 - `work_dir_at_capture` is **not on the wire** (it was in earlier drafts). It is the worker's own filesystem layout; keep it in worker-local state.
 
+- **What a checkpoint captures (library behaviour, `lib/checkpoint.sh`).** The wip commit is one commit on top of `head_sha` whose tree is the
+  working tree: tracked edits, staged changes, untracked files that are not ignored. Restore verifies that chain (`wip^ == head_sha`, one
+  parent; otherwise `why: chain_mismatch`) and lays the tree over `head_sha` as **unstaged** changes. Not captured, by design:
+  - a merge or rebase in progress is captured as plain working-tree content (conflict markers included); `MERGE_HEAD` and the rebase
+    state directories are not captured, so a restored worktree is not "mid-merge";
+  - the staged versus unstaged split is lost on restore (everything comes back unstaged);
+  - files marked assume-unchanged / skip-worktree are not captured (git is told they did not change);
+  - an unborn HEAD (no commit yet) cannot be checkpointed: `take` exits 1 with `{"why":"unborn_head"}`;
+  - nested repositories and checked-out submodules: their dirty files and unpushed commits are **not** in the checkpoint and the entry is never
+    recorded as a bare gitlink. They are listed in `untracked_skipped` with `reason: embedded_repo`, and `restore` reports `incomplete: true`;
+  - symlinks are captured as links (never followed, sized as the link); untracked files over `MOTHER_CHECKPOINT_MAX_FILE_MB` (default 50) are
+    listed as `too_large` and never hashed into the object store; `untracked_skipped` is cut at the 1024-entry wire cap and flagged with
+    `untracked_skipped_truncated`;
+  - the transcript is copied once per take and its bytes, sha256 and delta come from that copy; it is capped at
+    `MOTHER_CHECKPOINT_MAX_TRANSCRIPT_MB` (256, `transcript.truncated`) and the subagent directory at `MOTHER_CHECKPOINT_MAX_SUBAGENT_MB`
+    (64, `transcript.subagents_skipped`).
+- **Fencing inputs.** `take` needs `MOTHER_LEASE_ID` and (unless `--salvage-epoch`) `MOTHER_LEASE_EPOCH`, checked before anything is pushed. The
+  lease's expected remote value is `--expect-sha` / `MOTHER_CHECKPOINT_EXPECT_SHA`, else the last value this job dir pushed, else the work dir's
+  `mother-wip-expect` marker (written by restore and by a successful take), else the remote's current value: a restored worker at a new path can
+  checkpoint, a stale expected value still fences (exit 3). A take whose previous manifest says `pushed:false` re-pushes instead of skipping.
+- **Hostile repositories.** Every git call runs with hooks, fsmonitor, signing, credential helpers and `filter.*`/`diff.*` drivers disabled, the
+  global and system config ignored, `LC_ALL=C`, a deadline (`MOTHER_CHECKPOINT_TIMEOUT_S`, one for the whole take; local git included) and, on
+  expiry, a kill of the whole process group.
 - The wip ref is `refs/mother/wip/<job>`; the salvage ref is `refs/mother/wip-salvage/<job>/lease-<epoch>`.
   The salvage ref is in a different directory on purpose: git cannot hold `refs/mother/wip/<job>` and `refs/mother/wip/<job>/lease-<n>`
   together (a ref cannot be both a file and a directory; the second push is rejected with a refname conflict).

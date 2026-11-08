@@ -7,11 +7,19 @@
 # mother_checkpoint_restore rebuild HEAD, the working changes and the transcript at another path.
 #
 # Never runs `git stash`, `git add` on the real index, `git commit` or `git reset` in the job's worktree.
+# Every git call goes through _ckpt_git: hardened against repo-controlled config (hooks, fsmonitor,
+# filter/textconv drivers, signing, credential helpers, upload/receive-pack overrides), bounded by the
+# take's deadline, and killed as a process group when it hangs.
 # No runtime path calls this library yet (P1-6 wires it). Sourced under `set -u`, bash 3.2: no
 # `declare -A`, no `mapfile`. Needs lib/state.sh (_bounded_run, _switch_with_lock, _iso_now,
 # safe_rm_tree) and jq.
 
 _CKPT_TMPS=""
+_CKPT_DEADLINE=0
+_CKPT_PREPARED=0
+_CKPT_GITARGS=()
+_CKPT_INDEX=""
+_CKPT_RESTORED_T=""
 
 _ckpt_cleanup() {
     local f
@@ -43,6 +51,82 @@ mother_checkpoint_interval_s() {
     echo "$v"
 }
 
+# --- hardened, bounded git -----------------------------------------------------------------------
+
+_ckpt_expired() { [ "$SECONDS" -ge "${_CKPT_DEADLINE:-0}" ]; }
+
+_ckpt_remaining() {
+    local left=$(( ${_CKPT_DEADLINE:-0} - SECONDS ))
+    [ "$left" -lt 1 ] && left=1
+    echo "$left"
+}
+
+# _ckpt_run <secs> <out-file> <in-file> <cmd...>: run in its OWN process group (job control), stdout to
+# <out-file>, stdin from <in-file>; after <secs> the whole group is killed (git's ssh and
+# git-remote-https children included). Returns the exit code (137 when killed).
+_ckpt_run() {
+    local secs="$1" out="$2" in="$3"; shift 3
+    local pid wd rc=0
+    set -m
+    ( "$@" >"$out" 2>/dev/null <"$in" 3>&- ) &
+    pid=$!
+    ( sleep "$secs"; kill -KILL -- "-$pid" 2>/dev/null ) >/dev/null 2>&1 3>&- &
+    wd=$!
+    set +m
+    wait "$pid" 2>/dev/null || rc=$?
+    kill -KILL -- "-$wd" 2>/dev/null
+    kill "$wd" 2>/dev/null
+    wait "$wd" 2>/dev/null
+    return "$rc"
+}
+
+# _ckpt_env <cmd...>: the sanitized environment every git runs in.
+_ckpt_env() {
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_EXTERNAL_DIFF -u GIT_ASKPASS -u GIT_PAGER \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+        GIT_OPTIONAL_LOCKS=0 LC_ALL=C LANG=C \
+        ${_CKPT_INDEX:+"GIT_INDEX_FILE=$_CKPT_INDEX"} "$@"
+}
+
+# _ckpt_prepare <dir>: build the -c overrides for one operation. Call it from the main shell (not inside
+# $(...)): the result is cached in _CKPT_GITARGS and applies to every directory of the operation (a
+# repo, its worktrees, the new worktree all share the local config). Besides the fixed switches it
+# empties every filter clean/smudge/process, diff textconv/command and credential helper and resets the
+# remote vcs commands found in the local (and worktree) config. remote.<n>.uploadpack/receivepack
+# cannot be overridden with -c (git keeps the first value), so push/fetch/ls-remote pass
+# --receive-pack / --upload-pack explicitly.
+_ckpt_prepare() {
+    local d="$1" name
+    _CKPT_GITARGS=(-c core.fsmonitor=false -c core.hooksPath=/dev/null -c commit.gpgsign=false
+        -c tag.gpgsign=false -c push.gpgsign=false -c gpg.program=false -c core.sshCommand=ssh
+        -c protocol.ext.allow=never -c credential.helper= -c core.gitProxy= -c core.pager=cat
+        -c core.askPass= -c core.editor=true -c push.recurseSubmodules=no -c fetch.recurseSubmodules=false
+        -c diff.external= -c advice.detachedHead=false)
+    while IFS= read -r -d '' name; do
+        case "$name" in
+            filter.*.clean|filter.*.smudge|filter.*.process|diff.*.textconv|diff.*.command|credential.*.helper|remote.*.vcs)
+                _CKPT_GITARGS+=(-c "$name=") ;;
+            filter.*.required) _CKPT_GITARGS+=(-c "$name=false") ;;
+        esac
+    done < <(_ckpt_env git -C "$d" config --list --name-only -z 2>/dev/null)
+    _CKPT_PREPARED=1
+}
+
+# _ckpt_git <dir> <git args...>: hardened, deadline-bounded git. stdout passes through; stdin is
+# $_CKPT_IN (default /dev/null); stderr is dropped. Returns 137 once the deadline has passed.
+_ckpt_git() {
+    local d="$1"; shift
+    _ckpt_expired && return 137
+    [ "$_CKPT_PREPARED" = 1 ] || _ckpt_prepare "$d"
+    local out rc=0
+    out=$(mktemp "${TMPDIR:-/tmp}/mother-ckpt.XXXXXX") || return 1
+    _ckpt_run "$(_ckpt_remaining)" "$out" "${_CKPT_IN:-/dev/null}" \
+        _ckpt_env git -C "$d" ${_CKPT_GITARGS[@]+"${_CKPT_GITARGS[@]}"} "$@" || rc=$?
+    cat "$out"
+    rm -f "$out"
+    return "$rc"
+}
+
 # --- helpers -------------------------------------------------------------------------------------
 
 # Claude slugs a path by replacing '/' and '.' with '-' (same as cmd_peek).
@@ -72,7 +156,7 @@ _ckpt_branch_ok() {
     git check-ref-format "refs/heads/$1" 2>/dev/null
 }
 
-# A session id is a path component under the projects dir: IDOK charset, no "..", not starting with ".".
+# A session or lease id is a path component: IDOK charset, no "..", not starting with ".".
 _ckpt_session_ok() {
     case "$1" in ''|*[!A-Za-z0-9._:-]*|*..*|.*) return 1 ;; esac
     [ "${#1}" -le 128 ]
@@ -90,59 +174,112 @@ _ckpt_sha256() {
 
 _ckpt_size() { wc -c <"$1" | tr -d ' '; }
 
-# _ckpt_index_path <work_dir>: absolute path of the worktree's real index.
-_ckpt_index_path() {
-    local idx; idx=$(git -C "$1" rev-parse --git-path index) || return 1
-    case "$idx" in /*) printf '%s' "$idx" ;; *) printf '%s/%s' "$1" "$idx" ;; esac
+# A repo-relative path from a tree is safe to rm/join: no empty, absolute, "." / ".." / ".git" component.
+_ckpt_relpath_ok() {
+    case "$1" in ''|/*) return 1 ;; esac
+    case "/$1/" in */../*|*/./*|*/.git/*|*//*) return 1 ;; esac
+    return 0
+}
+
+# _ckpt_git_path <dir> <name>: absolute path of a file in the worktree's private git dir.
+_ckpt_git_path() {
+    local p; p=$(_ckpt_git "$1" rev-parse --git-path "$2") || return 1
+    case "$p" in /*) printf '%s' "$p" ;; *) printf '%s/%s' "$1" "$p" ;; esac
+}
+
+_ckpt_ls_remote_ref() {
+    local o; o=$(_ckpt_git "$1" ls-remote --upload-pack=git-upload-pack origin "$2") || return 1
+    printf '%s' "$o" | awk 'NR==1 {print $1}'
 }
 
 # _ckpt_tree_of <work_dir> <tmpidx> <skipfile>: tree of the worktree contents (non-ignored), built in
-# <tmpidx>, which must already hold a copy of the index. Untracked files over the size cap are left
-# out and written to <skipfile> as "<bytes>\t<path>". Prints the tree sha.
+# <tmpidx>, which must already hold a copy of the index. Prints the tree sha. Never hashes a file it
+# will not keep, never follows a symlink, never runs git inside a nested repository. Not captured
+# (written to <skipfile> as "<bytes>\t<reason>\t<path>"): untracked files over the size cap
+# (too_large), nested repositories and checked-out submodules (embedded_repo: their dirty files and
+# unpushed commits are NOT in the checkpoint), special files. A path git or the wire cannot carry
+# is written as "0\t!\tunlisted".
 _ckpt_tree_of() {
     local wd="$1" tmpidx="$2" skipfile="$3" max_mb="${MOTHER_CHECKPOINT_MAX_FILE_MB:-50}"
     case "$max_mb" in ''|*[!0-9]*) max_mb=50 ;; esac
-    local max_bytes=$((max_mb * 1048576)) f sz
+    local max_bytes=$((max_mb * 1048576)) f sz rec p paths="$skipfile.paths"
+    local _CKPT_INDEX="$tmpidx"
     : >"$skipfile"
-    GIT_INDEX_FILE="$tmpidx" git -C "$wd" add -A -- . >/dev/null 2>&1 || return 1
+    : >"$paths"
+    # Tracked files changed or deleted in the worktree (submodules excluded: their content is never read).
+    while IFS= read -r -d '' f; do printf '%s\0' "$f" >>"$paths"; done \
+        < <(_ckpt_git "$wd" diff-files -z --name-only --ignore-submodules=all)
+    # Untracked, not ignored.
     while IFS= read -r -d '' f; do
-        [ -f "$wd/$f" ] || continue
-        sz=$(_ckpt_size "$wd/$f")
-        if [ "$sz" -gt "$max_bytes" ]; then
-            GIT_INDEX_FILE="$tmpidx" git -C "$wd" update-index --force-remove -- "$f" >/dev/null 2>&1 || return 1
-            printf '%s\t%s\n' "$sz" "$f" >>"$skipfile"
+        case "$f" in
+            *[[:cntrl:]]*|*\\*) printf '0\t!\tunlisted\n' >>"$skipfile"; continue ;;
+        esac
+        case "$f" in
+            */) printf '0\tembedded_repo\t%s\n' "${f%/}" >>"$skipfile"; continue ;;
+        esac
+        if [ -L "$wd/$f" ]; then
+            printf '%s\0' "$f" >>"$paths"
+        elif [ -f "$wd/$f" ]; then
+            sz=$(_ckpt_size "$wd/$f")
+            if [ "$sz" -gt "$max_bytes" ]; then
+                printf '%s\ttoo_large\t%s\n' "$sz" "$f" >>"$skipfile"
+            else
+                printf '%s\0' "$f" >>"$paths"
+            fi
+        elif [ -e "$wd/$f" ]; then
+            printf '0\tspecial_file\t%s\n' "$f" >>"$skipfile"
         fi
-    done < <(git -C "$wd" ls-files --others --exclude-standard -z)
-    GIT_INDEX_FILE="$tmpidx" git -C "$wd" write-tree
+    done < <(_ckpt_git "$wd" ls-files --others --exclude-standard -z)
+    # Tracked submodules that are checked out: the gitlink stays as the index has it; the contents are not captured.
+    while IFS= read -r -d '' rec; do
+        case "$rec" in
+            160000\ *)
+                p="${rec#*$'\t'}"
+                if [ -e "$wd/$p/.git" ]; then
+                    case "$p" in
+                        *[[:cntrl:]]*|*\\*) printf '0\t!\tunlisted\n' >>"$skipfile" ;;
+                        *) printf '0\tembedded_repo\t%s\n' "$p" >>"$skipfile" ;;
+                    esac
+                fi ;;
+        esac
+    done < <(_ckpt_git "$wd" ls-files --stage -z)
+    if [ -s "$paths" ]; then
+        _CKPT_IN="$paths" _ckpt_git "$wd" update-index --add --remove -z --stdin >/dev/null || { rm -f "$paths"; return 1; }
+    fi
+    rm -f "$paths"
+    _ckpt_git "$wd" write-tree
 }
 
-# _ckpt_push <work_dir> <timeout> <out> <git push args...>: bounded `git push --porcelain`, stdout in <out>.
+# _ckpt_push <work_dir> <out> <git push args...>: bounded `git push --porcelain`, stdout in <out>.
 _ckpt_push() {
-    local wd="$1" secs="$2" out="$3"; shift 3
-    GIT_TERMINAL_PROMPT=0 _bounded_run "$secs" "$out" git -C "$wd" push --porcelain --no-verify "$@"
-}
-
-_ckpt_remaining() {
-    local left=$(( ${_CKPT_DEADLINE:-0} - SECONDS ))
-    [ "$left" -lt 1 ] && left=1
-    echo "$left"
+    local wd="$1" out="$2" o rc=0; shift 2
+    o=$(_ckpt_git "$wd" push --porcelain --no-verify --no-recurse-submodules --receive-pack=git-receive-pack "$@") || rc=$?
+    printf '%s\n' "$o" >"$out"
+    return "$rc"
 }
 
 # --- take ----------------------------------------------------------------------------------------
 
-# mother_checkpoint_take <job-file> <out-dir> [--salvage-epoch N] [--final]
-# Prints the manifest (or {"skipped":"unchanged"}). Exit 0 ok (a failed push is pushed:false, not an
-# error), 3 fenced (lease lost), 1 usage/other failure. The previous manifest is
-# $MOTHER_CHECKPOINT_PREV_MANIFEST, else <out-dir>/manifest.json. The timeout (60 s, 30 s with --final)
-# is a deadline shared by every git network call of the take.
+# mother_checkpoint_take <job-file> <out-dir> [--salvage-epoch N] [--final] [--expect-sha SHA]
+# Prints the manifest (or {"skipped":"unchanged"}, or {"why":...} on a failure that produced no
+# manifest: timeout, unborn_head, snapshot_failed). Exit 0 ok (a failed push is pushed:false, not an
+# error), 3 fenced (lease lost), 1 usage/other failure. Needs MOTHER_LEASE_ID (an id) and, without
+# --salvage-epoch, MOTHER_LEASE_EPOCH (a positive integer); both are checked before anything runs or is
+# pushed. The previous manifest is $MOTHER_CHECKPOINT_PREV_MANIFEST, else <out-dir>/manifest.json.
+# The lease's expected remote value (what a push may replace) is --expect-sha /
+# $MOTHER_CHECKPOINT_EXPECT_SHA, else <out-dir>/../.last-pushed, else the work dir's mother-wip-expect
+# marker (written by a successful take and by restore), else the remote's current value: a missing
+# local state file is never "fenced". The timeout (60 s, 30 s with --final) is one deadline for the
+# whole take: every git call, local or network, is bounded by it and killed as a process group.
 mother_checkpoint_take() {
     local job_file="${1:-}" out_dir="${2:-}"
     [ $# -ge 2 ] && shift 2 || shift $#
-    local salvage="" final=0
+    local salvage="" final=0 expect_flag="${MOTHER_CHECKPOINT_EXPECT_SHA:-}"
     while [ $# -gt 0 ]; do
         case "$1" in
             --salvage-epoch) salvage="${2:-}"; shift 2 ;;
             --final) final=1; shift ;;
+            --expect-sha) expect_flag="${2:-}"; shift 2 ;;
             *) echo "mother: checkpoint take: unknown argument: $1" >&2; return 1 ;;
         esac
     done
@@ -151,21 +288,46 @@ mother_checkpoint_take() {
         '') ;;
         *[!0-9]*|0*) echo "mother: checkpoint take: --salvage-epoch must be a positive integer" >&2; return 1 ;;
     esac
+    if [ -n "$expect_flag" ] && ! _ckpt_sha_ok "$expect_flag"; then
+        echo "mother: checkpoint take: --expect-sha must be a 40 or 64 hex sha" >&2; return 1
+    fi
+    # Lease identity first: nothing is built or pushed without it.
+    if ! _ckpt_session_ok "${MOTHER_LEASE_ID:-}"; then
+        echo "mother: checkpoint take: MOTHER_LEASE_ID must be set to an id (1..128 of [A-Za-z0-9._:-])" >&2; return 1
+    fi
+    if [ -z "$salvage" ]; then
+        case "${MOTHER_LEASE_EPOCH:-}" in
+            ''|*[!0-9]*|0*) echo "mother: checkpoint take: MOTHER_LEASE_EPOCH must be set to a positive integer" >&2; return 1 ;;
+        esac
+        [ "${#MOTHER_LEASE_EPOCH}" -le 15 ] || { echo "mother: checkpoint take: MOTHER_LEASE_EPOCH is too large" >&2; return 1; }
+    fi
+    [ "${#salvage}" -le 15 ] || { echo "mother: checkpoint take: --salvage-epoch is too large" >&2; return 1; }
 
     local timeout="${MOTHER_CHECKPOINT_TIMEOUT_S:-60}"
     [ "$final" -eq 1 ] && timeout="${MOTHER_CHECKPOINT_FINAL_TIMEOUT_S:-30}"
+    case "$timeout" in ''|*[!0-9]*|0) timeout=60 ;; esac
     _CKPT_DEADLINE=$((SECONDS + timeout))
+    _CKPT_PREPARED=0
 
     mkdir -p "$out_dir" || return 1
     local parent; parent=$(cd "$out_dir/.." && pwd) || return 1
-    _switch_with_lock "$parent/.ckpt" "checkpoint" 200 _ckpt_take_locked "$job_file" "$out_dir" "$parent" "$salvage" "$final"
+    _switch_with_lock "$parent/.ckpt" "checkpoint" 200 _ckpt_take_locked "$job_file" "$out_dir" "$parent" "$salvage" "$final" "$expect_flag"
     local rc=$?
     _ckpt_cleanup
     return $rc
 }
 
+# _ckpt_take_fail <why> <message>: a failure that produced no manifest. A passed deadline wins.
+_ckpt_take_fail() {
+    local why="$1"
+    _ckpt_expired && why=timeout
+    echo "mother: checkpoint take: $2 ($why)" >&2
+    jq -n -c --arg why "$why" '{why:$why}'
+    return 1
+}
+
 _ckpt_take_locked() {
-    local job_file="$1" out_dir="$2" parent="$3" salvage="$4" final="$5"
+    local job_file="$1" out_dir="$2" parent="$3" salvage="$4" final="$5" expect_flag="$6"
     local job wd branch base_sha session
     job=$(jq -r '.id // ""' "$job_file") || return 1
     wd=$(jq -r '.work_dir // ""' "$job_file")
@@ -177,71 +339,100 @@ _ckpt_take_locked() {
     _ckpt_branch_ok "$branch" || { echo "mother: checkpoint take: branch is not a conservative ref name: $branch" >&2; return 1; }
     _ckpt_session_ok "$session" || { echo "mother: checkpoint take: bad session_id" >&2; return 1; }
 
-    local head
-    head=$(git -C "$wd" rev-parse HEAD 2>/dev/null) || { echo "mother: checkpoint take: no HEAD in $wd" >&2; return 1; }
+    local lease="$MOTHER_LEASE_ID" epoch="${MOTHER_LEASE_EPOCH:-}"
+    [ -n "$salvage" ] && epoch="$salvage"
 
-    # 1. WIP tree from a temp copy of the index; the worktree and its index are never written.
+    _ckpt_prepare "$wd"
+    local head
+    head=$(_ckpt_git "$wd" rev-parse --verify -q HEAD) || { _ckpt_take_fail unborn_head "no commit at HEAD in $wd (an unborn HEAD cannot be checkpointed)"; return 1; }
+    _ckpt_sha_ok "$head" || { _ckpt_take_fail unborn_head "HEAD did not resolve in $wd"; return 1; }
+
+    # 1. Transcript: copied ONCE; size, sha256 and the delta all come from this copy.
+    local tdir tfile="" tcopy tsize=0 tsha t_trunc=false tcap_mb="${MOTHER_CHECKPOINT_MAX_TRANSCRIPT_MB:-256}" tcap
+    case "$tcap_mb" in ''|*[!0-9]*|0) tcap_mb=256 ;; esac
+    tcap=$((tcap_mb * 1048576))
+    tdir="$(_ckpt_projects_dir)/$(_ckpt_encode_path "$wd")"
+    tcopy=$(_ckpt_mktemp) || return 1
+    if [ -n "$session" ] && [ -f "$tdir/$session.jsonl" ] && [ ! -L "$tdir/$session.jsonl" ]; then
+        tfile="$tdir/$session.jsonl"
+        head -c "$((tcap + 1))" "$tfile" >"$tcopy" || return 1
+        tsize=$(_ckpt_size "$tcopy")
+        if [ "$tsize" -gt "$tcap" ]; then
+            head -c "$tcap" "$tcopy" >"$tcopy.cap" && mv "$tcopy.cap" "$tcopy" || return 1
+            tsize=$tcap; t_trunc=true
+        fi
+        tsha=$(_ckpt_sha256 <"$tcopy")
+    else
+        tsha=$(: | _ckpt_sha256)
+    fi
+
+    # 2. WIP tree from a temp copy of the index; the worktree and its index are never written.
     local idx tmpidx skipfile tree
-    idx=$(_ckpt_index_path "$wd") || return 1
+    idx=$(_ckpt_git_path "$wd" index) || { _ckpt_take_fail snapshot_failed "could not locate the index"; return 1; }
     tmpidx=$(_ckpt_mktemp) || return 1
     skipfile=$(_ckpt_mktemp) || return 1
     if [ -f "$idx" ]; then cp "$idx" "$tmpidx" || return 1; else rm -f "$tmpidx"; fi
-    tree=$(_ckpt_tree_of "$wd" "$tmpidx" "$skipfile") || { echo "mother: checkpoint take: could not snapshot $wd" >&2; return 1; }
+    tree=$(_ckpt_tree_of "$wd" "$tmpidx" "$skipfile") || { rm -f "$skipfile.paths"; _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
+    [ -n "$tree" ] || { _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
 
     local prev="${MOTHER_CHECKPOINT_PREV_MANIFEST:-$out_dir/manifest.json}"
-    local prev_n=0 prev_head="" prev_wip="" prev_tbytes=0 prev_tsha=""
+    local prev_n=0 prev_head="" prev_wip="" prev_tbytes=0 prev_tsha="" prev_pushed=false
     if [ -s "$prev" ] && jq -e . "$prev" >/dev/null 2>&1; then
         prev_n=$(jq -r '.n // 0' "$prev")
         prev_head=$(jq -r '.head_sha // ""' "$prev")
         prev_wip=$(jq -r '.wip_sha // ""' "$prev")
         prev_tbytes=$(jq -r '.transcript.bytes // 0' "$prev")
         prev_tsha=$(jq -r '.transcript.sha256 // ""' "$prev")
+        prev_pushed=$(jq -r '.pushed // false' "$prev")
     fi
 
-    local tdir tfile="" tsize=0
-    tdir="$(_ckpt_projects_dir)/$(_ckpt_encode_path "$wd")"
-    if [ -n "$session" ] && [ -f "$tdir/$session.jsonl" ]; then
-        tfile="$tdir/$session.jsonl"
-        tsize=$(_ckpt_size "$tfile")
-    fi
-
-    # 2. Skip when nothing changed.
-    if [ "$final" -ne 1 ] && [ -n "$prev_wip" ] && [ "$prev_head" = "$head" ] && [ "$prev_tbytes" = "$tsize" ] \
-        && [ "$(git -C "$wd" rev-parse "$prev_wip^{tree}" 2>/dev/null || true)" = "$tree" ]; then
+    # 3. Skip only when the previous take really reached the remote and nothing changed since.
+    if [ "$final" -ne 1 ] && [ -z "$salvage" ] && [ "$prev_pushed" = true ] && [ -n "$prev_wip" ] && [ "$prev_head" = "$head" ] \
+        && [ "$prev_tbytes" = "$tsize" ] && [ "$prev_tsha" = "$tsha" ] \
+        && [ "$(_ckpt_git "$wd" rev-parse "$prev_wip^{tree}" 2>/dev/null || true)" = "$tree" ]; then
         echo '{"skipped":"unchanged"}'
         return 0
     fi
 
     local n=$((prev_n + 1)) now wip
     now=$(_iso_now)
-    wip=$(git -C "$wd" -c user.name=mother-checkpoint -c user.email=mother@localhost \
-        commit-tree "$tree" -p "$head" -m "mother wip $job n=$n at $now") || return 1
+    wip=$(_ckpt_git "$wd" -c user.name=mother-checkpoint -c user.email=mother@localhost \
+        commit-tree "$tree" -p "$head" -m "mother wip $job n=$n at $now") \
+        || { _ckpt_take_fail commit_failed "could not create the wip commit"; return 1; }
 
-    # 3. Push with fencing. The lease's expected value is the last wip sha THIS job dir pushed (a
-    # failed push does not advance it), kept next to the per-take dirs.
-    local pushed=false push_error="" branch_push="" rc=0 pout wip_ref="refs/mother/wip/$job" target expect state_file
+    # 4. Push with fencing.
+    local pushed=false push_error="" branch_push="" rc=0 pout wip_ref="refs/mother/wip/$job" target expect="" state_file marker
     state_file="$parent/.last-pushed"
+    marker=$(_ckpt_git_path "$wd" mother-wip-expect) || marker=""
     pout=$(_ckpt_mktemp) || return 1
     if [ -n "$salvage" ]; then
         target="refs/mother/wip-salvage/$job/lease-$salvage"
-        _ckpt_push "$wd" "$(_ckpt_remaining)" "$pout" origin "+$wip:$target" || rc=$?
+        _ckpt_push "$wd" "$pout" origin "+$wip:$target" || rc=$?
     else
         target="$wip_ref"
-        expect=""
-        [ -s "$state_file" ] && expect=$(cat "$state_file")
+        if [ -n "$expect_flag" ]; then expect="$expect_flag"
+        elif [ -s "$state_file" ]; then expect=$(cat "$state_file")
+        elif [ -n "$marker" ] && [ -s "$marker" ]; then expect=$(cat "$marker")
+        else expect=$(_ckpt_ls_remote_ref "$wd" "$target" || true)
+        fi
         # No "+" on the refspec: a "+" overrides the lease check, so a moved ref would be overwritten.
         # The explicit lease alone allows the non-fast-forward update when the ref is where we left it.
-        _ckpt_push "$wd" "$(_ckpt_remaining)" "$pout" origin "$wip:$target" \
-            "--force-with-lease=$target:$expect" || rc=$?
+        _ckpt_push "$wd" "$pout" origin "$wip:$target" "--force-with-lease=$target:$expect" || rc=$?
     fi
-    local exit_code=0
+    local exit_code=0 cur
     if [ "$rc" -eq 0 ]; then
         pushed=true
-        [ -z "$salvage" ] && printf '%s' "$wip" >"$state_file"
-    elif grep -q 'stale info' "$pout" 2>/dev/null; then
-        push_error="fenced"; exit_code=3
+        if [ -z "$salvage" ]; then
+            printf '%s' "$wip" >"$state_file"
+            [ -n "$marker" ] && printf '%s' "$wip" >"$marker" 2>/dev/null
+        fi
     elif [ "$rc" -eq 137 ]; then
         push_error="push timed out"
+    elif [ -z "$salvage" ] && grep -q '^!' "$pout" 2>/dev/null \
+        && cur=$(_ckpt_ls_remote_ref "$wd" "$target") && [ "$cur" != "$expect" ]; then
+        # The remote refused the update (a "!" porcelain flag) AND the ref is no longer where our lease
+        # said it was: the lease is lost. Language-independent: no message text is matched.
+        push_error="fenced"; exit_code=3
     else
         push_error="push failed (exit $rc)"
     fi
@@ -252,41 +443,59 @@ _ckpt_take_locked() {
         branch_push=$(_ckpt_push_branch "$wd" "$branch" "$head" "$pout")
     fi
 
-    # 4. Transcript delta (the whole file when it shrank or its prefix changed).
-    local tsha t_reset=false
-    if [ -n "$tfile" ]; then tsha=$(_ckpt_sha256 <"$tfile"); else tsha=$(: | _ckpt_sha256); fi
-    : >"$out_dir/transcript.delta"
-    safe_rm_tree "$out_dir/transcript.subagents"
-    if [ -n "$tfile" ]; then
-        if [ "$prev_tbytes" -gt 0 ] && [ "$tsize" -ge "$prev_tbytes" ] \
-            && [ "$(head -c "$prev_tbytes" "$tfile" | _ckpt_sha256)" = "$prev_tsha" ]; then
-            tail -c +"$((prev_tbytes + 1))" "$tfile" >"$out_dir/transcript.delta"
-        else
-            cp "$tfile" "$out_dir/transcript.delta"
-            [ "$prev_tbytes" -gt 0 ] && t_reset=true
-        fi
-        if [ -d "$tdir/$session" ]; then cp -R "$tdir/$session" "$out_dir/transcript.subagents"; fi
+    # 5. Transcript delta from the copy (the whole copy when it shrank or its prefix changed); outputs
+    # are written to temp names and moved into place.
+    local t_reset=false sub_skipped=false dtmp="$out_dir/.transcript.delta.tmp.$$"
+    if [ -n "$tfile" ] && [ "$prev_tbytes" -gt 0 ] && [ "$tsize" -ge "$prev_tbytes" ] \
+        && [ "$(head -c "$prev_tbytes" "$tcopy" | _ckpt_sha256)" = "$prev_tsha" ]; then
+        tail -c +"$((prev_tbytes + 1))" "$tcopy" >"$dtmp" || return 1
+    elif [ -n "$tfile" ]; then
+        cp "$tcopy" "$dtmp" || return 1
+        [ "$prev_tbytes" -gt 0 ] && t_reset=true
+    else
+        : >"$dtmp"
     fi
+    mv "$dtmp" "$out_dir/transcript.delta" || return 1
+    local subsrc="$tdir/$session" subtmp="$out_dir/.transcript.subagents.tmp.$$" scap_mb="${MOTHER_CHECKPOINT_MAX_SUBAGENT_MB:-64}" kb
+    case "$scap_mb" in ''|*[!0-9]*|0) scap_mb=64 ;; esac
+    safe_rm_tree "$subtmp"
+    if [ -n "$tfile" ] && [ -d "$subsrc" ] && [ ! -L "$subsrc" ]; then
+        kb=$(du -sk "$subsrc" 2>/dev/null | awk '{print $1}')
+        if [ "${kb:-0}" -gt $((scap_mb * 1024)) ]; then
+            sub_skipped=true
+        else
+            cp -RP "$subsrc" "$subtmp" || { safe_rm_tree "$subtmp"; sub_skipped=true; }
+        fi
+    fi
+    safe_rm_tree "$out_dir/transcript.subagents"
+    [ -d "$subtmp" ] && mv "$subtmp" "$out_dir/transcript.subagents"
 
-    # 5. Manifest.
-    local skipped_json lease epoch manifest
-    skipped_json=$(jq -R -s -c '
-        split("\n") | map(select(length>0) | split("\t") | {path: (.[1:] | join("\t")), bytes: (.[0] | tonumber)})' <"$skipfile")
-    lease="${MOTHER_LEASE_ID:-}"; epoch="${MOTHER_LEASE_EPOCH:-0}"
-    [ -n "$salvage" ] && epoch="$salvage"
+    # 6. Manifest.
+    local skipped_json skip_trunc manifest sk
+    sk=$(jq -R -s -c '
+        split("\n") | map(select(length>0) | split("\t")) as $rows
+        | ($rows | map(select(.[1] != "!")) | map({path: (.[2:] | join("\t")), bytes: (.[0] | tonumber), reason: .[1]})) as $list
+        | {list: $list[:1024], truncated: (($list | length) > 1024 or ($rows | map(select(.[1] == "!")) | length) > 0)}' <"$skipfile")
+    skipped_json=$(printf '%s' "$sk" | jq -c .list)
+    skip_trunc=$(printf '%s' "$sk" | jq -c .truncated)
     manifest=$(jq -n -c \
-        --arg job "$job" --arg lease "$lease" --argjson epoch "${epoch:-0}" --argjson n "$n" --arg at "$now" \
+        --arg job "$job" --arg lease "$lease" --argjson epoch "$epoch" --argjson n "$n" --arg at "$now" \
         --arg head "$head" --arg branch "$branch" --arg base "$base_sha" --arg wip "$wip" --arg wipref "$wip_ref" \
         --argjson pushed "$pushed" --arg perr "$push_error" --arg bp "$branch_push" --arg sess "$session" \
         --arg tpath "checkpoints/$job/$session.jsonl" --argjson tbytes "$tsize" --arg tsha "$tsha" --argjson treset "$t_reset" \
-        --argjson skipped "$skipped_json" '
+        --argjson ttrunc "$t_trunc" --argjson subskip "$sub_skipped" \
+        --argjson skipped "$skipped_json" --argjson skiptrunc "$skip_trunc" '
         {v:1, job:$job, lease:$lease, epoch:$epoch, n:$n, at:$at, head_sha:$head, branch:$branch, base_sha:$base,
          wip_sha:$wip, wip_ref:$wipref, pushed:$pushed}
         + (if $perr != "" then {push_error:$perr} else {} end)
         + (if $bp != "" then {branch_push:$bp} else {} end)
         + {session_id:$sess,
-           transcript: ({path_rel:$tpath, bytes:$tbytes, sha256:$tsha} + (if $treset then {reset:true} else {} end)),
-           untracked_skipped:$skipped}') || return 1
+           transcript: ({path_rel:$tpath, bytes:$tbytes, sha256:$tsha}
+               + (if $treset then {reset:true} else {} end)
+               + (if $ttrunc then {truncated:true} else {} end)
+               + (if $subskip then {subagents_skipped:true} else {} end)),
+           untracked_skipped:$skipped}
+        + (if $skiptrunc then {untracked_skipped_truncated:true} else {} end)') || return 1
     printf '%s\n' "$manifest" >"$out_dir/manifest.json.tmp.$$" && mv "$out_dir/manifest.json.tmp.$$" "$out_dir/manifest.json" || return 1
     printf '%s\n' "$manifest"
     return "$exit_code"
@@ -297,14 +506,13 @@ _ckpt_take_locked() {
 # branch is not on origin (or origin is unreachable).
 _ckpt_push_branch() {
     local wd="$1" branch="$2" head="$3" tmp="$4" remote rc=0
-    GIT_TERMINAL_PROMPT=0 _bounded_run "$(_ckpt_remaining)" "$tmp" git -C "$wd" ls-remote origin "refs/heads/$branch" || return 0
-    remote=$(awk 'NR==1 {print $1}' "$tmp")
+    remote=$(_ckpt_ls_remote_ref "$wd" "refs/heads/$branch") || return 0
     [ -n "$remote" ] || return 0
     if [ "$remote" = "$head" ]; then echo uptodate; return 0; fi
-    if git -C "$wd" merge-base --is-ancestor "$remote" "$head" 2>/dev/null; then
-        _ckpt_push "$wd" "$(_ckpt_remaining)" "$tmp" origin "$head:refs/heads/$branch" || rc=$?
+    if _ckpt_git "$wd" merge-base --is-ancestor "$remote" "$head" >/dev/null 2>&1; then
+        _ckpt_push "$wd" "$tmp" origin "$head:refs/heads/$branch" || rc=$?
         if [ "$rc" -eq 0 ]; then echo fast_forwarded; else echo failed; fi
-    elif git -C "$wd" merge-base --is-ancestor "$head" "$remote" 2>/dev/null; then
+    elif _ckpt_git "$wd" merge-base --is-ancestor "$head" "$remote" >/dev/null 2>&1; then
         echo behind
     else
         echo diverged
@@ -319,22 +527,43 @@ _ckpt_restore_fail() {
 }
 
 # mother_checkpoint_restore <manifest> <transcript-file> <repo_path> <new_work_dir>
-# Exit 0 restored, 4 not restorable (why: wip_missing, head_missing, transcript_mismatch, tree_mismatch),
-# 1 usage. Never falls back to a fresh start.
+# Exit 0 restored, 4 not restorable (why: wip_missing, head_missing, chain_mismatch,
+# transcript_mismatch, tree_mismatch), 1 usage/other. Never falls back to a fresh start; a failure after
+# the worktree was added removes it again. <new_work_dir> must be absolute, without "..", and
+# nonexistent or empty. Branch handling: the local branch at head_sha is used; one that is an
+# ancestor of head_sha is fast-forwarded; a newer or diverged one is left alone and the work is
+# restored detached (branch_state "detached"); a branch checked out in another worktree is refused.
+# Output: restored, head_sha, wip_sha, transcript_sha, source, branch_state, detached, base_sha,
+# base_moved, incomplete (embedded repos were not captured), skipped.
 mother_checkpoint_restore() {
     local manifest="${1:-}" tfile="${2:-}" repo="${3:-}" newwd="${4:-}"
     [ -r "$manifest" ] && [ -n "$repo" ] && [ -n "$newwd" ] \
         || { echo "mother: checkpoint restore: usage: <manifest> <transcript-file> <repo_path> <new_work_dir>" >&2; return 1; }
-    local job branch head wip session tsha_want
+    local job branch head wip session tsha_want base_sha
     job=$(jq -r '.job // ""' "$manifest") || return 1
     branch=$(jq -r '.branch // ""' "$manifest")
     head=$(jq -r '.head_sha // ""' "$manifest")
     wip=$(jq -r '.wip_sha // ""' "$manifest")
+    base_sha=$(jq -r '.base_sha // ""' "$manifest")
     session=$(jq -r '.session_id // ""' "$manifest")
     tsha_want=$(jq -r '.transcript.sha256 // ""' "$manifest")
     _ckpt_job_ok "$job" && _ckpt_branch_ok "$branch" && _ckpt_sha_ok "$head" && _ckpt_sha_ok "$wip" \
         || { echo "mother: checkpoint restore: manifest has a malformed job, branch or sha" >&2; return 1; }
     _ckpt_session_ok "$session" || { echo "mother: checkpoint restore: bad session_id" >&2; return 1; }
+
+    newwd="${newwd%/}"
+    case "$newwd" in
+        /*) ;;
+        *) echo "mother: checkpoint restore: new work dir must be an absolute path: $newwd" >&2; return 1 ;;
+    esac
+    case "$newwd/" in
+        */../*|*/./*|*//*) echo "mother: checkpoint restore: new work dir must not contain '..', '.' or '//': $newwd" >&2; return 1 ;;
+    esac
+    if [ -e "$newwd" ] || [ -L "$newwd" ]; then
+        if [ -L "$newwd" ] || [ ! -d "$newwd" ] || [ -n "$(ls -A "$newwd" 2>/dev/null)" ]; then
+            echo "mother: checkpoint restore: new work dir exists and is not an empty directory: $newwd" >&2; return 1
+        fi
+    fi
     git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "mother: checkpoint restore: not a git repo: $repo" >&2; return 1; }
 
     # Transcript first: nothing is created if it does not match.
@@ -342,57 +571,122 @@ mother_checkpoint_restore() {
         _ckpt_restore_fail transcript_mismatch; return $?
     fi
 
+    local rt="${MOTHER_CHECKPOINT_RESTORE_TIMEOUT_S:-300}"
+    case "$rt" in ''|*[!0-9]*|0) rt=300 ;; esac
+    _CKPT_DEADLINE=$((SECONDS + rt))
+    _ckpt_prepare "$repo"
+
     # 1. The wip commit: fetch it, or use the object already in a shared store.
     local ref="refs/mother/wip/$job" source=origin
-    if ! GIT_TERMINAL_PROMPT=0 _bounded_run "${MOTHER_CHECKPOINT_TIMEOUT_S:-60}" - \
-            git -C "$repo" fetch --no-tags origin "+$ref:$ref"; then
-        source=local_object
-    fi
-    git -C "$repo" cat-file -e "$wip^{commit}" 2>/dev/null || { _ckpt_restore_fail wip_missing; return $?; }
-    git -C "$repo" cat-file -e "$head^{commit}" 2>/dev/null || { _ckpt_restore_fail head_missing; return $?; }
-    local wip_tree; wip_tree=$(git -C "$repo" rev-parse "$wip^{tree}") || { _ckpt_restore_fail wip_missing; return $?; }
+    _ckpt_git "$repo" fetch --no-tags --no-recurse-submodules --upload-pack=git-upload-pack origin "+$ref:$ref" >/dev/null || source=local_object
+    _ckpt_git "$repo" cat-file -e "$wip^{commit}" >/dev/null 2>&1 || { _ckpt_restore_fail wip_missing; return $?; }
+    _ckpt_git "$repo" cat-file -e "$head^{commit}" >/dev/null 2>&1 || { _ckpt_restore_fail head_missing; return $?; }
+    local wip_tree parents
+    wip_tree=$(_ckpt_git "$repo" rev-parse "$wip^{tree}") || { _ckpt_restore_fail wip_missing; return $?; }
+    # The wip commit must be exactly one commit on top of head_sha.
+    parents=$(_ckpt_git "$repo" rev-list --parents -n 1 "$wip") || { _ckpt_restore_fail wip_missing; return $?; }
+    # shellcheck disable=SC2086
+    set -- $parents
+    if [ $# -ne 2 ] || [ "$2" != "$head" ]; then _ckpt_restore_fail chain_mismatch; return $?; fi
 
-    # 2. New worktree at head_sha, then the wip tree laid over it as unstaged changes.
-    git -C "$repo" worktree prune >/dev/null 2>&1 || true
-    if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
-        git -C "$repo" worktree add --force "$newwd" "$branch" >/dev/null 2>&1 \
-            || { echo "mother: checkpoint restore: worktree add failed" >&2; return 1; }
+    # 2. New worktree (no checkout yet), then the content under the hardened wrapper (no hooks, no drivers).
+    _ckpt_git "$repo" worktree prune >/dev/null 2>&1 || true
+    local tip="" branch_state=exact detached=false created_branch=0
+    if _ckpt_git "$repo" show-ref --verify --quiet "refs/heads/$branch" >/dev/null 2>&1; then
+        tip=$(_ckpt_git "$repo" rev-parse "refs/heads/$branch") || return 1
+        if [ "$tip" = "$head" ]; then
+            _ckpt_git "$repo" worktree add --no-checkout "$newwd" "$branch" >/dev/null \
+                || { echo "mother: checkpoint restore: worktree add failed (branch $branch may be checked out elsewhere)" >&2; return 1; }
+        elif _ckpt_git "$repo" merge-base --is-ancestor "$tip" "$head" >/dev/null 2>&1; then
+            _ckpt_git "$repo" worktree add --no-checkout "$newwd" "$branch" >/dev/null \
+                || { echo "mother: checkpoint restore: worktree add failed (branch $branch may be checked out elsewhere)" >&2; return 1; }
+            _ckpt_git "$newwd" update-ref -m "mother checkpoint restore: fast-forward" "refs/heads/$branch" "$head" "$tip" >/dev/null \
+                || { _ckpt_restore_cleanup "$repo" "$newwd" 0 "$branch"; echo "mother: checkpoint restore: could not fast-forward $branch" >&2; return 1; }
+            branch_state=fast_forwarded
+        else
+            _ckpt_git "$repo" worktree add --no-checkout --detach "$newwd" "$head" >/dev/null \
+                || { echo "mother: checkpoint restore: worktree add failed" >&2; return 1; }
+            branch_state=detached; detached=true
+        fi
     else
-        git -C "$repo" worktree add --force -b "$branch" "$newwd" "$head" >/dev/null 2>&1 \
+        _ckpt_git "$repo" worktree add --no-checkout -b "$branch" "$newwd" "$head" >/dev/null \
             || { echo "mother: checkpoint restore: worktree add failed" >&2; return 1; }
+        branch_state=created; created_branch=1
     fi
-    git -C "$newwd" reset -q --hard "$head" || return 1
-    local f
-    # Files deleted in the worktree at capture time (in HEAD, absent from the wip tree) go first,
-    # while the tree is exactly HEAD, so no path is resolved through anything the wip tree adds.
-    while IFS= read -r -d '' f; do rm -f "$newwd/$f"; done \
-        < <(git -C "$newwd" diff-tree -r -z --name-only --diff-filter=D "$head" "$wip_tree")
-    git -C "$newwd" read-tree "$wip_tree" || return 1
-    git -C "$newwd" checkout-index -a -f || return 1
-    git -C "$newwd" reset -q --mixed "$head" || return 1
 
-    # 3. Transcript under the new path's encoded dir (plus the subagent dir next to the file).
+    local rc=0
+    _CKPT_RESTORED_T=""
+    _ckpt_restore_populate "$manifest" "$tfile" "$repo" "$newwd" "$head" "$wip" "$wip_tree" "$session" "$tsha_want" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        _ckpt_restore_cleanup "$repo" "$newwd" "$created_branch" "$branch"
+        return "$rc"
+    fi
+
+    local base_moved=true
+    if _ckpt_sha_ok "$base_sha" && _ckpt_git "$repo" cat-file -e "$base_sha^{commit}" >/dev/null 2>&1 \
+        && _ckpt_git "$repo" merge-base --is-ancestor "$base_sha" "$head" >/dev/null 2>&1; then
+        base_moved=false
+    fi
+    local mk; mk=$(_ckpt_git_path "$newwd" mother-wip-expect) && printf '%s' "$wip" >"$mk" 2>/dev/null
+    jq -n -c --arg head "$head" --arg wip "$wip" --arg tsha "$tsha_want" --arg src "$source" \
+        --arg bs "$branch_state" --argjson det "$detached" --arg base "$base_sha" --argjson bm "$base_moved" \
+        --slurpfile m "$manifest" '
+        {restored:true, head_sha:$head, wip_sha:$wip, transcript_sha:$tsha, source:$src, branch_state:$bs, detached:$det,
+         base_sha:$base, base_moved:$bm,
+         incomplete: ((($m[0].untracked_skipped // []) | map(select(.reason == "embedded_repo")) | length) > 0),
+         skipped:($m[0].untracked_skipped // [])}'
+}
+
+# _ckpt_restore_populate: lay head + the wip tree into <newwd>, copy the transcript, verify. Prints a
+# failure JSON itself for the exit-4 reasons; returns 0 / 1 / 4.
+_ckpt_restore_populate() {
+    local manifest="$1" tfile="$2" repo="$3" newwd="$4" head="$5" wip="$6" wip_tree="$7" session="$8" tsha_want="$9" f
+    _ckpt_git "$newwd" reset -q --hard "$head" >/dev/null || { echo "mother: checkpoint restore: could not check out $head" >&2; return 1; }
+    # Files deleted in the worktree at capture time (in HEAD, absent from the wip tree) go first, while
+    # the tree is exactly HEAD, so no path is resolved through anything the wip tree adds.
+    while IFS= read -r -d '' f; do
+        _ckpt_relpath_ok "$f" || { echo "mother: checkpoint restore: unsafe path in the wip tree: $f" >&2; return 1; }
+        rm -f "${newwd:?}/${f:?}"
+    done < <(_ckpt_git "$newwd" diff-tree -r -z --name-only --diff-filter=D "$head" "$wip_tree")
+    _ckpt_git "$newwd" read-tree "$wip_tree" >/dev/null || return 1
+    _ckpt_git "$newwd" checkout-index -a -f >/dev/null || return 1
+    _ckpt_git "$newwd" reset -q --mixed "$head" >/dev/null || return 1
+
+    # Transcript under the new path's encoded dir (plus the subagent dir next to the file).
     local tdir; tdir="$(_ckpt_projects_dir)/$(_ckpt_encode_path "$newwd")"
-    mkdir -p "$tdir" && cp "$tfile" "$tdir/$session.jsonl" || return 1
+    mkdir -p "$tdir" && cp "$tfile" "$tdir/$session.jsonl" || { echo "mother: checkpoint restore: could not write the transcript" >&2; return 1; }
+    _CKPT_RESTORED_T="$tdir/$session.jsonl"
     if [ -d "$(dirname "$tfile")/$session" ]; then
         safe_rm_tree "$tdir/$session"
-        cp -R "$(dirname "$tfile")/$session" "$tdir/$session" || return 1
+        cp -RP "$(dirname "$tfile")/$session" "$tdir/$session" || return 1
     fi
 
-    # 4. Verify HEAD, the working tree and the transcript.
+    # Verify HEAD, the working tree and the transcript.
     local got_head idx tmpidx skipfile got_tree
-    got_head=$(git -C "$newwd" rev-parse HEAD)
+    got_head=$(_ckpt_git "$newwd" rev-parse HEAD) || return 1
     [ "$got_head" = "$head" ] || { _ckpt_restore_fail head_missing; return $?; }
-    idx=$(_ckpt_index_path "$newwd") || return 1
+    idx=$(_ckpt_git_path "$newwd" index) || return 1
     tmpidx=$(_ckpt_mktemp) || return 1
     skipfile=$(_ckpt_mktemp) || return 1
     cp "$idx" "$tmpidx" || return 1
     got_tree=$(_ckpt_tree_of "$newwd" "$tmpidx" "$skipfile") || got_tree=""
+    rm -f "$skipfile.paths"
     _ckpt_cleanup
     [ "$got_tree" = "$wip_tree" ] || { _ckpt_restore_fail tree_mismatch; return $?; }
     [ "$(_ckpt_sha256 <"$tdir/$session.jsonl")" = "$tsha_want" ] || { _ckpt_restore_fail transcript_mismatch; return $?; }
+    return 0
+}
 
-    jq -n -c --arg head "$head" --arg wip "$wip" --arg tsha "$tsha_want" --arg src "$source" \
-        --slurpfile m "$manifest" \
-        '{restored:true, head_sha:$head, wip_sha:$wip, transcript_sha:$tsha, source:$src, skipped:($m[0].untracked_skipped // [])}'
+# _ckpt_restore_cleanup <repo> <newwd> <created_branch> <branch>: undo a half-built restore so a retry
+# at the same path starts clean.
+_ckpt_restore_cleanup() {
+    local repo="$1" newwd="$2" created="$3" branch="$4"
+    _CKPT_DEADLINE=$((SECONDS + 30))
+    _ckpt_git "$repo" worktree remove --force "$newwd" >/dev/null 2>&1 || true
+    [ -d "$newwd" ] && safe_rm_tree "$newwd"
+    _ckpt_git "$repo" worktree prune >/dev/null 2>&1 || true
+    [ "$created" = 1 ] && { _ckpt_git "$repo" branch -D "$branch" >/dev/null 2>&1 || true; }
+    [ -n "${_CKPT_RESTORED_T:-}" ] && rm -f "$_CKPT_RESTORED_T"
+    _ckpt_cleanup
+    return 0
 }

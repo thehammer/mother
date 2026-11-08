@@ -53,11 +53,21 @@ type Transcript struct {
 	PathRel string `json:"path_rel"`
 	Bytes   int64  `json:"bytes"`
 	SHA256  string `json:"sha256"`
+	// Reset: the transcript shrank or its prefix changed, so the delta is the whole file.
+	Reset bool `json:"reset,omitempty"`
+	// Truncated: the live transcript exceeded the worker's cap; Bytes/SHA256 describe the captured prefix.
+	Truncated bool `json:"truncated,omitempty"`
+	// SubagentsSkipped: the subagent directory exceeded the worker's cap and was not copied.
+	SubagentsSkipped bool `json:"subagents_skipped,omitempty"`
 }
 
+// SkippedFile is a path the checkpoint did not capture. Reason is one of too_large, embedded_repo
+// (a nested repository or submodule: its dirty files and unpushed commits are NOT in the checkpoint),
+// special_file; empty in manifests written before the field existed.
 type SkippedFile struct {
-	Path  string `json:"path"`
-	Bytes int64  `json:"bytes"`
+	Path   string `json:"path"`
+	Bytes  int64  `json:"bytes"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // Manifest is the checkpoint manifest. Field order is the wire key order. The worker-local
@@ -84,6 +94,9 @@ type Manifest struct {
 	SessionID        string        `json:"session_id"`
 	Transcript       Transcript    `json:"transcript"`
 	UntrackedSkipped []SkippedFile `json:"untracked_skipped"`
+	// UntrackedSkippedTruncated: the list was cut at MaxUntrackedSkipped (or entries with unsendable
+	// paths were dropped); more paths were skipped than are listed.
+	UntrackedSkippedTruncated bool `json:"untracked_skipped_truncated,omitempty"`
 }
 
 var (
@@ -129,6 +142,11 @@ func ValidateManifest(m Manifest) error {
 		return protoErr(CodeInvalid, "manifest: untracked_skipped has %d entries, limit %d", len(m.UntrackedSkipped), MaxUntrackedSkipped)
 	}
 	for _, u := range m.UntrackedSkipped {
+		switch u.Reason {
+		case "", "too_large", "embedded_repo", "special_file":
+		default:
+			return protoErr(CodeInvalid, "manifest: bad untracked_skipped reason")
+		}
 		if u.Bytes < 0 || u.Path == "" || len(u.Path) > MaxPathLen || !textOK(u.Path, MaxPathLen) ||
 			strings.HasPrefix(u.Path, "/") || strings.Contains(u.Path, "\\") || path.Clean(u.Path) != u.Path ||
 			u.Path == ".." || strings.HasPrefix(u.Path, "../") {
