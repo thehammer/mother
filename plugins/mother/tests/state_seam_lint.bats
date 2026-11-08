@@ -33,7 +33,7 @@ load 'test_helper'
 # --- the allowlist ---------------------------------------------------------------------------------
 
 # Helper definition sites: the mirrored write path itself (and the canonical-side replay writer).
-SEAM_ALLOW_HELPERS="_job_write_doc mother_job_write_doc mother_job_update _job_update _usage_job_write _ca_job_set_locked"
+SEAM_ALLOW_HELPERS="_job_write_doc mother_job_write_doc mother_job_update _job_update _usage_job_write _ca_job_set_locked _ca_stall"
 
 # bin/mother functions that are not reachable from inside a running job:
 #   cmd_add            enqueue: creates the job document

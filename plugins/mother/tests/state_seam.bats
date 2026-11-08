@@ -383,7 +383,8 @@ _ss_norm_events() {
 _ss_norm_rows() {
     local id="$1" f="$2"
     { grep -F "\"job_id\":\"$id\"" "$f" 2>/dev/null || true; } \
-        | jq -S -s --argjson subs "$(_ss_subs)" "$(_ss_norm_filter)"
+        | jq -c 'del(.apply_id)' \
+        | jq -S -s --argjson subs "$(_ss_subs)" "$(_ss_norm_filter)"   # apply_id is the replay's stable row id
 }
 
 # _ss_same <label> <file-a> <file-b> — fail with a diff when the two normalised files differ.
@@ -1101,7 +1102,7 @@ _ss_go_list() {
     [ "$(grep -c '"kind":"c"' "$SS_C/events/$id.jsonl")" = "1" ]
 }
 
-@test "poison: an op that can never apply (no .data, bad type, escaping path) is skipped; a transient failure retries and is quarantined after the cap, not before" {
+@test "poison: an op that can never apply (no .data, bad type) is quarantined; a transient failure is never quarantined, it stays pending and applies once the fault clears" {
     [ "$(id -u)" != "0" ] || skip "root ignores file permissions"
     local id="poison-2" ops="$BATS_TEST_TMPDIR/poison2.ndjson"
     _ss_seed_hand "$id"
@@ -1113,18 +1114,73 @@ _ss_go_list() {
     } > "$ops"
     : > "$SS_C/events/$id.jsonl"
     chmod 444 "$SS_C/events/$id.jsonl"      # the event append fails transiently
+    local n
+    for n in 1 2 3 4; do
+        _ss_replay_to "$SS_C" "$id" "$ops"
+        [ "$status" -eq 1 ] || { echo "attempt $n: status $status" >&2; return 1; }
+        [ "$(_ss_last_line)" = "2" ]
+        [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "2" ]
+    done
+    jq -s -e '[.[] | select(.code == "transient_stop")] | length == 4' "$SS_C/runner/leases/audit.jsonl" >/dev/null
+    jq -e '.needs_attention.reason == "apply_stalled"' "$SS_C/jobs/$id.json" >/dev/null
+    chmod 644 "$SS_C/events/$id.jsonl"
     _ss_replay_to "$SS_C" "$id" "$ops"
-    [ "$status" -eq 1 ]                     # attempt 1: stopped at seq 3
-    [ "$(_ss_last_line)" = "2" ]
-    [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "2" ]
-    _ss_replay_to "$SS_C" "$id" "$ops"
-    [ "$status" -eq 1 ]                     # attempt 2
-    [ "$(_ss_last_line)" = "2" ]
-    _ss_replay_to "$SS_C" "$id" "$ops"      # attempt 3: quarantined, moves on
-    [ "$status" -eq 3 ]
+    [ "$status" -eq 0 ]
     [ "$(_ss_last_line)" = "4" ]
     [ "$(jq -r '.activity' "$SS_C/jobs/$id.json")" = "after" ]
-    [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "3" ]
+    [ "$(grep -c '"kind":"t"' "$SS_C/events/$id.jsonl")" = "1" ]
+    [ "$(jq -s 'length' "$SS_C/runner/leases/$id.quarantine.ndjson")" = "2" ]
+}
+
+@test "transient: three consecutive job-lock timeouts on a state-carrying job.set leave it pending; it applies once the lock frees" {
+    local id="trans-1" ops="$BATS_TEST_TMPDIR/trans.ndjson" n
+    _ss_seed_hand "$id"
+    _ss_op 1 job.set '{"set":{"state":"cancelled"},"del":[]}' > "$ops"
+    # A live process (this test) holds the job lock (the lockdir names its pid): the replay's 10 s wait times out.
+    mkdir "$SS_C/jobs/$id.json.lockdir" && echo "$$" > "$SS_C/jobs/$id.json.lockdir/owner"
+    for n in 1 2 3; do
+        _ss_replay_to "$SS_C" "$id" "$ops"
+        [ "$status" -eq 1 ] || { echo "attempt $n: status $status" >&2; return 1; }
+        [ "$(_ss_last_line)" = "0" ]
+    done
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "running" ]
+    [ ! -e "$SS_C/runner/leases/$id.quarantine.ndjson" ]
+    jq -s -e '[.[] | select(.code == "transient_stop")] | length == 3' "$SS_C/runner/leases/audit.jsonl" >/dev/null
+    jq -e '.needs_attention.reason == "apply_stalled"' "$SS_C/jobs/$id.json" >/dev/null
+    rm -f "$SS_C/jobs/$id.json.lockdir/owner"; rmdir "$SS_C/jobs/$id.json.lockdir"   # the lock frees
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ] || { echo "status $status / $stderr" >&2; return 1; }
+    [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "cancelled" ]
+}
+
+@test "crash: dying between apply and persist never duplicates an event or a usage row, nor double-counts cost; a repeated identical event with a new seq still applies" {
+    local id="crash-1" ops="$BATS_TEST_TMPDIR/crash.ndjson" ev row n
+    _ss_seed_hand "$id"
+    ev='{"ts":"2026-11-08T12:00:00.000Z","kind":"same","detail":{}}'
+    row=$(jq -nc --arg j "$id" '{job_id: $j, cost_usd: 1.5, tokens_in: 10, tokens_out: 5, model: "sonnet"}')
+    {
+        _ss_op 1 event.append "$(jq -nc --arg l "$ev" '{line: $l}')"
+        _ss_op 2 record.append "$(jq -nc --arg l "$row" '{stream: "metrics/runs.jsonl", line: $l}')"
+        _ss_op 3 event.append "$(jq -nc --arg l "$ev" '{line: $l}')"
+    } > "$ops"
+    # Crash 1: after the event landed, before seq 1 is persisted. Crash 2: after the usage row landed.
+    for n in 1 2; do
+        run --separate-stderr _ss_in_world "$SS_C" 0 env MOTHER_TEST_CRASH_AFTER_APPLY="$n" \
+            bash -c '"$0" "$1" "$2" < "$3"' "$SS_COORD_APPLY" "$SS_C" "$id" "$ops"
+        [ "$status" -ne 0 ]
+    done
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ] || { echo "status $status / $stderr" >&2; return 1; }
+    [ "$(_ss_last_line)" = "3" ]
+    # seq 1 and seq 3 are the same line but different ops: two events; the crash added none.
+    [ "$(grep -c '"kind":"same"' "$SS_C/events/$id.jsonl")" = "2" ]
+    [ "$(grep -c "\"job_id\":\"$id\"" "$SS_C/metrics/runs.jsonl")" = "1" ]
+    [ "$(jq -r '.actual_cost_usd' "$SS_C/jobs/$id.json")" = "1.5" ]
+    [ "$(jq -r '.actual_tokens' "$SS_C/jobs/$id.json")" = "15" ]
+    # A full re-run changes nothing.
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$(grep -c '"kind":"same"' "$SS_C/events/$id.jsonl")" = "2" ]
+    [ "$(grep -c "\"job_id\":\"$id\"" "$SS_C/metrics/runs.jsonl")" = "1" ]
 }
 
 # ---------------------------------------------------------------------------

@@ -939,8 +939,15 @@ against the Go kinds and sizes. Keys apply one by one (refused keys are audited 
 `state` refuses the whole op. The one bash-side extension is `pipeline`: only its `reviewer_findings` object is merged (typed,
 <= 64 KiB), because `_review_slot_write` writes it in worker mode; add it to the Go table in P1-3. seq must be contiguous
 (`seq <= applied` is a duplicate, a gap stops the replay); a structurally bad line or op is quarantined to
-`runner/leases/<job>.quarantine.ndjson` and skipped, a transient failure retries `MOTHER_APPLY_MAX_RETRIES` (3) times then is
-quarantined. Each call holds a per-job apply lock and stops after `MOTHER_APPLY_MAX_SECONDS` (120) / `MOTHER_APPLY_MAX_OPS`
+`runner/leases/<job>.quarantine.ndjson` and skipped, a transient failure (lock timeout, I/O) is **never** quarantined: it stops the replay
+(exit 1), is audited (`transient_stop`) and retried on the next call, and after `MOTHER_APPLY_STALL_ATTEMPTS` (3) consecutive stops
+the job gets `needs_attention {reason: apply_stalled}`. Exactly-once across a crash between apply and persist: an inflight marker
+(`runner/leases/applied/<job>.inflight`, seq + line sha) precedes each `event.append`/`record.append`; on restart an event already at
+the tail of the events file is skipped, and a usage row carries `apply_id` = `<job>:<seq>` so it is never appended twice (cost is
+recomputed, idempotently). Test seam: `MOTHER_TEST_CRASH_AFTER_APPLY=<seq>` (only with `MOTHER_TEST_ROOT=1`). **Until P1-5 a
+worker-mode job stays `running` on the canonical side**: `succeeded` is refused from a worker and the coordinator does not derive it
+yet. `mother_job_update` in worker mode takes the job lock and is re-entrant only within one shell (child processes contend
+normally). Each call holds a per-job apply lock and stops after `MOTHER_APPLY_MAX_SECONDS` (120) / `MOTHER_APPLY_MAX_OPS`
 (exit 4: call again). Caps: `MOTHER_APPLY_MAX_LINE_BYTES`, `_EVENT_BYTES` (64 KiB), `_ROW_BYTES` (16 KiB), `_FILE_BYTES`,
 `_ARTIFACT_BYTES` (per job, 1 GiB); a `final` artifact chunk needs a sha256. Exit: 0 applied, 1 stopped, 3 done with quarantined
 ops, 4 budget. `mother_recompute_job_cost` is a no-op in worker mode (the canonical side recomputes on a terminal `failed` /

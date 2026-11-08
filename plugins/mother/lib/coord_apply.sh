@@ -29,12 +29,20 @@
 # Exactly-once: ops must arrive with contiguous seq. seq <= the persisted applied seq
 # ($root/runner/leases/applied/<job>.seq) is a duplicate (skipped); a gap stops the replay and says so.
 # There is no tail-line dedupe: a legitimately repeated identical line is applied, a duplicate seq is not.
-# (A crash between applying an op and persisting its seq can re-apply that one op on the retry.)
+# A crash between applying an op and persisting its seq must not double-count: before a non-idempotent op
+# (event.append, record.append) is applied an inflight marker (<job>.inflight: seq and sha256 of the op line)
+# is written; it is cleared once the seq is persisted. On restart, a marker for the next seq means that op may
+# have landed: an event is skipped when it is already the last line of the events file, and a usage row carries
+# a stable id `apply_id` = <job>:<seq>, so a row already in runs.jsonl is never appended twice (the cost
+# recompute, which is idempotent, still runs). job.set and artifact.put are idempotent.
 #
 # No poison line: a structurally bad line (not JSON, no seq, oversize) or op (invalid value, escaping
 # path, bad sha) is quarantined to runner/leases/<job>.quarantine.ndjson with an audit entry and the
 # replay moves on, so the job can still reach its terminal state. A transient failure (lock timeout,
-# unwritable file) stops the replay and retries; after MOTHER_APPLY_MAX_RETRIES (3) it is quarantined.
+# unwritable file) is NEVER quarantined: it stops the replay (exit 1) and the next call retries the same op.
+# Every such stop is counted in runner/leases/applied/<job>.retry, audited (code transient_stop), and after
+# MOTHER_APPLY_STALL_ATTEMPTS (3) consecutive stops on one op the job gets a needs_attention flag
+# (reason apply_stalled). Quarantine is for lines that can never apply.
 #
 # Per call the replay holds a per-job apply lock (two replays can never double-apply) and stops
 # cleanly after MOTHER_APPLY_MAX_SECONDS (120; 0 = no limit) or MOTHER_APPLY_MAX_OPS (0 = no limit);
@@ -252,6 +260,9 @@ _ca_apply_event() {
     printf '%s' "$ev" | jq -e 'type == "object" and (.kind | type) == "string"' >/dev/null 2>&1 \
         || { _ca_log "event.append: line is not a single event object"; return 1; }
     ef=$(_events_path "$job")
+    # Crash recovery: the inflight marker for this very seq (set by the driver) says this op may already be
+    # the last line of the events file. Only then is the tail compared, so a genuinely repeated line is kept.
+    if [ -n "${_CA_RECOVERING:-}" ] && [ "$(tail -n 1 "$ef" 2>/dev/null)" = "$ev" ]; then return 0; fi
     _with_lock "$ef" _append_line "$ef" "$ev" || return 2
 }
 
@@ -274,7 +285,17 @@ _ca_apply_record() {
         >/dev/null 2>&1 || { _ca_log "record.append: row is not a valid usage row for $job"; return 1; }
     file="$MOTHER_ROOT/$stream"
     mkdir -p "$(dirname "$file")" 2>/dev/null || return 2
-    _with_lock "$file" _append_line "$file" "$row" || return 2
+    # Stable row id from (job, seq): a row that already landed (crash before the seq was persisted) is not
+    # appended again. The id is only added when the op carries a seq (always, via the replay driver).
+    local aid="${_CA_CUR_SEQ:+$job:$_CA_CUR_SEQ}"
+    if [ -n "$aid" ]; then
+        row=$(printf '%s' "$row" | jq -c --arg a "$aid" '.apply_id = $a') || return 1
+        if ! grep -qF "\"apply_id\":\"$aid\"" "$file" 2>/dev/null; then
+            _with_lock "$file" _append_line "$file" "$row" || return 2
+        fi
+    else
+        _with_lock "$file" _append_line "$file" "$row" || return 2
+    fi
     # What mother_record_run_usage does after appending a row, on the canonical side.
     type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$job"
     type mother_maybe_token_alert >/dev/null 2>&1 && mother_maybe_token_alert "$job" >/dev/null
@@ -411,6 +432,27 @@ _ca_apply_op() {
     esac
 }
 
+_ca_inflight_file() { printf '%s/runner/leases/applied/%s.inflight' "$MOTHER_ROOT" "$1"; }
+
+_ca_line_sha() { printf '%s' "$1" | shasum -a 256 | cut -c1-64; }
+
+# _ca_stall <job> <seq> <rn> — a transient stop: audit it, and flag the job after N consecutive ones.
+_ca_stall() {
+    local job="$1" seq="$2" rn="$3" jf
+    _ca_audit "$job" transient_stop "$(jq -nc --arg s "$seq" --argjson n "$rn" '["seq=" + $s, "attempt=" + ($n | tostring)]')"
+    if [ "$rn" -ge "${MOTHER_APPLY_STALL_ATTEMPTS:-3}" ]; then
+        jf=$(_job_path "$job")
+        [ -f "$jf" ] || return 0
+        # Best effort and lock-free on purpose: the stall is often a job-lock timeout, and this flag must
+        # not wait on that same lock. A racing writer at worst loses it; the next stop writes it again.
+        local doc
+        doc=$(jq -c --arg s "$seq" --arg n "$rn" --arg t "$(_iso_now)" \
+            '.needs_attention = {reason: "apply_stalled", note: ("outbox op seq " + $s + " failed transiently " + $n + " times in a row; it stays pending and is retried on the next replay"), since: (.needs_attention.since // $t)}' "$jf" 2>/dev/null) \
+            && _atomic_write "$jf" "$doc"
+    fi
+    return 0
+}
+
 _ca_persist_seq() { # <file> <seq>
     printf '%s' "$2" > "${1}.tmp.$$" && mv "${1}.tmp.$$" "$1"
 }
@@ -454,13 +496,29 @@ _ca_stream_locked() {
         [ "$seq" -gt "$applied" ] || continue                       # duplicate: already applied
         if [ "$seq" -ne $((applied + 1)) ]; then
             if [ "$poison" -gt 0 ] && [ "$seq" -le $((applied + 1 + poison)) ]; then
-                :                                                    # quarantined lines took the missing slots
+                # Quarantined lines took the missing slots. Bounded caveat: this lets one garbage line mask
+                # one genuinely lost seq (a garbage line cannot be told from a lost op); it never masks more
+                # than the number of lines quarantined since the last applied seq.
+                :
             else
                 _ca_log "gap in the outbox: applied through seq $applied, next op is seq $seq; stopping"
                 rc=1; break
             fi
         fi
+        # Inflight marker before a non-idempotent op (see the header); an existing one for this seq and line
+        # means a previous call died between apply and persist.
+        local inf inf_t inf_state
+        inf=$(_ca_inflight_file "$job"); _CA_RECOVERING=""; _CA_CUR_SEQ="$seq"
+        inf_t=$(printf '%s' "$line" | jq -r '.t // empty')
+        case "$inf_t" in
+            event.append|record.append)
+                inf_state="$seq $(_ca_line_sha "$line")"
+                if [ "$(cat "$inf" 2>/dev/null)" = "$inf_state" ]; then _CA_RECOVERING=1
+                else printf '%s\n' "$inf_state" > "$inf" 2>/dev/null || { _ca_log "cannot write the inflight marker for seq $seq"; rc=1; break; }
+                fi ;;
+        esac
         _ca_apply_op "$job" "$line" </dev/null; op_rc=$?
+        _CA_RECOVERING=""
         case "$op_rc" in
             0) ;;
             1) _ca_quarantine "$job" "$seq" "op cannot be applied (see the log line above)" "$line"; q_rc=$?
@@ -470,19 +528,18 @@ _ca_stream_locked() {
             *) rn=0
                if read -r rseq rn < "$retry_file" 2>/dev/null && [ "$rseq" = "$seq" ]; then :; else rn=0; fi
                rn=$((rn + 1))
-               if [ "$rn" -ge "${MOTHER_APPLY_MAX_RETRIES:-3}" ]; then
-                   rm -f "$retry_file"
-                   _ca_quarantine "$job" "$seq" "transient failure persisted after $rn attempts" "$line"; q_rc=$?
-                   [ "$q_rc" -le 5 ] && [ "$q_rc" -ne 1 ] || { rc=1; break; }
-                   [ "$q_rc" -eq 0 ] && rc=3
-               else
-                   printf '%s %s\n' "$seq" "$rn" > "$retry_file" 2>/dev/null
-                   _ca_log "op seq $seq failed transiently (attempt $rn); stopping"
-                   rc=1; break
-               fi ;;
+               printf '%s %s\n' "$seq" "$rn" > "$retry_file" 2>/dev/null
+               _ca_log "op seq $seq failed transiently (attempt $rn); stopping, it stays pending"
+               _ca_stall "$job" "$seq" "$rn"
+               rc=1; break ;;
         esac
         rm -f "$retry_file"
+        if [ -n "${MOTHER_TEST_CRASH_AFTER_APPLY:-}" ] && [ "${MOTHER_TEST_ROOT:-}" = "1" ] \
+            && [ "$MOTHER_TEST_CRASH_AFTER_APPLY" = "$seq" ]; then
+            kill -9 $$   # test seam: die between apply and persist (MOTHER_TEST_ROOT only)
+        fi
         _ca_persist_seq "$af" "$seq" || { _ca_log "cannot persist applied seq $seq"; rc=1; break; }
+        rm -f "$(_ca_inflight_file "$job")"
         applied="$seq"; poison=0; ops=$((ops + 1))
     done
     printf '%s\n' "$applied"
