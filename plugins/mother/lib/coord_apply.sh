@@ -119,6 +119,7 @@ _ca_apply_event() {
     local job="$1" line="$2" ev ef tail
     ev=$(printf '%s' "$line" | jq -r '.data.line // empty') || return 1
     [ -n "$ev" ] || { _ca_log "event.append without a line"; return 1; }
+    case "$ev" in *$'\n'*|*$'\r'*) _ca_log "event.append: line contains a newline"; return 1 ;; esac
     # One JSON object with a kind: a worker's line never becomes anything but a single event line.
     printf '%s' "$ev" | jq -e 'type == "object" and (.kind | type) == "string"' >/dev/null 2>&1 \
         || { _ca_log "event.append: line is not a single event object"; return 1; }
@@ -137,6 +138,7 @@ _ca_apply_record() {
         *) _ca_log "record.append: unknown stream '$stream'"; return 1 ;;
     esac
     [ -n "$row" ] || { _ca_log "record.append without a line"; return 1; }
+    case "$row" in *$'\n'*|*$'\r'*) _ca_log "record.append: line contains a newline"; return 1 ;; esac
     # A usage row feeds cost totals and the cost cap: it must be one object for this job, with
     # non-negative numeric cost/tokens.
     printf '%s' "$row" | jq -e --arg j "$job" '
