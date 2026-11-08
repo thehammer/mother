@@ -1176,3 +1176,12 @@ STUB
     [ "$(git -C "$NEWWT" rev-parse HEAD)" = "$HEAD_SHA" ]
     [ -f "$MOTHER_CLAUDE_PROJECTS_DIR/$(_enc "$NEWWT")/$SID.jsonl" ]
 }
+
+@test "take refuses a repo whose config sets core.worktree" {
+    make_dirty
+    git -C "$REPO" config core.worktree "$T/elsewhere"
+    take
+    [ "$CST" -eq 1 ]
+    [ "$(printf '%s' "$COUT" | jq -r .why)" = "unsafe_config" ]
+    [ -z "$(remote_sha "$WIPREF")" ]
+}

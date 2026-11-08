@@ -17,6 +17,7 @@
 _CKPT_TMPS=""
 _CKPT_DEADLINE=0
 _CKPT_PREPARED=0
+_CKPT_REFUSE=""
 _CKPT_GITARGS=()
 _CKPT_INDEX=""
 _CKPT_RESTORED_T=""
@@ -101,12 +102,14 @@ _ckpt_prepare() {
         -c tag.gpgsign=false -c push.gpgsign=false -c gpg.program=false -c core.sshCommand=ssh
         -c protocol.ext.allow=never -c credential.helper= -c core.gitProxy= -c core.pager=cat
         -c core.askPass= -c core.editor=true -c push.recurseSubmodules=no -c fetch.recurseSubmodules=false
-        -c diff.external= -c advice.detachedHead=false)
+        -c diff.external= -c advice.detachedHead=false -c core.alternateRefsCommand= -c core.alternateRefsPrefixes=)
+    _CKPT_REFUSE=""
     while IFS= read -r -d '' name; do
         case "$name" in
             filter.*.clean|filter.*.smudge|filter.*.process|diff.*.textconv|diff.*.command|credential.*.helper|remote.*.vcs)
                 _CKPT_GITARGS+=(-c "$name=") ;;
             filter.*.required) _CKPT_GITARGS+=(-c "$name=false") ;;
+            core.worktree) _CKPT_REFUSE="core.worktree is set (it would redirect git to another directory)" ;;
         esac
     done < <(_ckpt_env git -C "$d" config --list --name-only -z 2>/dev/null)
     _CKPT_PREPARED=1
@@ -343,6 +346,7 @@ _ckpt_take_locked() {
     [ -n "$salvage" ] && epoch="$salvage"
 
     _ckpt_prepare "$wd"
+    [ -z "$_CKPT_REFUSE" ] || { echo "mother: checkpoint take: refusing $wd: $_CKPT_REFUSE" >&2; jq -n -c '{why:"unsafe_config"}'; return 1; }
     local head
     head=$(_ckpt_git "$wd" rev-parse --verify -q HEAD) || { _ckpt_take_fail unborn_head "no commit at HEAD in $wd (an unborn HEAD cannot be checkpointed)"; return 1; }
     _ckpt_sha_ok "$head" || { _ckpt_take_fail unborn_head "HEAD did not resolve in $wd"; return 1; }
@@ -575,6 +579,7 @@ mother_checkpoint_restore() {
     case "$rt" in ''|*[!0-9]*|0) rt=300 ;; esac
     _CKPT_DEADLINE=$((SECONDS + rt))
     _ckpt_prepare "$repo"
+    [ -z "$_CKPT_REFUSE" ] || { echo "mother: checkpoint restore: refusing $repo: $_CKPT_REFUSE" >&2; return 1; }
 
     # 1. The wip commit: fetch it, or use the object already in a shared store.
     local ref="refs/mother/wip/$job" source=origin
