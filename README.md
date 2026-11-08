@@ -169,11 +169,11 @@ only `mother undrain` (or the end of a successful `mother upgrade`) clears it.
   open to anyone. A drain on for more than 60 minutes raises an info-level `drain_stuck` attention item.
 - `drain`, `undrain` and `upgrade` are **owner-only**, the same refusal as `mother limiter mode`: refused from a
   worker, an agent session (`CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT`) or a non-TTY stdin.
-- `mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running]` runs the safe sequence on the
+- `mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running] [--undrain]` runs the safe sequence on the
   checkout the runner runs from (`$MOTHER_CODE_ROOT/mother`; must be on `main`, clean, `git fetch` working): drain,
   wait for idle, `git pull --ff-only`, rebuild the broker if Go/broker files changed, `mother daemon stop` / `start`
   (verifies a new runner pid and that `mother status` answers), undrain, then prints old/new commit and the limiter
-  line. A timeout exits 3 with drain left ON and nothing pulled; it never proceeds with jobs running unless you pass
+  line. A manual drain already on at the start is left ON (`--undrain` removes it). A timeout exits 3 with drain left ON and nothing pulled; it never proceeds with jobs running unless you pass
   `--restart-with-running`. Any failure names the step and leaves drain ON. `--dry-run` prints the steps and changes
   nothing (it skips the fetch).
 

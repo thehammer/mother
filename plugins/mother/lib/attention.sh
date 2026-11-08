@@ -128,13 +128,20 @@ _attention_drain_items() {
     [ -f "$f" ] || return 0
     t=$(jq -r '(.since // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch empty' "$f" 2>/dev/null)
     if [ -z "$t" ]; then
-        jq -nc --arg since "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        # First-seen time lives beside the flag (the corrupt file cannot hold it) so it stays stable across reads.
+        local seen="$f.unreadable-since" since
+        since=$(cat "$seen" 2>/dev/null)
+        if [ -z "$since" ]; then
+            since=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '%s\n' "$since" > "$seen" 2>/dev/null || true
+        fi
+        jq -nc --arg since "$since" '
             {kind: "drain_stuck", job_id: "", repo: "", branch: "",
              reason: "drain flag unreadable: dispatch is drained but its age is unknown",
              since: $since, detail: {level: "info", unreadable: true},
              hint: "inspect the runner drain.json; `mother undrain` removes it and resumes dispatch"}'
         return 0
     fi
+    rm -f "$f.unreadable-since" 2>/dev/null
     jq -c --argjson now "$(date +%s)" --argjson lim "${MOTHER_DRAIN_STUCK_S:-3600}" --argjson t "$t" '
         select(($now - $t) > $lim)
         | {kind: "drain_stuck", job_id: "", repo: "", branch: "",

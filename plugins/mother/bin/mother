@@ -5468,7 +5468,7 @@ Usage:
   mother drain [--reason TEXT] [--wait [--timeout SECS]] | --status
                                               (maintenance mode: no new job starts; running jobs untouched. Owner-only)
   mother undrain                              (owner-only)
-  mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running]
+  mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running] [--undrain]
                                               (drain, wait idle, git pull --ff-only, rebuild broker, restart daemon, undrain)
   mother list [--state STATE] [--repo REPO] [--project NAME] [--label LABEL] [--format json|table]
   mother status [ID] [--format json|text]     (no ID: queue overview, awaiting jobs, needs-attention list)

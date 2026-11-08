@@ -28,7 +28,7 @@ mother_drain_set() {
         && chmod 600 "$f.tmp.$$" && mv "$f.tmp.$$" "$f" || { rm -f "$f.tmp.$$"; return 1; }
 }
 
-mother_drain_clear() { rm -f "$(mother_drain_file)"; }
+mother_drain_clear() { rm -f "$(mother_drain_file)" "$(mother_drain_file).unreadable-since"; }
 
 # _drain_update <jq filter> [jq args...] — atomically rewrite the flag (0600); a no-op when it is missing/unreadable.
 _drain_update() {
@@ -220,16 +220,18 @@ _upgrade_runner_started() {
     tail -c +$((size + 1)) "$1" 2>/dev/null | grep -q 'mother-runner started'
 }
 
-# mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running]
+# mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running] [--undrain]
+# A manual drain already in place at the start is adopted but left ON at the end (--undrain removes it too).
 cmd_upgrade() {
-    local timeout=900 dry=0 force_running=0 resume=0 holder
+    local timeout=900 dry=0 force_running=0 resume=0 undrain=0 holder
     while [ $# -gt 0 ]; do
         case "$1" in
             --timeout) [ $# -ge 2 ] || _die "upgrade: --timeout needs a value"; timeout="$2"; shift 2 ;;
             --dry-run) dry=1; shift ;;
             --resume) resume=1; shift ;;
             --restart-with-running) force_running=1; shift ;;
-            *) _die "usage: mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running]" ;;
+            --undrain) undrain=1; shift ;;
+            *) _die "usage: mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running] [--undrain]" ;;
         esac
     done
     case "$timeout" in ''|*[!0-9]*) _die "upgrade: --timeout must be a whole number of seconds" ;; esac
@@ -241,17 +243,17 @@ cmd_upgrade() {
     if [ -d "$_UPGRADE_LOCKDIR" ] && [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
         _die "upgrade: another mother upgrade is already running (pid $holder, $_UPGRADE_LOCKDIR)"
     fi
-    _switch_with_lock "$_UPGRADE_LOCKDIR" upgrade 20 _upgrade_locked "$dry" "$force_running" "$timeout" \
+    _switch_with_lock "$_UPGRADE_LOCKDIR" upgrade 20 _upgrade_locked "$dry" "$force_running" "$timeout" "$undrain" \
         || _die "upgrade: could not take $_UPGRADE_LOCKDIR (another upgrade is starting?)"
 }
 
 _upgrade_locked() {
-    local dry="$1" force_running="$2" timeout="$3"
+    local dry="$1" force_running="$2" timeout="$3" undrain="$4"
     trap '_upgrade_on_signal INT' INT
     trap '_upgrade_on_signal TERM' TERM
     trap '_upgrade_on_exit' EXIT
 
-    local root cli bin_dir rtop btop branch old_full head_full target pending new new_full resuming=0 prev_step=""
+    local root cli bin_dir rtop btop branch old_full head_full target pending new new_full resuming=0 prev_step="" manual=false
     root="$(mother_code_root)/mother"
     bin_dir="${MOTHER_BIN_DIR:-$(cd "$(dirname "$0")" && pwd)}"
     cli="${MOTHER_UPGRADE_CLI:-$bin_dir/mother}"
@@ -315,8 +317,14 @@ _upgrade_locked() {
 
     _UPGRADE_STEP="drain"
     if [ "$resuming" -eq 0 ]; then
-        mother_drain_set "mother upgrade" || _upgrade_fail "could not write drain flag"
-        _drain_update '.upgrade = {old_sha: $o, step: "drain"}' --arg o "$old_full" || _upgrade_fail "could not record the upgrade in the drain flag"
+        manual=false
+        if mother_drain_active && _drain_flag_readable; then
+            manual=true   # keep the operator's own reason/by; only add the upgrade record
+        else
+            mother_drain_set "mother upgrade" || _upgrade_fail "could not write drain flag"
+        fi
+        _drain_update '.upgrade = {old_sha: $o, step: "drain", manual: $m}' --arg o "$old_full" --argjson m "$manual" \
+            || _upgrade_fail "could not record the upgrade in the drain flag"
     fi
     echo "upgrade: drain ON"
 
@@ -353,10 +361,11 @@ _upgrade_locked() {
     local oldpid="" newpid="" tries=0 logf="$RUNNER_DIR/runner.log" logsize
     [ -f "$RUNNER_DIR/runner.pid" ] && oldpid=$(cat "$RUNNER_DIR/runner.pid" 2>/dev/null)
     logsize=$(wc -c < "$logf" 2>/dev/null | tr -d ' '); logsize="${logsize:-0}"
-    _upgrade_cmd "$cli" daemon stop || _upgrade_fail "mother daemon stop failed"
+    # Armed BEFORE the stop: a signal or failure while `daemon stop` runs (it may go on to kill the runner
+    # after we are gone) must still say the daemon may be down. Cleared only once the new runner is verified.
     _UPGRADE_DAEMON_STOPPED=1
+    _upgrade_cmd "$cli" daemon stop || _upgrade_fail "mother daemon stop failed"
     _upgrade_cmd "$cli" daemon start || _upgrade_fail "mother daemon start failed"
-    _UPGRADE_DAEMON_STOPPED=0
     while [ "$tries" -lt 20 ]; do
         newpid=$(cat "$RUNNER_DIR/runner.pid" 2>/dev/null)
         if [ -n "$newpid" ] && [ "$newpid" != "$oldpid" ] && kill -0 "$newpid" 2>/dev/null \
@@ -367,14 +376,20 @@ _upgrade_locked() {
     sleep "${MOTHER_UPGRADE_SETTLE_S:-3}"
     { kill -0 "$newpid" 2>/dev/null && [ "$(cat "$RUNNER_DIR/runner.pid" 2>/dev/null)" = "$newpid" ]; } \
         || _upgrade_fail "runner pid $newpid did not stay alive after the restart (see $logf)"
+    _UPGRADE_DAEMON_STOPPED=0
 
     _UPGRADE_STEP="verify"
     _upgrade_record_step
     _upgrade_cmd "$cli" status || _upgrade_fail "mother status does not answer after restart"
 
     _UPGRADE_STEP="undrain"
-    mother_drain_clear || _upgrade_fail "could not remove the drain flag"
-    echo "upgrade: drain OFF"
+    if [ "$(jq -r '.upgrade.manual // false' "$(mother_drain_file)" 2>/dev/null)" = "true" ] && [ "$undrain" -ne 1 ]; then
+        _drain_update 'del(.upgrade)' || _upgrade_fail "could not update the drain flag"
+        echo "upgrade: drain left ON (it was set manually before the upgrade); \`mother undrain\` resumes dispatch"
+    else
+        mother_drain_clear || _upgrade_fail "could not remove the drain flag"
+        echo "upgrade: drain OFF"
+    fi
 
     echo "upgrade: done. $(git -C "$root" rev-parse --short "$old_full") -> $new (runner pid $newpid)"
     "$cli" limiter status 2>/dev/null | head -1 || true

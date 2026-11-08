@@ -813,3 +813,97 @@ _failed_restart_upgrade() {
     ! _drain_on
     [ "$(grep -c 'mother-runner started' "$RUNNER_DIR/runner.log")" -eq 2 ]
 }
+
+# ---- round 2: STOPPED warning armed before `daemon stop`; fail-closed; stable unreadable time; manual drain ----
+
+# CLI stub whose `daemon stop` sleeps (signals in-stop first), or fails, per $MOTHER_ROOT/stop-mode.
+_stop_stub() {
+    local real="$MOTHER_ROOT/cli-stub-real"
+    mv "$MOTHER_ROOT/cli-stub" "$real"
+    cat > "$MOTHER_ROOT/cli-stub" <<EOF2
+#!/usr/bin/env bash
+if [ "\$1 \$2" = "daemon stop" ]; then
+    case "\$(cat "$MOTHER_ROOT/stop-mode" 2>/dev/null)" in
+        slow) touch "$MOTHER_ROOT/in-stop"; sleep 2; exit 0 ;;
+        fail) echo "stop exploded" >&2; exit 1 ;;
+    esac
+fi
+exec "$real" "\$@"
+EOF2
+    chmod +x "$MOTHER_ROOT/cli-stub"
+}
+
+@test "SIGTERM DURING daemon stop: prints the STOPPED warning with the recovery command, leaves drain on" {
+    _upgrade_setup; _push_upstream x.txt; _stop_stub
+    echo slow > "$MOTHER_ROOT/stop-mode"
+    local out="$MOTHER_ROOT/upgrade.out"
+    _upgrade_bg "$out"
+    _wait_until 20 test -f "$MOTHER_ROOT/in-stop"
+    kill -TERM "$UPID"
+    _upgrade_reap
+    [ "$URC" -ne 0 ]
+    grep -qi 'interrupted' "$out"
+    grep -q 'daemon is STOPPED' "$out"
+    grep -q 'mother daemon start' "$out"
+    _drain_on
+    [ ! -e "$RUNNER_DIR/upgrade.lockdir" ]
+}
+
+# (No SIGINT variant: a backgrounded non-interactive bash starts with INT ignored; _upgrade_on_signal serves INT and TERM alike.)
+
+@test "a failed daemon stop also warns that the daemon may be STOPPED" {
+    _upgrade_setup; _push_upstream x.txt; _stop_stub
+    echo fail > "$MOTHER_ROOT/stop-mode"
+    run _mu upgrade
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"daemon stop failed"* ]]
+    [[ "$output" == *"daemon is STOPPED"* ]]
+    _drain_on
+}
+
+@test "fail closed: with lib/drain.sh missing, run --once and force-start refuse with a clear message" {
+    mkdir -p "$MOTHER_ROOT/libcopy"
+    cp "$MOTHER_LIB_DIR"/* "$MOTHER_ROOT/libcopy/" 2>/dev/null || true
+    rm -f "$MOTHER_ROOT/libcopy/drain.sh"
+    _ready_job d-fc
+    MOTHER_LIB_DIR="$MOTHER_ROOT/libcopy" run mother run --once < /dev/null
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"lib/drain.sh is missing"* ]]
+    [[ "$output" == *"draining"* ]]
+    MOTHER_LIB_DIR="$MOTHER_ROOT/libcopy" run mother force-start d-fc < /dev/null
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"lib/drain.sh is missing"* ]]
+    [ "$(_state_of d-fc)" = "ready" ]
+}
+
+@test "corrupt drain flag: the unreadable attention item keeps a stable first-seen time" {
+    echo 'not json' > "$RUNNER_DIR/drain.json"
+    local a b
+    a=$(_m status --format json 2>/dev/null | jq -r '[.needs_attention[] | select(.kind == "drain_stuck")][0].since')
+    sleep 1.2
+    b=$(_m status --format json 2>/dev/null | jq -r '[.needs_attention[] | select(.kind == "drain_stuck")][0].since')
+    [ -n "$a" ] && [ "$a" != "null" ]
+    [ "$a" = "$b" ]
+    _m undrain >/dev/null
+    [ ! -e "$RUNNER_DIR/drain.json.unreadable-since" ]
+}
+
+@test "upgrade leaves a manual drain that was already on, ON at the end, and says so; reason is kept" {
+    _upgrade_setup; _push_upstream x.txt
+    _m drain --reason "manual hold" >/dev/null
+    run _mu upgrade
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"left ON"* ]]
+    _drain_on
+    [ "$(jq -r '.reason' "$RUNNER_DIR/drain.json")" = "manual hold" ]
+    [ "$(jq -r '.upgrade // "none"' "$RUNNER_DIR/drain.json")" = "none" ]
+    grep -q 'daemon stop' "$MOTHER_ROOT/steps.log"
+}
+
+@test "upgrade --undrain removes a manual drain at the end" {
+    _upgrade_setup; _push_upstream x.txt
+    _m drain --reason "manual hold" >/dev/null
+    run _mu upgrade --undrain
+    [ "$status" -eq 0 ]
+    ! _drain_on
+}
