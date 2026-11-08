@@ -104,6 +104,7 @@ func main() {
 		os.Exit(1)
 	}
 	if *secretsFD > 2 {
+		syscall.CloseOnExec(*secretsFD) // stays open for the daemon's life: the applier and any child must not inherit it
 		f := os.NewFile(uintptr(*secretsFD), "secrets")
 		// Registrations are read for as long as the launcher keeps the descriptor open, so a restarted worker
 		// (a new pid) is re-registered without restarting the coordinator. Only this inherited fd registers.
