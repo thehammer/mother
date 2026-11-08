@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -65,8 +66,22 @@ func statusJSON(r string) int {
 	return 0
 }
 
+// parseRegistration parses one `worker-id=pid=secret` line. The pid is the worker daemon's real pid: a
+// registration without one is refused (no binding to the first connection).
+func parseRegistration(line string) (id string, pid int, secret string, err error) {
+	parts := strings.SplitN(strings.TrimSpace(line), "=", 3)
+	if len(parts) != 3 || parts[0] == "" {
+		return "", 0, "", errors.New("want worker-id=pid=secret")
+	}
+	pid, err = strconv.Atoi(parts[1])
+	if err != nil || pid <= 0 {
+		return "", 0, "", fmt.Errorf("worker %q: pid %q is not a real pid", parts[0], parts[1])
+	}
+	return parts[0], pid, parts[2], nil
+}
+
 func main() {
-	secretsFD := flag.Int("secrets-fd", 0, "inherited fd carrying one `worker-id=secret` line per worker this coordinator accepts")
+	secretsFD := flag.Int("secrets-fd", 0, "inherited fd carrying `worker-id=pid=secret` lines (the daemon pid), read until closed")
 	status := flag.Bool("status-json", false, "print connected workers, caps, slots, active leases and heartbeat ages as JSON")
 	flag.Parse()
 	r := root()
@@ -90,19 +105,21 @@ func main() {
 	}
 	if *secretsFD > 2 {
 		f := os.NewFile(uintptr(*secretsFD), "secrets")
-		sc := bufio.NewScanner(f)
-		for sc.Scan() {
-			id, secret, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
-			if !ok || id == "" {
-				continue
+		// Registrations are read for as long as the launcher keeps the descriptor open, so a restarted worker
+		// (a new pid) is re-registered without restarting the coordinator. Only this inherited fd registers.
+		go func() {
+			sc := bufio.NewScanner(f)
+			for sc.Scan() {
+				id, pid, secret, err := parseRegistration(sc.Text())
+				if err == nil {
+					err = s.RegisterWorker(id, pid, secret)
+				}
+				if err != nil {
+					logf("refusing registration: %v", err)
+				}
 			}
-			if err := s.RegisterWorker(id, 0, secret); err != nil {
-				fmt.Fprintln(os.Stderr, "mother-coord:", err)
-				release()
-				os.Exit(1)
-			}
-		}
-		f.Close() // never inherited by the applier or anything else
+			f.Close() // never inherited by the applier or anything else
+		}()
 	}
 	ln, err := coord.Listen(r)
 	if err != nil {

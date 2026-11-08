@@ -108,6 +108,7 @@ type connState struct {
 	pre     bool // has not completed hello
 	evicted bool
 	at      time.Time
+	pid     int // peer pid, 0 when unknown
 }
 
 // Server is the coordinator. One mutex guards all state; connection goroutines only parse, then
@@ -129,6 +130,7 @@ type Server struct {
 
 	wg      sync.WaitGroup
 	connMu  sync.Mutex
+	pidSet  map[int]struct{} // registered worker pids; guarded by connMu (exempt from pre-hello eviction)
 	conns   map[*connState]struct{}
 	preConn int
 }
@@ -236,7 +238,7 @@ func (s *Server) restore() error {
 		s.loadCmds(jl)
 		for _, c := range jl.cmds {
 			if f, err := workerproto.Decode(c.Frame); err == nil {
-				s.adm.Issued(f)
+				s.adm.IssuedTo(jl.rec.WorkerID, f)
 			}
 		}
 		s.jobs[r.Job] = jl
@@ -277,6 +279,12 @@ func isTransient(err error) bool {
 // pre-hello connection is evicted (an idle flood cannot starve a real worker's handshake); when the total
 // is full the new socket is refused.
 func (s *Server) admitConn(c net.Conn) *connState {
+	pid := 0
+	if uc, ok := c.(*net.UnixConn); ok {
+		if _, p, err := peerCred(uc); err == nil {
+			pid = p
+		}
+	}
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	if len(s.conns) >= s.cfg.MaxConns {
@@ -285,6 +293,9 @@ func (s *Server) admitConn(c net.Conn) *connState {
 	if s.preConn >= s.cfg.MaxPreHello {
 		var oldest *connState
 		for cs := range s.conns {
+			if _, isWorker := s.pidSet[cs.pid]; isWorker && cs.pid > 0 {
+				continue // a flood of sockets must not evict the registered worker's own connection
+			}
 			if cs.pre && !cs.evicted && (oldest == nil || cs.at.Before(oldest.at)) {
 				oldest = cs
 			}
@@ -296,7 +307,7 @@ func (s *Server) admitConn(c net.Conn) *connState {
 		s.preConn--
 		oldest.c.Close()
 	}
-	cs := &connState{c: c, pre: true, at: time.Now()}
+	cs := &connState{c: c, pre: true, at: time.Now(), pid: pid}
 	s.conns[cs] = struct{}{}
 	s.preConn++
 	return cs
@@ -647,7 +658,7 @@ func (s *Server) register(w *workerConn, welcome *workerproto.Welcome) {
 				continue
 			}
 			if f, err := workerproto.Decode(c.Frame); err == nil {
-				s.adm.Issued(f)
+				s.adm.IssuedTo(jl.rec.WorkerID, f)
 			}
 			s.enqueue(w, append(append([]byte{}, c.Frame...), '\n'))
 		}
@@ -838,6 +849,25 @@ func (s *Server) onCmdAck(w *workerConn, f workerproto.Frame) {
 		s.persistRec(jl)
 		_ = s.persistTable()
 		_ = os.Remove(s.dispatchPath(jl.job))
+		s.dropOldRevokes(jl)
+	}
+}
+
+// dropOldRevokes drops owed lease.revoke commands of earlier leases of the job (carried into this lease's
+// list by offer): once the worker has accepted the new offer it has certainly stopped the old one.
+func (s *Server) dropOldRevokes(jl *jobLease) {
+	keep := jl.cmds[:0]
+	for _, c := range jl.cmds {
+		if c.Type == workerproto.TypeLeaseRevoke {
+			if f, err := workerproto.Decode(c.Frame); err == nil && f.Lease != nil && *f.Lease != jl.rec.LeaseID {
+				continue
+			}
+		}
+		keep = append(keep, c)
+	}
+	if len(keep) != len(jl.cmds) {
+		jl.cmds = keep
+		s.persistCmds(jl)
 	}
 }
 
@@ -1247,7 +1277,7 @@ func (s *Server) queueCmd(jl *jobLease, t string, data any) error {
 	_ = json.Unmarshal(f.Data, &c)
 	jl.cmds = append(jl.cmds, cmdEntry{ID: c.CmdID, Type: t, Frame: []byte(strings.TrimRight(string(b), "\n"))})
 	s.persistCmds(jl)
-	s.adm.Issued(f)
+	s.adm.IssuedTo(jl.rec.WorkerID, f)
 	if w := s.workers[jl.rec.WorkerID]; w != nil {
 		s.enqueue(w, b)
 	}

@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"mother-broker/coord"
 	"mother-broker/workerproto"
 )
 
@@ -81,7 +80,7 @@ func (d *Daemon) runSession(ctx context.Context) (welcomed bool, err error) {
 		nb := make([]byte, 16)
 		_, _ = cryptorand.Read(nb)
 		h.Auth.Nonce = hex.EncodeToString(nb) // per connection
-		h.Auth.Credential = coord.CredentialProof(d.cfg.Secret, h)
+		h.Auth.Credential = workerproto.CredentialProof(d.cfg.Secret, h)
 	}
 	hello := helloData{Hello: h, Slots: d.cfg.Slots}
 	b, err := build(workerproto.TypeHello, nil, nil, hello)

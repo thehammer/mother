@@ -7,8 +7,9 @@
 #
 #   coordinator   MOTHER_ROOT=<canonical root C>, MOTHER_LEASE_TTL_S (tests use 6; default 180). Writes
 #                 runner/coord/coord.pid, listens on runner/coord/worker.sock (0600, in the 0700 runner/coord dir),
-#                 accepts only workers whose id has a secret handed over `--secrets-fd` ("id=secret" lines) and
-#                 whose hello proves it, refreshes runner/coord-status.json once a
+#                 accepts only workers registered over `--secrets-fd` ("id=pid=secret" lines, the daemon's real pid, read
+#                 while the fd stays open; a registration without a real pid is refused) and whose hello proves
+#                 the secret from that pid, refreshes runner/coord-status.json once a
 #                 second (`mother-coord --status-json` is a reader of it). Dispatch request: a file
 #                 runner/dispatch/<job>.json = {"job":"<id>"}; the coordinator leases the job to a connected worker
 #                 with a free slot, records runner/leases/<job>.json
@@ -73,6 +74,11 @@ setup() {
     CW_SECRET_W1="cw-secret-w1-$$-$RANDOM$RANDOM"
     CW_SECRET_PROBE="cw-secret-probe-$$-$RANDOM$RANDOM"
     CW_PIDS="$MOTHER_ROOT/cw-pids"
+    # Registrations (worker-id=pid=secret lines) reach the coordinator over an inherited fd 4 on this fifo, held
+    # open read-write by the launcher for the daemon's life; the pids and secrets live in shell variables only.
+    CW_REG="$BATS_TEST_TMPDIR/cw-reg.fifo"
+    mkfifo "$CW_REG"
+    CW_REG_W1="" CW_REG_PROBE=""
     CW_TTL=6
     export CW_CLAUDE_DIR="$MOTHER_ROOT/claude"
     CW_NORM_ROOTS="$CW_L $CW_W $CW_C"
@@ -282,11 +288,23 @@ _cw_coord_up_new() {
 _cw_start_coord() {
     local old; old=$(_cw_coord_pid)
     mkdir -p "$CW_C/runner"
-    ( cd / && MOTHER_LEASE_TTL_S="$CW_TTL" exec mother-coord --secrets-fd 4 \
-        4< <(printf 'w1=%s\ncw-probe=%s\n' "$CW_SECRET_W1" "$CW_SECRET_PROBE") ) >> "$CW_C/coord.out" 2>&1 3>&- &
+    ( cd / && MOTHER_LEASE_TTL_S="$CW_TTL" exec mother-coord --secrets-fd 4 ) \
+        4<>"$CW_REG" >> "$CW_C/coord.out" 2>&1 3>&- &
     _cw_note P "$!"
     _cw_must 20 "coordinator to publish its pid and socket" _cw_coord_up_new "$old" || return 1
     _cw_note P "$(_cw_coord_pid)"
+    # A new coordinator has forgotten every registration: replay the live workers' (id=pid=secret).
+    [ -z "$CW_REG_W1" ] || printf 'w1=%s=%s\n' "$CW_REG_W1" "$CW_SECRET_W1" > "$CW_REG"
+    [ -z "$CW_REG_PROBE" ] || printf 'cw-probe=%s=%s\n' "$CW_REG_PROBE" "$CW_SECRET_PROBE" > "$CW_REG"
+}
+
+# _cw_register w1|cw-probe <pid> — tell the running coordinator the real pid of a worker daemon (or probe client).
+_cw_register() {
+    case "$1" in
+        w1) CW_REG_W1="$2"; _cw_alive "$(_cw_coord_pid)" && printf 'w1=%s=%s\n' "$2" "$CW_SECRET_W1" > "$CW_REG" ;;
+        cw-probe) CW_REG_PROBE="$2"; _cw_alive "$(_cw_coord_pid)" && printf 'cw-probe=%s=%s\n' "$2" "$CW_SECRET_PROBE" > "$CW_REG" ;;
+    esac
+    return 0
 }
 
 # _cw_stop_coord — SIGKILL the coordinator by the exact pid it published (a crash, not a clean stop).
@@ -319,12 +337,15 @@ _cw_start_worker() {
             MOTHER_ROOT="$CW_W" MOTHER_WORKER_BACKOFF_MAX_S=2 \
             mother-worker --id w1 --root "$CW_W" --coord-sock "$sock" --slots 2 --secret-fd 4
     ) 4< <(printf '%s\n' "$CW_SECRET_W1") >> "$CW_C/worker.out" 2>&1 3>&- &
-    _cw_note P "$!"
+    local launched=$!
+    _cw_note P "$launched"
+    _cw_register w1 "$launched"   # exec chain: the subshell's pid is the daemon's pid
     _cw_must 20 "worker.pid to appear" _cw_worker_up_new "$old" || return 1
     local pid pgid
     read -r pid pgid < "$CW_W/worker.pid"
     _cw_note P "$pid"
     _cw_note G "$pgid"
+    [ "$pid" = "$launched" ] || _cw_register w1 "$pid"
 }
 
 _cw_connected() {
@@ -691,7 +712,19 @@ _cw_write_fence_client() {
     cat > "$BATS_TEST_TMPDIR/fence_client.py" <<'PY'
 import datetime, hashlib, hmac, json, os, socket, sys, uuid
 
-sock_path, job, lease, epoch, worker, marker = sys.argv[1:7]
+go = os.environ.get("CW_GO")
+if go:
+    # Probe host mode: the process (and so its pid) exists first and is registered with the coordinator; the
+    # arguments arrive in the CW_GO file, the output goes to CW_OUT and the exit code to CW_OUT.rc.
+    import time
+    for _ in range(1800):
+        if os.path.exists(go):
+            break
+        time.sleep(0.1)
+    sock_path, job, lease, epoch, worker, marker = open(go).read().split()
+    sys.stdout = open(os.environ["CW_OUT"], "w")
+else:
+    sock_path, job, lease, epoch, worker, marker = sys.argv[1:7]
 secret = os.environ.get("CW_PROBE_SECRET", "")
 CAPS = ["log.stream", "artifact.chunked", "checkpoint.v1", "hold.boundary"]
 
@@ -714,32 +747,45 @@ def frame(t, data, job=None, lease=None, epoch=None, seq=None, ack=None):
                        "epoch": epoch, "seq": seq, "ack": ack, "data": data}, separators=(",", ":")) + "\n"
 
 
-s = socket.socket(socket.AF_UNIX)
-s.settimeout(10)
-s.connect(sock_path)
-rf = s.makefile("rb")
-instance = "i-" + uuid.uuid4().hex[:16]
-nonce = uuid.uuid4().hex
-s.sendall(frame("hello", {"proto_min": 1, "proto_max": 1, "caps": CAPS,
-                          "worker_id": worker, "instance_id": instance, "kind": "worker",
-                          "auth": {"method": "peercred", "nonce": nonce, "credential": proof(instance, nonce)}}).encode())
-line = rf.readline()
-if not line or json.loads(line).get("t") != "welcome":
-    print(line.decode(errors="replace"))
-    sys.exit(2)
-s.sendall(frame("event.append", {"line": json.dumps({"kind": marker})}, job=job, lease=lease,
-                epoch=int(epoch), seq=1).encode())
+def run():
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(10)
+    s.connect(sock_path)
+    rf = s.makefile("rb")
+    instance = "i-" + uuid.uuid4().hex[:16]
+    nonce = uuid.uuid4().hex
+    s.sendall(frame("hello", {"proto_min": 1, "proto_max": 1, "caps": CAPS,
+                              "worker_id": worker, "instance_id": instance, "kind": "worker",
+                              "auth": {"method": "peercred", "nonce": nonce, "credential": proof(instance, nonce)}}).encode())
+    line = rf.readline()
+    if not line or json.loads(line).get("t") != "welcome":
+        print(line.decode(errors="replace"))
+        sys.exit(2)
+    s.sendall(frame("event.append", {"line": json.dumps({"kind": marker})}, job=job, lease=lease,
+                    epoch=int(epoch), seq=1).encode())
+    try:
+        while True:
+            line = rf.readline()
+            if not line:
+                sys.exit(4)
+            f = json.loads(line)
+            if f.get("t") == "refuse":
+                print(line.decode().strip())
+                sys.exit(0)
+    except socket.timeout:
+        sys.exit(3)
+
+
 try:
-    while True:
-        line = rf.readline()
-        if not line:
-            sys.exit(4)
-        f = json.loads(line)
-        if f.get("t") == "refuse":
-            print(line.decode().strip())
-            sys.exit(0)
-except socket.timeout:
-    sys.exit(3)
+    run()
+    rc = 0
+except SystemExit as e:
+    rc = e.code or 0
+sys.stdout.flush()
+if go:
+    with open(os.environ["CW_OUT"] + ".rc", "w") as fh:
+        fh.write(str(rc))
+sys.exit(rc)
 PY
 }
 
@@ -756,7 +802,16 @@ PY
     stale=$(( epoch + 5 ))
 
     _cw_write_fence_client
-    run env CW_PROBE_SECRET="$CW_SECRET_PROBE" python3 -I "$BATS_TEST_TMPDIR/fence_client.py" "$CW_SOCK" "$id" "$lease" "$stale" "cw-probe" "fenced_probe_marker"
+    # The probe is a registered client: its pid is told to the coordinator before it says hello.
+    CW_GO="$BATS_TEST_TMPDIR/probe.go" CW_OUT="$BATS_TEST_TMPDIR/probe.out" CW_PROBE_SECRET="$CW_SECRET_PROBE" \
+        python3 -I "$BATS_TEST_TMPDIR/fence_client.py" &
+    local probe=$!
+    _cw_note P "$probe"
+    _cw_register cw-probe "$probe"
+    printf '%s %s %s %s %s %s' "$CW_SOCK" "$id" "$lease" "$stale" "cw-probe" "fenced_probe_marker" > "$BATS_TEST_TMPDIR/probe.go"
+    _cw_must 30 "the probe to finish" test -f "$BATS_TEST_TMPDIR/probe.out.rc"
+    status=$(cat "$BATS_TEST_TMPDIR/probe.out.rc")
+    output=$(cat "$BATS_TEST_TMPDIR/probe.out")
     if [ "$status" -ne 0 ]; then echo "client exited $status: $output" >&2; return 1; fi
     local code
     code=$(printf '%s' "$output" | jq -r '.data.code')
@@ -902,4 +957,23 @@ PY
     [ -f "$CW_W/applied-cmds.json" ]
     [ "$(grep -o 'cancel-cmd-1' "$CW_W/applied-cmds.json" | wc -l | tr -d ' ')" = "1" ]
     [ "$(grep -o 'offer-cmd-1' "$CW_W/applied-cmds.json" | wc -l | tr -d ' ')" = "1" ]
+}
+
+# ===========================================================================
+# 12. The worker secret is fd-only
+
+@test "a worker started without a secret fd refuses to run, even with the secret in its environment" {
+    run env MOTHER_WORKER_SECRET="$CW_SECRET_W1" MOTHER_WORKER_SECRET_FD="" MOTHER_ROOT="$CW_W" \
+        mother-worker --id w1 --root "$CW_W" --coord-sock "$CW_SOCK" --slots 1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"secret fd"* ]]
+    [ ! -e "$CW_W/worker.pid" ]
+}
+
+@test "the secret is not in the running worker's own environment block" {
+    _cw_boot "cw-env" 20
+    local pid; read -r pid _ < "$CW_W/worker.pid"
+    _cw_num "$pid"
+    ! ps eww -o command= -p "$pid" 2>/dev/null | grep -q "$CW_SECRET_W1"
+    ! ps eww -o command= -p "$pid" 2>/dev/null | grep -q "MOTHER_WORKER_SECRET="
 }

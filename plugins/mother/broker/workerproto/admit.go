@@ -32,6 +32,7 @@ func NewAdmitter(leases *LeaseTable, jobState func(job string) JobState) *Admitt
 type issuedRec struct {
 	typ, job, lease string
 	epoch           int64
+	worker          string // the worker the command was issued to ("" = unrecorded)
 }
 
 func (r issuedRec) forLease(f Frame) bool {
@@ -69,14 +70,18 @@ func (a *Admitter) stream(f Frame) *InStream {
 
 // Issued records a command the coordinator is about to send, so a later cmd.ack is judged against what
 // was really issued and not against the worker's own `for` field. The record is bounded by DedupeHorizon.
-func (a *Admitter) Issued(f Frame) {
+func (a *Admitter) Issued(f Frame) { a.IssuedTo("", f) }
+
+// IssuedTo is Issued for a command sent to worker. A lease.revoke ack is judged against this record (the
+// lease and worker the revoke was issued for), not against whatever lease the job holds now.
+func (a *Admitter) IssuedTo(worker string, f Frame) {
 	var c struct {
 		CmdID string `json:"cmd_id"`
 	}
 	if !commandTypes[f.T] || json.Unmarshal(f.Data, &c) != nil || c.CmdID == "" {
 		return
 	}
-	rec := issuedRec{typ: f.T}
+	rec := issuedRec{typ: f.T, worker: worker}
 	if f.Job != nil && f.Lease != nil && f.Epoch != nil {
 		rec.job, rec.lease, rec.epoch = *f.Job, *f.Lease, *f.Epoch
 	}
@@ -139,8 +144,13 @@ func (a *Admitter) Admit(worker string, line []byte, now time.Time) (Admission, 
 		// An ack of a lease.revoke is judged on the coordinator's own record too: the lease is already
 		// ended (so the fence below would refuse it), but the revoke must still be acknowledgeable.
 		if known && rec.typ == TypeLeaseRevoke && rec.forLease(f) {
-			// Only the worker that held the revoked lease may acknowledge it.
-			if l, ok := a.leases.Get(*f.Job); !ok || l.ID != *f.Lease || l.Worker != worker {
+			// Only the worker the revoke was issued to may acknowledge it, even when the job has since
+			// been re-leased (the issued record, not the current table entry, names the lease).
+			if rec.worker != "" {
+				if rec.worker != worker {
+					return adm, protoErr(CodeNotLeased, "lease %s is not held by this worker", *f.Lease)
+				}
+			} else if l, ok := a.leases.Get(*f.Job); !ok || l.ID != *f.Lease || l.Worker != worker {
 				return adm, protoErr(CodeNotLeased, "lease %s is not held by this worker", *f.Lease)
 			}
 			break

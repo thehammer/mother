@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -29,28 +30,35 @@ func envDur(name string) time.Duration {
 	return 0
 }
 
-// readSecret takes the worker's coordinator secret from an inherited fd (read once, then closed so no
-// child inherits it) or the environment, and removes it from the environment either way.
-func readSecret(fd int) string {
+// readSecret takes the worker's coordinator secret ONLY from an inherited fd (--secret-fd, else the fd
+// number in $MOTHER_WORKER_SECRET_FD): read once, closed so no child inherits it, held in memory. There is
+// deliberately no environment fallback: the initial environment block stays readable by a same-uid process
+// (/proc/<pid>/environ, `ps eww`), which is exactly the attacker the identity binding is for. With no fd it
+// fails closed. Same-uid ptrace/debugger access is out of scope for the local carrier.
+func readSecret(fd int) (string, error) {
 	if fd == 0 {
 		if v := os.Getenv("MOTHER_WORKER_SECRET_FD"); v != "" {
 			fd, _ = strconv.Atoi(v)
 		}
 	}
-	env := os.Getenv("MOTHER_WORKER_SECRET")
-	os.Unsetenv("MOTHER_WORKER_SECRET")
-	os.Unsetenv("MOTHER_WORKER_SECRET_FD")
-	if fd > 2 {
-		f := os.NewFile(uintptr(fd), "secret")
-		if f != nil {
-			b, _ := io.ReadAll(io.LimitReader(f, 4096))
-			f.Close()
-			if v := strings.TrimSpace(string(b)); v != "" {
-				return v
-			}
-		}
+	os.Unsetenv("MOTHER_WORKER_SECRET_FD") // an fd number, not a secret; keep it from children anyway
+	if fd <= 2 {
+		return "", errors.New("no secret fd: pass --secret-fd N (or MOTHER_WORKER_SECRET_FD) with the coordinator secret on an inherited descriptor; the environment is not accepted")
 	}
-	return strings.TrimSpace(env)
+	f := os.NewFile(uintptr(fd), "secret")
+	if f == nil {
+		return "", fmt.Errorf("secret fd %d is not open", fd)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 4096))
+	f.Close()
+	if err != nil {
+		return "", fmt.Errorf("reading secret fd %d: %w", fd, err)
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return "", fmt.Errorf("secret fd %d was empty", fd)
+	}
+	return v, nil
 }
 
 func main() {
@@ -58,7 +66,7 @@ func main() {
 	root := flag.String("root", "", "worker root directory (required)")
 	sock := flag.String("coord-sock", "", "coordinator socket (default $MOTHER_ROOT/runner/worker.sock)")
 	slots := flag.Int("slots", 1, "jobs this worker runs at once")
-	secretFD := flag.Int("secret-fd", 0, "inherited fd to read this worker's coordinator secret from (else $MOTHER_WORKER_SECRET_FD, else $MOTHER_WORKER_SECRET)")
+	secretFD := flag.Int("secret-fd", 0, "inherited fd to read this worker's coordinator secret from (else $MOTHER_WORKER_SECRET_FD); required, there is no environment fallback")
 	flag.Parse()
 	if *id == "" || *root == "" {
 		fmt.Fprintln(os.Stderr, "usage: mother-worker --id <name> --root <worker-root> [--coord-sock <path>] [--slots N]")
@@ -92,7 +100,11 @@ func main() {
 	logf := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "%s mother-worker[%s]: %s\n", time.Now().UTC().Format(time.RFC3339), *id, fmt.Sprintf(format, args...))
 	}
-	secret := readSecret(*secretFD)
+	secret, err := readSecret(*secretFD)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mother-worker:", err)
+		os.Exit(1)
+	}
 	d, err := worker.New(worker.Config{
 		Secret: secret, ID: *id, Root: absRoot, CoordSock: *sock, Slots: *slots, BinDir: binDir, LibDir: libDir,
 		BackoffMax: envDur("MOTHER_WORKER_BACKOFF_MAX_S"), Logf: logf,

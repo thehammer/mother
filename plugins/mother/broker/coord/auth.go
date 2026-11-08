@@ -3,7 +3,6 @@ package coord
 import (
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,15 +16,15 @@ import (
 // Worker identity. Same-uid peercred only proves "some process of ours"; a job's agent is exactly that.
 // So a worker id is bound twice: to a per-worker secret (proved in hello.auth.credential, an HMAC over
 // the hello transcript with the worker's nonce) and to the worker daemon's pid (SO_PEERCRED/LOCAL_PEERPID).
-// The secret is memory-only on both ends, handed over an inherited fd (or env var that scrubbedEnv drops).
+// The secret is memory-only on both ends, handed over an inherited fd only (never the environment: the
+// initial environment block stays readable by a same-uid process).
 
 // MinNonce is the shortest hello nonce accepted.
 const MinNonce = 16
 
 type workerCred struct {
-	secret   []byte
-	pid      int  // expected peer pid; 0 = not bound yet
-	explicit bool // pid was registered (launch), not learned: never rebinds while registered
+	secret []byte
+	pid    int // the worker daemon's pid; the only peer pid that may authenticate as this worker
 }
 
 // NewSecret returns a fresh random worker secret (hex).
@@ -35,26 +34,34 @@ func NewSecret() string {
 	return hex.EncodeToString(b)
 }
 
-// CredentialProof is the hello.auth.credential for secret: HMAC-SHA256 over HelloTranscript(h).
-func CredentialProof(secret string, h workerproto.Hello) string {
-	m := hmac.New(sha256.New, []byte(secret))
-	m.Write(workerproto.HelloTranscript(h))
-	return hex.EncodeToString(m.Sum(nil))
-}
-
-// RegisterWorker makes id a known worker. pid is the worker daemon's pid when the caller launched it, or 0
-// to bind to the first authenticated connection. Re-registering replaces the credential and drops any
-// live connection of that id.
+// RegisterWorker makes id a known worker bound to pid, the real pid of the worker daemon the caller
+// launched. A pid <= 0 is refused: binding to "the first authenticated connection" would let any process
+// that learns the secret win the id. Re-registering replaces the credential and pid and drops any live
+// connection of that id.
+//
+// Trust notes: a pid reused by an unrelated process after the worker died makes that worker refuse
+// (pid_mismatch) until it is re-registered or the coordinator restarts. The hello proof has no coordinator
+// challenge; replay of a captured proof is blocked by the pid binding. Same-uid ptrace/debugger access to
+// the worker or coordinator is out of scope for the local carrier.
 func (s *Server) RegisterWorker(id string, pid int, secret string) error {
 	if !workerproto.IDOK(id) {
 		return fmt.Errorf("bad worker id %q", id)
+	}
+	if pid <= 0 {
+		return errors.New("worker pid must be the launched daemon's real pid")
 	}
 	if len(secret) < 16 {
 		return errors.New("worker secret too short")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.creds[id] = &workerCred{secret: []byte(secret), pid: pid, explicit: pid > 0}
+	s.creds[id] = &workerCred{secret: []byte(secret), pid: pid}
+	s.connMu.Lock()
+	if s.pidSet == nil {
+		s.pidSet = map[int]struct{}{}
+	}
+	s.pidSet[pid] = struct{}{}
+	s.connMu.Unlock()
 	if old := s.workers[id]; old != nil {
 		old.close()
 	}
@@ -106,18 +113,15 @@ func (s *Server) authenticate(h workerproto.Hello, peerPID int) string {
 	if len(h.Auth.Nonce) < MinNonce || h.Auth.Credential == "" {
 		return "no_credential"
 	}
-	want := CredentialProof(string(cred.secret), h)
+	want := workerproto.CredentialProof(string(cred.secret), h)
 	if !hmac.Equal([]byte(want), []byte(h.Auth.Credential)) {
 		return "bad_credential"
 	}
-	if cred.pid != 0 && cred.pid != peerPID {
-		if cred.explicit || pidAlive(cred.pid) {
-			return "pid_mismatch"
-		}
+	if cred.pid != peerPID {
+		return "pid_mismatch"
 	}
 	if old := s.workers[h.WorkerID]; old != nil && !old.closed() && old.instance != h.InstanceID {
 		return "already_connected"
 	}
-	cred.pid = peerPID
 	return ""
 }

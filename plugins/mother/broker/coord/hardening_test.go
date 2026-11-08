@@ -90,7 +90,7 @@ func hxMakeHello(id, inst string) workerproto.Hello {
 }
 
 func hxSign(h workerproto.Hello, secret string) workerproto.Hello {
-	h.Auth.Credential = CredentialProof(secret, h)
+	h.Auth.Credential = workerproto.CredentialProof(secret, h)
 	return h
 }
 
@@ -485,6 +485,19 @@ func TestHelperAgentProcess(t *testing.T) {
 			fmt.Println("HX_LISTEN=ok")
 			ln.Close()
 		}
+	case "flood": // many idle sockets from a pid that is not any worker's
+		var keep []net.Conn
+		for i := 0; i < 100; i++ {
+			c, err := net.Dial("unix", os.Getenv("HX_SOCK"))
+			if err != nil {
+				fmt.Println("HX_FLOOD=err")
+				return
+			}
+			keep = append(keep, c)
+		}
+		fmt.Println("HX_FLOOD=ready")
+		time.Sleep(time.Minute)
+		_ = keep
 	case "hello", "launched":
 		id, inst, secret := os.Getenv("HX_ID"), os.Getenv("HX_INST"), os.Getenv("HX_SECRET")
 		if mode == "launched" {
@@ -576,7 +589,7 @@ func TestHandshakeRefusesEveryPeerThatCannotProveTheWorkersCredential(t *testing
 	short.Auth.Nonce = "tooshort"
 	short = hxSign(short, secret) // a valid proof, but over a nonce too short to be fresh
 	replay := hxMakeHello("w1", "i-b")
-	replay.Auth.Credential = CredentialProof(secret, hxMakeHello("w1", "i-a")) // proof lifted from another hello
+	replay.Auth.Credential = workerproto.CredentialProof(secret, hxMakeHello("w1", "i-a")) // proof lifted from another hello
 	other := hxSign(hxMakeHello("w1", "i-o"), NewSecret())
 	unknown := hxSign(hxMakeHello("ghost", "i-g"), secret)
 
@@ -679,30 +692,26 @@ func TestAnotherProcessCannotTakeOverARegisteredWorkerId(t *testing.T) {
 	}
 }
 
-func TestWorkerIdIsBoundToTheFirstAuthenticatedProcessWhenNoPidWasRegistered(t *testing.T) {
+func TestWorkerIdIsBoundToTheRegisteredPidAndAReusedPidIsRefusedUntilReRegistered(t *testing.T) {
 	r := startRig(t, nil, nil)
 	secret := NewSecret()
-	if err := r.s.RegisterWorker("w1", 0, secret); err != nil { // pid 0: bind to the first authenticated peer
+	// Registered with another live process's pid (the test's parent): this process has the secret but not the pid.
+	if err := r.s.RegisterWorker("w1", os.Getppid(), secret); err != nil {
 		t.Fatal(err)
 	}
-	sock := SocketPath(r.root)
-	// A first process authenticates and goes away; its pid is now dead.
-	if got := hxRunHelper(t, "HX_HELPER=hello", "HX_SOCK="+sock, "HX_ID=w1", "HX_INST=i-first", "HX_SECRET="+secret)["HX_REPLY"]; got != "welcome" {
-		t.Fatalf("the first authenticated process was not welcomed: %q", got)
-	}
-	// A restarted worker (this process, a new pid) takes over from the dead binding.
-	w, ok := r.connectEventually("w1", "i-second", secret)
-	if !ok {
-		t.Fatal("a worker restarted after the bound process died was never accepted")
-	}
-	// Now bound to a live pid, another process is refused even with the secret.
-	if got := hxRunHelper(t, "HX_HELPER=hello", "HX_SOCK="+sock, "HX_ID=w1", "HX_INST=i-third", "HX_SECRET="+secret)["HX_REPLY"]; got != "refuse:auth_failed" {
-		t.Fatalf("a process other than the live bound one got %q", got)
+	if _, f := r.connect("w1", "i-1", secret); hxRefuseCode(f) != workerproto.CodeAuthFailed {
+		t.Fatalf("a process with the secret but not the registered pid got %s", f.T)
 	}
 	if hxCountCode(t, r.s, "auth_failed:pid_mismatch") == 0 {
 		t.Fatalf("not audited as pid_mismatch: %v", auditCodes(t, r.s))
 	}
-	_ = w
+	// Re-registering with the real pid (a restarted launch) is what lets it in.
+	if err := r.s.RegisterWorker("w1", os.Getpid(), secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.connectEventually("w1", "i-2", secret); !ok {
+		t.Fatal("the re-registered pid was never accepted")
+	}
 }
 
 func TestLegitimateReconnectResumesTheLeaseAndReplacesTheOldConnection(t *testing.T) {
@@ -789,7 +798,7 @@ func TestLaunchWorkerHandsTheSecretOverAnFdAndRegistersThePid(t *testing.T) {
 	r.s.mu.Lock()
 	c := r.s.creds["wl"]
 	r.s.mu.Unlock()
-	if c == nil || c.pid != pid || !c.explicit {
+	if c == nil || c.pid != pid {
 		t.Fatalf("the launched pid %d was not registered as the worker's explicit pid: %+v", pid, c)
 	}
 }
@@ -1193,19 +1202,23 @@ func TestIdleConnectionFloodDoesNotStarveOrCrashTheCoordinator(t *testing.T) {
 	warm := r.mustConnect("w2", "i-w2", r2secret)
 	base := runtime.NumGoroutine()
 
-	var flood []net.Conn
-	for i := 0; i < 100; i++ {
-		c, err := net.Dial("unix", SocketPath(r.root))
-		if err != nil {
-			t.Fatalf("dial %d: %v", i, err)
-		}
-		flood = append(flood, c)
+	// The flood comes from another process: sockets from the registered worker's own pid are exempt from
+	// eviction, so a same-pid flood would be a different test.
+	fl := exec.Command(os.Args[0], "-test.run=TestHelperAgentProcess")
+	fl.Env = append(os.Environ(), "HX_HELPER=flood", "HX_SOCK="+SocketPath(r.root))
+	fo, err := fl.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		for _, c := range flood {
-			c.Close()
-		}
-	})
+	if err := fl.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stopFlood := func() { _ = fl.Process.Kill(); _ = fl.Wait() }
+	var floodOnce sync.Once
+	t.Cleanup(func() { floodOnce.Do(stopFlood) })
+	if line, _ := bufio.NewReader(fo).ReadString('\n'); !strings.Contains(line, "ready") {
+		t.Fatalf("flood helper: %q", line)
+	}
 	time.Sleep(200 * time.Millisecond)
 	r.s.connMu.Lock()
 	pre, total := r.s.preConn, len(r.s.conns)
@@ -1228,10 +1241,7 @@ func TestIdleConnectionFloodDoesNotStarveOrCrashTheCoordinator(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, c := range flood {
-		c.Close()
-	}
-	flood = nil
+	floodOnce.Do(stopFlood)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		r.s.connMu.Lock()

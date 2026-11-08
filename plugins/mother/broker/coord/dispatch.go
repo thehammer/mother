@@ -72,6 +72,9 @@ func (s *Server) dispatchPass() {
 		if l, ok := s.leases.Get(job); ok && (l.State == workerproto.LeaseOffered || l.State == workerproto.LeaseActive) {
 			continue
 		}
+		if old := s.jobs[job]; old != nil && old.applying {
+			continue // the previous lease's coord_apply is still running: never overlap it; retried next pass
+		}
 		if req.Held != "" {
 			continue // offered and rejected too often: waits for the operator
 		}
@@ -140,6 +143,9 @@ func (s *Server) pickWorker(want string) (*workerConn, string) {
 }
 
 func (s *Server) offer(job string, req dispatchReq, w *workerConn) error {
+	if old := s.jobs[job]; old != nil && old.applying {
+		return fmt.Errorf("previous lease of %s is still applying", job)
+	}
 	jobDoc, err := os.ReadFile(s.jobPath(job))
 	if err != nil {
 		return fmt.Errorf("job doc: %w", err)
