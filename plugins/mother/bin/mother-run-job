@@ -267,6 +267,23 @@ _diff_base() {
     printf '%s' "${v:-${base_ref:-}}"
 }
 
+# _pr_created_this_run <url> -> 0 when GitHub says the PR was created at or
+# after this run's spawn (current_run.spawned_at); 1 when it predates the run
+# or when that cannot be established (gh failure, missing/unparseable
+# timestamps: unverifiable never counts as the job's own). Only consulted for
+# --expect-branch-mismatch jobs, where a head-branch match is not available as
+# evidence: a pre-existing PR merely mentioned in the plan, prompt or log must
+# never be adopted.
+_pr_created_this_run() {
+    local created spawned ce se
+    created=$(gh pr view "$1" --json createdAt -q .createdAt 2>/dev/null || true)
+    spawned=$(jq -r '.current_run.spawned_at // empty' "$job_file" 2>/dev/null)
+    [ -n "$created" ] && [ -n "$spawned" ] || return 1
+    ce=$(_iso_to_epoch "$created"); se=$(_iso_to_epoch "$spawned")
+    [ "${ce:-0}" -gt 0 ] && [ "${se:-0}" -gt 0 ] || return 1
+    [ "$ce" -ge "$se" ]
+}
+
 # Gate for any PR URL scraped out of the worker transcript. Accepts the URL
 # only when GitHub-side evidence ties the PR to THIS job:
 #   - the PR's head branch is the job's branch, or expect_branch_mismatch is set
@@ -318,7 +335,11 @@ GATE_PV_EOF
     [ "$pv_head" = "${branch:-}" ] && return 0
 
     expect_mismatch=$(jq -r '.expect_branch_mismatch // false' "$job_file" 2>/dev/null)
-    [ "$expect_mismatch" = "true" ] && return 0
+    if [ "$expect_mismatch" = "true" ]; then
+        _pr_created_this_run "$url" && return 0
+        _pr_gate_reason="pr_predates_run"
+        return 1
+    fi
 
     # No commits of its own: nothing can be "contained", and HEAD is just the
     # base commit (which a recently merged PR may well contain).
@@ -1905,6 +1926,62 @@ _verify_run_advanced_or_fail() {
     return 1
 }
 
+# _verify_pushed_or_fail — success requires the push. For a job with a pr_url,
+# the PR's head branch on origin must contain the job's final commit. Worktree
+# jobs use HEAD; main-dir jobs (HEAD already restored to the operator's branch)
+# use refs/heads/<branch>. If the commit is missing, try one `git push`; if it
+# is still missing, fail with reason `unpushed_commit` and flag the job for
+# attention. Skips (returns 0) when the check cannot apply: no local checkout,
+# no origin remote, or the final commit cannot be resolved. An origin that
+# exists but cannot be reached fails closed.
+_verify_pushed_or_fail() {
+    [ -n "${work_dir:-}" ] && [ -d "$work_dir" ] || return 0
+    (cd "$work_dir" && git remote get-url origin >/dev/null 2>&1) || return 0
+    local final remote_branch
+    remote_branch=$(jq -r '.actual_branch // empty' "$job_file" 2>/dev/null)
+    [ -n "$remote_branch" ] || remote_branch="$branch"
+    if [ "${isolation:-worktree}" = "main-dir" ]; then
+        final=$(cd "$work_dir" && git rev-parse --verify -q "refs/heads/$branch" 2>/dev/null)
+    else
+        final=$(cd "$work_dir" && git rev-parse --verify -q HEAD 2>/dev/null)
+    fi
+    [ -n "$final" ] || return 0
+
+    local remote_sha=""
+    if _remote_contains_commit "$remote_branch" "$final"; then
+        return 0
+    fi
+    local push_rc=0
+    (cd "$work_dir" && git push origin "$final:refs/heads/$remote_branch" >/dev/null 2>&1) || push_rc=$?
+    if [ "$push_rc" -eq 0 ] && _remote_contains_commit "$remote_branch" "$final"; then
+        _append_event "unpushed_commit_pushed" \
+            "$(jq -nc --arg b "$remote_branch" --arg sha "$final" '{branch: $b, commit: $sha}')"
+        return 0
+    fi
+    remote_sha=$(cd "$work_dir" && git ls-remote origin "refs/heads/$remote_branch" 2>/dev/null | awk '{print $1}' | head -1)
+    local note="the job's final commit is not on origin's $remote_branch and a push attempt did not land it"
+    _job_update ".needs_attention = $(jq -nc --arg note "$note" --arg since "$(iso_now)" \
+        '{reason: "unpushed_commit", note: $note, since: $since}')"
+    _transition failed "$(jq -nc \
+        --arg pr "${pr_url:-}" --arg b "$remote_branch" --arg fin "$final" --arg rs "$remote_sha" \
+        --argjson push_rc "$push_rc" --arg wd "$work_dir" \
+        '{reason: "unpushed_commit", pr_url: $pr, branch: $b, final_commit: $fin, remote_sha: $rs,
+          push_exit_code: $push_rc, work_dir: $wd,
+          note: "run ended with a PR but its final commit is not on the remote branch"}')"
+    return 1
+}
+
+# _remote_contains_commit <branch> <sha> -> 0 when origin's <branch> head
+# contains <sha> (fetch, then merge-base --is-ancestor), else 1.
+_remote_contains_commit() {
+    local rb="$1" sha="$2" rsha
+    rsha=$(cd "$work_dir" && git ls-remote origin "refs/heads/$rb" 2>/dev/null | awk '{print $1}' | head -1)
+    [ -n "$rsha" ] || return 1
+    [ "$rsha" = "$sha" ] && return 0
+    (cd "$work_dir" && git fetch -q origin "refs/heads/$rb" >/dev/null 2>&1) || true
+    (cd "$work_dir" && git merge-base --is-ancestor "$sha" "$rsha" >/dev/null 2>&1)
+}
+
 _verify_artifact_or_fail() {
     # Plans with no_pr:true opt out of the push/PR contract below, but the
     # commits-on-branch contract is enforced, not skipped — see
@@ -1918,8 +1995,12 @@ _verify_artifact_or_fail() {
     # A run that began with a shipped artifact must have advanced it.
     _verify_run_advanced_or_fail || return 1
 
-    # If a pr_url was captured (live or post-loop), the artifact is real.
-    [ -z "${pr_url:-}" ] || return 0
+    # If a pr_url was captured (live or post-loop), the artifact is real, but
+    # only once the job's final commit is on the remote branch.
+    if [ -n "${pr_url:-}" ]; then
+        _verify_pushed_or_fail
+        return $?
+    fi
     # Only worktree jobs carry the "branch must be on origin" contract.
     # main-dir jobs share a workspace and can't be verified this way.
     [ "$isolation" = "worktree" ] || return 0
@@ -2122,6 +2203,16 @@ PV_EOF
 
     # --- branch mismatch ---
     if [ "$expect_mismatch" = "true" ]; then
+        # A PR stored by an earlier run was vetted when captured; a first
+        # capture must have been created by this run.
+        if [ "$first_capture" -eq 1 ] && ! _pr_created_this_run "$pr_url"; then
+            _append_event "pr_url_rejected" \
+                "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
+                    '{url: $url, reason: "pr_predates_run", pr_branch: $prb, job_branch: $jb}')"
+            _job_update ".pr_url = null"
+            pr_url=""
+            return 0
+        fi
         _job_update ".actual_branch = \"$pv_head\""
         _append_event "pr_branch_mismatch_accepted" \
             "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
@@ -2160,6 +2251,13 @@ CAND_EOF
         _append_event "pr_branch_mismatch_unverified" \
             "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
                 '{pr_url: $url, pr_branch: $prb, job_branch: $jb}')"
+        if [ "$first_capture" -eq 1 ]; then
+            # Unverifiable: never adopt a URL on first capture; a later
+            # finalize retries.
+            _job_update ".pr_url = null"
+            pr_url=""
+            return 0
+        fi
         _maybe_emit_pr_opened
         return 0
     fi

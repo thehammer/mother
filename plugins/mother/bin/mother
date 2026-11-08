@@ -3898,7 +3898,10 @@ cmd_adherence_review() {
             adherence_status="failed_first"
             # Store notes and pending_answer; runner re-queues with activity=cody_rework.
             if ! _job_update "$id" \
-                '.adherence_status = $status | .adherence_notes = $notes | .adherence_attempts = $attempts | .pending_answer = $notes' \
+                '.adherence_status = $status | .adherence_notes = $notes | .adherence_attempts = $attempts | .pending_answer = $notes
+                 | .state = "ready" | .activity = "cody_rework" | .finished_at = null | .worker_pid = null
+                 | .cancel_requested = null | .pause_requested = null | .final_result_at = null
+                 | .force_start = null | .force_ignore_deps = null' \
                 --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts"; then
                 echo "mother: adherence-review: failed to record fail for $id" >&2
                 return 2

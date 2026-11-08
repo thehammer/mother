@@ -31,7 +31,7 @@ mother_failure_class() {
             fi ;;
         no_pr_no_push)
             echo "reconcile_then_hold" ;;
-        rework_no_new_commit|branch_create_failed|checkout_failed)
+        rework_no_new_commit|unpushed_commit|branch_create_failed|checkout_failed)
             echo "hold" ;;
         worktree_create_failed|runner_died_early|unspecified|"")
             echo "retry_once" ;;
@@ -84,6 +84,15 @@ EOF
 Job $id's latest run started with an existing PR (${pr:-none}) / origin ref ${rref:-?}@${rsha:-none} and ended without pushing anything new to it, so Mother refused to call it succeeded. Local branch advanced: $la; uncommitted files: $unc.
 Options:
   mother resume $id "commit and push the pending work"
+  mother reconcile $id                    (if the PR is already complete)
+  mother cancel $id
+EOF
+            ;;
+        unpushed_commit)
+            cat <<EOF
+Job $id ended with a PR (${pr:-none}) but its final commit is not on the remote branch ${branch:-?}, and one push attempt did not land it, so Mother refused to call it succeeded. Worktree: $work_dir.
+Options:
+  mother resume $id "push the commit in the worktree (resolve whatever rejected the push)"
   mother reconcile $id                    (if the PR is already complete)
   mother cancel $id
 EOF

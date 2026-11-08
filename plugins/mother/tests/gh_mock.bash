@@ -237,3 +237,11 @@ gh_mock_set_pr_checks() {
     done
     printf '%s' "$out" > "$MOTHER_ROOT/gh/pr-checks/$(_gh_mock_key "$url").json"
 }
+
+# gh_mock_set_pr_created <url> <iso-timestamp>
+#   Adds createdAt to an existing PR fixture (`gh pr view <url> --json createdAt -q .createdAt`).
+gh_mock_set_pr_created() {
+    local f tmp; f=$(_gh_mock_pr_file "$1") || return 1
+    tmp="$f.tmp.$$"
+    jq --arg c "$2" '.createdAt = $c' "$f" > "$tmp" && mv "$tmp" "$f"
+}
