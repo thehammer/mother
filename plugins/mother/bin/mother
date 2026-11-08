@@ -2576,9 +2576,10 @@ HITEOF
 
     # A fork PR with the job's branch name is not the job's PR.
     if [ "$verified" -eq 1 ] && [ -n "$url" ] && [ "$match_kind" != "asserted" ]; then
-        if [ "$(gh pr view "$url" --json isCrossRepository -q '.isCrossRepository' 2>/dev/null)" = "true" ]; then
-            verified=0
-        fi
+        # Fail closed: a gh failure (empty answer) or a fork is not verified.
+        local cross_flag
+        cross_flag=$(gh pr view "$url" --json isCrossRepository -q '.isCrossRepository' 2>/dev/null)
+        case "$cross_flag" in true|"") verified=0 ;; esac
     fi
 
     if [ "$verified" -ne 1 ]; then

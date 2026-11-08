@@ -2247,8 +2247,6 @@ _finalize_pr_url() {
     if [ -z "$pv_head" ]; then
         if _pr_view_fields "$pr_url"; then
             pv_head="$_pv_head"; pv_cross="$_pv_cross"; pv_created="$_pv_created"
-        else
-            pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
         fi
     fi
 

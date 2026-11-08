@@ -664,6 +664,9 @@ case "\$*" in
     *"commits/$head_sha/pulls"*)
         printf '[{"state":"open","updated_at":"2026-01-01T00:00:00Z","html_url":"$pr"}]\n'
         ;;
+    *"pr view $pr --json state,headRefName"*)
+        printf 'OPEN\tfeature/fin-1\tfalse\t-\n'
+        ;;
     *"pr view $pr --json headRefName"*)
         echo "feature/fin-1"
         ;;
@@ -741,6 +744,9 @@ case "\$*" in
         ;;
     *"commits/$head_sha/pulls"*)
         printf '[{"state":"open","updated_at":"2026-01-01T00:00:00Z","html_url":"$pr"}]\n'
+        ;;
+    *"pr view $pr --json state,headRefName"*)
+        printf 'OPEN\tsome-other-branch\tfalse\t-\n'
         ;;
     *"pr view $pr --json headRefName"*)
         echo "some-other-branch"

@@ -59,6 +59,9 @@ _rc_install_mock_gh() {
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "${MOTHER_ROOT:?}/mock-gh-calls"
 case "\$*" in
+    *"pr view"*isCrossRepository*)
+        echo "false"
+        ;;
     *"pr view"*headRefName*)
         echo "$head_branch"
         ;;
