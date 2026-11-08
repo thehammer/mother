@@ -107,7 +107,7 @@ func TestDecodeRejects(t *testing.T) {
 	cases := []struct{ name, line, code string }{
 		{"unknown type", `{"v":1,"t":"nope","id":"i","ts":"t"}`, CodeUnsupported},
 		{"missing v", `{"t":"bye","id":"i","ts":"t"}`, CodeInvalid},
-		{"wrong v", `{"v":2,"t":"bye","id":"i","ts":"t"}`, CodeInvalid},
+		{"wrong v", `{"v":2,"t":"bye","id":"i","ts":"t"}`, CodeVersion},
 		{"missing t", `{"v":1,"id":"i","ts":"t"}`, CodeInvalid},
 		{"not json", `{"v":1,`, CodeInvalid},
 		{"embedded newline", "{\"v\":1,\n\"t\":\"bye\"}", CodeInvalid},
@@ -119,9 +119,13 @@ func TestDecodeRejects(t *testing.T) {
 	}
 }
 
-func TestAdditiveEnvelopeFieldsAllowed(t *testing.T) {
-	if _, err := Decode([]byte(`{"v":1,"t":"bye","id":"i","ts":"t","future":1,"data":{"reason":"x"}}`)); err != nil {
+// Additive fields are allowed inside data only; the envelope is closed (new envelope keys are v2).
+func TestAdditiveFieldsOnlyInData(t *testing.T) {
+	if _, err := Decode([]byte(`{"v":1,"t":"bye","id":"i","ts":"t","data":{"reason":"x","future":1}}`)); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := Decode([]byte(`{"v":1,"t":"bye","id":"i","ts":"t","future":1,"data":{"reason":"x"}}`)); ErrorCode(err) != CodeInvalid {
+		t.Fatalf("unknown envelope key must be refused, got %v", err)
 	}
 }
 
@@ -194,7 +198,7 @@ func TestValidate(t *testing.T) {
 		"sync.job key":       {cmdFrame(t, TypeSyncJob, SyncJob{CmdID: "c", Set: map[string]json.RawMessage{"repo_path": []byte(`"x"`)}}), CodeOwnership},
 		"refuse bad code":    {mustFrame(t, TypeRefuse, Refuse{Code: "bogus"}), CodeInvalid},
 		"hello no auth":      {mustFrame(t, TypeHello, Hello{ProtoMin: 1, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local"}), CodeInvalid},
-		"hello bad range":    {mustFrame(t, TypeHello, Hello{ProtoMin: 2, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local", Auth: Auth{"peercred"}}), CodeInvalid},
+		"hello bad range":    {mustFrame(t, TypeHello, Hello{ProtoMin: 2, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local", Auth: Auth{Method: "peercred"}}), CodeInvalid},
 		"manifest other job": {streamFrame(t, TypeCheckpointTaken, CheckpointTaken{Manifest: otherJobManifest()}), CodeInvalid},
 		"cmd.ack outcome":    {mustFrame(t, TypeCmdAck, CmdAck{CmdID: "c", Outcome: "maybe"}), CodeInvalid},
 	}
@@ -228,6 +232,16 @@ func TestFixturesRoundTripByteIdentical(t *testing.T) {
 }
 
 func otherJobManifest() Manifest {
-	return Manifest{V: 1, Job: "job2", Lease: "lease1", Epoch: 1, N: 1, At: "t", HeadSHA: "a", Branch: "b", BaseSHA: "c", WipSHA: "d",
-		WipRef: WipRef("job2"), SessionID: "s", Transcript: Transcript{PathRel: "p", SHA256: strings.Repeat("d", 64)}, WorkDirAtCapture: "/w"}
+	return goodManifest("job2")
+}
+
+func goodManifest(job string) Manifest {
+	return Manifest{V: 1, Job: job, Lease: "lease1", Epoch: 1, N: 1, At: "2026-11-08T15:06:05.000Z",
+		HeadSHA: strings.Repeat("a", 40), Branch: "feature/b", BaseSHA: strings.Repeat("b", 40), WipSHA: strings.Repeat("c", 40),
+		WipRef: WipRef(job), SessionID: "s", Transcript: Transcript{PathRel: "checkpoints/" + job + "/transcript.jsonl", SHA256: strings.Repeat("d", 64)},
+		UntrackedSkipped: []SkippedFile{}}
+}
+
+func readFixtureBytes(name string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(fixtureDir, name))
 }

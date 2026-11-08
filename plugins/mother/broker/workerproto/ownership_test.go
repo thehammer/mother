@@ -14,12 +14,12 @@ func TestCheckJobSet(t *testing.T) {
 		del  []string
 	}{
 		{"pending_answer null", map[string]json.RawMessage{"pending_answer": raw("null")}, nil},
-		{"worker keys", map[string]json.RawMessage{"pr_url": raw(`"u"`), "activity": raw(`"gating"`), "gates": raw(`{}`)}, []string{"limiter_hold"}},
+		{"worker keys", map[string]json.RawMessage{"session_id": raw(`"u"`), "activity": raw(`"gating"`), "gates": raw(`{}`)}, []string{"limiter_hold"}},
 		{"state running->awaiting", map[string]json.RawMessage{"state": raw(`"awaiting"`)}, nil},
 		{"pending_answer delete", nil, []string{"pending_answer"}},
 	}
 	for _, c := range ok {
-		if v := CheckJobSet(c.set, c.del); len(v) != 0 {
+		if v := CheckJobSet(JobState{State: "running"}, c.set, c.del); len(v) != 0 {
 			t.Errorf("%s: unexpected %+v", c.name, v)
 		}
 	}
@@ -40,12 +40,12 @@ func TestCheckJobSet(t *testing.T) {
 		{"delete coordinator key", nil, []string{"escalation_count"}, "escalation_count"},
 	}
 	for _, c := range bad {
-		v := CheckJobSet(c.set, c.del)
+		v := CheckJobSet(JobState{State: "running"}, c.set, c.del)
 		if len(v) != 1 || v[0].Key != c.key || v[0].Reason == "" {
 			t.Errorf("%s: want one violation on %s, got %+v", c.name, c.key, v)
 		}
 	}
-	if v := CheckJobSet(map[string]json.RawMessage{"repo_path": raw(`"x"`), "branch": raw(`"y"`)}, []string{"state"}); len(v) != 3 {
+	if v := CheckJobSet(JobState{}, map[string]json.RawMessage{"repo_path": raw(`"x"`), "branch": raw(`"y"`)}, []string{"state"}); len(v) != 3 {
 		t.Fatalf("all violations are reported: %+v", v)
 	}
 }

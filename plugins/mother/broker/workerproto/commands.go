@@ -2,8 +2,50 @@ package workerproto
 
 import "encoding/json"
 
-// DefaultDedupeCap bounds the worker-side dedupe set.
-const DefaultDedupeCap = 4096
+// DefaultDedupeCap bounds the worker-side dedupe set. It is the dedupe horizon: DedupeSet forgets ids
+// older than the most recent DedupeHorizon. A command redelivered after that would be applied twice,
+// so the coordinator never redelivers one that old (CmdOutbox enforces it) and a worker must treat a
+// command it can no longer dedupe as undeliverable, not as new.
+const (
+	DefaultDedupeCap = 4096
+	DedupeHorizon    = DefaultDedupeCap
+)
+
+// CmdOutbox is the coordinator's per-worker record of commands it issued and has not seen acked. It
+// enforces the horizon: a command is redeliverable only while fewer than DedupeHorizon newer commands
+// have been issued to that worker; older ones are dropped (the coordinator applies the effect directly
+// when the job's lease moves).
+type CmdOutbox struct {
+	n       int64
+	pending map[string]int64
+}
+
+func NewCmdOutbox() *CmdOutbox { return &CmdOutbox{pending: map[string]int64{}} }
+
+// Issue records a newly sent command.
+func (o *CmdOutbox) Issue(id string) { o.n++; o.pending[id] = o.n }
+
+// Ack forgets a command the worker acknowledged.
+func (o *CmdOutbox) Ack(id string) { delete(o.pending, id) }
+
+// Redeliverable reports whether id is unacked and still inside the dedupe horizon.
+func (o *CmdOutbox) Redeliverable(id string) bool {
+	at, ok := o.pending[id]
+	return ok && o.n-at < DedupeHorizon
+}
+
+// Expire drops unacked commands that fell out of the horizon and returns their ids (oldest first
+// is not guaranteed). Call it before redelivering on reconnect.
+func (o *CmdOutbox) Expire() []string {
+	var out []string
+	for id, at := range o.pending {
+		if o.n-at >= DedupeHorizon {
+			out = append(out, id)
+			delete(o.pending, id)
+		}
+	}
+	return out
+}
 
 // DedupeSet remembers recent cmd_ids so a redelivered command is applied at most once (MC-19).
 // It is bounded: past the cap the oldest ids are forgotten. It serialises so a restarted worker

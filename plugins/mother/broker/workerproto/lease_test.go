@@ -14,7 +14,7 @@ func activeLease(t *testing.T, tb *LeaseTable, job, id string, now time.Time) Le
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tb.Accept(job, id, l.Epoch, now); err != nil {
+	if err := tb.AcceptFor("w", job, id, l.Epoch, now); err != nil {
 		t.Fatal(err)
 	}
 	return l
@@ -26,28 +26,28 @@ func TestLeaseLifecycle(t *testing.T) {
 	if l.Epoch != 1 || l.State != LeaseOffered {
 		t.Fatalf("%+v", l)
 	}
-	if ErrorCode(tb.CheckFence("j", "L1", 1)) != CodeFenced {
+	if ErrorCode(tb.checkFence("j", "L1", 1)) != CodeFenced {
 		t.Fatal("an offered lease is not yet active")
 	}
 	if _, err := tb.Offer("j", "L1b", "w", t0); ErrorCode(err) != CodeBusy {
 		t.Fatalf("live lease: %v", err)
 	}
-	if err := tb.Accept("j", "L1", 1, t0); err != nil {
+	if err := tb.AcceptFor("w", "j", "L1", 1, t0); err != nil {
 		t.Fatal(err)
 	}
-	if err := tb.CheckFence("j", "L1", 1); err != nil {
+	if err := tb.checkFence("j", "L1", 1); err != nil {
 		t.Fatal(err)
 	}
-	if ErrorCode(tb.CheckFence("nope", "L1", 1)) != CodeUnknownJob {
+	if ErrorCode(tb.checkFence("nope", "L1", 1)) != CodeUnknownJob {
 		t.Fatal("unknown job")
 	}
-	if err := tb.Release("j", "L1", 1); err != nil {
+	if err := tb.ReleaseFor("w", "j", "L1", 1); err != nil {
 		t.Fatal(err)
 	}
-	if ErrorCode(tb.Release("j", "L1", 1)) != CodeFenced || ErrorCode(tb.Revoke("j", "L1", 1)) != CodeFenced {
+	if ErrorCode(tb.ReleaseFor("w", "j", "L1", 1)) != CodeFenced || ErrorCode(tb.Revoke("j", "L1", 1)) != CodeFenced {
 		t.Fatal("release is terminal")
 	}
-	if ErrorCode(tb.Heartbeat("j", "L1", 1, t0)) != CodeFenced {
+	if ErrorCode(tb.HeartbeatFor("w", "j", "L1", 1, t0)) != CodeFenced {
 		t.Fatal("no heartbeat after release")
 	}
 }
@@ -58,7 +58,7 @@ func TestRevokeIsTerminal(t *testing.T) {
 	if err := tb.Revoke("j", "L1", 1); err != nil {
 		t.Fatal(err)
 	}
-	if ErrorCode(tb.CheckFence("j", "L1", 1)) != CodeFenced || ErrorCode(tb.Release("j", "L1", 1)) != CodeFenced {
+	if ErrorCode(tb.checkFence("j", "L1", 1)) != CodeFenced || ErrorCode(tb.ReleaseFor("w", "j", "L1", 1)) != CodeFenced {
 		t.Fatal("revoke is terminal")
 	}
 	if l, _ := tb.Get("j"); l.State != LeaseRevoked {
@@ -75,17 +75,17 @@ func TestEpochBumpAndFence(t *testing.T) {
 	if err != nil || l2.Epoch != 2 {
 		t.Fatalf("%+v %v", l2, err)
 	}
-	tb.Accept("j", "L2", 2, t0.Add(time.Hour))
-	if ErrorCode(tb.CheckFence("j", "L1", 1)) != CodeFenced {
+	tb.AcceptFor("w2", "j", "L2", 2, t0.Add(time.Hour))
+	if ErrorCode(tb.checkFence("j", "L1", 1)) != CodeFenced {
 		t.Fatal("old lease must be fenced")
 	}
-	if ErrorCode(tb.CheckFence("j", "L2", 1)) != CodeFenced || ErrorCode(tb.CheckFence("j", "L1", 2)) != CodeFenced {
+	if ErrorCode(tb.checkFence("j", "L2", 1)) != CodeFenced || ErrorCode(tb.checkFence("j", "L1", 2)) != CodeFenced {
 		t.Fatal("lease id and epoch must both match")
 	}
-	if err := tb.CheckFence("j", "L2", 2); err != nil {
+	if err := tb.checkFence("j", "L2", 2); err != nil {
 		t.Fatal(err)
 	}
-	if ErrorCode(tb.Heartbeat("j", "L1", 1, t0)) != CodeFenced {
+	if ErrorCode(tb.HeartbeatFor("w", "j", "L1", 1, t0)) != CodeFenced {
 		t.Fatal("old heartbeat fenced")
 	}
 }
@@ -97,7 +97,7 @@ func TestExpireTTL(t *testing.T) {
 	if got := tb.Expire(t0.Add(LeaseTTL-time.Second), up); len(got) != 0 {
 		t.Fatal("not yet expired")
 	}
-	tb.Heartbeat("j", "L1", 1, t0.Add(100*time.Second))
+	tb.HeartbeatFor("w", "j", "L1", 1, t0.Add(100*time.Second))
 	if got := tb.Expire(t0.Add(100*time.Second+LeaseTTL-time.Second), up); len(got) != 0 {
 		t.Fatal("heartbeat resets the TTL")
 	}
@@ -123,7 +123,7 @@ func TestCoordinatorDowntimeNeverExpiresLease(t *testing.T) {
 		t.Fatal("must not expire before the coordinator has been up one TTL")
 	}
 	// A heartbeat inside that grace window saves it.
-	tb.Heartbeat("j", "L1", 1, restart.Add(60*time.Second))
+	tb.HeartbeatFor("w", "j", "L1", 1, restart.Add(60*time.Second))
 	if got := tb.Expire(restart.Add(LeaseTTL), restart); len(got) != 0 {
 		t.Fatal("worker reconnected and heartbeated: not lost")
 	}
@@ -154,13 +154,13 @@ func TestFencedAfterRequeueFixture(t *testing.T) {
 				// the second offer arrives after the first was revoked
 				t.Fatal(err)
 			}
-			if err := tb.Accept(*f.Job, *f.Lease, *f.Epoch, t0); err != nil {
+			if err := tb.AcceptFor("w", *f.Job, *f.Lease, *f.Epoch, t0); err != nil {
 				t.Fatal(err)
 			}
 		case TypeHb:
 			var hb Hb
 			json.Unmarshal(f.Data, &hb)
-			if err := tb.Heartbeat(hb.Jobs[0].Job, hb.Jobs[0].Lease, hb.Jobs[0].Epoch, t0); err != nil {
+			if err := tb.HeartbeatFor("w", hb.Jobs[0].Job, hb.Jobs[0].Lease, hb.Jobs[0].Epoch, t0); err != nil {
 				t.Fatal(err)
 			}
 		case TypeLeaseRevoke:
@@ -168,7 +168,7 @@ func TestFencedAfterRequeueFixture(t *testing.T) {
 				t.Fatal(err)
 			}
 		case TypeEventAppend:
-			err := tb.CheckFence(*f.Job, *f.Lease, *f.Epoch)
+			err := tb.checkFence(*f.Job, *f.Lease, *f.Epoch)
 			if ErrorCode(err) != CodeFenced {
 				t.Fatalf("late frame from the old lease must be fenced: %v", err)
 			}

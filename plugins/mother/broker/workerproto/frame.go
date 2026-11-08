@@ -3,15 +3,20 @@
 // lease table, command dedupe and the job-field ownership table.
 //
 // The package is pure: no goroutines, clocks, files or sockets. Time is always a parameter.
-// A test enforces that no non-test file reaches for os, net, os/exec, io/ioutil or time.Now.
+// An AST-walking test (purity_test.go) enforces it: no I/O, randomness, sync or log imports, no go
+// statements and no wall-clock calls.
 package workerproto
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -150,8 +155,98 @@ func Encode(f Frame) ([]byte, error) {
 	return b, nil
 }
 
+// envelopeKeys are the only top-level keys an envelope may carry, in wire order.
+var envelopeKeys = []string{"v", "t", "id", "ts", "job", "lease", "epoch", "seq", "ack", "data"}
+
+// scanObjectKeys walks the top level of one JSON object, returning its keys in order. It rejects
+// anything that is not exactly one object, duplicate keys, and (when known is non-nil) any key that
+// is a case-variant of a known key without being it: encoding/json matches keys case-insensitively
+// and keeps the last duplicate, so a non-canonical frame could otherwise say different things to
+// different parsers. Unknown keys are returned for the caller to judge.
+func scanObjectKeys(b []byte, known []string) ([]string, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, protoErr(CodeInvalid, "frame must be a JSON object")
+	}
+	var keys []string
+	seen := map[string]bool{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, protoErr(CodeInvalid, "json: %v", err)
+		}
+		k, _ := tok.(string)
+		if seen[k] {
+			return nil, protoErr(CodeInvalid, "duplicate key %q", k)
+		}
+		seen[k] = true
+		for _, kk := range known {
+			if k != kk && strings.EqualFold(k, kk) {
+				return nil, protoErr(CodeInvalid, "key %q is a case-variant of %q", k, kk)
+			}
+		}
+		keys = append(keys, k)
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return nil, protoErr(CodeInvalid, "json: %v", err)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, protoErr(CodeInvalid, "json: %v", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, protoErr(CodeInvalid, "trailing data after frame")
+	}
+	return keys, nil
+}
+
+// loneSurrogateEscape reports a JSON \uD800-\uDFFF escape that is not half of a valid pair: encoding/json
+// silently turns it into U+FFFD, so the text a parser sees would differ from what was sent.
+func loneSurrogateEscape(b []byte) bool {
+	hex4 := func(i int) (rune, bool) {
+		if i+6 > len(b) || b[i] != '\\' || b[i+1] != 'u' {
+			return 0, false
+		}
+		var r rune
+		for _, c := range b[i+2 : i+6] {
+			switch {
+			case c >= '0' && c <= '9':
+				r = r<<4 | rune(c-'0')
+			case c >= 'a' && c <= 'f':
+				r = r<<4 | rune(c-'a'+10)
+			case c >= 'A' && c <= 'F':
+				r = r<<4 | rune(c-'A'+10)
+			default:
+				return 0, false
+			}
+		}
+		return r, true
+	}
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\\' {
+			continue
+		}
+		if r, ok := hex4(i); ok && r >= 0xD800 && r <= 0xDFFF {
+			if r >= 0xDC00 {
+				return true // low surrogate with no high before it (a valid pair is consumed below)
+			}
+			lo, ok := hex4(i + 6)
+			if !ok || lo < 0xDC00 || lo > 0xDFFF {
+				return true
+			}
+			i += 11
+			continue
+		}
+		i++ // skip the escaped character, so \\ud800 (a literal backslash) is not misread
+	}
+	return false
+}
+
 // Decode parses one NDJSON line (trailing newline optional). It checks the envelope only: size,
-// framing, v and a known t. Use Validate for the per-type data checks.
+// framing, valid UTF-8, strict keys (no duplicates, no case-variants, no unknown envelope keys:
+// only data tolerates additive fields), v and a known t. A v other than 1 is `version`, not
+// `invalid`, so a v:2 hello can be answered with refuse{version}. Use Validate for the per-type
+// data checks.
 func Decode(line []byte) (Frame, error) {
 	var f Frame
 	body := bytes.TrimSuffix(line, []byte("\n"))
@@ -161,6 +256,21 @@ func Decode(line []byte) (Frame, error) {
 	if bytes.IndexByte(body, '\n') >= 0 {
 		return f, protoErr(CodeInvalid, "embedded newline")
 	}
+	if !utf8.Valid(body) {
+		return f, protoErr(CodeInvalid, "invalid UTF-8")
+	}
+	if loneSurrogateEscape(body) {
+		return f, protoErr(CodeInvalid, "lone surrogate escape")
+	}
+	keys, err := scanObjectKeys(body, envelopeKeys)
+	if err != nil {
+		return Frame{}, err
+	}
+	for _, k := range keys {
+		if !contains(envelopeKeys, k) {
+			return Frame{}, protoErr(CodeInvalid, "unknown envelope key %q (additive fields belong in data)", k)
+		}
+	}
 	if err := json.Unmarshal(body, &f); err != nil {
 		return Frame{}, protoErr(CodeInvalid, "json: %v", err)
 	}
@@ -168,7 +278,7 @@ func Decode(line []byte) (Frame, error) {
 		return Frame{}, protoErr(CodeInvalid, "missing v")
 	}
 	if f.V != Version {
-		return Frame{}, protoErr(CodeInvalid, "unsupported envelope v %d", f.V)
+		return f, protoErr(CodeVersion, "unsupported envelope v %d", f.V)
 	}
 	if f.T == "" {
 		return Frame{}, protoErr(CodeInvalid, "missing t")
@@ -190,6 +300,34 @@ func NewFrame(t, id string, ts time.Time, data any) (Frame, error) {
 		f.Data = b
 	}
 	return f, nil
+}
+
+// ReadFrame reads one line from r, enforcing MaxFrameBytes (newline included) while reading: a line
+// that has not ended by then yields too_large after at most MaxFrameBytes plus one buffer of input is
+// consumed, never the whole line. The caller must close the connection after too_large (the rest of
+// the line is unread). Partial data at EOF is io.ErrUnexpectedEOF, since a frame is newline terminated.
+func ReadFrame(r *bufio.Reader) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		buf = append(buf, chunk...)
+		if len(buf) > MaxFrameBytes {
+			return nil, protoErr(CodeTooLarge, "frame exceeds %d bytes", MaxFrameBytes)
+		}
+		switch err {
+		case nil:
+			return buf, nil
+		case bufio.ErrBufferFull:
+			continue
+		case io.EOF:
+			if len(buf) > 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, io.EOF
+		default:
+			return nil, err
+		}
+	}
 }
 
 // Str, Int return pointers for building envelopes.

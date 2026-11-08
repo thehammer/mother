@@ -1,5 +1,5 @@
 {"v":1,"t":"hold","id":"00000000-0000-4000-8000-000000000030","ts":"2026-11-08T15:04:05.030Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":null,"ack":null,"data":{"cmd_id":"cmd-10","code":"backoff","reason":"distress"}}
 {"v":1,"t":"hold","id":"00000000-0000-4000-8000-000000000030","ts":"2026-11-08T15:04:05.030Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":null,"ack":null,"data":{"cmd_id":"cmd-10","code":"backoff","reason":"distress"}}
 {"v":1,"t":"cancel","id":"00000000-0000-4000-8000-000000000031","ts":"2026-11-08T15:04:05.031Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":null,"ack":null,"data":{"cmd_id":"cmd-11"}}
-{"v":1,"t":"cmd.ack","id":"00000000-0000-4000-8000-000000000032","ts":"2026-11-08T15:04:05.032Z","job":null,"lease":null,"epoch":null,"seq":null,"ack":null,"data":{"cmd_id":"cmd-10","outcome":"applied"}}
-{"v":1,"t":"cmd.ack","id":"00000000-0000-4000-8000-000000000033","ts":"2026-11-08T15:04:05.033Z","job":null,"lease":null,"epoch":null,"seq":null,"ack":null,"data":{"cmd_id":"cmd-10","outcome":"duplicate"}}
+{"v":1,"t":"cmd.ack","id":"00000000-0000-4000-8000-000000000032","ts":"2026-11-08T15:04:05.032Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":null,"ack":null,"data":{"cmd_id":"cmd-10","outcome":"applied"}}
+{"v":1,"t":"cmd.ack","id":"00000000-0000-4000-8000-000000000033","ts":"2026-11-08T15:04:05.033Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":null,"ack":null,"data":{"cmd_id":"cmd-10","outcome":"duplicate"}}

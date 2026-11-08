@@ -35,34 +35,50 @@ func TestOutStreamWindow(t *testing.T) {
 	}
 }
 
+// step is Accept plus, for Apply, the caller's apply-persist-Commit.
+func step(t *testing.T, s *InStream, seq int64) Verdict {
+	t.Helper()
+	v := s.Accept(seq, 0)
+	if v == Apply {
+		if err := s.Commit(seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return v
+}
+
 func TestInStream(t *testing.T) {
 	s := NewInStream(0)
-	if s.Accept(1) != Apply || s.Accept(2) != Apply {
+	if step(t, s, 1) != Apply || step(t, s, 2) != Apply {
 		t.Fatal("in order applies")
 	}
-	if s.Accept(2) != Duplicate || s.Accept(1) != Duplicate {
+	if step(t, s, 2) != Duplicate || step(t, s, 1) != Duplicate {
 		t.Fatal("already applied is a duplicate")
 	}
-	if s.Accept(5) != Gap || !s.HasGap() || s.ResendFrom() != 3 {
+	if step(t, s, 5) != Gap || !s.HasGap() || s.ResendFrom() != 3 {
 		t.Fatal("ahead of applied+1 is a gap; resend from applied+1")
 	}
-	if s.Accept(5) != Duplicate {
+	if step(t, s, 5) != Duplicate {
 		t.Fatal("a buffered seq seen again is a duplicate")
 	}
-	if s.Accept(3) != Apply {
+	if step(t, s, 3) != Apply {
 		t.Fatal("gap filler applies")
 	}
-	if len(s.Drain()) != 0 || s.Applied() != 3 {
-		t.Fatal("seq 4 still missing: nothing drains")
+	if len(s.Ready()) != 0 || s.Applied() != 3 {
+		t.Fatal("seq 4 still missing: nothing is ready")
 	}
-	if s.Accept(4) != Apply {
+	if step(t, s, 4) != Apply {
 		t.Fatal()
 	}
-	if got := s.Drain(); !reflect.DeepEqual(got, []int64{5}) || s.Applied() != 5 || s.HasGap() {
-		t.Fatalf("drain applies buffered 5: %v applied=%d", got, s.Applied())
+	got := s.Ready()
+	if !reflect.DeepEqual(got, []int64{5}) || s.Applied() != 4 {
+		t.Fatalf("ready is buffered 5, not yet applied: %v applied=%d", got, s.Applied())
+	}
+	if err := s.Commit(5); err != nil || s.Applied() != 5 || s.HasGap() || s.BufferedBytes() != 0 {
+		t.Fatalf("commit 5: applied=%d gap=%v", s.Applied(), s.HasGap())
 	}
 	// Restore from a persisted applied_seq.
-	if r := NewInStream(5); r.Accept(5) != Duplicate || r.Accept(6) != Apply {
+	if r := NewInStream(5); r.Accept(5, 0) != Duplicate || r.Accept(6, 0) != Apply {
 		t.Fatal("restored stream")
 	}
 }
@@ -77,13 +93,19 @@ func TestStreamRedeliveryFixture(t *testing.T) {
 	for _, f := range decodeFixture(t, "stream_redelivery.ndjson") {
 		var d EventAppend
 		_ = json.Unmarshal(f.Data, &d)
-		v := in.Accept(*f.Seq)
+		v := in.Accept(*f.Seq, len(f.Data))
 		verdicts = append(verdicts, v)
 		switch v {
 		case Apply:
 			applied = append(applied, d.Line)
-			for _, seq := range in.Drain() {
+			if err := in.Commit(*f.Seq); err != nil {
+				t.Fatal(err)
+			}
+			for _, seq := range in.Ready() {
 				applied = append(applied, buffered[seq])
+				if err := in.Commit(seq); err != nil {
+					t.Fatal(err)
+				}
 			}
 		case Gap:
 			buffered[*f.Seq] = d.Line

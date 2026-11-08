@@ -5,14 +5,41 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"path"
+	"reflect"
 	"regexp"
 	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+// Explicit limits. Every list, map and string a peer controls is bounded here, so no frame under
+// MaxFrameBytes can make the coordinator allocate or loop unreasonably.
+const (
+	MaxIDLen            = 128      // job, lease, session, frame, command and worker ids
+	MaxListLen          = 256      // generic list length (hello.caps, job.set del)
+	MaxKeys             = 128      // keys in one job.set / sync.job set
+	MaxCaps             = 64       // hello.caps entries
+	MaxCapLen           = 64       // one capability flag
+	MaxHbJobs           = 256      // entries in one hb
+	MaxUntrackedSkipped = 1024     // manifest.untracked_skipped entries
+	MaxKindLen          = 64       // hello.kind, reasons, codes
+	MaxMsgLen           = 512      // refuse.msg, push_error
+	MaxTextLen          = 8192     // question, limiter_resume_prompt
+	MaxPathLen          = 1024     // any path-like field
+	MaxStructBytes      = 64 << 10 // an object/array-valued job key
+	MaxURLLen           = 2048
 )
 
 // Payload types, one per frame type that carries data.
 
+// Auth is the hello.auth object, the extension point for non-peercred credentials (spec section 5).
+// Phase 1 (peercred) sends only Method. A wss carrier adds a per-worker Credential and a worker-chosen
+// Nonce; the credential's proof must cover HelloTranscript (which includes caps and the nonce), so a
+// non-TLS carrier cannot downgrade the negotiated caps without invalidating it.
 type Auth struct {
-	Method string `json:"method"`
+	Method     string `json:"method"`
+	Credential string `json:"credential,omitempty"`
+	Nonce      string `json:"nonce,omitempty"`
 }
 
 type Hello struct {
@@ -148,21 +175,64 @@ const (
 	OutcomeRejected  = "rejected"
 )
 
+// CmdAck acknowledges one command. It carries the job/lease/epoch envelope of the command it
+// answers and is fence-checked like a stream frame. The one exemption is For == "sync.file": that
+// command is not job-scoped, so its ack has a null job/lease/epoch and is bound only to the
+// authenticated connection.
 type CmdAck struct {
 	CmdID   string `json:"cmd_id"`
 	Outcome string `json:"outcome"`
 	Why     string `json:"why,omitempty"`
+	For     string `json:"for,omitempty"`
 }
 
-// Frame vocabularies.
+// Frame vocabularies. Unexported so a caller cannot widen them at run time; read copies through
+// RecordStreams and SyncFilePaths.
 var (
-	// RecordStreams lists the streams record.append may target. P1-2's inventory extends this list.
-	RecordStreams = []string{"metrics/runs.jsonl"}
-	// SyncFilePaths is the sync.file path allowlist (relative to $MOTHER_ROOT).
-	SyncFilePaths = []string{"limiter/mode.json", "quota-gate.json", "ratelimit-until"}
+	recordStreams = []string{"metrics/runs.jsonl"}
+	syncFilePaths = []string{"limiter/mode.json", "quota-gate.json", "ratelimit-until"}
 )
 
-var sha256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
+// RecordStreams lists the streams record.append may target (a copy). P1-2's inventory extends it.
+func RecordStreams() []string { return append([]string(nil), recordStreams...) }
+
+// SyncFilePaths is the sync.file path allowlist, relative to $MOTHER_ROOT (a copy).
+func SyncFilePaths() []string { return append([]string(nil), syncFilePaths...) }
+
+var (
+	sha256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	idRe     = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+	tokenRe  = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+	tsRe     = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`)
+)
+
+// IDOK reports whether s is a well-formed id (job, lease, session, frame or command id): 1..128 of
+// [A-Za-z0-9._:-] with no "..". The job id is interpolated into ref names and paths, so this is the
+// gate before any WipRef(job) or artifact path.
+func IDOK(s string) bool { return idRe.MatchString(s) && !strings.Contains(s, "..") }
+
+// TimestampOK reports whether s is a protocol timestamp (UTC, exactly 3 fractional digits).
+func TimestampOK(s string) bool {
+	if !tsRe.MatchString(s) {
+		return false
+	}
+	_, err := time.Parse("2006-01-02T15:04:05.000Z", s)
+	return err == nil
+}
+
+// textOK reports whether s is valid UTF-8 within max bytes with no control characters other than
+// \n and \t (so no NUL, ESC or CR).
+func textOK(s string, max int) bool {
+	if len(s) > max || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 && r != '\n' && r != '\t' || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
 
 func contains(list []string, s string) bool {
 	for _, x := range list {
@@ -180,17 +250,35 @@ func parseData[T any](f Frame) (T, error) {
 	if len(d) == 0 || string(d) == "null" {
 		d = []byte("{}")
 	}
+	if d[0] == '{' {
+		if _, err := scanObjectKeys(d, jsonKeys(reflect.TypeOf(v))); err != nil {
+			return v, protoErr(CodeInvalid, "%s data: %v", f.T, err)
+		}
+	}
 	if err := json.Unmarshal(d, &v); err != nil {
 		return v, protoErr(CodeInvalid, "%s data: %v", f.T, err)
 	}
 	return v, nil
 }
 
+// jsonKeys lists the wire names of a payload struct, so parseData can refuse duplicate and
+// case-variant keys inside data too (unknown, non-variant keys stay tolerated there).
+func jsonKeys(t reflect.Type) []string {
+	var out []string
+	for i := 0; i < t.NumField(); i++ {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 func needEnvelope(f Frame, job, lease, epoch, seq bool) error {
-	if job && (f.Job == nil || *f.Job == "") {
+	if job && (f.Job == nil || !IDOK(*f.Job)) {
 		return protoErr(CodeInvalid, "%s: job required", f.T)
 	}
-	if lease && (f.Lease == nil || *f.Lease == "") {
+	if lease && (f.Lease == nil || !IDOK(*f.Lease)) {
 		return protoErr(CodeInvalid, "%s: lease required", f.T)
 	}
 	if epoch && (f.Epoch == nil || *f.Epoch < 1) {
@@ -216,7 +304,10 @@ func decodeChunk(b64 string) (int, error) {
 // ArtifactPathOK reports whether p is a relative, clean path confined to crew/<job>/ or
 // checkpoints/<job>/ (and names something below that directory).
 func ArtifactPathOK(job, p string) bool {
-	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, "\\") || path.Clean(p) != p {
+	if !IDOK(job) {
+		return false
+	}
+	if p == "" || len(p) > MaxPathLen || !textOK(p, MaxPathLen) || strings.HasPrefix(p, "/") || strings.Contains(p, "\\") || path.Clean(p) != p {
 		return false
 	}
 	for _, root := range []string{"crew/" + job + "/", "checkpoints/" + job + "/"} {
@@ -227,14 +318,77 @@ func ArtifactPathOK(job, p string) bool {
 	return false
 }
 
-// Validate checks f against its type's rules: envelope fields that type requires, and the data shape.
-// Errors are *ProtoError (invalid, too_large, unsupported).
-func Validate(f Frame) error {
+// Direction is which side sent a frame.
+type Direction int
+
+const (
+	FromWorker Direction = iota
+	FromCoordinator
+)
+
+// AllowedFromWorker reports whether a worker may send frame type t: its hello, heartbeats, command
+// acks, bye and the seq-numbered stream frames. Everything else (lease.offer, lease.revoke, cancel,
+// hold, release, sync.job, sync.file, welcome, refuse, ack) is coordinator-only.
+func AllowedFromWorker(t string) bool {
+	return streamTypes[t] || t == TypeHello || t == TypeHb || t == TypeCmdAck || t == TypeBye
+}
+
+// AllowedFromCoordinator reports whether the coordinator may send t: welcome, refuse, ack, bye and the
+// commands. Worker-only types (hello, hb, cmd.ack, every stream type) are refused.
+func AllowedFromCoordinator(t string) bool {
+	return commandTypes[t] || t == TypeWelcome || t == TypeRefuse || t == TypeAck || t == TypeBye
+}
+
+// ValidateFrom is Validate plus the direction rule: a frame type the sender may not send is invalid.
+func ValidateFrom(dir Direction, f Frame) error {
 	if f.V != Version {
-		return protoErr(CodeInvalid, "unsupported envelope v %d", f.V)
+		return protoErr(CodeVersion, "unsupported envelope v %d", f.V)
 	}
 	if !KnownType(f.T) {
 		return protoErr(CodeUnsupported, "unknown frame type %q", f.T)
+	}
+	if dir == FromWorker && !AllowedFromWorker(f.T) {
+		return protoErr(CodeInvalid, "%s may not be sent by a worker", f.T)
+	}
+	if dir == FromCoordinator && !AllowedFromCoordinator(f.T) {
+		return protoErr(CodeInvalid, "%s may not be sent by the coordinator", f.T)
+	}
+	return Validate(f)
+}
+
+func capsOK(caps []string) error {
+	if len(caps) > MaxCaps {
+		return protoErr(CodeInvalid, "caps: %d entries, limit %d", len(caps), MaxCaps)
+	}
+	for _, c := range caps {
+		if !tokenRe.MatchString(c) || len(c) > MaxCapLen {
+			return protoErr(CodeInvalid, "caps: bad capability flag")
+		}
+	}
+	return nil
+}
+
+// Validate checks f's shape: envelope field shapes, the fields the type requires, and its data
+// (bounds, charsets, ownership of job.set keys). It is direction-agnostic; use ValidateFrom (or
+// Admitter.Admit) at a trust boundary. Errors are *ProtoError.
+func Validate(f Frame) error {
+	if f.V != Version {
+		return protoErr(CodeVersion, "unsupported envelope v %d", f.V)
+	}
+	if !KnownType(f.T) {
+		return protoErr(CodeUnsupported, "unknown frame type %q", f.T)
+	}
+	if !IDOK(f.ID) {
+		return protoErr(CodeInvalid, "bad frame id")
+	}
+	if !TimestampOK(f.TS) {
+		return protoErr(CodeInvalid, "bad ts (want UTC with 3 fractional digits)")
+	}
+	if f.Job != nil && !IDOK(*f.Job) || f.Lease != nil && !IDOK(*f.Lease) {
+		return protoErr(CodeInvalid, "bad job or lease id")
+	}
+	if f.Epoch != nil && *f.Epoch < 1 || f.Seq != nil && *f.Seq < 1 || f.Ack != nil && *f.Ack < 0 {
+		return protoErr(CodeInvalid, "bad epoch, seq or ack")
 	}
 	if streamTypes[f.T] {
 		if err := needEnvelope(f, true, true, true, true); err != nil {
@@ -250,9 +404,13 @@ func Validate(f Frame) error {
 		if h.ProtoMin < 1 || h.ProtoMax < h.ProtoMin {
 			return protoErr(CodeInvalid, "hello: bad proto range %d..%d", h.ProtoMin, h.ProtoMax)
 		}
-		if h.WorkerID == "" || h.InstanceID == "" || h.Kind == "" || h.Auth.Method == "" {
-			return protoErr(CodeInvalid, "hello: worker_id, instance_id, kind and auth.method are required")
+		if !IDOK(h.WorkerID) || !IDOK(h.InstanceID) || !tokenRe.MatchString(h.Kind) || !tokenRe.MatchString(h.Auth.Method) {
+			return protoErr(CodeInvalid, "hello: worker_id, instance_id, kind and auth.method must be well-formed")
 		}
+		if len(h.Auth.Credential) > 4096 || !textOK(h.Auth.Credential, 4096) || len(h.Auth.Nonce) > MaxIDLen || !textOK(h.Auth.Nonce, MaxIDLen) {
+			return protoErr(CodeInvalid, "hello: bad auth credential or nonce")
+		}
+		return capsOK(h.Caps)
 	case TypeWelcome:
 		w, err := parseData[Welcome](f)
 		if err != nil {
@@ -261,6 +419,7 @@ func Validate(f Frame) error {
 		if w.Proto < 1 {
 			return protoErr(CodeInvalid, "welcome: proto required")
 		}
+		return capsOK(w.Caps)
 	case TypeRefuse:
 		r, err := parseData[Refuse](f)
 		if err != nil {
@@ -269,14 +428,20 @@ func Validate(f Frame) error {
 		if !errorCodes[r.Code] {
 			return protoErr(CodeInvalid, "refuse: unknown code %q", r.Code)
 		}
+		if !textOK(r.Msg, MaxMsgLen) || r.RetryAfterS != nil && *r.RetryAfterS < 0 {
+			return protoErr(CodeInvalid, "refuse: bad msg or retry_after_s")
+		}
 	case TypeHb:
 		h, err := parseData[Hb](f)
 		if err != nil {
 			return err
 		}
+		if len(h.Jobs) > MaxHbJobs {
+			return protoErr(CodeInvalid, "hb: %d jobs, limit %d", len(h.Jobs), MaxHbJobs)
+		}
 		for _, j := range h.Jobs {
-			if j.Job == "" || j.Lease == "" || j.Epoch < 1 || j.LastSeq < 0 {
-				return protoErr(CodeInvalid, "hb: bad job entry %+v", j)
+			if !IDOK(j.Job) || !IDOK(j.Lease) || j.Epoch < 1 || j.LastSeq < 0 {
+				return protoErr(CodeInvalid, "hb: bad job entry")
 			}
 		}
 	case TypeAck:
@@ -284,7 +449,7 @@ func Validate(f Frame) error {
 		if err != nil {
 			return err
 		}
-		if a.Job == "" || a.Lease == "" || a.Epoch < 1 || a.Seq < 0 {
+		if !IDOK(a.Job) || !IDOK(a.Lease) || a.Epoch < 1 || a.Seq < 0 {
 			return protoErr(CodeInvalid, "ack: job, lease, epoch and seq are required")
 		}
 	case TypeBye:
@@ -292,7 +457,7 @@ func Validate(f Frame) error {
 		if err != nil {
 			return err
 		}
-		if b.Reason == "" {
+		if b.Reason == "" || !textOK(b.Reason, MaxMsgLen) {
 			return protoErr(CodeInvalid, "bye: reason required")
 		}
 	case TypeJobSet:
@@ -303,22 +468,18 @@ func Validate(f Frame) error {
 		if len(s.Set) == 0 && len(s.Del) == 0 {
 			return protoErr(CodeInvalid, "job.set: set or del required")
 		}
-		for k := range s.Set {
-			if k == "" {
-				return protoErr(CodeInvalid, "job.set: empty key")
-			}
+		if len(s.Set) > MaxKeys || len(s.Del) > MaxKeys {
+			return protoErr(CodeInvalid, "job.set: more than %d keys", MaxKeys)
 		}
-		for _, k := range s.Del {
-			if k == "" {
-				return protoErr(CodeInvalid, "job.set: empty del key")
-			}
+		if vs := checkJobSetStatic(s.Set, s.Del); len(vs) > 0 {
+			return protoErr(vs[0].Code, "job.set: %s: %s", vs[0].Key, vs[0].Reason)
 		}
 	case TypeEventAppend:
 		e, err := parseData[EventAppend](f)
 		if err != nil {
 			return err
 		}
-		if e.Line == "" || strings.Contains(e.Line, "\n") {
+		if e.Line == "" || strings.Contains(e.Line, "\n") || !textOK(e.Line, MaxFrameBytes) {
 			return protoErr(CodeInvalid, "event.append: line must be a single non-empty line")
 		}
 	case TypeRecordAppend:
@@ -326,10 +487,10 @@ func Validate(f Frame) error {
 		if err != nil {
 			return err
 		}
-		if !contains(RecordStreams, r.Stream) {
+		if !contains(recordStreams, r.Stream) {
 			return protoErr(CodeInvalid, "record.append: stream %q not allowed", r.Stream)
 		}
-		if r.Line == "" || strings.Contains(r.Line, "\n") {
+		if r.Line == "" || strings.Contains(r.Line, "\n") || !textOK(r.Line, MaxFrameBytes) {
 			return protoErr(CodeInvalid, "record.append: line must be a single non-empty line")
 		}
 	case TypeLogAppend:
@@ -349,7 +510,7 @@ func Validate(f Frame) error {
 			return err
 		}
 		if !ArtifactPathOK(*f.Job, a.Path) {
-			return protoErr(CodeInvalid, "artifact.put: path %q not allowed for job %s", a.Path, *f.Job)
+			return protoErr(CodeInvalid, "artifact.put: path not allowed for job %s", *f.Job)
 		}
 		if a.Offset < 0 {
 			return protoErr(CodeInvalid, "artifact.put: negative offset")
@@ -376,8 +537,11 @@ func Validate(f Frame) error {
 		if err != nil {
 			return err
 		}
-		if r.Reason == "" {
+		if !tokenRe.MatchString(r.Reason) {
 			return protoErr(CodeInvalid, "lease.release: reason required")
+		}
+		if r.FinalSHA != "" && !shaOK(r.FinalSHA) {
+			return protoErr(CodeInvalid, "lease.release: bad final_sha")
 		}
 	case TypeLeaseOffer:
 		if err := needEnvelope(f, true, true, true, false); err != nil {
@@ -390,7 +554,7 @@ func Validate(f Frame) error {
 		if err := needCmdID(f.T, o.CmdID); err != nil {
 			return err
 		}
-		if len(o.JobDoc) == 0 || o.JobDoc[0] != '{' || o.Repo == "" || o.Attempt < 1 {
+		if len(o.JobDoc) == 0 || o.JobDoc[0] != '{' || !textOK(o.Repo, 256) || o.Repo == "" || o.Attempt < 1 {
 			return protoErr(CodeInvalid, "lease.offer: job_doc object, repo and attempt >= 1 required")
 		}
 	case TypeLeaseRevoke:
@@ -404,7 +568,7 @@ func Validate(f Frame) error {
 		if err := needCmdID(f.T, r.CmdID); err != nil {
 			return err
 		}
-		if r.Reason == "" {
+		if !tokenRe.MatchString(r.Reason) {
 			return protoErr(CodeInvalid, "lease.revoke: reason required")
 		}
 	case TypeCancel:
@@ -436,7 +600,7 @@ func Validate(f Frame) error {
 		if err := needCmdID(f.T, h.CmdID); err != nil {
 			return err
 		}
-		if h.Code == "" || h.Reason == "" {
+		if !tokenRe.MatchString(h.Code) || !textOK(h.Reason, MaxMsgLen) || h.Reason == "" {
 			return protoErr(CodeInvalid, "hold: code and reason required")
 		}
 	case TypeSyncJob:
@@ -450,12 +614,15 @@ func Validate(f Frame) error {
 		if err := needCmdID(f.T, s.CmdID); err != nil {
 			return err
 		}
-		if len(s.Set) == 0 {
-			return protoErr(CodeInvalid, "sync.job: set required")
+		if len(s.Set) == 0 || len(s.Set) > MaxKeys {
+			return protoErr(CodeInvalid, "sync.job: set required, at most %d keys", MaxKeys)
 		}
-		for k := range s.Set {
+		for k, v := range s.Set {
 			if !contains(SyncDownKeys, k) {
 				return protoErr(CodeOwnership, "sync.job: key %q does not flow down", k)
+			}
+			if len(v) > MaxStructBytes {
+				return protoErr(CodeTooLarge, "sync.job: value for %q is too large", k)
 			}
 		}
 	case TypeSyncFile:
@@ -466,8 +633,8 @@ func Validate(f Frame) error {
 		if err := needCmdID(f.T, s.CmdID); err != nil {
 			return err
 		}
-		if !contains(SyncFilePaths, s.Path) {
-			return protoErr(CodeInvalid, "sync.file: path %q not allowed", s.Path)
+		if !contains(syncFilePaths, s.Path) {
+			return protoErr(CodeInvalid, "sync.file: path not allowed")
 		}
 		c := bytes.TrimSpace(s.Content)
 		if len(c) == 0 || (string(c) != "null" && c[0] != '"') {
@@ -478,18 +645,28 @@ func Validate(f Frame) error {
 		if err != nil {
 			return err
 		}
-		if a.CmdID == "" {
-			return protoErr(CodeInvalid, "cmd.ack: cmd_id required")
+		if err := needCmdID(f.T, a.CmdID); err != nil {
+			return err
 		}
 		if a.Outcome != OutcomeApplied && a.Outcome != OutcomeDuplicate && a.Outcome != OutcomeRejected {
 			return protoErr(CodeInvalid, "cmd.ack: bad outcome %q", a.Outcome)
+		}
+		if !textOK(a.Why, MaxMsgLen) || a.For != "" && !commandTypes[a.For] {
+			return protoErr(CodeInvalid, "cmd.ack: bad why or for")
+		}
+		if a.For != TypeSyncFile {
+			return needEnvelope(f, true, true, true, false)
 		}
 	}
 	return nil
 }
 
+func shaOK(s string) bool { return len(s) == 40 && hexRe.MatchString(s) || sha256Re.MatchString(s) }
+
+var hexRe = regexp.MustCompile(`^[0-9a-f]+$`)
+
 func needCmdID(t, id string) error {
-	if id == "" {
+	if !IDOK(id) {
 		return protoErr(CodeInvalid, "%s: cmd_id required", t)
 	}
 	return nil
