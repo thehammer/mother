@@ -1,0 +1,5 @@
+{"v":1,"t":"event.append","id":"00000000-0000-4000-8000-000000000010","ts":"2026-11-08T15:04:05.010Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":1,"ack":null,"data":{"line":"{\"kind\":\"started\"}"}}
+{"v":1,"t":"event.append","id":"00000000-0000-4000-8000-000000000011","ts":"2026-11-08T15:04:05.011Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":2,"ack":null,"data":{"line":"{\"kind\":\"tool\"}"}}
+{"v":1,"t":"event.append","id":"00000000-0000-4000-8000-000000000011","ts":"2026-11-08T15:04:05.011Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":2,"ack":null,"data":{"line":"{\"kind\":\"tool\"}"}}
+{"v":1,"t":"event.append","id":"00000000-0000-4000-8000-000000000013","ts":"2026-11-08T15:04:05.013Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":4,"ack":null,"data":{"line":"{\"kind\":\"gate\"}"}}
+{"v":1,"t":"event.append","id":"00000000-0000-4000-8000-000000000012","ts":"2026-11-08T15:04:05.012Z","job":"job-abc123","lease":"lease-1","epoch":1,"seq":3,"ack":null,"data":{"line":"{\"kind\":\"pr\"}"}}
