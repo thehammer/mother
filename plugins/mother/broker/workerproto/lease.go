@@ -161,12 +161,17 @@ func (t *LeaseTable) CheckFenceFor(worker, job, leaseID string, epoch int64) err
 // for LeaseTTL and the coordinator itself has been up for at least LeaseTTL (MC-16): coordinator
 // downtime never expires a lease, and a restarted coordinator gives workers a full TTL to reconnect.
 func (t *LeaseTable) Expire(now, coordUpSince time.Time) []Lease {
-	if now.Sub(coordUpSince) < LeaseTTL {
+	return t.ExpireTTL(now, coordUpSince, LeaseTTL)
+}
+
+// ExpireTTL is Expire with an explicit TTL (the coordinator's configured value; tests shorten it).
+func (t *LeaseTable) ExpireTTL(now, coordUpSince time.Time, ttl time.Duration) []Lease {
+	if now.Sub(coordUpSince) < ttl {
 		return nil
 	}
 	var lost []Lease
 	for _, l := range t.current {
-		if !l.State.terminal() && now.Sub(l.LastHB) >= LeaseTTL {
+		if !l.State.terminal() && now.Sub(l.LastHB) >= ttl {
 			l.State = LeaseLost
 			lost = append(lost, *l)
 		}
