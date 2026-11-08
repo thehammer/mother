@@ -1146,7 +1146,6 @@ _ss_go_list() {
     [ "$(jq -r '.state' "$SS_C/jobs/$id.json")" = "running" ]
     [ ! -e "$SS_C/runner/leases/$id.quarantine.ndjson" ]
     jq -s -e '[.[] | select(.code == "transient_stop")] | length == 3' "$SS_C/runner/leases/audit.jsonl" >/dev/null
-    jq -e '.needs_attention.reason == "apply_stalled"' "$SS_C/jobs/$id.json" >/dev/null
     rm -f "$SS_C/jobs/$id.json.lockdir/owner"; rmdir "$SS_C/jobs/$id.json.lockdir"   # the lock frees
     _ss_replay_to "$SS_C" "$id" "$ops"
     [ "$status" -eq 0 ] || { echo "status $status / $stderr" >&2; return 1; }

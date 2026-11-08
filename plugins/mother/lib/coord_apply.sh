@@ -290,7 +290,10 @@ _ca_apply_record() {
     local aid="${_CA_CUR_SEQ:+$job:$_CA_CUR_SEQ}"
     if [ -n "$aid" ]; then
         row=$(printf '%s' "$row" | jq -c --arg a "$aid" '.apply_id = $a') || return 1
-        if ! grep -qF "\"apply_id\":\"$aid\"" "$file" 2>/dev/null; then
+        # grep only prefilters: the match is on the parsed top-level field, so a worker cannot fake it
+        # by putting the id text inside another field of some other row.
+        if ! { grep -F "\"apply_id\":\"$aid\"" "$file" 2>/dev/null || true; } \
+                | jq -e --arg a "$aid" 'select(type == "object" and .apply_id == $a)' >/dev/null 2>&1; then
             _with_lock "$file" _append_line "$file" "$row" || return 2
         fi
     else
@@ -436,6 +439,13 @@ _ca_inflight_file() { printf '%s/runner/leases/applied/%s.inflight' "$MOTHER_ROO
 
 _ca_line_sha() { printf '%s' "$1" | shasum -a 256 | cut -c1-64; }
 
+_ca_stall_flag() { # <job-file> <seq> <rn> — under the job lock
+    local doc
+    doc=$(jq -c --arg s "$2" --arg n "$3" --arg t "$(_iso_now)" \
+        '.needs_attention = {reason: "apply_stalled", note: ("outbox op seq " + $s + " failed transiently " + $n + " times in a row; it stays pending and is retried on the next replay"), since: (.needs_attention.since // $t)}' "$1") \
+        && _atomic_write "$1" "$doc"
+}
+
 # _ca_stall <job> <seq> <rn> — a transient stop: audit it, and flag the job after N consecutive ones.
 _ca_stall() {
     local job="$1" seq="$2" rn="$3" jf
@@ -443,12 +453,9 @@ _ca_stall() {
     if [ "$rn" -ge "${MOTHER_APPLY_STALL_ATTEMPTS:-3}" ]; then
         jf=$(_job_path "$job")
         [ -f "$jf" ] || return 0
-        # Best effort and lock-free on purpose: the stall is often a job-lock timeout, and this flag must
-        # not wait on that same lock. A racing writer at worst loses it; the next stop writes it again.
-        local doc
-        doc=$(jq -c --arg s "$seq" --arg n "$rn" --arg t "$(_iso_now)" \
-            '.needs_attention = {reason: "apply_stalled", note: ("outbox op seq " + $s + " failed transiently " + $n + " times in a row; it stays pending and is retried on the next replay"), since: (.needs_attention.since // $t)}' "$jf" 2>/dev/null) \
-            && _atomic_write "$jf" "$doc"
+        # Short lock wait (about 0.1 s): the stall is often a job-lock timeout, so wait long for that same
+        # lock would be pointless. No lock, no flag; the next stalled call tries again.
+        _switch_with_lock "$jf.lockdir" "$jf" 2 _ca_stall_flag "$jf" "$seq" "$rn" 2>/dev/null || true
     fi
     return 0
 }
