@@ -119,6 +119,9 @@ _ca_apply_event() {
     local job="$1" line="$2" ev ef tail
     ev=$(printf '%s' "$line" | jq -r '.data.line // empty') || return 1
     [ -n "$ev" ] || { _ca_log "event.append without a line"; return 1; }
+    # One JSON object with a kind: a worker's line never becomes anything but a single event line.
+    printf '%s' "$ev" | jq -e 'type == "object" and (.kind | type) == "string"' >/dev/null 2>&1 \
+        || { _ca_log "event.append: line is not a single event object"; return 1; }
     ef=$(_events_path "$job")
     tail=$(tail -n 1 "$ef" 2>/dev/null)
     [ "$tail" = "$ev" ] && return 0
@@ -134,6 +137,12 @@ _ca_apply_record() {
         *) _ca_log "record.append: unknown stream '$stream'"; return 1 ;;
     esac
     [ -n "$row" ] || { _ca_log "record.append without a line"; return 1; }
+    # A usage row feeds cost totals and the cost cap: it must be one object for this job, with
+    # non-negative numeric cost/tokens.
+    printf '%s' "$row" | jq -e --arg j "$job" '
+        type == "object" and .job_id == $j
+        and all(.cost_usd, .tokens_in, .tokens_out; . == null or (type == "number" and . >= 0))' \
+        >/dev/null 2>&1 || { _ca_log "record.append: row is not a valid usage row for $job"; return 1; }
     file="$MOTHER_ROOT/$stream"
     mkdir -p "$(dirname "$file")" 2>/dev/null || return 1
     tail=$(grep -F "\"job_id\":\"${job}\"" "$file" 2>/dev/null | tail -n 1)
