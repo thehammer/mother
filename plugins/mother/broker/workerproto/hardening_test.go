@@ -158,6 +158,7 @@ func TestValidateManifestHostile(t *testing.T) {
 		"skipped dotdot":       func(m *Manifest) { m.UntrackedSkipped = []SkippedFile{{Path: "../../etc/passwd", Bytes: 1}} },
 		"skipped absolute":     func(m *Manifest) { m.UntrackedSkipped = []SkippedFile{{Path: "/etc/passwd", Bytes: 1}} },
 		"skipped nul":          func(m *Manifest) { m.UntrackedSkipped = []SkippedFile{{Path: "a\x00", Bytes: 1}} },
+		"skipped bad reason":   func(m *Manifest) { m.UntrackedSkipped = []SkippedFile{{Path: "a", Bytes: 1, Reason: "x;rm"}} },
 		"skipped negative":     func(m *Manifest) { m.UntrackedSkipped = []SkippedFile{{Path: "a", Bytes: -5}} },
 		"skipped too many":     func(m *Manifest) { m.UntrackedSkipped = make([]SkippedFile, MaxUntrackedSkipped+1); fill(m) },
 		"push_error control":   func(m *Manifest) { m.PushError = "token\x1b[31m" },
