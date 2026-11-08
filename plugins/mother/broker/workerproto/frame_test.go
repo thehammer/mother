@@ -195,6 +195,7 @@ func TestValidate(t *testing.T) {
 		"refuse bad code":    {mustFrame(t, TypeRefuse, Refuse{Code: "bogus"}), CodeInvalid},
 		"hello no auth":      {mustFrame(t, TypeHello, Hello{ProtoMin: 1, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local"}), CodeInvalid},
 		"hello bad range":    {mustFrame(t, TypeHello, Hello{ProtoMin: 2, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local", Auth: Auth{"peercred"}}), CodeInvalid},
+		"manifest other job": {streamFrame(t, TypeCheckpointTaken, CheckpointTaken{Manifest: otherJobManifest()}), CodeInvalid},
 		"cmd.ack outcome":    {mustFrame(t, TypeCmdAck, CmdAck{CmdID: "c", Outcome: "maybe"}), CodeInvalid},
 	}
 	for n, c := range bad {
@@ -224,4 +225,9 @@ func TestFixturesRoundTripByteIdentical(t *testing.T) {
 			}
 		}
 	}
+}
+
+func otherJobManifest() Manifest {
+	return Manifest{V: 1, Job: "job2", Lease: "lease1", Epoch: 1, N: 1, At: "t", HeadSHA: "a", Branch: "b", BaseSHA: "c", WipSHA: "d",
+		WipRef: WipRef("job2"), SessionID: "s", Transcript: Transcript{PathRel: "p", SHA256: strings.Repeat("d", 64)}, WorkDirAtCapture: "/w"}
 }

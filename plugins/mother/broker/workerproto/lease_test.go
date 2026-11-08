@@ -194,3 +194,17 @@ func TestLeaseTimingConstants(t *testing.T) {
 		t.Fatal("welcome constants must match")
 	}
 }
+
+func TestCheckFenceForWorkerIdentity(t *testing.T) {
+	tb := NewLeaseTable()
+	activeLease(t, tb, "j", "L1", t0) // granted to worker "w"
+	if err := tb.CheckFenceFor("w", "j", "L1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if ErrorCode(tb.CheckFenceFor("other", "j", "L1", 1)) != CodeNotLeased {
+		t.Fatal("a different worker must get not_leased")
+	}
+	if ErrorCode(tb.CheckFenceFor("w", "j", "L1", 2)) != CodeFenced {
+		t.Fatal("fencing still applies")
+	}
+}

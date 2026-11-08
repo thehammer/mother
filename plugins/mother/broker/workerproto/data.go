@@ -368,6 +368,9 @@ func Validate(f Frame) error {
 		if err := ValidateManifest(c.Manifest); err != nil {
 			return err
 		}
+		if c.Manifest.Job != *f.Job || c.Manifest.Lease != *f.Lease || c.Manifest.Epoch != *f.Epoch {
+			return protoErr(CodeInvalid, "checkpoint.taken: manifest job/lease/epoch must match the envelope")
+		}
 	case TypeLeaseRelease:
 		r, err := parseData[LeaseRelease](f)
 		if err != nil {

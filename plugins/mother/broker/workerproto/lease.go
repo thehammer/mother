@@ -115,6 +115,19 @@ func (t *LeaseTable) CheckFence(job, leaseID string, epoch int64) error {
 	return nil
 }
 
+// CheckFenceFor is CheckFence plus a worker-identity check: the frame must come from the worker the
+// lease was granted to (MC-27). Pass the identity authenticated for the connection (peercred in
+// Phase 1), never a value read from the frame; a different worker gets not_leased.
+func (t *LeaseTable) CheckFenceFor(worker, job, leaseID string, epoch int64) error {
+	if err := t.CheckFence(job, leaseID, epoch); err != nil {
+		return err
+	}
+	if t.current[job].Worker != worker {
+		return protoErr(CodeNotLeased, "job %s is not leased to worker %s", job, worker)
+	}
+	return nil
+}
+
 // Expire marks live leases lost and returns them. A lease is lost only when it has had no heartbeat
 // for LeaseTTL and the coordinator itself has been up for at least LeaseTTL (MC-16): coordinator
 // downtime never expires a lease, and a restarted coordinator gives workers a full TTL to reconnect.
