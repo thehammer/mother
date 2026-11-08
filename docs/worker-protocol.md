@@ -324,3 +324,32 @@ walks the AST to enforce it: no `os`, `net`, `os/exec`, `os/signal`, `io/fs`, `l
 The review of PR #116 tightened v1 before any caller exists. Golden fixtures were re-recorded for two of them: `checkpoint_manifest.json` loses
 `work_dir_at_capture` and its transcript path moves under `checkpoints/<job>/`, and the two `cmd.ack` lines in `command_dedupe.ndjson` gain the
 `job`/`lease`/`epoch` envelope. All other frames round-trip byte for byte unchanged.
+
+## 14. Phase 1 local carrier: additions made by `mother-coord` / `mother-worker` (P1-4)
+
+Everything here is additive inside `data` (section 5: additive data fields are allowed within v1) or lives outside the frames.
+
+- `hello.data.slots` (int, default 1): jobs the worker runs at once. The coordinator never offers a lease past `slots`.
+- `welcome.data.jobs[{job, lease, epoch, applied_seq, wire_seq, log_offset}]`: for each live lease of the connecting worker, the coordinator's
+  committed position. `applied_seq` is the last **outbox op** applied (`coord_apply.sh`'s own persisted seq), `wire_seq` the last stream seq
+  committed, `log_offset` the size of the canonical job log. On every connection the worker **rebases** each stream to this position: it re-reads
+  its outbox from `applied_seq + 1` and its log from `log_offset` and numbers new frames from `wire_seq + 1`, and the coordinator discards anything it
+  buffered from the previous connection. Nothing depends on the worker remembering its unacked window across a restart, and a crash between apply and
+  persist is absorbed by `coord_apply`'s seq idempotence.
+- Op frames (`job.set`, `event.append`, `record.append`, `artifact.put`) carry `oseq` (the op's seq in the worker's outbox file) in `data`; the coordinator
+  hands it to `coord_apply.sh` as the op's `seq`. Log chunks and `lease.release` have no outbox seq, which is why the wire seq and the outbox seq are not the same number.
+  `oskip: [from, to]` on an op names outbox ops consumed without being sent (a `job.set` whose every key the ownership table refuses: the supervisor writes
+  `finished_at`, `exit_code`, `state: succeeded` into its own mirror, but the wire refuses them, so the worker strips them); the coordinator fills the range
+  with empty `job.set` ops, which `coord_apply` accepts as no-ops, to keep its seq contiguous. At most 4096 per frame.
+- `lease.offer.data.repo_path`: the repo's path on the coordinator's machine; `repo` is `owner/name` from its origin URL.
+- A heartbeat naming a lease still `offered` to that worker is ignored, not refused: the offer ack that activates it may still be in flight (or the offer is being redelivered after a coordinator restart).
+- `sync.job` carries only the keys in both the plan's list and `SyncDownKeys`: `cancel_requested`, `pause_requested`, `max_cost_usd`, `force_start`.
+  (`paused_reason` and `auto_resume_at` are not in the shared table, and `paused_reason` is worker-owned, so they stay on the worker side.)
+- Files: `runner/dispatch/<job>.json` (request, gains `wait_reason`), `runner/leases/<job>.json`, `<job>.cmds.jsonl` (unacked commands), `<job>.lost`,
+  `table.json` (the durable lease table snapshot, written before each offer leaves), `audit.jsonl`, `runner/coord.pid`, `runner/coord-status.json`.
+  Worker root: `leases/<job>.json`, `children/<pid>.json`, `applied-cmds.json`, `worker.pid` (`<pid> <pgid>`).
+- Release rule: a worker sends `lease.release` only after its supervisor exited, the outbox and log are fully acked, and the mirror's state is terminal or
+  `awaiting` (reason = that state, or `supervisor_exited` for a supervisor found dead at start). A supervisor that died with the job still `running` is not
+  released and no longer heartbeated, so the coordinator's TTL decides. The wire (and hence P1-5) still refuses `succeeded` from a worker.
+- Known gap for P1-6: a job re-leased to a worker that has no outbox for it restarts its outbox seq at 1 while the coordinator's `applied_seq` is higher; a resume
+  onto a different worker needs the outbox seeded from the coordinator's `applied_seq`.
