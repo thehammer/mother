@@ -32,6 +32,25 @@ mother_ensure_live_marker() {
     return 0
 }
 
+# mother_ensure_worker_marker — create $MOTHER_ROOT/.mother-worker-live when running in worker
+# mode (MOTHER_WORKER_MODE=1). A worker root is a mirror of leased jobs plus an unshipped outbox:
+# deleting it loses ops the coordinator never saw, so safe_rm_tree refuses it like a live tree.
+# No-op under MOTHER_TEST_ROOT=1, when the root doesn't exist, or outside worker mode.
+mother_ensure_worker_marker() {
+    [ "${MOTHER_TEST_ROOT:-0}" = "1" ] && return 0
+    [ "${MOTHER_WORKER_MODE:-0}" = "1" ] || return 0
+    local root="${MOTHER_ROOT:-}"
+    [ -n "$root" ] && [ -d "$root" ] || return 0
+    local marker="$root/.mother-worker-live"
+    [ -e "$marker" ] && return 0
+    {
+        printf 'This directory is a Mother WORKER root (job mirror and unshipped outbox).\n'
+        printf 'Mother refuses to recursively delete any directory that contains this file.\n'
+        printf 'created: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$marker" 2>/dev/null || true
+    return 0
+}
+
 # _safe_rm_physical <path> — echo the symlink-resolved absolute path of an
 # existing directory, or the input unchanged when it can't be resolved.
 _safe_rm_physical() {
@@ -85,9 +104,11 @@ safe_rm_tree() {
         local hit
         if [ -e "$real/.mother-live" ]; then
             hit="$real/.mother-live"
+        elif [ -e "$real/.mother-worker-live" ]; then
+            hit="$real/.mother-worker-live"
         else
             hit=$(find "$real" -maxdepth 4 \( -name node_modules -o -name .git \) -prune -o \
-                -name .mother-live -print -quit 2>/dev/null)
+                \( -name .mother-live -o -name .mother-worker-live \) -print -quit 2>/dev/null)
         fi
         if [ -n "$hit" ]; then
             echo "safe_rm_tree: refusing to delete $path (contains live-tree marker $hit)" >&2
@@ -96,7 +117,7 @@ safe_rm_tree() {
         # Deeper ancestors of a live root: marker too far down for find.
         local root rreal
         for root in "${MOTHER_ROOT:-}" "${MOTHER_LIVE_ROOT:-}" "${HOME:-}/.mother"; do
-            [ -n "$root" ] && [ -e "$root/.mother-live" ] || continue
+            [ -n "$root" ] && { [ -e "$root/.mother-live" ] || [ -e "$root/.mother-worker-live" ]; } || continue
             rreal=$(_safe_rm_physical "$root")
             case "$rreal/" in
                 "$real"/*)

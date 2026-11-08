@@ -30,6 +30,13 @@ mkdir -p "$JOBS_DIR" "$EVENTS_DIR" "$LOGS_DIR" "$DRAFTS_DIR" "$CURSORS_DIR" "$RU
     && source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/safe-rm.sh"
 type mother_ensure_live_marker >/dev/null 2>&1 && mother_ensure_live_marker
 
+# Worker-mode outbox (lib/outbox.sh): mirrors every state write as a protocol op. No-op unless
+# MOTHER_WORKER_MODE=1. A worker root carries .mother-worker-live (see mother_ensure_worker_marker).
+# shellcheck source=/dev/null
+[ -r "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh" ] \
+    && source "${MOTHER_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")}/outbox.sh"
+type mother_ensure_worker_marker >/dev/null 2>&1 && mother_ensure_worker_marker
+
 # ---------- primitives ----------
 
 # Millisecond-precision RFC 3339 timestamp (e.g. 2026-05-30T09:30:56.510Z).
@@ -133,7 +140,9 @@ mother_event_append() {
     ev=$(jq -nc --arg ts "$(_iso_now)" --arg kind "$kind" --argjson detail "$detail" \
         '{ts: $ts, kind: $kind, detail: $detail}') || return 1
     _eventpath=$(_events_path "$id")
-    _with_lock "$_eventpath" _append_line "$_eventpath" "$ev"
+    _with_lock "$_eventpath" _append_line "$_eventpath" "$ev" || return 1
+    mother_outbox_enabled && mother_outbox_emit "$id" event.append "$(jq -nc --arg l "$ev" '{line: $l}')"
+    return 0
 }
 
 _job_exists() { [ -f "$(_job_path "$1")" ]; }
@@ -165,7 +174,27 @@ mother_job_update() {
     _jobpath=$(_job_path "$id")
     [ -f "$_jobpath" ] || { echo "mother: no such job: $id" >&2; return 1; }
     merged=$(jq "$@" "$filter" "$_jobpath") || return 1
+    if mother_outbox_enabled; then
+        local _before; _before=$(cat "$_jobpath" 2>/dev/null)
+        _atomic_write "$_jobpath" "$merged" || return 1
+        mother_outbox_job_set "$id" "$_before" "$merged"
+        return 0
+    fi
     _atomic_write "$_jobpath" "$merged"
+}
+
+# Replace a job document that the caller already merged (typically under the job-file lock):
+# atomic write, then (worker mode) the top-level diff goes to the outbox as job.set.
+# Usage: mother_job_write_doc <job-file> <merged-json>
+mother_job_write_doc() {
+    local _jf="$1" _merged="$2" _before="" _jid
+    mother_outbox_enabled && _before=$(cat "$_jf" 2>/dev/null)
+    _atomic_write "$_jf" "$_merged" || return 1
+    if [ -n "$_before" ]; then
+        _jid="${_jf##*/}"; _jid="${_jid%.json}"
+        mother_outbox_job_set "$_jid" "$_before" "$_merged"
+    fi
+    return 0
 }
 
 # Typed attention on a job (`.attention[]`, `{reason, since}`; reasons are the

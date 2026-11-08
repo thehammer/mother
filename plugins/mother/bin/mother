@@ -3433,6 +3433,7 @@ EOF
         mkdir -p "$err_dir" || _die "review-lens: cannot create $err_dir"
         _atomic_write "$err_dir/$lens.json" "$(jq -n --arg why "$err_reason" \
             '{findings: [], examined: [], cost_usd: null, decision: "error", state: "error", error_reason: $why}')"
+        mother_outbox_artifact "$id" "crew/$id/wave/c${cycle}/$lens.json"
         echo "mother: review-lens: perri:$lens produced no review ($err_reason); recorded as error" >&2
         return 2
     fi
@@ -3476,6 +3477,7 @@ EOF
     _atomic_write "$wave_dir/$lens.json" "$(jq -n \
         --argjson f "$tagged" --argjson e "$raw_examined" --argjson c "$cost_usd" --arg d "$decision" \
         '{findings: $f, examined: $e, cost_usd: $c, decision: $d}')"
+    mother_outbox_artifact "$id" "crew/$id/wave/c${cycle}/$lens.json"
 
     _append_event "$id" "reviewed" \
         "$(jq -nc --arg r "perri:$lens" --argjson fc "$finding_count" --arg d "$decision" \
@@ -3494,7 +3496,7 @@ _review_slot_write() {
         (.pipeline.reviewer_findings //= {}) |
         .pipeline.reviewer_findings[$r] = $rf
     ' "$jf") || return 1
-    _atomic_write "$jf" "$merged"
+    mother_job_write_doc "$jf" "$merged"
 }
 
 # ---------- _merge_reviewer_findings ----------
@@ -3571,6 +3573,7 @@ cmd_merge_findings() {
     rm -f "$changed_file"
     [ $rc -eq 0 ] || _die "merge-findings: merge failed"
 
+    mother_outbox_artifact "$id" "crew/$wave/wave/c${cycle}/merged.json"
     _append_event "$id" "claims_verified" "$(printf '%s' "$summary" | jq -c '.claims')"
     jq '.actionable' "$wave_dir/merged.json"
 }
@@ -3613,7 +3616,9 @@ _adherence_pre_ready_side_file() {
     [ -n "$cost" ] || cost=null
     _atomic_write "$dir/c${cycle}.json" "$(jq -n --arg v "$verdict" --arg s "$status" --arg n "$notes" \
         --arg h "$head" --argjson c "$cost" \
-        '{verdict: (if $v == "" then null else $v end), status: $s, notes: $n, head_sha: $h, cost_usd: $c}')"
+        '{verdict: (if $v == "" then null else $v end), status: $s, notes: $n, head_sha: $h, cost_usd: $c}')" \
+        || return 1
+    mother_outbox_artifact "$id" "crew/$id/adherence/c${cycle}.json"
 }
 
 # _adherence_record_pre_ready <id> <verdict> <notes> <attempts> <cycle> <head>
@@ -3996,17 +4001,15 @@ $(cat "$cost_cap_flag" 2>/dev/null)"
     # this pause must come from a fresh `mother resume` call, not a
     # leftover from a previous cycle or a system-pause that's been
     # superseded by an operator-initiated one).
-    local job_file merged
-    job_file=$(_job_path "$id")
-    merged=$(jq --arg q "$question" --arg ts "$(_iso_now)" --arg pr "$paused_reason" '
+    mother_job_update "$id" '
         .question = $q
         | .paused_at = $ts
         | .paused_reason = $pr
         | .pending_answer = null
         | .auto_resume_at = null
         | .state = "awaiting"
-    ' "$job_file") || _die "await: jq update failed"
-    _atomic_write "$job_file" "$merged"
+    ' --arg q "$question" --arg ts "$(_iso_now)" --arg pr "$paused_reason" \
+        || _die "await: jq update failed"
     _append_event "$id" "awaiting_input" \
         "$(jq -nc --arg q "$question" --arg pr "$paused_reason" '{question: $q, paused_reason: $pr}')"
 

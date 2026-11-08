@@ -905,6 +905,24 @@ ETA hi; empty if none) next to the **unchanged 6-field cache**; `MOTHER_PROGRESS
 PASS/FAIL vs 70% and `MOTHER_I13_WIDTH_TARGET`, default `5`, i.e. median band ≤ 5× median remaining per the 2026-10-17 decision) and `progress_flags` (real = operator acted while raised, or job
 failed/cancelled; target >= 50%).
 
+## Worker mode: the state seam (cluster P1-2)
+
+With `MOTHER_WORKER_MODE=1` and `MOTHER_WORKER_OUTBOX_DIR` set (default: off, behaviour unchanged), `mother-run-job` and
+everything it calls run against a **worker root** (`MOTHER_ROOT` = a mirror holding the job; marker `.mother-worker-live`,
+which `safe_rm_tree` refuses like `.mother-live`). Every write still lands in the mirror, and `lib/outbox.sh` also appends it
+as a protocol op (`docs/worker-protocol.md` section 4: `job.set`, `event.append`, `record.append`, `artifact.put`) to
+`$MOTHER_WORKER_OUTBOX_DIR/<job>.ndjson`, seq from `<job>.seq`, both under `_switch_with_lock`. Lease/epoch are added later by
+the worker daemon. `lib/coord_apply.sh <canonical-root> <job> < ops.ndjson` replays an outbox onto a canonical tree (persisted
+applied seq under `runner/leases/applied/`, tail-line dedupe as backstop, ownership audit in `runner/leases/audit.jsonl`,
+canonical-side `mother_recompute_job_cost`). `mother_recompute_job_cost` is a no-op in worker mode.
+
+Rules for new code: write a job document only through `mother_job_update`, `mother_job_write_doc` (lib/state.sh),
+`_job_update` / `_job_write_doc` (mother-run-job) or usage.sh's `_usage_job_write`; append events through
+`mother_event_append`/`_append_event`/`_usage_append_event`; call `mother_outbox_artifact` after finalising a file under
+`crew/<id>/`. `tests/state_seam_lint.bats` enforces this by function name. Applier ownership policy lives in
+`coord_apply.sh` (`_CA_*_KEYS`): the P1-1 worker keys plus the P1-2 inventory of what the supervisor writes; until P1-5 the
+replay also accepts completion evidence and `succeeded` (it is the stand-in for the coordinator's derivation).
+
 ## Internals reference (lazy-loaded)
 
 Resource teardown (worktrees/containers), PR detection (`lib/prdetect.sh`,
