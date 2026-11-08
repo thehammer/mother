@@ -72,6 +72,12 @@ _ckpt_branch_ok() {
     git check-ref-format "refs/heads/$1" 2>/dev/null
 }
 
+# A session id is a path component under the projects dir: IDOK charset, no "..", not starting with ".".
+_ckpt_session_ok() {
+    case "$1" in ''|*[!A-Za-z0-9._:-]*|*..*|.*) return 1 ;; esac
+    [ "${#1}" -le 128 ]
+}
+
 _ckpt_sha_ok() {
     case "$1" in *[!0-9a-f]*|'') return 1 ;; esac
     [ "${#1}" -eq 40 ] || [ "${#1}" -eq 64 ]
@@ -169,7 +175,7 @@ _ckpt_take_locked() {
     _ckpt_job_ok "$job" || { echo "mother: checkpoint take: job id is not a valid ref component" >&2; return 1; }
     [ -n "$wd" ] && [ -d "$wd" ] || { echo "mother: checkpoint take: work_dir missing: $wd" >&2; return 1; }
     _ckpt_branch_ok "$branch" || { echo "mother: checkpoint take: branch is not a conservative ref name: $branch" >&2; return 1; }
-    case "$session" in *[!A-Za-z0-9._:-]*) echo "mother: checkpoint take: bad session_id" >&2; return 1 ;; esac
+    _ckpt_session_ok "$session" || { echo "mother: checkpoint take: bad session_id" >&2; return 1; }
 
     local head
     head=$(git -C "$wd" rev-parse HEAD 2>/dev/null) || { echo "mother: checkpoint take: no HEAD in $wd" >&2; return 1; }
@@ -328,7 +334,7 @@ mother_checkpoint_restore() {
     tsha_want=$(jq -r '.transcript.sha256 // ""' "$manifest")
     _ckpt_job_ok "$job" && _ckpt_branch_ok "$branch" && _ckpt_sha_ok "$head" && _ckpt_sha_ok "$wip" \
         || { echo "mother: checkpoint restore: manifest has a malformed job, branch or sha" >&2; return 1; }
-    case "$session" in ''|*[!A-Za-z0-9._:-]*) echo "mother: checkpoint restore: bad session_id" >&2; return 1 ;; esac
+    _ckpt_session_ok "$session" || { echo "mother: checkpoint restore: bad session_id" >&2; return 1; }
     git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "mother: checkpoint restore: not a git repo: $repo" >&2; return 1; }
 
     # Transcript first: nothing is created if it does not match.
@@ -357,11 +363,12 @@ mother_checkpoint_restore() {
     fi
     git -C "$newwd" reset -q --hard "$head" || return 1
     local f
-    git -C "$newwd" read-tree "$wip_tree" || return 1
-    git -C "$newwd" checkout-index -a -f || return 1
-    # Files deleted in the worktree at capture time: in HEAD, absent from the wip tree.
+    # Files deleted in the worktree at capture time (in HEAD, absent from the wip tree) go first,
+    # while the tree is exactly HEAD, so no path is resolved through anything the wip tree adds.
     while IFS= read -r -d '' f; do rm -f "$newwd/$f"; done \
         < <(git -C "$newwd" diff-tree -r -z --name-only --diff-filter=D "$head" "$wip_tree")
+    git -C "$newwd" read-tree "$wip_tree" || return 1
+    git -C "$newwd" checkout-index -a -f || return 1
     git -C "$newwd" reset -q --mixed "$head" || return 1
 
     # 3. Transcript under the new path's encoded dir (plus the subagent dir next to the file).
