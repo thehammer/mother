@@ -7,10 +7,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,11 +29,36 @@ func envDur(name string) time.Duration {
 	return 0
 }
 
+// readSecret takes the worker's coordinator secret from an inherited fd (read once, then closed so no
+// child inherits it) or the environment, and removes it from the environment either way.
+func readSecret(fd int) string {
+	if fd == 0 {
+		if v := os.Getenv("MOTHER_WORKER_SECRET_FD"); v != "" {
+			fd, _ = strconv.Atoi(v)
+		}
+	}
+	env := os.Getenv("MOTHER_WORKER_SECRET")
+	os.Unsetenv("MOTHER_WORKER_SECRET")
+	os.Unsetenv("MOTHER_WORKER_SECRET_FD")
+	if fd > 2 {
+		f := os.NewFile(uintptr(fd), "secret")
+		if f != nil {
+			b, _ := io.ReadAll(io.LimitReader(f, 4096))
+			f.Close()
+			if v := strings.TrimSpace(string(b)); v != "" {
+				return v
+			}
+		}
+	}
+	return strings.TrimSpace(env)
+}
+
 func main() {
 	id := flag.String("id", "", "worker id (required)")
 	root := flag.String("root", "", "worker root directory (required)")
 	sock := flag.String("coord-sock", "", "coordinator socket (default $MOTHER_ROOT/runner/worker.sock)")
 	slots := flag.Int("slots", 1, "jobs this worker runs at once")
+	secretFD := flag.Int("secret-fd", 0, "inherited fd to read this worker's coordinator secret from (else $MOTHER_WORKER_SECRET_FD, else $MOTHER_WORKER_SECRET)")
 	flag.Parse()
 	if *id == "" || *root == "" {
 		fmt.Fprintln(os.Stderr, "usage: mother-worker --id <name> --root <worker-root> [--coord-sock <path>] [--slots N]")
@@ -46,7 +73,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "mother-worker: --coord-sock or MOTHER_ROOT is required")
 			os.Exit(2)
 		}
-		*sock = filepath.Join(base, "runner", "worker.sock")
+		*sock = filepath.Join(base, "runner", "coord", "worker.sock")
 	}
 	absRoot, err := filepath.Abs(*root)
 	if err != nil {
@@ -65,8 +92,9 @@ func main() {
 	logf := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "%s mother-worker[%s]: %s\n", time.Now().UTC().Format(time.RFC3339), *id, fmt.Sprintf(format, args...))
 	}
+	secret := readSecret(*secretFD)
 	d, err := worker.New(worker.Config{
-		ID: *id, Root: absRoot, CoordSock: *sock, Slots: *slots, BinDir: binDir, LibDir: libDir,
+		Secret: secret, ID: *id, Root: absRoot, CoordSock: *sock, Slots: *slots, BinDir: binDir, LibDir: libDir,
 		BackoffMax: envDur("MOTHER_WORKER_BACKOFF_MAX_S"), Logf: logf,
 	})
 	if err != nil {

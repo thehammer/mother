@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"time"
 
 	"mother-broker/workerproto"
 )
@@ -75,35 +76,36 @@ func withOseq(data json.RawMessage, oseq, skipFrom int64) json.RawMessage {
 
 // filterJobSet drops the keys the wire's ownership table refuses (coordinator-derived keys,
 // `state: succeeded`, ...): the supervisor writes them into its own mirror, but a job.set carrying any is
-// refused whole. It returns nil when nothing is left to send.
-func filterJobSet(data json.RawMessage) json.RawMessage {
+// refused whole. It returns nil data when nothing is left to send, and ok=false when data is not a
+// job.set at all (that is a lost op, not a refused one).
+func filterJobSet(data json.RawMessage) (json.RawMessage, bool) {
 	var js workerproto.JobSet
 	if json.Unmarshal(data, &js) != nil {
-		return nil
+		return nil, false
 	}
 	bad := map[string]bool{}
 	for _, v := range workerproto.CheckJobSet(workerproto.JobState{State: "running"}, js.Set, js.Del) {
 		bad[v.Key] = true
 	}
 	if len(bad) == 0 {
-		return data
+		return data, true
 	}
-	out := workerproto.JobSet{Set: map[string]json.RawMessage{}, Del: []string{}}
+	kept := workerproto.JobSet{Set: map[string]json.RawMessage{}, Del: []string{}}
 	for k, v := range js.Set {
 		if !bad[k] {
-			out.Set[k] = v
+			kept.Set[k] = v
 		}
 	}
 	for _, k := range js.Del {
 		if !bad[k] {
-			out.Del = append(out.Del, k)
+			kept.Del = append(kept.Del, k)
 		}
 	}
-	if len(out.Set) == 0 && len(out.Del) == 0 {
-		return nil
+	if len(kept.Set) == 0 && len(kept.Del) == 0 {
+		return nil, true
 	}
-	b, _ := json.Marshal(out)
-	return b
+	b, _ := json.Marshal(kept)
+	return b, true
 }
 
 // shipLease sends whatever is new for l: outbox ops, then log bytes, then (once the supervisor has
@@ -159,8 +161,31 @@ func (d *Daemon) drained(l *lease) bool {
 	return true
 }
 
+// opLost handles an outbox op that cannot be sent (unreadable, not a JSON object, or too large for a
+// frame). It is never skipped and never replaced by a placeholder: shipping of this lease's ops stops at
+// the op, the degraded flag the supervisor holds on is set (runner/<job>.outbox-degraded, as
+// lib/outbox.sh writes it) and the reason rides on every heartbeat, so the coordinator audits it and
+// flags the job.
+func (d *Daemon) opLost(l *lease, oseq int64, why string) {
+	if l.degraded != "" {
+		return
+	}
+	l.degraded = why
+	d.logf("%s: outbox op %d cannot be shipped (%s): outbox degraded", l.loc.Job, oseq, why)
+	flag := d.p("runner", l.loc.Job+".outbox-degraded")
+	if _, err := os.Stat(flag); err != nil {
+		rec, _ := json.Marshal(map[string]any{"at": workerproto.Timestamp(time.Now()), "op": oseq, "why": why})
+		if err := writeFileAtomic(flag, append(rec, '\n')); err != nil {
+			d.logf("%s: write degraded flag: %v", l.loc.Job, err)
+		}
+	}
+}
+
 func (d *Daemon) shipOps(s *session, l *lease) bool {
 	sh := l.ship
+	if l.degraded != "" {
+		return true // an op was lost: nothing after it is shipped (the coordinator holds the job)
+	}
 	f, err := os.Open(d.p("outbox", l.loc.Job+".ndjson"))
 	if err != nil {
 		return true
@@ -178,36 +203,46 @@ func (d *Daemon) shipOps(s *session, l *lease) bool {
 		if err != nil {
 			return true // EOF, or a line still being written: not consumed
 		}
-		sh.outPos += int64(len(line))
 		var op outboxOp
 		if json.Unmarshal(bytes.TrimSpace(line), &op) != nil || op.Seq < 1 || !workerproto.IsStreamType(op.T) {
-			d.logf("%s: skipping an unreadable outbox line", l.loc.Job)
-			continue
+			d.opLost(l, sh.nextOseq, "unreadable_op")
+			return true // outPos is not advanced
 		}
+		lineStart := sh.outPos
+		sh.outPos += int64(len(line))
 		if op.Seq < sh.nextOseq {
 			continue // already applied by the coordinator
 		}
 		data := op.Data
 		if op.T == workerproto.TypeJobSet {
-			data = filterJobSet(data)
+			var ok bool
+			if data, ok = filterJobSet(data); !ok {
+				sh.outPos = lineStart
+				d.opLost(l, op.Seq, "op_not_an_object")
+				return true
+			}
 		}
 		var skipFrom int64
 		if op.Seq > sh.nextOseq {
 			skipFrom = sh.nextOseq
 		}
-		var payload json.RawMessage
-		if data != nil {
-			payload = withOseq(data, op.Seq, skipFrom)
-		}
-		if payload == nil {
-			// Nothing sendable (every key refused, or too large): the next op carries the skip range.
+		if data == nil && op.T == workerproto.TypeJobSet {
+			// Every key was refused by the ownership table: nothing to send, and the coordinator could
+			// not apply it anyway. The next op carries the skip range.
 			continue
+		}
+		payload := withOseq(data, op.Seq, skipFrom)
+		if payload == nil {
+			sh.outPos = lineStart
+			d.opLost(l, op.Seq, "op_not_an_object")
+			return true
 		}
 		seq := sh.base + sh.out.Last() + 1
 		b, err := build(op.T, l, &seq, payload)
 		if err != nil {
-			d.logf("%s: outbox op %d cannot be sent: %v", l.loc.Job, op.Seq, err)
-			continue
+			sh.outPos = lineStart
+			d.opLost(l, op.Seq, "op_too_large")
+			return true
 		}
 		sh.out.Append(op.T, payload)
 		sh.meta[seq] = frameMeta{oseq: op.Seq}

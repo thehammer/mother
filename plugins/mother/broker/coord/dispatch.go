@@ -23,6 +23,7 @@ const (
 	waitNoWorker = "no_worker_connected"
 	waitBusy     = "all_workers_busy"
 	waitOffer    = "offer_failed"
+	waitUnknown  = "unknown_worker"
 )
 
 func (s *Server) dispatchPath(job string) string { return filepath.Join(s.dispatchDir(), job+".json") }
@@ -33,6 +34,8 @@ type dispatchReq struct {
 	ResumeFrom json.RawMessage `json:"resume_from"`
 	Attempt    int             `json:"attempt"`
 	WaitReason string          `json:"wait_reason"`
+	Rejects    int             `json:"rejects"`
+	Held       string          `json:"held"`
 }
 
 // dispatchPass turns runner/dispatch/<job>.json requests into leases. A request whose job has a live
@@ -67,6 +70,13 @@ func (s *Server) dispatchPass() {
 			continue
 		}
 		if l, ok := s.leases.Get(job); ok && (l.State == workerproto.LeaseOffered || l.State == workerproto.LeaseActive) {
+			continue
+		}
+		if req.Held != "" {
+			continue // offered and rejected too often: waits for the operator
+		}
+		if req.Worker != "" && s.creds[req.Worker] == nil {
+			s.setWait(job, raw, req.WaitReason, waitUnknown)
 			continue
 		}
 		w, reason := s.pickWorker(req.Worker)
@@ -191,6 +201,13 @@ func (s *Server) offer(job string, req dispatchReq, w *workerConn) error {
 	if err := s.persistTable(); err != nil {
 		return s.abandonOffer(job, l, err)
 	}
+	if old := s.jobs[job]; old != nil {
+		for _, c := range old.cmds { // an unacked revoke of an earlier lease is still owed to its worker
+			if c.Type == workerproto.TypeLeaseRevoke {
+				jl.cmds = append(jl.cmds, c)
+			}
+		}
+	}
 	s.jobs[job] = jl
 	s.adm.SetApplied(job, l.ID, l.Epoch, 0)
 	jl.rec.AppliedSeq = s.truthApplied(jl)
@@ -206,6 +223,7 @@ func (s *Server) offer(job string, req dispatchReq, w *workerConn) error {
 // abandonOffer revokes a lease that could not be sent, so the job is not left "busy" for a TTL.
 func (s *Server) abandonOffer(job string, l workerproto.Lease, cause error) error {
 	_ = s.leases.Revoke(job, l.ID, l.Epoch)
+	s.adm.Forget(job, l.ID, l.Epoch)
 	delete(s.jobs, job)
 	_ = s.persistTable()
 	_ = os.Remove(s.cmdsPath(job))

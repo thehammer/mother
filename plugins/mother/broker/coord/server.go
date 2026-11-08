@@ -13,9 +13,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -31,6 +34,21 @@ var ServerCaps = []string{"log.stream", "artifact.chunked", "checkpoint.v1", "ho
 // owns paused_reason, and the supervisor derives the pause details from pause_requested).
 var downlinkKeys = []string{"cancel_requested", "pause_requested", "max_cost_usd", "force_start"}
 
+// Bounds on the connection and refusal paths.
+const (
+	defaultMaxConns       = 64
+	defaultMaxPreHello    = 8
+	defaultHelloTimeout   = 10 * time.Second
+	maxConsecutiveRefusal = 50
+	auditThrottle         = 5 * time.Second
+	defaultAuditMaxBytes  = 4 << 20
+	maxOfferRejects       = 3
+	revokeRetain          = 24 * time.Hour
+)
+
+// Time: lease TTLs, LastHB and the restore path use wall-clock time (Config.Now). A clock step while the
+// coordinator is down can shift how much of a TTL has elapsed after a restart; restore refreshes LastHB to
+// the restore time's frame of reference only through the uptime grace in ExpireTTL.
 type Config struct {
 	Root       string // canonical $MOTHER_ROOT
 	LibDir     string // plugin lib dir (coord_apply.sh)
@@ -41,6 +59,13 @@ type Config struct {
 	FlushOps   int           // default 64
 	PollEvery  time.Duration // default 1s
 	Logf       func(format string, args ...any)
+
+	MaxConns       int           // total connections (default 64)
+	MaxPreHello    int           // connections that have not said hello (default 8)
+	HelloTimeout   time.Duration // default 10s
+	IdleTimeout    time.Duration // post-hello read deadline; default 3 heartbeat intervals
+	AuditMaxBytes  int64         // audit.jsonl rotates past this (default 4 MiB)
+	AcceptMinSleep time.Duration // first retry delay after a temporary Accept error (default 5ms)
 }
 
 type workerConn struct {
@@ -50,14 +75,43 @@ type workerConn struct {
 	caps     []string
 	conn     net.Conn
 	out      chan []byte
+	done     chan struct{}
 	since    time.Time
 	once     sync.Once
+	refusals int          // consecutive refused frames; guarded by Server.mu
+	readAt   atomic.Int64 // unix nanos of a frame read but not yet handled; 0 when idle
 }
 
-func (w *workerConn) close() { w.once.Do(func() { w.conn.Close() }) }
+func newWorkerConn(id, instance string, slots int, caps []string, conn net.Conn, since time.Time) *workerConn {
+	return &workerConn{id: id, instance: instance, slots: slots, caps: caps, conn: conn, out: make(chan []byte, 4096), done: make(chan struct{}), since: since}
+}
+
+func (w *workerConn) close() {
+	w.once.Do(func() {
+		close(w.done)
+		w.conn.Close()
+	})
+}
+
+func (w *workerConn) closed() bool {
+	select {
+	case <-w.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// connState tracks one accepted socket for the bounds and for shutdown.
+type connState struct {
+	c       net.Conn
+	pre     bool // has not completed hello
+	evicted bool
+	at      time.Time
+}
 
 // Server is the coordinator. One mutex guards all state; connection goroutines only parse, then
-// call into handleLine under it.
+// call into handleLine under it. (A slow Applier runs with the mutex released: see flushJob.)
 type Server struct {
 	cfg Config
 
@@ -66,10 +120,22 @@ type Server struct {
 	adm      *workerproto.Admitter
 	jobs     map[string]*jobLease
 	workers  map[string]*workerConn
+	creds    map[string]*workerCred
 	upSince  time.Time
 	fileSent map[string]string
 	kick     chan struct{}
 	ln       net.Listener
+	auditAt  map[string]auditEntry
+
+	wg      sync.WaitGroup
+	connMu  sync.Mutex
+	conns   map[*connState]struct{}
+	preConn int
+}
+
+type auditEntry struct {
+	at         time.Time
+	suppressed int
 }
 
 func New(cfg Config) (*Server, error) {
@@ -88,15 +154,34 @@ func New(cfg Config) (*Server, error) {
 	if cfg.PollEvery <= 0 {
 		cfg.PollEvery = time.Second
 	}
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = defaultMaxConns
+	}
+	if cfg.MaxPreHello <= 0 {
+		cfg.MaxPreHello = defaultMaxPreHello
+	}
+	if cfg.HelloTimeout <= 0 {
+		cfg.HelloTimeout = defaultHelloTimeout
+	}
+	if cfg.AuditMaxBytes <= 0 {
+		cfg.AuditMaxBytes = defaultAuditMaxBytes
+	}
+	if cfg.AcceptMinSleep <= 0 {
+		cfg.AcceptMinSleep = 5 * time.Millisecond
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
 	if cfg.Applier == nil {
 		cfg.Applier = ExecApplier{Root: cfg.Root, LibDir: cfg.LibDir}
 	}
-	s := &Server{cfg: cfg, jobs: map[string]*jobLease{}, workers: map[string]*workerConn{}, fileSent: map[string]string{}, kick: make(chan struct{}, 1)}
+	s := &Server{cfg: cfg, jobs: map[string]*jobLease{}, workers: map[string]*workerConn{}, creds: map[string]*workerCred{},
+		fileSent: map[string]string{}, kick: make(chan struct{}, 1), auditAt: map[string]auditEntry{}, conns: map[*connState]struct{}{}}
 	s.upSince = cfg.Now()
-	if err := os.MkdirAll(s.leasesDir(), 0o755); err != nil {
+	if err := os.MkdirAll(s.leasesDir(), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(s.leasesDir(), 0o700); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(s.dispatchDir(), 0o755); err != nil {
@@ -113,8 +198,16 @@ func New(cfg Config) (*Server, error) {
 
 func (s *Server) logf(format string, args ...any) { s.cfg.Logf(format, args...) }
 
+func (s *Server) idleTimeout() time.Duration {
+	if s.cfg.IdleTimeout > 0 {
+		return s.cfg.IdleTimeout
+	}
+	return 3 * time.Duration(s.hbIntervalS()) * time.Second
+}
+
 // restore loads the lease table snapshot and each live lease's record and queued commands. A corrupt
-// snapshot is refused (never loaded): reissuing an epoch could let a stale worker write.
+// snapshot is refused (never loaded): reissuing an epoch could let a stale worker write. Every restored
+// command is re-registered as issued, so a cmd.ack arriving after a restart is judged against it.
 func (s *Server) restore() error {
 	var snap workerproto.LeaseSnapshot
 	if b, err := os.ReadFile(s.tablePath()); err == nil {
@@ -141,6 +234,11 @@ func (s *Server) restore() error {
 		jl.rec.State = string(r.State)
 		jl.rec.LastHB = fmtTime(r.LastHB)
 		s.loadCmds(jl)
+		for _, c := range jl.cmds {
+			if f, err := workerproto.Decode(c.Frame); err == nil {
+				s.adm.Issued(f)
+			}
+		}
 		s.jobs[r.Job] = jl
 		s.adm.SetApplied(r.Job, r.ID, r.Epoch, jl.rec.WireSeq)
 	}
@@ -166,31 +264,142 @@ func (s *Server) Close() {
 	s.mu.Unlock()
 }
 
-// Serve runs the daemon on ln until ctx is done.
+func isTransient(err error) bool {
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ENOBUFS) || errors.Is(err, syscall.ENOMEM) || errors.Is(err, syscall.EINTR) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) //nolint:staticcheck
+}
+
+// admitConn registers an accepted socket against the bounds. When the pre-hello slots are full the oldest
+// pre-hello connection is evicted (an idle flood cannot starve a real worker's handshake); when the total
+// is full the new socket is refused.
+func (s *Server) admitConn(c net.Conn) *connState {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if len(s.conns) >= s.cfg.MaxConns {
+		return nil
+	}
+	if s.preConn >= s.cfg.MaxPreHello {
+		var oldest *connState
+		for cs := range s.conns {
+			if cs.pre && !cs.evicted && (oldest == nil || cs.at.Before(oldest.at)) {
+				oldest = cs
+			}
+		}
+		if oldest == nil {
+			return nil
+		}
+		oldest.evicted, oldest.pre = true, false
+		s.preConn--
+		oldest.c.Close()
+	}
+	cs := &connState{c: c, pre: true, at: time.Now()}
+	s.conns[cs] = struct{}{}
+	s.preConn++
+	return cs
+}
+
+func (s *Server) helloDone(cs *connState) {
+	if cs == nil {
+		return
+	}
+	s.connMu.Lock()
+	if cs.pre {
+		cs.pre = false
+		s.preConn--
+	}
+	s.connMu.Unlock()
+}
+
+func (s *Server) dropConn(cs *connState) {
+	if cs == nil {
+		return
+	}
+	s.connMu.Lock()
+	if cs.pre {
+		cs.pre = false
+		s.preConn--
+	}
+	delete(s.conns, cs)
+	s.connMu.Unlock()
+}
+
+func (s *Server) closeAllConns() {
+	s.connMu.Lock()
+	for cs := range s.conns {
+		cs.c.Close()
+	}
+	s.connMu.Unlock()
+}
+
+// Serve runs the daemon on ln until ctx is done. A temporary Accept error (EMFILE, ...) is retried with
+// backoff and never ends the coordinator. Every goroutine it starts is waited for before it returns.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	s.mu.Lock()
 	s.ln = ln
 	s.mu.Unlock()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); s.loops(ctx) }()
-	go func() { <-ctx.Done(); ln.Close() }()
+	s.wg.Add(2)
+	go func() { defer s.wg.Done(); s.loops(ctx) }()
+	go func() { defer s.wg.Done(); <-ctx.Done(); ln.Close() }()
+	var serveErr error
+	var delay time.Duration
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			wg.Wait()
 			if ctx.Err() != nil {
-				return nil
+				break
 			}
-			return err
+			if isTransient(err) {
+				if delay == 0 {
+					delay = s.cfg.AcceptMinSleep
+				} else if delay *= 2; delay > time.Second {
+					delay = time.Second
+				}
+				s.logf("accept: %v (retrying in %s)", err, delay)
+				select {
+				case <-ctx.Done():
+				case <-time.After(delay):
+				}
+				continue
+			}
+			serveErr = err
+			break
 		}
+		delay = 0
 		uc, ok := c.(*net.UnixConn)
 		if !ok {
 			c.Close()
 			continue
 		}
-		go s.handleConn(uc)
+		cs := s.admitConn(uc)
+		if cs == nil {
+			uc.Close()
+			continue
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer s.dropConn(cs)
+			s.handleConn(uc, cs)
+		}()
 	}
+	cancel()
+	s.closeAllConns()
+	s.mu.Lock()
+	for _, w := range s.workers {
+		w.close()
+	}
+	s.mu.Unlock()
+	s.wg.Wait()
+	if ctx.Err() != nil && serveErr == nil {
+		return nil
+	}
+	return serveErr
 }
 
 func (s *Server) loops(ctx context.Context) {
@@ -212,14 +421,20 @@ func (s *Server) loops(ctx context.Context) {
 		defer w.Close()
 		_ = w.Add(s.dispatchDir())
 		_ = w.Add(s.path("runner"))
+		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case _, ok := <-w.Events:
+				case ev, ok := <-w.Events:
 					if !ok {
 						return
+					}
+					// pollOnce writes coord-status.json in runner/: its own writes must not wake it again.
+					if strings.HasPrefix(filepath.Base(ev.Name), "coord-status.json") {
+						continue
 					}
 					select {
 					case s.kick <- struct{}{}:
@@ -255,22 +470,25 @@ func (s *Server) pollOnce() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dispatchPass()
+	s.revokePass()
 	s.holdPass()
 	s.syncJobPass()
 	s.syncFilePass()
+	s.pruneStaleCmds()
 	s.writeStatus()
 }
 
 // ---------- connections ----------
 
-func (s *Server) handleConn(c *net.UnixConn) {
+func (s *Server) handleConn(c *net.UnixConn, cs *connState) {
 	defer c.Close()
-	if err := peerUIDOK(c); err != nil {
+	peerPID, err := peerIdentity(c)
+	if err != nil {
 		s.logf("refusing worker connection: %v", err)
 		return
 	}
 	br := bufio.NewReaderSize(c, 64<<10)
-	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = c.SetReadDeadline(time.Now().Add(s.cfg.HelloTimeout))
 	line, err := workerproto.ReadFrame(br)
 	if err != nil {
 		return
@@ -281,6 +499,7 @@ func (s *Server) handleConn(c *net.UnixConn) {
 			return
 		}
 		if b, e := workerproto.Encode(f); e == nil {
+			_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			_, _ = c.Write(b)
 		}
 	}
@@ -303,8 +522,14 @@ func (s *Server) handleConn(c *net.UnixConn) {
 		reply(workerproto.TypeRefuse, ref)
 		return
 	}
-	w := &workerConn{id: h.WorkerID, instance: h.InstanceID, slots: slots, caps: welcome.Caps, conn: c, out: make(chan []byte, 4096), since: s.now()}
+	w := newWorkerConn(h.WorkerID, h.InstanceID, slots, welcome.Caps, c, s.now())
 	s.mu.Lock()
+	if why := s.authenticate(h, peerPID); why != "" {
+		s.auditRefusal(h.WorkerID, "", "", 0, "auth_failed:"+why)
+		s.mu.Unlock()
+		reply(workerproto.TypeRefuse, workerproto.Refuse{Code: workerproto.CodeAuthFailed, Msg: "authentication failed"})
+		return
+	}
 	// hello goes through Admit like every frame: the identity is the connection's, not the frame's.
 	if _, err := s.adm.Admit(w.id, line, s.now()); err != nil {
 		s.mu.Unlock()
@@ -313,14 +538,21 @@ func (s *Server) handleConn(c *net.UnixConn) {
 	}
 	s.register(w, welcome)
 	s.mu.Unlock()
-	_ = c.SetReadDeadline(time.Time{})
+	s.helloDone(cs)
 
+	s.wg.Add(1)
 	go func() {
-		for b := range w.out {
-			_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if _, err := c.Write(b); err != nil {
-				w.close()
+		defer s.wg.Done()
+		for {
+			select {
+			case <-w.done:
 				return
+			case b := <-w.out:
+				_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if _, err := c.Write(b); err != nil {
+					w.close()
+					return
+				}
 			}
 		}
 	}()
@@ -332,7 +564,9 @@ func (s *Server) handleConn(c *net.UnixConn) {
 		s.mu.Unlock()
 		w.close()
 	}()
+	idle := s.idleTimeout()
 	for {
+		_ = c.SetReadDeadline(time.Now().Add(idle))
 		line, err := workerproto.ReadFrame(br)
 		if err != nil {
 			if workerproto.ErrorCode(err) == workerproto.CodeTooLarge {
@@ -342,10 +576,12 @@ func (s *Server) handleConn(c *net.UnixConn) {
 			}
 			return
 		}
+		w.readAt.Store(time.Now().UnixNano())
 		s.mu.Lock()
 		closeIt := s.handleLine(w, line)
 		s.mu.Unlock()
-		if closeIt {
+		w.readAt.Store(0)
+		if closeIt || w.closed() {
 			return
 		}
 	}
@@ -383,7 +619,7 @@ func (s *Server) hbIntervalS() int {
 // the worker re-derives its frames from that position.
 func (s *Server) register(w *workerConn, welcome *workerproto.Welcome) {
 	if old := s.workers[w.id]; old != nil {
-		old.close()
+		old.close() // authenticate() already established it is dead or the same instance
 	}
 	s.workers[w.id] = w
 	welcome.HbIntervalS = s.hbIntervalS()
@@ -401,10 +637,15 @@ func (s *Server) register(w *workerConn, welcome *workerproto.Welcome) {
 	}
 	s.sendFrame(w, workerproto.TypeWelcome, nil, welcome)
 	for _, jl := range s.sortedJobs() {
-		if jl.rec.WorkerID != w.id || !live(jl.rec.State) {
+		if jl.rec.WorkerID != w.id {
 			continue
 		}
+		isLive := live(jl.rec.State)
 		for _, c := range jl.cmds {
+			// An ended lease only has its lease.revoke left to deliver (until acked).
+			if !isLive && c.Type != workerproto.TypeLeaseRevoke {
+				continue
+			}
 			if f, err := workerproto.Decode(c.Frame); err == nil {
 				s.adm.Issued(f)
 			}
@@ -482,6 +723,10 @@ func (s *Server) sendRefuse(w *workerConn, f *workerproto.Frame, code string) {
 // handleLine admits one worker frame. It returns true when the connection should be closed.
 func (s *Server) handleLine(w *workerConn, line []byte) bool {
 	now := s.now()
+	// Admit is reached only for a connection that completed hello (handleConn registers it first).
+	if cur := s.workers[w.id]; cur != w {
+		return true // displaced or not registered
+	}
 	adm, err := s.adm.Admit(w.id, line, now)
 	f := adm.Frame
 	if err != nil {
@@ -489,6 +734,7 @@ func (s *Server) handleLine(w *workerConn, line []byte) bool {
 		if code == "" {
 			code = workerproto.CodeInvalid
 		}
+		w.refusals++
 		switch code {
 		case workerproto.CodeFenced, workerproto.CodeNotLeased, workerproto.CodeUnknownJob, workerproto.CodeOwnership:
 			job, lease, epoch := "", "", int64(0)
@@ -501,11 +747,16 @@ func (s *Server) handleLine(w *workerConn, line []byte) bool {
 			if f.Epoch != nil {
 				epoch = *f.Epoch
 			}
-			s.audit(w.id, job, lease, epoch, code)
+			s.auditRefusal(w.id, job, lease, epoch, code)
 		}
 		s.sendRefuse(w, &f, code)
+		if w.refusals >= maxConsecutiveRefusal {
+			s.auditRefusal(w.id, "", "", 0, "too_many_refusals")
+			return true
+		}
 		return false
 	}
+	w.refusals = 0
 	switch f.T {
 	case workerproto.TypeHello:
 		s.sendRefuse(w, &f, workerproto.CodeInvalid)
@@ -535,7 +786,7 @@ func (s *Server) onHb(w *workerConn, f workerproto.Frame, adm workerproto.Admiss
 			if l, ok := s.leases.Get(j.Job); ok && l.State == workerproto.LeaseOffered && l.ID == j.Lease && l.Epoch == j.Epoch && l.Worker == w.id {
 				continue
 			}
-			s.audit(w.id, j.Job, j.Lease, j.Epoch, code)
+			s.auditRefusal(w.id, j.Job, j.Lease, j.Epoch, code)
 			fr := workerproto.Frame{Job: workerproto.Str(j.Job), Lease: workerproto.Str(j.Lease), Epoch: workerproto.Int(j.Epoch)}
 			s.sendRefuse(w, &fr, code)
 			continue
@@ -543,6 +794,9 @@ func (s *Server) onHb(w *workerConn, f workerproto.Frame, adm workerproto.Admiss
 		jl := s.jobs[j.Job]
 		if jl == nil {
 			continue
+		}
+		if j.Degraded != "" {
+			s.noteDegraded(jl, j.Degraded)
 		}
 		if l, ok := s.leases.Get(j.Job); ok && l.ID == j.Lease {
 			jl.rec.LastHB = fmtTime(l.LastHB)
@@ -575,9 +829,10 @@ func (s *Server) onCmdAck(w *workerConn, f workerproto.Frame) {
 	}
 	if ack.Outcome == workerproto.OutcomeRejected {
 		s.audit(w.id, jl.job, jl.rec.LeaseID, jl.rec.Epoch, "offer_rejected")
+		s.rejectOffer(jl, ack.Why)
 		return
 	}
-	if l, ok := s.leases.Get(jl.job); ok && l.State == workerproto.LeaseActive && jl.rec.State != string(workerproto.LeaseActive) {
+	if l, ok := s.leases.Get(jl.job); ok && l.State == workerproto.LeaseActive && l.ID == jl.rec.LeaseID && jl.rec.State != string(workerproto.LeaseActive) {
 		jl.rec.State = string(workerproto.LeaseActive)
 		jl.rec.LastHB = fmtTime(l.LastHB)
 		s.persistRec(jl)
@@ -630,6 +885,9 @@ func isOp(t string) bool {
 // directly, then (apply, persist, commit, ack) in that order. A stalled op (applier error, gap) leaves
 // the rest pending for the next tick.
 func (s *Server) flushJob(jl *jobLease) {
+	if jl.applying {
+		return // another flush of this job is in its (unlocked) apply; the next tick continues
+	}
 	if !live(jl.rec.State) {
 		jl.pending = map[int64]workerproto.Frame{}
 		jl.dirty = false
@@ -692,10 +950,21 @@ func (s *Server) flushJob(jl *jobLease) {
 	}
 	var applied int64
 	if len(ops) > 0 {
-		var aerr error
-		applied, aerr = s.cfg.Applier.Apply(jl.job, ops)
+		// The applier can take seconds (it execs a script): run it with the mutex released, so heartbeats
+		// and other workers' frames keep flowing and no healthy lease expires behind a slow apply.
+		leaseID, epoch := jl.rec.LeaseID, jl.rec.Epoch
+		jl.applying = true
+		s.mu.Unlock()
+		a, aerr := s.cfg.Applier.Apply(jl.job, ops)
+		s.mu.Lock()
+		jl.applying = false
+		applied = a
 		if aerr != nil {
 			s.logf("apply %s: %v", jl.job, aerr)
+		}
+		if jl.rec.LeaseID != leaseID || jl.rec.Epoch != epoch || !live(jl.rec.State) {
+			jl.dirty = len(jl.pending) > 0
+			return // the lease ended while applying; coord_apply tracks what landed
 		}
 	}
 	committed := 0
@@ -740,7 +1009,7 @@ func (s *Server) flushJob(jl *jobLease) {
 		s.persistRec(jl)
 	}
 	jl.dirty = len(jl.pending) > 0
-	if w := s.workers[jl.rec.WorkerID]; w != nil && committed > 0 {
+	if w := s.workers[jl.rec.WorkerID]; w != nil && committed > 0 && live(jl.rec.State) {
 		s.sendAck(w, jl, anchor)
 	}
 }
@@ -821,10 +1090,10 @@ func (s *Server) writeLog(jl *jobLease, la workerproto.LogAppend) bool {
 		return true
 	}
 	raw = raw[size-la.Offset:]
-	if err := os.MkdirAll(s.path("logs"), 0o755); err != nil {
+	if err := os.MkdirAll(s.path("logs"), 0o700); err != nil {
 		return false
 	}
-	f, err := os.OpenFile(s.logPath(jl.job), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.logPath(jl.job), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		s.logf("log %s: %v", jl.job, err)
 		return false
@@ -845,6 +1114,7 @@ func (s *Server) endLease(jl *jobLease, to workerproto.LeaseState, reason string
 	jl.pending = map[int64]workerproto.Frame{}
 	jl.cmds = nil
 	jl.dirty = false
+	s.adm.Forget(jl.job, jl.rec.LeaseID, jl.rec.Epoch)
 	s.persistCmds(jl)
 	s.persistRec(jl)
 	if err := s.persistTable(); err != nil {
@@ -855,6 +1125,18 @@ func (s *Server) endLease(jl *jobLease, to workerproto.LeaseState, reason string
 // ---------- loss ----------
 
 func (s *Server) expire() {
+	// A worker whose frame has been read but is still waiting on the mutex has not been judged yet: its
+	// leases are not stale just because we were busy.
+	now := s.now()
+	for id, w := range s.workers {
+		if at := w.readAt.Load(); at != 0 && time.Since(time.Unix(0, at)) < s.cfg.TTL {
+			for _, jl := range s.jobs {
+				if jl.rec.WorkerID == id && jl.rec.State == string(workerproto.LeaseActive) {
+					_ = s.leases.HeartbeatFor(id, jl.job, jl.rec.LeaseID, jl.rec.Epoch, now)
+				}
+			}
+		}
+	}
 	for _, l := range s.leases.ExpireTTL(s.now(), s.upSince, s.cfg.TTL) {
 		jl := s.jobs[l.Job]
 		if jl == nil || jl.rec.LeaseID != l.ID {
@@ -866,7 +1148,6 @@ func (s *Server) expire() {
 		if err := writeFileAtomic(s.lostPath(l.Job), append(note, '\n'), false); err != nil {
 			s.logf("write lost marker %s: %v", l.Job, err)
 		}
-		s.adm.Forget(l.Job, l.ID, l.Epoch)
 	}
 }
 
@@ -892,11 +1173,19 @@ type StatusLease struct {
 }
 
 type Status struct {
-	Running   bool           `json:"running"`
-	PID       int            `json:"pid"`
-	UpdatedAt string         `json:"updated_at"`
-	Workers   []StatusWorker `json:"workers"`
-	Leases    []StatusLease  `json:"leases"`
+	Running   bool              `json:"running"`
+	PID       int               `json:"pid"`
+	UpdatedAt string            `json:"updated_at"`
+	Workers   []StatusWorker    `json:"workers"`
+	Leases    []StatusLease     `json:"leases"`
+	Attention []StatusAttention `json:"attention,omitempty"`
+}
+
+// StatusAttention is something the operator should look at (e.g. a lease whose worker lost an outbox op).
+type StatusAttention struct {
+	Job    string `json:"job"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
 }
 
 func (s *Server) liveCount(worker string) int {
@@ -927,6 +1216,9 @@ func (s *Server) writeStatus() {
 		age := 0.0
 		if l, ok := s.leases.Get(jl.job); ok {
 			age = s.now().Sub(l.LastHB).Seconds()
+		}
+		if jl.rec.Degraded != "" {
+			st.Attention = append(st.Attention, StatusAttention{Job: jl.job, Reason: "outbox_degraded", Detail: jl.rec.Degraded})
 		}
 		st.Leases = append(st.Leases, StatusLease{Job: jl.job, LeaseID: jl.rec.LeaseID, Epoch: jl.rec.Epoch, WorkerID: jl.rec.WorkerID, State: jl.rec.State, HbAgeS: age})
 	}
@@ -980,9 +1272,14 @@ func (s *Server) revokeLocked(job, reason string) error {
 	if err := s.leases.Revoke(job, jl.rec.LeaseID, jl.rec.Epoch); err != nil {
 		return err
 	}
-	cmds := jl.cmds
+	var keep []cmdEntry
+	for _, c := range jl.cmds {
+		if c.Type == workerproto.TypeLeaseRevoke { // holds and syncs for a dead lease are moot
+			keep = append(keep, c)
+		}
+	}
 	s.endLease(jl, workerproto.LeaseRevoked, reason)
-	jl.cmds = cmds // keep the revoke queued for redelivery
+	jl.cmds = keep // the revoke stays queued, and is redelivered on every connect until acked
 	s.persistCmds(jl)
 	return nil
 }

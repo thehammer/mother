@@ -79,7 +79,7 @@ func (h *harness) connect(id string, slots int) {
 	a, b := net.Pipe()
 	h.peer = b
 	h.rd = bufio.NewReader(b)
-	h.w = &workerConn{id: id, slots: slots, conn: a, out: make(chan []byte, 4096), since: h.now}
+	h.w = newWorkerConn(id, "i-"+id, slots, nil, a, h.now)
 	go func() {
 		for line := range h.w.out {
 			_, _ = a.Write(line)

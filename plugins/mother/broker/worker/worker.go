@@ -31,6 +31,11 @@ type Config struct {
 	Slots     int
 	BinDir    string // where mother-run-job lives
 	LibDir    string // lib/ (worker_sync.sh)
+	// Secret is this worker's credential for the coordinator (proved in hello.auth). It lives in memory only:
+	// it is never put in the environment of anything the daemon starts.
+	Secret string
+	// TermGrace is how long a fenced supervisor group gets after SIGTERM before SIGKILL (default 10s).
+	TermGrace time.Duration
 	// BackoffBase/BackoffMax bound the reconnect delay: base doubling to max, plus up to 20% jitter.
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
@@ -56,6 +61,9 @@ func New(cfg Config) (*Daemon, error) {
 	}
 	if cfg.BackoffMax <= 0 {
 		cfg.BackoffMax = 30 * time.Second
+	}
+	if cfg.TermGrace <= 0 {
+		cfg.TermGrace = 10 * time.Second
 	}
 	if cfg.Slots < 1 {
 		cfg.Slots = 1
@@ -84,7 +92,7 @@ func (d *Daemon) p(parts ...string) string {
 // initRoot creates the worker root skeleton (idempotent: an existing root is kept as is).
 func (d *Daemon) initRoot() error {
 	for _, sub := range []string{"jobs", "events", "logs", "runner", "outbox", "metrics", "crew", "leases", "children"} {
-		if err := os.MkdirAll(d.p(sub), 0o755); err != nil {
+		if err := os.MkdirAll(d.p(sub), 0o700); err != nil {
 			return err
 		}
 	}
@@ -92,7 +100,7 @@ func (d *Daemon) initRoot() error {
 	if _, err := os.Stat(marker); err != nil {
 		msg := "This directory is a Mother WORKER root (job mirror and unshipped outbox).\n" +
 			"Mother refuses to recursively delete any directory that contains this file.\n"
-		if err := os.WriteFile(marker, []byte(msg), 0o644); err != nil {
+		if err := os.WriteFile(marker, []byte(msg), 0o600); err != nil {
 			return err
 		}
 	}
@@ -188,7 +196,7 @@ func writeJSON(path string, v any) error {
 }
 
 func writeFileAtomic(path string, b []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp.")

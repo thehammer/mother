@@ -17,14 +17,25 @@ type Admitter struct {
 	leases   *LeaseTable
 	jobState func(job string) JobState
 	streams  map[string]*InStream
-	issued   map[string]string // cmd_id -> command type, for the commands the coordinator sent
+	issued   map[string]issuedRec // cmd_id -> what the coordinator sent
 	issuedQ  []string
 }
 
 // NewAdmitter wraps a lease table. jobState reports a job's current state for job.set transition rules
 // (it must not be nil; return the zero JobState when unknown).
 func NewAdmitter(leases *LeaseTable, jobState func(job string) JobState) *Admitter {
-	return &Admitter{leases: leases, jobState: jobState, streams: map[string]*InStream{}, issued: map[string]string{}}
+	return &Admitter{leases: leases, jobState: jobState, streams: map[string]*InStream{}, issued: map[string]issuedRec{}}
+}
+
+// issuedRec is what the coordinator recorded for a command it sent: its type and, for job-scoped
+// commands, the lease it was sent under.
+type issuedRec struct {
+	typ, job, lease string
+	epoch           int64
+}
+
+func (r issuedRec) forLease(f Frame) bool {
+	return f.Job != nil && f.Lease != nil && f.Epoch != nil && r.job == *f.Job && r.lease == *f.Lease && r.epoch == *f.Epoch
 }
 
 // HbRefusal is one heartbeat entry that was not accepted (fenced, not_leased or unknown_job).
@@ -65,7 +76,11 @@ func (a *Admitter) Issued(f Frame) {
 	if !commandTypes[f.T] || json.Unmarshal(f.Data, &c) != nil || c.CmdID == "" {
 		return
 	}
-	a.issued[c.CmdID] = f.T
+	rec := issuedRec{typ: f.T}
+	if f.Job != nil && f.Lease != nil && f.Epoch != nil {
+		rec.job, rec.lease, rec.epoch = *f.Job, *f.Lease, *f.Epoch
+	}
+	a.issued[c.CmdID] = rec
 	a.issuedQ = append(a.issuedQ, c.CmdID)
 	for len(a.issuedQ) > DedupeHorizon {
 		delete(a.issued, a.issuedQ[0])
@@ -82,6 +97,9 @@ func (a *Admitter) SetApplied(job, lease string, epoch, applied int64) {
 func (a *Admitter) Forget(job, lease string, epoch int64) {
 	delete(a.streams, streamKey(job, lease, epoch))
 }
+
+// StreamCount is the number of inbound streams held in memory (leases whose state has not been forgotten).
+func (a *Admitter) StreamCount() int { return len(a.streams) }
 
 // Admit processes one line from the worker named by worker. Errors are *ProtoError whose code is the
 // refuse to send (too_large for a frame beyond the window, ownership for a bad job.set, fenced,
@@ -114,7 +132,13 @@ func (a *Admitter) Admit(worker string, line []byte, now time.Time) (Admission, 
 		// The sync.file exemption (not job-scoped, so no lease to fence) rests on what the coordinator
 		// recorded for this cmd_id, never on the worker's `for`: a worker cannot skip the fence by
 		// labelling an ack sync.file.
-		if issuedType := a.issued[ack.CmdID]; issuedType == TypeSyncFile {
+		rec, known := a.issued[ack.CmdID]
+		if known && rec.typ == TypeSyncFile {
+			break
+		}
+		// An ack of a lease.revoke is judged on the coordinator's own record too: the lease is already
+		// ended (so the fence below would refuse it), but the revoke must still be acknowledgeable.
+		if known && rec.typ == TypeLeaseRevoke && rec.forLease(f) {
 			break
 		}
 		if ack.For == TypeSyncFile || f.Job == nil {
@@ -130,6 +154,9 @@ func (a *Admitter) Admit(worker string, line []byte, now time.Time) (Admission, 
 			// The only command that can be outstanding on an offered lease is lease.offer, so its first
 			// applied ack activates the lease. A rejected ack leaves it to lapse (or be revoked).
 			if ack.Outcome == OutcomeApplied {
+				if !known || rec.typ != TypeLeaseOffer || !rec.forLease(f) {
+					return adm, protoErr(CodeInvalid, "cmd.ack: cmd_id is not this lease's outstanding lease.offer")
+				}
 				if err := a.leases.AcceptFor(worker, *f.Job, *f.Lease, *f.Epoch, now); err != nil {
 					return adm, err
 				}

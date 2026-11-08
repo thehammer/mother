@@ -3,12 +3,15 @@ package worker
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
+	"mother-broker/coord"
 	"mother-broker/workerproto"
 )
 
@@ -60,13 +63,27 @@ func (d *Daemon) runSession(ctx context.Context) (welcomed bool, err error) {
 		return false, err
 	}
 	s := &session{d: d, conn: conn}
+	// Every goroutine of the session is owned here: sctx ends them, wg waits for them, so a reconnect
+	// never leaves one behind.
+	sctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	defer conn.Close()
-	go func() { <-ctx.Done(); conn.Close() }()
+	defer cancel()
+	wg.Add(1)
+	go func() { defer wg.Done(); <-sctx.Done(); conn.Close() }()
 
-	hello := helloData{Hello: workerproto.Hello{
+	h := workerproto.Hello{
 		ProtoMin: workerproto.ProtoMin, ProtoMax: workerproto.ProtoMax, Caps: d.caps(), WorkerID: d.cfg.ID,
 		InstanceID: d.instance, Kind: "worker", Auth: workerproto.Auth{Method: workerproto.AuthMethodPeercred},
-	}, Slots: d.cfg.Slots}
+	}
+	if d.cfg.Secret != "" {
+		nb := make([]byte, 16)
+		_, _ = cryptorand.Read(nb)
+		h.Auth.Nonce = hex.EncodeToString(nb) // per connection
+		h.Auth.Credential = coord.CredentialProof(d.cfg.Secret, h)
+	}
+	hello := helloData{Hello: h, Slots: d.cfg.Slots}
 	b, err := build(workerproto.TypeHello, nil, nil, hello)
 	if err != nil {
 		return false, err
@@ -112,10 +129,9 @@ func (d *Daemon) runSession(ctx context.Context) (welcomed bool, err error) {
 	d.mu.Unlock()
 	d.logf("connected to the coordinator (%d lease(s) resumed)", len(w.Jobs))
 
-	sctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go d.shipLoop(sctx, s)
-	go d.hbLoop(sctx, s, hb)
+	wg.Add(2)
+	go func() { defer wg.Done(); d.shipLoop(sctx, s) }()
+	go func() { defer wg.Done(); d.hbLoop(sctx, s, hb) }()
 	defer func() {
 		d.mu.Lock()
 		if d.sess == s {
@@ -176,7 +192,7 @@ func (d *Daemon) sendHb(s *session) {
 		if l.ship != nil {
 			last = l.ship.base + l.ship.out.Last()
 		}
-		jobs = append(jobs, workerproto.HbJob{Job: l.loc.Job, Lease: l.loc.LeaseID, Epoch: l.loc.Epoch, LastSeq: last})
+		jobs = append(jobs, workerproto.HbJob{Job: l.loc.Job, Lease: l.loc.LeaseID, Epoch: l.loc.Epoch, LastSeq: last, Degraded: l.degraded})
 		if len(jobs) >= workerproto.MaxHbJobs {
 			break
 		}

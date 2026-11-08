@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -65,6 +66,7 @@ func statusJSON(r string) int {
 }
 
 func main() {
+	secretsFD := flag.Int("secrets-fd", 0, "inherited fd carrying one `worker-id=secret` line per worker this coordinator accepts")
 	status := flag.Bool("status-json", false, "print connected workers, caps, slots, active leases and heartbeat ages as JSON")
 	flag.Parse()
 	r := root()
@@ -85,6 +87,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, "mother-coord:", err)
 		release()
 		os.Exit(1)
+	}
+	if *secretsFD > 2 {
+		f := os.NewFile(uintptr(*secretsFD), "secrets")
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			id, secret, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
+			if !ok || id == "" {
+				continue
+			}
+			if err := s.RegisterWorker(id, 0, secret); err != nil {
+				fmt.Fprintln(os.Stderr, "mother-coord:", err)
+				release()
+				os.Exit(1)
+			}
+		}
+		f.Close() // never inherited by the applier or anything else
 	}
 	ln, err := coord.Listen(r)
 	if err != nil {

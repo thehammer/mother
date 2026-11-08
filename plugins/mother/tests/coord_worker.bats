@@ -2,11 +2,13 @@
 # coord_worker.bats — the coordinator and worker daemons (cluster Phase 1, slice P1-4).
 #
 # Black-box contract for `mother-coord` (the coordinator) and `mother-worker` (the worker daemon), which speak
-# docs/worker-protocol.md over $MOTHER_ROOT/runner/worker.sock. Nothing here reads either daemon's internals;
+# docs/worker-protocol.md over $MOTHER_ROOT/runner/coord/worker.sock. Nothing here reads either daemon's internals;
 # everything is observed through files and sockets:
 #
 #   coordinator   MOTHER_ROOT=<canonical root C>, MOTHER_LEASE_TTL_S (tests use 6; default 180). Writes
-#                 runner/coord.pid, listens on runner/worker.sock (0600), refreshes runner/coord-status.json once a
+#                 runner/coord/coord.pid, listens on runner/coord/worker.sock (0600, in the 0700 runner/coord dir),
+#                 accepts only workers whose id has a secret handed over `--secrets-fd` ("id=secret" lines) and
+#                 whose hello proves it, refreshes runner/coord-status.json once a
 #                 second (`mother-coord --status-json` is a reader of it). Dispatch request: a file
 #                 runner/dispatch/<job>.json = {"job":"<id>"}; the coordinator leases the job to a connected worker
 #                 with a free slot, records runner/leases/<job>.json
@@ -65,7 +67,11 @@ setup() {
     CW_C="$MOTHER_ROOT"
     CW_W="$MOTHER_ROOT/w1"
     CW_L="$MOTHER_ROOT/worlds/legacy"
-    CW_SOCK="$MOTHER_ROOT/runner/worker.sock"
+    CW_SOCK="$MOTHER_ROOT/runner/coord/worker.sock"
+    # Per-worker secrets: the coordinator gets them on an inherited fd, each worker its own on another; no
+    # secret ever appears in an environment variable or a file.
+    CW_SECRET_W1="cw-secret-w1-$$-$RANDOM$RANDOM"
+    CW_SECRET_PROBE="cw-secret-probe-$$-$RANDOM$RANDOM"
     CW_PIDS="$MOTHER_ROOT/cw-pids"
     CW_TTL=6
     export CW_CLAUDE_DIR="$MOTHER_ROOT/claude"
@@ -264,7 +270,7 @@ _cw_prepare_canonical() {
 # ---------------------------------------------------------------------------
 # Daemons
 
-_cw_coord_pid() { { cat "$CW_C/runner/coord.pid" 2>/dev/null || true; } | tr -dc '0-9'; }
+_cw_coord_pid() { { cat "$CW_C/runner/coord/coord.pid" 2>/dev/null || true; } | tr -dc '0-9'; }
 
 _cw_coord_up_new() {
     local p; p=$(_cw_coord_pid)
@@ -276,7 +282,8 @@ _cw_coord_up_new() {
 _cw_start_coord() {
     local old; old=$(_cw_coord_pid)
     mkdir -p "$CW_C/runner"
-    ( cd / && MOTHER_LEASE_TTL_S="$CW_TTL" exec mother-coord ) >> "$CW_C/coord.out" 2>&1 3>&- &
+    ( cd / && MOTHER_LEASE_TTL_S="$CW_TTL" exec mother-coord --secrets-fd 4 \
+        4< <(printf 'w1=%s\ncw-probe=%s\n' "$CW_SECRET_W1" "$CW_SECRET_PROBE") ) >> "$CW_C/coord.out" 2>&1 3>&- &
     _cw_note P "$!"
     _cw_must 20 "coordinator to publish its pid and socket" _cw_coord_up_new "$old" || return 1
     _cw_note P "$(_cw_coord_pid)"
@@ -310,8 +317,8 @@ _cw_start_worker() {
         exec env -u JOBS_DIR -u EVENTS_DIR -u LOGS_DIR -u DRAFTS_DIR -u CURSORS_DIR -u RUNNER_DIR \
             -u ARCHIVE_DIR -u TEARDOWN_DIR \
             MOTHER_ROOT="$CW_W" MOTHER_WORKER_BACKOFF_MAX_S=2 \
-            mother-worker --id w1 --root "$CW_W" --coord-sock "$sock" --slots 2
-    ) >> "$CW_C/worker.out" 2>&1 3>&- &
+            mother-worker --id w1 --root "$CW_W" --coord-sock "$sock" --slots 2 --secret-fd 4
+    ) 4< <(printf '%s\n' "$CW_SECRET_W1") >> "$CW_C/worker.out" 2>&1 3>&- &
     _cw_note P "$!"
     _cw_must 20 "worker.pid to appear" _cw_worker_up_new "$old" || return 1
     local pid pgid
@@ -682,9 +689,19 @@ _cw_same() {
 # then print the first refuse frame the coordinator answers with (exit 0), or fail (2 no welcome, 3 timeout, 4 closed).
 _cw_write_fence_client() {
     cat > "$BATS_TEST_TMPDIR/fence_client.py" <<'PY'
-import datetime, json, socket, sys, uuid
+import datetime, hashlib, hmac, json, os, socket, sys, uuid
 
 sock_path, job, lease, epoch, worker, marker = sys.argv[1:7]
+secret = os.environ.get("CW_PROBE_SECRET", "")
+CAPS = ["log.stream", "artifact.chunked", "checkpoint.v1", "hold.boundary"]
+
+
+def proof(instance, nonce):
+    # HMAC-SHA256 over HelloTranscript: compact JSON, fields in this order, caps sorted.
+    t = json.dumps({"proto_min": 1, "proto_max": 1, "caps": sorted(CAPS), "worker_id": worker,
+                    "instance_id": instance, "kind": "worker", "method": "peercred", "nonce": nonce},
+                   separators=(",", ":"), ensure_ascii=False)
+    return hmac.new(secret.encode(), t.encode(), hashlib.sha256).hexdigest()
 
 
 def ts():
@@ -701,10 +718,11 @@ s = socket.socket(socket.AF_UNIX)
 s.settimeout(10)
 s.connect(sock_path)
 rf = s.makefile("rb")
-s.sendall(frame("hello", {"proto_min": 1, "proto_max": 1,
-                          "caps": ["log.stream", "artifact.chunked", "checkpoint.v1", "hold.boundary"],
-                          "worker_id": worker, "instance_id": str(uuid.uuid4()), "kind": "worker",
-                          "auth": {"method": "peercred"}}).encode())
+instance = "i-" + uuid.uuid4().hex[:16]
+nonce = uuid.uuid4().hex
+s.sendall(frame("hello", {"proto_min": 1, "proto_max": 1, "caps": CAPS,
+                          "worker_id": worker, "instance_id": instance, "kind": "worker",
+                          "auth": {"method": "peercred", "nonce": nonce, "credential": proof(instance, nonce)}}).encode())
 line = rf.readline()
 if not line or json.loads(line).get("t") != "welcome":
     print(line.decode(errors="replace"))
@@ -738,7 +756,7 @@ PY
     stale=$(( epoch + 5 ))
 
     _cw_write_fence_client
-    run python3 -I "$BATS_TEST_TMPDIR/fence_client.py" "$CW_SOCK" "$id" "$lease" "$stale" "cw-probe" "fenced_probe_marker"
+    run env CW_PROBE_SECRET="$CW_SECRET_PROBE" python3 -I "$BATS_TEST_TMPDIR/fence_client.py" "$CW_SOCK" "$id" "$lease" "$stale" "cw-probe" "fenced_probe_marker"
     if [ "$status" -ne 0 ]; then echo "client exited $status: $output" >&2; return 1; fi
     local code
     code=$(printf '%s' "$output" | jq -r '.data.code')
@@ -758,6 +776,24 @@ PY
 
     # The probe did not disturb the real lease.
     case "$(_cw_lease_state "$id")" in active|released) ;; *) echo "lease is $(_cw_lease_state "$id")" >&2; return 1 ;; esac
+}
+
+@test "a process that claims the real worker's id without its secret is refused and the real worker is undisturbed" {
+    local id="cw-impostor"
+    CW_TTL=6
+    _cw_boot "$id" 20
+    _cw_dispatch "$id"
+    _cw_must 20 "the lease to be active" _cw_lease_is "$id" active
+    _cw_write_fence_client
+    # Same uid, same socket, the real worker's id, no secret (then a wrong one).
+    run env CW_PROBE_SECRET="" python3 -I "$BATS_TEST_TMPDIR/fence_client.py" "$CW_SOCK" "$id" "x" "1" "w1" "impostor_marker"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *auth_failed* ]]
+    run env CW_PROBE_SECRET="not-the-secret-at-all" python3 -I "$BATS_TEST_TMPDIR/fence_client.py" "$CW_SOCK" "$id" "x" "1" "w1" "impostor_marker"
+    [ "$status" -eq 2 ]
+    _cw_must 5 "an auth_failed audit line" _cw_audit_has '.code | startswith("auth_failed")'
+    _cw_connected
+    [ "$(_cw_lease_state "$id")" = "active" ]
 }
 
 # ===========================================================================

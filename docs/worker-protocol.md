@@ -23,7 +23,7 @@ This protocol is separate from the broker's client protocol and from Nostromo's 
 
 ## 2. Transport and framing
 
-- Phase 1: a Unix socket at `$MOTHER_ROOT/runner/worker.sock`, mode 0600.
+- Phase 1: a Unix socket at `$MOTHER_ROOT/runner/coord/worker.sock`, mode 0600, in a private 0700 directory (verified with `Lstat` on every start: ours, not a symlink) that also holds `coord.pid` and `coord.lock` (an `flock` held for the coordinator's lifetime). Same-uid peercred alone does not identify a worker (a job's agent runs as the same uid), so a worker id is bound to a per-worker secret (memory-only; `hello.auth.credential` = HMAC-SHA256 over `HelloTranscript` with the worker's `nonce`) and to the worker daemon's pid (`SO_PEERCRED` / `LOCAL_PEERPID`). A second live connection for an id is refused unless instance id and credential match.
 - NDJSON: one UTF-8 JSON object per line, at most **1 MiB including the newline** (1 048 576 bytes). Encoders emit no
   embedded newlines (`encoding/json` never does); a decoder rejects a line containing one. An oversized frame is `too_large`.
 - Readers use `ReadFrame(*bufio.Reader)`, which enforces the limit **while reading**: a line still unterminated at 1 MiB
@@ -346,7 +346,7 @@ Everything here is additive inside `data` (section 5: additive data fields are a
 - `sync.job` carries only the keys in both the plan's list and `SyncDownKeys`: `cancel_requested`, `pause_requested`, `max_cost_usd`, `force_start`.
   (`paused_reason` and `auto_resume_at` are not in the shared table, and `paused_reason` is worker-owned, so they stay on the worker side.)
 - Files: `runner/dispatch/<job>.json` (request, gains `wait_reason`), `runner/leases/<job>.json`, `<job>.cmds.jsonl` (unacked commands), `<job>.lost`,
-  `table.json` (the durable lease table snapshot, written before each offer leaves), `audit.jsonl`, `runner/coord.pid`, `runner/coord-status.json`.
+  `table.json` (the durable lease table snapshot, written before each offer leaves), `audit.jsonl`, `runner/coord/coord.pid`, `runner/coord-status.json`.
   Worker root: `leases/<job>.json`, `children/<pid>.json`, `applied-cmds.json`, `worker.pid` (`<pid> <pgid>`).
 - Release rule: a worker sends `lease.release` only after its supervisor exited, the outbox and log are fully acked, and the mirror's state is terminal or
   `awaiting` (reason = that state, or `supervisor_exited` for a supervisor found dead at start). A supervisor that died with the job still `running` is not

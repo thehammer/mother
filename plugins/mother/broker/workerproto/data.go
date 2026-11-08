@@ -84,6 +84,9 @@ type HbJob struct {
 	Lease   string `json:"lease"`
 	Epoch   int64  `json:"epoch"`
 	LastSeq int64  `json:"last_seq"`
+	// Degraded (additive) names why this lease's outbox can no longer be shipped faithfully (an op was
+	// lost); empty when healthy. The coordinator audits it and flags the job for the operator.
+	Degraded string `json:"degraded,omitempty"`
 }
 
 type Hb struct {
@@ -461,7 +464,7 @@ func Validate(f Frame) error {
 			return protoErr(CodeInvalid, "hb: %d jobs, limit %d", len(h.Jobs), MaxHbJobs)
 		}
 		for _, j := range h.Jobs {
-			if !IDOK(j.Job) || !IDOK(j.Lease) || j.Epoch < 1 || j.LastSeq < 0 {
+			if !IDOK(j.Job) || !IDOK(j.Lease) || j.Epoch < 1 || j.LastSeq < 0 || !textOK(j.Degraded, MaxKindLen*3) {
 				return protoErr(CodeInvalid, "hb: bad job entry")
 			}
 		}

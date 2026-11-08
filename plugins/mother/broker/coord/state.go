@@ -31,6 +31,7 @@ type LeaseRec struct {
 	Synced     map[string]json.RawMessage `json:"synced,omitempty"`
 	HoldSent   string                     `json:"hold_sent,omitempty"`
 	HoldActive bool                       `json:"hold_active,omitempty"`
+	Degraded   string                     `json:"degraded,omitempty"` // worker-reported outbox loss
 }
 
 type cmdEntry struct {
@@ -46,6 +47,7 @@ type jobLease struct {
 	pending     map[int64]workerproto.Frame
 	cmds        []cmdEntry
 	dirty       bool
+	applying    bool
 	lastPersist time.Time
 }
 
@@ -138,12 +140,46 @@ func (s *Server) loadCmds(jl *jobLease) {
 }
 
 func (s *Server) audit(worker, job, lease string, epoch int64, code string) {
-	b, _ := json.Marshal(map[string]any{
+	s.auditWith(worker, job, lease, epoch, code, 0)
+}
+
+func (s *Server) auditWith(worker, job, lease string, epoch int64, code string, suppressed int) {
+	m := map[string]any{
 		"ts": workerproto.Timestamp(s.now()), "worker_id": worker, "job": job, "lease": lease, "epoch": epoch, "code": code,
-	})
+	}
+	if suppressed > 0 {
+		m["suppressed"] = suppressed
+	}
+	b, _ := json.Marshal(m)
+	// Rotate rather than grow without bound: one previous generation is kept.
+	if fi, err := os.Stat(s.auditPath()); err == nil && fi.Size() >= s.cfg.AuditMaxBytes {
+		_ = os.Rename(s.auditPath(), s.auditPath()+".1")
+	}
 	if err := appendLine(s.auditPath(), b); err != nil {
 		s.logf("audit: %v", err)
 	}
+}
+
+// auditRefusal is audit for refusals a peer can provoke at will: at most one line per (worker, code) per
+// auditThrottle window, the lines in between counted into the next one.
+func (s *Server) auditRefusal(worker, job, lease string, epoch int64, code string) {
+	key := worker + "\x00" + code
+	now := s.now()
+	e, ok := s.auditAt[key]
+	if ok && now.Sub(e.at) < auditThrottle && !now.Before(e.at) {
+		e.suppressed++
+		s.auditAt[key] = e
+		return
+	}
+	if len(s.auditAt) > 1024 {
+		for k, v := range s.auditAt {
+			if now.Sub(v.at) >= auditThrottle {
+				delete(s.auditAt, k)
+			}
+		}
+	}
+	s.auditAt[key] = auditEntry{at: now}
+	s.auditWith(worker, job, lease, epoch, code, e.suppressed)
 }
 
 // jobState is what Admitter needs to judge a job.set transition.
@@ -157,3 +193,5 @@ func (s *Server) jobState(job string) workerproto.JobState {
 }
 
 func fmtTime(t time.Time) string { return workerproto.Timestamp(t) }
+
+func parseTime(v string) (time.Time, error) { return time.Parse("2006-01-02T15:04:05.000Z", v) }

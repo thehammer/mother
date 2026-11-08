@@ -40,6 +40,8 @@ type lease struct {
 	loc localLease
 
 	pid         int           // supervisor pid (0 unknown)
+	pidStart    string        // the pid's process start time when we took it on, to detect pid reuse
+	degraded    string        // why the outbox can no longer be shipped faithfully ("" when healthy)
 	done        chan struct{} // closed when an own child has been reaped (nil for an adopted one)
 	adopted     bool
 	exited      bool
@@ -108,7 +110,7 @@ func (d *Daemon) adopt() {
 			continue
 		}
 		if alive(c.PID) && d.isSupervisor(c.PID) {
-			l.pid, l.adopted = c.PID, true
+			l.pid, l.adopted, l.pidStart = c.PID, true, procStart(c.PID)
 			d.logf("re-adopted supervisor %d for %s", c.PID, c.JobID)
 		}
 	}
@@ -143,12 +145,15 @@ func (d *Daemon) isSupervisor(pid int) bool {
 }
 
 // scrubbedEnv is the environment for anything run against the worker root: the worker's own variables
-// plus whatever it inherited, minus path variables that would point at another tree.
+// plus whatever it inherited, minus path variables that would point at another tree and minus the
+// worker's coordinator credential. It carries none of the coordinator's credentials (the worker never
+// holds any) and not this worker's secret, which is memory-only (Config.Secret): supervisors, agents and
+// hooks never see it.
 func (d *Daemon) scrubbedEnv(extra ...string) []string {
 	drop := map[string]bool{"MOTHER_LIVE_ROOT": true, "JOBS_DIR": true, "EVENTS_DIR": true, "LOGS_DIR": true, "DRAFTS_DIR": true,
 		"CURSORS_DIR": true, "RUNNER_DIR": true, "ARCHIVE_DIR": true, "TEARDOWN_DIR": true, "RESIDUE_DIR": true,
 		"MOTHER_JOB_ID": true, "MOTHER_ROOT": true, "MOTHER_WORKER_MODE": true, "MOTHER_WORKER_OUTBOX_DIR": true,
-		"MOTHER_LEASE_ID": true, "MOTHER_LEASE_EPOCH": true}
+		"MOTHER_LEASE_ID": true, "MOTHER_LEASE_EPOCH": true, "MOTHER_WORKER_SECRET": true, "MOTHER_WORKER_SECRET_FD": true}
 	var env []string
 	for _, kv := range os.Environ() {
 		if i := strings.IndexByte(kv, '='); i > 0 && drop[kv[:i]] {
@@ -169,10 +174,13 @@ func (d *Daemon) spawn(l *lease) error {
 	cmd := exec.Command(name, args...)
 	cmd.Env = d.scrubbedEnv("MOTHER_LEASE_ID="+l.loc.LeaseID, "MOTHER_LEASE_EPOCH="+itoa(l.loc.Epoch))
 	cmd.Dir = d.cfg.Root
+	// Own process group: fencing signals the whole group, so a hung claude does not outlive its supervisor.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	l.pid, l.done, l.exited = cmd.Process.Pid, make(chan struct{}), false
+	l.pidStart = procStart(l.pid)
 	entry, _ := json.Marshal(childEntry{PID: l.pid, JobID: l.loc.Job, StartedAt: time.Now().UTC().Format("2006-01-02T15:04:05.000Z")})
 	_ = writeFileAtomic(d.p("children", strconv.Itoa(l.pid)+".json"), append(entry, '\n'))
 	done, job := l.done, l.loc.Job
@@ -229,28 +237,59 @@ func releasableState(s string) bool {
 	return false
 }
 
-// terminate stops a supervisor by exact pid: SIGTERM (its wrapper trap forwards to claude), SIGKILL after 10 s.
-func terminate(pid int, done <-chan struct{}) {
+// procStart is the process start time of pid as ps prints it ("" when unknown): with the pid it identifies
+// the process, so a reused pid is not mistaken for the supervisor.
+func procStart(pid int) string {
+	out, err := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// terminate stops a supervisor and everything in its process group (the supervisor leads the group):
+// SIGTERM to the group (its wrapper trap forwards to claude), SIGKILL to the group after grace. An adopted
+// pid is re-verified (still a mother-run-job with the start time we recorded) before any signal.
+func (d *Daemon) terminate(pid int, startedAs string, done <-chan struct{}) {
 	if pid <= 0 {
 		return
 	}
-	_ = syscall.Kill(pid, syscall.SIGTERM)
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if done != nil {
-			select {
-			case <-done:
-				return
-			case <-time.After(100 * time.Millisecond):
-			}
-		} else {
-			if !alive(pid) {
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
+	if done == nil { // adopted: not our child, so the pid could have been reused
+		if !alive(pid) || (startedAs != "" && procStart(pid) != startedAs) || !d.isSupervisor(pid) {
+			return
 		}
 	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
+	// The supervisor leads its own group when we (or the old worker) started it with Setpgid; otherwise
+	// only the pid is signalled.
+	group := false
+	if pgid, err := syscall.Getpgid(pid); err == nil && pgid == pid {
+		group = true
+	}
+	gone := func() bool {
+		if group {
+			return syscall.Kill(-pid, 0) != nil
+		}
+		return !alive(pid)
+	}
+	signal := func(sig syscall.Signal) {
+		if group {
+			_ = syscall.Kill(-pid, sig)
+		} else {
+			_ = syscall.Kill(pid, sig)
+		}
+	}
+	signal(syscall.SIGTERM)
+	deadline := time.Now().Add(d.cfg.TermGrace)
+	for time.Now().Before(deadline) {
+		if gone() {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if done == nil && startedAs != "" && procStart(pid) != startedAs {
+		return
+	}
+	signal(syscall.SIGKILL)
 }
 
 // fence stops a job that this worker no longer holds (refuse{fenced} or lease.revoke): SIGTERM its
@@ -270,7 +309,7 @@ func (d *Daemon) fence(l *lease, why string) {
 	d.persistLease(l)
 	pid, done := l.pid, l.done
 	if pid > 0 && !l.exited {
-		go terminate(pid, done)
+		go d.terminate(pid, l.pidStart, done)
 	}
 	d.onFenced(l.loc.Job)
 }
