@@ -39,11 +39,16 @@
 # isDraft>` and `pr ready` exit 1 (a gh outage that only affects draft handling;
 # PR detection via `--json state,headRefName` keeps working).
 #
+# Failure knob: GH_MOCK_FAIL_VIEW=1 makes EVERY `gh pr view` exit 1 (a transient gh/network
+# outage), whether or not a fixture is registered. Unset it to "restore" gh.
+#
 # Every invocation's argv is appended (space-joined) to $MOTHER_ROOT/mock-gh-calls.
 #
 # Fixture helpers (call from tests):
 #   gh_mock_set_pr <url> <state> <headRefName> [commit-sha ...]
 #   gh_mock_set_pr_draft <url> <true|false>
+#   gh_mock_set_pr_cross <url> <true|false>   isCrossRepository (a fork PR when true)
+#   gh_mock_remove_pr <url>                   `gh pr view <url>` fails until set again
 #   gh_mock_set_pr_body <url> <text>
 #   gh_mock_pr_draft <url>        prints true|false (current fixture state)
 #   gh_mock_pr_body <url>         prints the fixture's current body
@@ -72,6 +77,7 @@ case "${1:-} ${2:-}" in
         done
         f="$root/pr/$(_key "$url").json"
         [ -f "$f" ] || exit 1
+        [ "${GH_MOCK_FAIL_VIEW:-0}" = "1" ] && exit 1
         if [ "${GH_MOCK_FAIL_DRAFT:-0}" = "1" ]; then
             case ",$fields," in *isDraft*) exit 1 ;; esac
         fi
@@ -244,4 +250,17 @@ gh_mock_set_pr_created() {
     local f tmp; f=$(_gh_mock_pr_file "$1") || return 1
     tmp="$f.tmp.$$"
     jq --arg c "$2" '.createdAt = $c' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+# gh_mock_set_pr_cross <url> <true|false>
+#   Sets isCrossRepository on an existing PR fixture (true = the head lives in a fork).
+gh_mock_set_pr_cross() {
+    local f tmp; f=$(_gh_mock_pr_file "$1") || return 1
+    tmp="$f.tmp.$$"
+    jq --argjson c "$2" '.isCrossRepository = $c' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+# gh_mock_remove_pr <url> — drops the fixture, so `gh pr view <url>` exits 1 again.
+gh_mock_remove_pr() {
+    rm -f "$MOTHER_ROOT/gh/pr/$(_gh_mock_key "$1").json"
 }

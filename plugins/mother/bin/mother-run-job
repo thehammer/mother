@@ -248,8 +248,25 @@ _reject_scraped_pr_url() {
         _pr_rejected_urls="${_pr_rejected_urls:-}${_pr_rejected_urls:+
 }$1"
     fi
-    _append_event "pr_url_rejected" "$(jq -nc --arg url "$1" --arg reason "$2" --argjson transient "$transient" \
+    _emit_pr_url_rejected "$1" "$2" "$(jq -nc --arg url "$1" --arg reason "$2" --argjson transient "$transient" \
         'if $transient then {url: $url, reason: $reason, transient: true} else {url: $url, reason: $reason} end')"
+}
+
+# _emit_pr_url_rejected <url> <reason> <detail-json> — appends pr_url_rejected
+# at most once per job per distinct (url, reason), however often the gate runs
+# (every poll tick, every spawn, every _finalize_pr_url call).
+_emit_pr_url_rejected() { _emit_pr_event_once "pr_url_rejected" "$1" "$2" "$3"; }
+
+# _emit_pr_event_once <kind> <url> <reason> <detail-json> — same dedupe for any
+# PR-gate event kind: at most one per job per (kind, url, reason).
+_emit_pr_event_once() {
+    local f="${EVENTS_DIR:-}/${id:-}.jsonl"
+    if [ -f "$f" ] && grep -F "\"$1\"" "$f" 2>/dev/null \
+        | jq -e --arg k "$1" --arg u "$2" --arg r "$3" \
+            'select(.kind == $k and (.detail.url // .detail.pr_url) == $u and .detail.reason == $r)' >/dev/null 2>&1; then
+        return 0
+    fi
+    _append_event "$1" "$4"
 }
 
 # _diff_base: the ref LOCAL diff consumers compare HEAD against (commits-ahead
@@ -267,39 +284,96 @@ _diff_base() {
     printf '%s' "${v:-${base_ref:-}}"
 }
 
-# _pr_created_this_run <url> -> 0 when GitHub says the PR was created at or
-# after this run's spawn (current_run.spawned_at); 1 when it predates the run
-# or when that cannot be established (gh failure, missing/unparseable
-# timestamps: unverifiable never counts as the job's own). Only consulted for
-# --expect-branch-mismatch jobs, where a head-branch match is not available as
-# evidence: a pre-existing PR merely mentioned in the plan, prompt or log must
-# never be adopted.
+# _pr_view_fields <url> -> one `gh pr view` call (state, head branch, createdAt,
+# fork flag) into _pv_state/_pv_head/_pv_cross/_pv_created. Returns 1 when gh
+# fails or the PR has no state/head. _pv_created is empty when GitHub gave no
+# createdAt. _pv_cross is "true" for a PR whose head lives in a fork.
+_pr_view_fields() {
+    local row
+    _pv_state=""; _pv_head=""; _pv_cross=""; _pv_created=""
+    row=$(gh pr view "$1" --json state,headRefName,createdAt,isCrossRepository,headRepositoryOwner \
+        --jq '[.state, .headRefName, ((.isCrossRepository // false) | tostring), (.createdAt // "-")] | join("\t")' 2>/dev/null || true)
+    [ -n "$row" ] || return 1
+    IFS=$'\t' read -r _pv_state _pv_head _pv_cross _pv_created <<PRV_EOF
+$row
+PRV_EOF
+    [ "$_pv_created" = "-" ] && _pv_created=""
+    [ -n "$_pv_state" ] && [ -n "$_pv_head" ]
+}
+
+# _pr_attempt_start -> this attempt's first-spawn time (job .attempt_run
+# .started_at, written once per escalation/retry key at spawn), falling back to
+# the latest spawn. current_run.spawned_at alone is the wrong clock: it is
+# rewritten on every spawn (gate-fix, rework, resume).
+_pr_attempt_start() {
+    jq -r '.attempt_run.started_at // .current_run.spawned_at // empty' "$job_file" 2>/dev/null
+}
+
+# _pr_created_this_run <createdAt> -> 0 when the PR was created at or after
+# this attempt's start; 1 when it predates it; 2 when that cannot be
+# established (missing/unparseable timestamps: unverifiable never counts as the
+# job's own). Only consulted for --expect-branch-mismatch jobs, where a
+# head-branch match is not available as evidence.
 _pr_created_this_run() {
-    local created spawned ce se
-    created=$(gh pr view "$1" --json createdAt -q .createdAt 2>/dev/null || true)
-    spawned=$(jq -r '.current_run.spawned_at // empty' "$job_file" 2>/dev/null)
-    [ -n "$created" ] && [ -n "$spawned" ] || return 1
-    ce=$(_iso_to_epoch "$created"); se=$(_iso_to_epoch "$spawned")
-    [ "${ce:-0}" -gt 0 ] && [ "${se:-0}" -gt 0 ] || return 1
+    local spawned ce se
+    spawned=$(_pr_attempt_start)
+    [ -n "${1:-}" ] && [ -n "$spawned" ] || return 2
+    ce=$(_iso_to_epoch "$1"); se=$(_iso_to_epoch "$spawned")
+    [ "${ce:-0}" -gt 0 ] && [ "${se:-0}" -gt 0 ] || return 2
     [ "$ce" -ge "$se" ]
+}
+
+# _pr_contains_own_commit <url> -> 0 when the PR contains one of the job's own
+# commits (needs at least one commit ahead of the diff base); 1 clean miss or
+# no commits of its own; 2 indeterminate (gh failure on some candidate and no
+# hit). A PR that merely predates the job and is mentioned in a plan or log
+# never contains the job's commits.
+_pr_contains_own_commit() {
+    local url="$1" ahead="" cands sha rc indeterminate=0 diff_base
+    diff_base=$(_diff_base)
+    if [ -n "${work_dir:-}" ] && [ -d "$work_dir" ] && [ -n "$diff_base" ]; then
+        ahead=$(cd "$work_dir" && git rev-list --count "${diff_base}..HEAD" 2>/dev/null || true)
+    fi
+    case "$ahead" in ''|*[!0-9]*|0) return 1 ;; esac
+    cands=$(prd_candidate_shas "${work_dir:-}" "${branch:-}" "$diff_base" 2>/dev/null)
+    if [ -n "$cands" ]; then
+        while IFS= read -r sha; do
+            [ -n "$sha" ] || continue
+            prd_pr_contains_sha "$url" "$sha"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+                return 0
+            elif [ "$rc" -eq 2 ]; then
+                indeterminate=1
+            fi
+        done <<OWN_CAND_EOF
+$cands
+OWN_CAND_EOF
+    fi
+    [ "$indeterminate" -eq 1 ] && return 2
+    return 1
 }
 
 # Gate for any PR URL scraped out of the worker transcript. Accepts the URL
 # only when GitHub-side evidence ties the PR to THIS job:
-#   - the PR's head branch is the job's branch, or expect_branch_mismatch is set
-#     on the job, or the PR contains one of the job's own commits
-#     (prd_pr_contains_sha over commits ahead of base_ref);
+#   - the PR is not from a fork (cross-repository head);
+#   - the PR's head branch is the job's branch; or, for an
+#     expect_branch_mismatch job, the PR was created since this attempt began
+#     or contains the job's own commits (a fix-up job lands on a PR that
+#     already exists); or the PR contains one of the job's own commits
+#     (prd_pr_contains_sha over commits ahead of the diff base);
 #   - and a PR that is already MERGED/CLOSED is rejected while the job has no
-#     commits of its own beyond base_ref (a stale PR picked up at minute zero).
+#     commits of its own beyond the base (a stale PR picked up at minute zero).
 # Return codes: 0 accepted; 1 rejected; 2 gh missing (cannot verify at all).
 # On non-zero, _pr_gate_reason holds the reason: gh_unavailable,
-# pr_unresolved, merged_before_job_commits, closed_before_job_commits,
-# head_branch_mismatch, evidence_indeterminate.
+# pr_unresolved, cross_repository, merged_before_job_commits,
+# closed_before_job_commits, head_branch_mismatch, pr_predates_run,
+# evidence_indeterminate.
 # Reads job_file, work_dir, branch, base_ref at call time. Emits no events —
 # callers decide how to report.
 # Usage: _accept_scraped_pr_url <url>
 _accept_scraped_pr_url() {
-    local url="$1" pv pv_state pv_head ahead cands sha rc indeterminate expect_mismatch
+    local url="$1" pv_state pv_head ahead rc expect_mismatch created_rc
     _pr_gate_reason=""
 
     if ! command -v gh >/dev/null 2>&1; then
@@ -307,15 +381,15 @@ _accept_scraped_pr_url() {
         return 2
     fi
 
-    pv=$(gh pr view "$url" --json state,headRefName --jq '(.state)+"\t"+(.headRefName)' 2>/dev/null || true)
-    if [ -z "$pv" ]; then
+    if ! _pr_view_fields "$url"; then
         _pr_gate_reason="pr_unresolved"
         return 1
     fi
-    pv_state=""; pv_head=""
-    IFS=$'\t' read -r pv_state pv_head <<GATE_PV_EOF
-$pv
-GATE_PV_EOF
+    pv_state="$_pv_state"; pv_head="$_pv_head"
+    if [ "$_pv_cross" = "true" ]; then
+        _pr_gate_reason="cross_repository"
+        return 1
+    fi
 
     ahead=""
     local diff_base; diff_base=$(_diff_base)
@@ -336,40 +410,29 @@ GATE_PV_EOF
 
     expect_mismatch=$(jq -r '.expect_branch_mismatch // false' "$job_file" 2>/dev/null)
     if [ "$expect_mismatch" = "true" ]; then
-        _pr_created_this_run "$url" && return 0
-        _pr_gate_reason="pr_predates_run"
+        created_rc=0
+        _pr_created_this_run "$_pv_created" || created_rc=$?
+        [ "$created_rc" -eq 0 ] && return 0
+        rc=0
+        _pr_contains_own_commit "$url" || rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        if [ "$created_rc" -eq 2 ] || [ "$rc" -eq 2 ]; then
+            _pr_gate_reason="pr_unresolved"
+        else
+            _pr_gate_reason="pr_predates_run"
+        fi
         return 1
     fi
 
     # No commits of its own: nothing can be "contained", and HEAD is just the
     # base commit (which a recently merged PR may well contain).
-    if [ "$ahead" = "0" ]; then
-        _pr_gate_reason="head_branch_mismatch"
-        return 1
-    fi
-
-    cands=$(prd_candidate_shas "${work_dir:-}" "${branch:-}" "$(_diff_base)" 2>/dev/null)
-    indeterminate=0
-    if [ -n "$cands" ]; then
-        while IFS= read -r sha; do
-            [ -n "$sha" ] || continue
-            prd_pr_contains_sha "$url" "$sha"
-            rc=$?
-            if [ "$rc" -eq 0 ]; then
-                return 0
-            elif [ "$rc" -eq 2 ]; then
-                indeterminate=1
-            fi
-        done <<GATE_CAND_EOF
-$cands
-GATE_CAND_EOF
-    fi
-
-    if [ "$indeterminate" -eq 1 ]; then
-        _pr_gate_reason="evidence_indeterminate"
-    else
-        _pr_gate_reason="head_branch_mismatch"
-    fi
+    rc=0
+    _pr_contains_own_commit "$url" || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2) _pr_gate_reason="evidence_indeterminate" ;;
+        *) _pr_gate_reason="head_branch_mismatch" ;;
+    esac
     return 1
 }
 
@@ -1952,13 +2015,13 @@ _verify_pushed_or_fail() {
         return 0
     fi
     local push_rc=0
-    (cd "$work_dir" && git push origin "$final:refs/heads/$remote_branch" >/dev/null 2>&1) || push_rc=$?
+    mother_git_bounded "${MOTHER_GIT_REMOTE_TIMEOUT:-60}" "$work_dir" push origin "$final:refs/heads/$remote_branch" >/dev/null || push_rc=$?
     if [ "$push_rc" -eq 0 ] && _remote_contains_commit "$remote_branch" "$final"; then
         _append_event "unpushed_commit_pushed" \
             "$(jq -nc --arg b "$remote_branch" --arg sha "$final" '{branch: $b, commit: $sha}')"
         return 0
     fi
-    remote_sha=$(cd "$work_dir" && git ls-remote origin "refs/heads/$remote_branch" 2>/dev/null | awk '{print $1}' | head -1)
+    remote_sha=$(mother_git_bounded "${MOTHER_GIT_REMOTE_TIMEOUT:-60}" "$work_dir" ls-remote origin "refs/heads/$remote_branch" | awk '{print $1}' | head -1)
     local note="the job's final commit is not on origin's $remote_branch and a push attempt did not land it"
     _job_update ".needs_attention = $(jq -nc --arg note "$note" --arg since "$(iso_now)" \
         '{reason: "unpushed_commit", note: $note, since: $since}')"
@@ -1974,12 +2037,22 @@ _verify_pushed_or_fail() {
 # _remote_contains_commit <branch> <sha> -> 0 when origin's <branch> head
 # contains <sha> (fetch, then merge-base --is-ancestor), else 1.
 _remote_contains_commit() {
-    local rb="$1" sha="$2" rsha
-    rsha=$(cd "$work_dir" && git ls-remote origin "refs/heads/$rb" 2>/dev/null | awk '{print $1}' | head -1)
-    [ -n "$rsha" ] || return 1
-    [ "$rsha" = "$sha" ] && return 0
-    (cd "$work_dir" && git fetch -q origin "refs/heads/$rb" >/dev/null 2>&1) || true
-    (cd "$work_dir" && git merge-base --is-ancestor "$sha" "$rsha" >/dev/null 2>&1)
+    mother_remote_contains_commit "${work_dir:-}" "$1" "$2"
+}
+
+# _head_live_on_origin -> 0 when HEAD is in the live head of at least one origin
+# branch that (per local remote-tracking refs) contains it. prd_sha_on_origin
+# reads only local tracking refs, which can be stale.
+_head_live_on_origin() {
+    local head ref
+    head=$(cd "$work_dir" && git rev-parse --verify -q HEAD 2>/dev/null) || return 1
+    while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        _remote_contains_commit "$ref" "$head" && return 0
+    done <<HLO_EOF
+$(cd "$work_dir" && git branch -r --contains HEAD 2>/dev/null | grep -v -- '->' | sed 's|^[* ]*origin/||' | grep -v '^[* ]')
+HLO_EOF
+    return 1
 }
 
 _verify_artifact_or_fail() {
@@ -2006,7 +2079,10 @@ _verify_artifact_or_fail() {
     [ "$isolation" = "worktree" ] || return 0
     [ -d "$work_dir" ] || return 0  # worktree gone — don't fail spuriously
 
-    if (cd "$work_dir" && git ls-remote --exit-code origin "$branch" >/dev/null 2>&1); then
+    if mother_git_bounded "${MOTHER_GIT_REMOTE_TIMEOUT:-60}" "$work_dir" ls-remote --exit-code origin "$branch" >/dev/null; then
+        # A branch merely existing on origin proves nothing: the job's final
+        # commit must be in its head (one push attempt, then unpushed_commit).
+        _verify_pushed_or_fail || return 1
         # Branch on origin — work shipped to remote, just no PR opened.
         # Probably still a success (some workflows push without opening
         # a PR; some PR-opening tools fail silently after the push). Note
@@ -2023,7 +2099,7 @@ _verify_artifact_or_fail() {
     # branch). That is still real, shipped work; only the branch-naming
     # contract was missed, not the actual delivery. See
     # .claude/bugs/*/2026-06-15-worker-ignores-assigned-branch-name.md.
-    if prd_sha_on_origin "$work_dir" "$(_diff_base)"; then
+    if prd_sha_on_origin "$work_dir" "$(_diff_base)" && _head_live_on_origin; then
         local origin_refs
         origin_refs=$(cd "$work_dir" && git branch -r --contains HEAD 2>/dev/null \
             | sed 's/^[* ]*//' | tr '\n' ',' | sed 's/,$//')
@@ -2118,22 +2194,19 @@ _maybe_emit_pr_opened() {
 # directly with SOURCE_ONLY=1, with those globals/helpers stubbed or set up
 # by the test itself.
 _finalize_pr_url() {
-    local stored_url pv pv_state pv_head hit hit_url hit_kind hit_sha
+    local stored_url hit hit_url hit_kind hit_sha
     local first_capture=0 expect_mismatch cands sha rc accepted indeterminate matched_sha
+    local pv_state pv_head pv_cross pv_created created_rc
 
     expect_mismatch=$(jq -r '.expect_branch_mismatch // false' "$job_file" 2>/dev/null)
     stored_url=$(jq -r '.pr_url // empty' "$job_file" 2>/dev/null)
     pr_url="$stored_url"
-    pv_head=""
+    pv_head=""; pv_state=""; pv_cross=""; pv_created=""
 
     # --- stale-URL re-derivation (only when a pr_url is already stored) ---
     if [ -n "$pr_url" ]; then
-        pv=$(gh pr view "$pr_url" --json state,headRefName --jq '(.state)+"\t"+(.headRefName)' 2>/dev/null)
-        pv_state=""; pv_head=""
-        if [ -n "$pv" ]; then
-            IFS=$'\t' read -r pv_state pv_head <<PV_EOF
-$pv
-PV_EOF
+        if _pr_view_fields "$pr_url"; then
+            pv_state="$_pv_state"; pv_head="$_pv_head"; pv_cross="$_pv_cross"; pv_created="$_pv_created"
         fi
 
         if [ -n "$pv_state" ] && [ "$pv_state" != "OPEN" ]; then
@@ -2147,11 +2220,7 @@ PV_EOF
                       match_kind: $mk, matched_sha: (if ($msha|length) > 0 then $msha else null end)}')"
                 _job_update ".pr_url = \"$hit_url\""
                 pr_url="$hit_url"
-                if [ "$hit_kind" = "branch" ]; then
-                    pv_head="$branch"
-                else
-                    pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
-                fi
+                pv_head=""; pv_cross=""; pv_created=""
             fi
         fi
     fi
@@ -2167,51 +2236,78 @@ PV_EOF
         if [ -n "$hit_url" ]; then
             pr_url="$hit_url"
             first_capture=1
-            if [ "$hit_kind" = "branch" ]; then
-                pv_head="$branch"
-            elif [ "$hit_kind" = "commit" ]; then
-                pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
-            fi
+            pv_head=""; pv_cross=""; pv_created=""
         fi
     fi
 
     [ -n "${pr_url:-}" ] || return 0
 
+    # One authoritative view of the PR (head branch, fork flag, createdAt) for
+    # whatever URL survived the steps above.
     if [ -z "$pv_head" ]; then
-        pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
+        if _pr_view_fields "$pr_url"; then
+            pv_head="$_pv_head"; pv_cross="$_pv_cross"; pv_created="$_pv_created"
+        else
+            pv_head=$(gh pr view "$pr_url" --json headRefName -q '.headRefName' 2>/dev/null || true)
+        fi
     fi
 
-    if [ "$first_capture" -eq 1 ]; then
-        _job_update ".pr_url = \"$pr_url\""
-    fi
-
     if [ -z "$pv_head" ]; then
-        # URL did not resolve (wrong repo, nonexistent PR, network error, etc.)
+        if [ "$first_capture" -eq 0 ]; then
+            # A STORED url was vetted when it was captured; a gh/network
+            # failure now says nothing about it. Keep it (the push check still
+            # runs against it) and retry on the next finalize. Logged once.
+            _emit_pr_event_once "pr_url_unresolved" "$pr_url" "pr_unresolved" "$(jq -nc --arg url "$pr_url" --arg jb "$branch" \
+                '{pr_url: $url, url: $url, reason: "pr_unresolved", job_branch: $jb, kept: true,
+                  note: "pr_url could not be resolved by gh pr view; keeping the stored pr_url and retrying later"}')"
+            return 0
+        fi
+        # A newly detected URL that does not resolve is not adopted.
         _append_event "pr_url_unresolved" \
             "$(jq -nc --arg url "$pr_url" --arg job_branch "$branch" \
-                '{note: "pr_url could not be resolved by gh pr view; clearing",
+                '{note: "pr_url could not be resolved by gh pr view; not adopting",
                   pr_url: $url, job_branch: $job_branch}')"
-        _job_update ".pr_url = null"
+        pr_url=""
+        return 0
+    fi
+
+    if [ "$pv_cross" = "true" ]; then
+        # A fork's same-named branch is not this job's PR, and nothing may be
+        # pushed to origin on its behalf.
+        _emit_pr_url_rejected "$pr_url" "cross_repository" "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
+            '{url: $url, reason: "cross_repository", pr_branch: $prb, job_branch: $jb}')"
+        [ "$first_capture" -eq 1 ] || _job_update ".pr_url = null"
         pr_url=""
         return 0
     fi
 
     if [ "$pv_head" = "$branch" ]; then
+        [ "$first_capture" -eq 1 ] && _job_update ".pr_url = \"$pr_url\""
         _maybe_emit_pr_opened
         return 0
     fi
 
     # --- branch mismatch ---
     if [ "$expect_mismatch" = "true" ]; then
-        # A PR stored by an earlier run was vetted when captured; a first
-        # capture must have been created by this run.
-        if [ "$first_capture" -eq 1 ] && ! _pr_created_this_run "$pr_url"; then
-            _append_event "pr_url_rejected" \
-                "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" \
-                    '{url: $url, reason: "pr_predates_run", pr_branch: $prb, job_branch: $jb}')"
-            _job_update ".pr_url = null"
-            pr_url=""
-            return 0
+        # A PR stored by an earlier run was vetted when captured. A first
+        # capture must have been created since this attempt began, or contain
+        # the job's own commits (a fix-up job lands on a PR that already exists).
+        if [ "$first_capture" -eq 1 ]; then
+            created_rc=0
+            _pr_created_this_run "$pv_created" || created_rc=$?
+            if [ "$created_rc" -ne 0 ]; then
+                rc=0
+                _pr_contains_own_commit "$pr_url" || rc=$?
+                if [ "$rc" -ne 0 ]; then
+                    local why="pr_predates_run"
+                    { [ "$created_rc" -eq 2 ] || [ "$rc" -eq 2 ]; } && why="pr_unresolved"
+                    _emit_pr_url_rejected "$pr_url" "$why" "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" --arg why "$why" \
+                        '{url: $url, reason: $why, pr_branch: $prb, job_branch: $jb}')"
+                    pr_url=""
+                    return 0
+                fi
+            fi
+            _job_update ".pr_url = \"$pr_url\""
         fi
         _job_update ".actual_branch = \"$pv_head\""
         _append_event "pr_branch_mismatch_accepted" \
@@ -2239,6 +2335,7 @@ CAND_EOF
     fi
 
     if [ "$accepted" -eq 1 ]; then
+        [ "$first_capture" -eq 1 ] && _job_update ".pr_url = \"$pr_url\""
         _job_update ".actual_branch = \"$pv_head\""
         _append_event "pr_branch_mismatch_accepted" \
             "$(jq -nc --arg url "$pr_url" --arg prb "$pv_head" --arg jb "$branch" --arg sha "$matched_sha" \
@@ -2254,7 +2351,6 @@ CAND_EOF
         if [ "$first_capture" -eq 1 ]; then
             # Unverifiable: never adopt a URL on first capture; a later
             # finalize retries.
-            _job_update ".pr_url = null"
             pr_url=""
             return 0
         fi
@@ -2272,7 +2368,7 @@ CAND_EOF
     # One more authoritative re-derivation attempt before giving up — the
     # worker may have opened the (correct) PR moments before we checked.
     hit_url=$(prd_pr_for_branch "$(_job_owner_repo)" "$branch" 2>/dev/null)
-    if [ -n "$hit_url" ]; then
+    if [ -n "$hit_url" ] && _pr_view_fields "$hit_url" && [ "$_pv_cross" != "true" ]; then
         _job_update ".pr_url = \"$hit_url\""
         pr_url="$hit_url"
     fi
@@ -2355,7 +2451,8 @@ _install_core_job_helpers() {
                 _reason_lit=$(_failure_reason_literal "$detail") || _reason_lit='"unspecified"'
                 _job_update ".failure_reason = $_reason_lit | .failure_routed = null" ;;
             succeeded)
-                _job_update ".failure_reason = null | .not_before = null | .backoff_count = null | .backoff_first_at = null" ;;
+                _job_update ".failure_reason = null | .not_before = null | .backoff_count = null | .backoff_first_at = null
+                    | (if ((.needs_attention | objects | .reason) // \"\") == \"unpushed_commit\" then .needs_attention = null else . end)" ;;
         esac
         case "$new" in
             running)    _job_update ".started_at = \"$(iso_now)\"" ;;
@@ -3118,6 +3215,13 @@ WRAP
         '{log_offset: $lo, spawned_at: $at, session_id: $sid,
           head_sha_at_start: $hs, remote_ref: $rr, remote_sha_at_start: $rs,
           pr_url_at_start: $pu, had_artifact_at_start: $ha, mode: $md}')"
+    # attempt_run: the first spawn of this escalation/retry attempt (same key as
+    # the rwx reset). Kept across resume/rework/gate-fix spawns; the right clock
+    # for "was this PR created by this attempt" (see _pr_attempt_start).
+    _job_update ".attempt_run = (
+        (\"\(.escalation_count // 0):\(.retry_count // 0)\") as \$k
+        | if (.attempt_run.key // \"\") == \$k then .attempt_run
+          else {key: \$k, started_at: \"$(iso_now)\"} end)"
     _append_event "worker_spawned" "$(jq -nc --argjson pid "$worker_pid" --arg sid "$session_id" --arg md "$mode" '{pid: $pid, session_id: $sid, mode: $md}')"
 
     # Live usage checks (F1/F2/F3): baseline spend/tokens read once at spawn.

@@ -93,7 +93,7 @@ EOF
 Job $id ended with a PR (${pr:-none}) but its final commit is not on the remote branch ${branch:-?}, and one push attempt did not land it, so Mother refused to call it succeeded. Worktree: $work_dir.
 Options:
   mother resume $id "push the commit in the worktree (resolve whatever rejected the push)"
-  mother reconcile $id                    (if the PR is already complete)
+  mother reconcile $id                    (only once the final commit is on origin's branch; reconcile re-checks that)
   mother cancel $id
 EOF
             ;;

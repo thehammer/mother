@@ -2350,7 +2350,7 @@ _retry_locked() {
         | .adherence_notes = null
         | .adherence_attempts = 0
         | .adherence_sha_runs = 0
-        | (if ((.needs_attention | objects | .reason) // "") == "adherence_loop_capped" then .needs_attention = null else . end)
+        | (if (((.needs_attention | objects | .reason) // "") | IN("adherence_loop_capped", "unpushed_commit")) then .needs_attention = null else . end)
         | .failure_routed = null
         | .not_before = null | .backoff_count = null | .backoff_first_at = null
         | (if $hold == 1 then .activity = null | .operator_hold = null else . end)
@@ -2444,7 +2444,7 @@ cmd_escalate() {
         | .adherence_notes = null
         | .adherence_attempts = 0
         | .adherence_sha_runs = 0
-        | (if ((.needs_attention | objects | .reason) // "") == "adherence_loop_capped" then .needs_attention = null else . end)
+        | (if (((.needs_attention | objects | .reason) // "") | IN("adherence_loop_capped", "unpushed_commit")) then .needs_attention = null else . end)
         | .force_start = null
         | .force_ignore_deps = null
         | .not_before = null | .backoff_count = null | .backoff_first_at = null
@@ -2574,6 +2574,13 @@ HITEOF
         fi
     fi
 
+    # A fork PR with the job's branch name is not the job's PR.
+    if [ "$verified" -eq 1 ] && [ -n "$url" ] && [ "$match_kind" != "asserted" ]; then
+        if [ "$(gh pr view "$url" --json isCrossRepository -q '.isCrossRepository' 2>/dev/null)" = "true" ]; then
+            verified=0
+        fi
+    fi
+
     if [ "$verified" -ne 1 ]; then
         if [ "$auto" -eq 1 ]; then
             # Non-interactive contract: nothing found/verified -> exit 3,
@@ -2590,6 +2597,25 @@ HITEOF
         fi
         [ -n "$url" ] || { echo "mother: reconcile: --yes given but no --pr-url and nothing was auto-detected" >&2; exit 1; }
         match_kind="asserted"; matched_sha=""
+    fi
+
+    # An unpushed_commit hold exists because the job's final commit is not on
+    # the remote branch. Identity of the PR cannot overrule that: the commit
+    # must be in the remote head before the job may be reconciled to succeeded.
+    if [ "$(jq -r '((.failure_reason // "") == "unpushed_commit") or (((.needs_attention | objects | .reason) // "") == "unpushed_commit")' "$job_file")" = "true" ]; then
+        local rc_final rc_remote_branch rc_iso
+        rc_remote_branch="${pr_branch:-$branch}"
+        rc_iso=$(jq -r '.isolation // "worktree"' "$job_file")
+        if [ "$rc_iso" = "main-dir" ]; then
+            rc_final=$(cd "$work_dir" 2>/dev/null && git rev-parse --verify -q "refs/heads/$branch" 2>/dev/null)
+        else
+            rc_final=$(cd "$work_dir" 2>/dev/null && git rev-parse --verify -q HEAD 2>/dev/null)
+        fi
+        if [ -n "$rc_final" ] && ! mother_remote_contains_commit "$work_dir" "$rc_remote_branch" "$rc_final"; then
+            [ "$auto" -eq 1 ] && exit 3
+            echo "mother: reconcile: job $id is held as unpushed_commit and its final commit ${rc_final:0:12} is not on origin's $rc_remote_branch; push it (or mother resume $id) first" >&2
+            exit 1
+        fi
     fi
 
     local source_val
@@ -2616,7 +2642,7 @@ HITEOF
         | .adherence_notes = null
         | .adherence_attempts = 0
         | .adherence_sha_runs = 0
-        | (if ((.needs_attention | objects | .reason) // "") == "adherence_loop_capped" then .needs_attention = null else . end)
+        | (if (((.needs_attention | objects | .reason) // "") | IN("adherence_loop_capped", "unpushed_commit")) then .needs_attention = null else . end)
         | .failure_reason = null
         | .failure_routed = null
         ' "$job_file") || _die "reconcile: jq update failed"
@@ -3897,13 +3923,21 @@ cmd_adherence_review() {
         if [ "$esc_attempts" -eq 0 ]; then
             adherence_status="failed_first"
             # Store notes and pending_answer; runner re-queues with activity=cody_rework.
+            # Conditional on the job still being `succeeded`: the review runs
+            # for minutes, and a cancel, retry or archive in the meantime must
+            # not be overwritten with state=ready.
             if ! _job_update "$id" \
-                '.adherence_status = $status | .adherence_notes = $notes | .adherence_attempts = $attempts | .pending_answer = $notes
+                'if .state != "succeeded" then . else
+                 .adherence_status = $status | .adherence_notes = $notes | .adherence_attempts = $attempts | .pending_answer = $notes
                  | .state = "ready" | .activity = "cody_rework" | .finished_at = null | .worker_pid = null
                  | .cancel_requested = null | .pause_requested = null | .final_result_at = null
-                 | .force_start = null | .force_ignore_deps = null' \
+                 | .force_start = null | .force_ignore_deps = null end' \
                 --arg status "$adherence_status" --arg notes "$notes" --argjson attempts "$new_attempts"; then
                 echo "mother: adherence-review: failed to record fail for $id" >&2
+                return 2
+            fi
+            if [ "$(jq -r '.adherence_status // ""' "$(_job_path "$id")" 2>/dev/null)" != "failed_first" ]; then
+                echo "$id: adherence review: FAIL, but the job is no longer succeeded; leaving it untouched" >&2
                 return 2
             fi
             _append_event "$id" "adherence_reviewed" \
@@ -4193,6 +4227,7 @@ cmd_resume() {
         | .operator_hold = null
         | .auto_retry_count = 0
         | .not_before = null | .backoff_count = null | .backoff_first_at = null
+        | (if (((.needs_attention | objects | .reason) // "") | IN("adherence_loop_capped", "unpushed_commit")) then .needs_attention = null else . end)
         | .state = "ready"
         | '"$(_decision_resume_jq "$decision_kind")"'
         | '"$MOTHER_DECISION_RESOLVE_JQ"

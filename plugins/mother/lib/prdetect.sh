@@ -199,3 +199,43 @@ prd_sha_on_origin() {
     case "${refs:-0}" in ''|*[!0-9]*) refs=0 ;; esac
     [ "$refs" -gt 0 ]
 }
+
+# mother_git_bounded <timeout_s> <dir> <git args...> -> git's stdout, git's
+# exit code; 124 when it outlives <timeout_s> (the git process is killed by
+# exact pid). Used for every network git call in the success-verification path
+# so a hung remote can never stall the supervisor. macOS has no `timeout(1)`.
+mother_git_bounded() {
+    local t="$1" dir="$2" out pid kid waited=0 rc
+    shift 2
+    out=$(mktemp "${TMPDIR:-/tmp}/mgb.XXXXXX") || return 1
+    ( cd "$dir" 2>/dev/null && exec git "$@" >"$out" 2>/dev/null </dev/null ) &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge $((t * 10)) ]; then
+            for kid in $(pgrep -P "$pid" 2>/dev/null); do kill -KILL "$kid" 2>/dev/null; done
+            kill -KILL "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            rm -f "$out"
+            return 124
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    wait "$pid" 2>/dev/null; rc=$?
+    cat "$out"; rm -f "$out"
+    return "$rc"
+}
+
+# mother_remote_contains_commit <work_dir> <branch> <sha> -> 0 when origin's
+# <branch> head (read live via ls-remote, then fetched) contains <sha>; 1 on
+# anything else, including a hung/unreachable remote (a timeout is a hold,
+# never a success). Remote ahead of <sha> counts as containing it.
+mother_remote_contains_commit() {
+    local wd="$1" rb="$2" sha="$3" rsha t="${MOTHER_GIT_REMOTE_TIMEOUT:-60}"
+    [ -n "$wd" ] && [ -d "$wd" ] && [ -n "$rb" ] && [ -n "$sha" ] || return 1
+    rsha=$(mother_git_bounded "$t" "$wd" ls-remote origin "refs/heads/$rb" | awk '{print $1}' | head -1)
+    [ -n "$rsha" ] || return 1
+    [ "$rsha" = "$sha" ] && return 0
+    mother_git_bounded "$t" "$wd" fetch -q origin "refs/heads/$rb" >/dev/null || true
+    (cd "$wd" && git merge-base --is-ancestor "$sha" "$rsha" >/dev/null 2>&1)
+}
