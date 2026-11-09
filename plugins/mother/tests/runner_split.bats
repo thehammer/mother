@@ -1237,11 +1237,15 @@ _rs_lost_lease_job() {
 @test "runner startup handles a lost lease before the orphan pass: worker_lost, not runner_died" {
     local id="rs-lost-start"
     _rs_lost_lease_job "$id"
-    _rs_runner "$RS_C" legacy
+    # Freeze the outcome at `failed` (no routing, no escalation): otherwise the live runner escalates the job on its
+    # next tick and the rerun clears failure_reason, so the assertions would depend on when the stop lands.
+    _rs_runner "$RS_C" legacy MOTHER_FAILURE_ROUTING_ENABLED=0 MOTHER_ESCALATION_ENABLED=0
     _rs_must 40 "the job to fail" _rs_state_is "$RS_C" "$id" failed
     _rs_runner_stop "$RS_C"
+    [ "$(_rs_state "$RS_C" "$id")" = "failed" ]
     [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
     _rs_event_reason_has "$RS_C" "$id" worker_lost
+    jq -e -s 'map(select(.kind == "failed" and .detail.reason == "worker_lost")) | length == 1' "$RS_C/events/$id.jsonl" >/dev/null
 }
 
 # --- work_dir is never a path the worker can aim at ------------------------------------
