@@ -1212,6 +1212,38 @@ LOG
     grep -qF "\"job_id\":\"$id\"" "$RS_C/metrics/runs.jsonl"
 }
 
+# --- 13.10 an unhandled lost lease is never reaped as runner_died ----------------------
+
+_rs_lost_lease_job() {
+    local id="$1"
+    _rs_job "$RS_C" "$id" '.state = "running" | .worker_pid = 2999999 | .current_run = {log_offset: 0}'
+    mkdir -p "$RS_C/runner/leases/active"
+    jq -nc '{lease_id: "L7", epoch: 1, worker_id: "local", state: "lost", last_hb: "2026-11-08T12:00:00.000Z"}' > "$RS_C/runner/leases/$id.json"
+    : > "$RS_C/runner/leases/active/$id"
+}
+
+@test "orphan pass leaves a lost, unhandled lease to the lost-lease pass, which then records worker_lost" {
+    local id="rs-lost-race"
+    _rs_lost_lease_job "$id"
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --recover-orphans-tick 0 ) >/dev/null 2>&1 || true
+    [ "$(_rs_state "$RS_C" "$id")" = "running" ]
+    ! _rs_event_reason_has "$RS_C" "$id" runner_died
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    [ "$(_rs_state "$RS_C" "$id")" = "failed" ]
+    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
+    _rs_event_reason_has "$RS_C" "$id" worker_lost
+}
+
+@test "runner startup handles a lost lease before the orphan pass: worker_lost, not runner_died" {
+    local id="rs-lost-start"
+    _rs_lost_lease_job "$id"
+    _rs_runner "$RS_C" legacy
+    _rs_must 40 "the job to fail" _rs_state_is "$RS_C" "$id" failed
+    _rs_runner_stop "$RS_C"
+    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
+    _rs_event_reason_has "$RS_C" "$id" worker_lost
+}
+
 # --- work_dir is never a path the worker can aim at ------------------------------------
 
 @test "work_dir: a worktree job takes the mirror's path only when it resolves under the worker's own root" {

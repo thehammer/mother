@@ -648,6 +648,21 @@ _lease_awaits_finalize() {
     [ "$(jq -r '[.state // "", .end_reason // ""] | join("/")' "$LEASES_DIR/$1.json" 2>/dev/null)" = "released/succeeded" ]
 }
 
+# _lease_lost_unhandled <job_id>: the lease is `lost` (or carries a `.lost` marker and is not live) and
+# _recover_lost_leases has not yet recorded it. The orphan reaper must leave such a job alone, otherwise it fails
+# it `runner_died` and the `worker_lost` event never appears. One stat for a non-indexed (legacy) job.
+_lease_lost_unhandled() {
+    [ -e "$ACTIVE_DIR/$1" ] || return 1
+    local lf="$LEASES_DIR/$1.json" st lease_id
+    st=$(jq -r '.state // empty' "$lf" 2>/dev/null)
+    if [ "$st" != "lost" ]; then
+        [ -f "$LEASES_DIR/$1.lost" ] || return 1
+        case "$st" in offered|active|released) return 1 ;; esac
+    fi
+    lease_id=$(jq -r '.lease_id // empty' "$lf" 2>/dev/null)
+    [ "$(cat "$LEASES_DIR/$1.lost-handled" 2>/dev/null)" != "$lease_id" ]
+}
+
 # _rebuild_active_index: once at startup (a runner upgraded from before the index existed, or restarted with
 # leases in flight): index every lease whose job is still `running`. This is the only pass over all lease files.
 _rebuild_active_index() {
@@ -1236,7 +1251,7 @@ _recover_orphans() {
         id=$(jq -r '.id' "$f")
         # The coordinator owns the liveness of a leased job (offered/active lease, a pending dispatch request,
         # or a released lease awaiting its success derivation); _recover_lost_leases handles a lost one.
-        if _job_is_leased "$id" || _lease_awaits_finalize "$id"; then
+        if _job_is_leased "$id" || _lease_awaits_finalize "$id" || _lease_lost_unhandled "$id"; then
             continue
         fi
         pid=$(jq -r '.worker_pid // empty' "$f")
@@ -2934,6 +2949,8 @@ main() {
     _rebuild_active_index
     # A runner started with worker-path state on disk (or upgraded from before the marker): one grep pass decides.
     if [ -d "$DISPATCH_DIR" ] || [ -d "$LEASES_DIR" ]; then : > "$WORKER_JOBS_MARKER"; fi
+    # Lost leases first: _recover_orphans leaves an unhandled lost lease to _recover_lost_leases.
+    if _worker_path_possible && [ -d "$ACTIVE_DIR" ]; then _recover_lost_leases; fi
     _recover_orphans
     type mother_publish_rates >/dev/null 2>&1 && mother_publish_rates
     _start_broker
