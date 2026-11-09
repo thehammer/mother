@@ -747,8 +747,13 @@ CA_MR_EOF
         if [ "$iso" = "main-dir" ]; then
             mwd=$(jq -r '.repo_path // empty' "$jf" 2>/dev/null)
         else
+            # A path the worker names is taken only when it resolves (symlinks and `..` included) to a directory
+            # under the local worker's own root; anything else is dropped.
+            local wroot; wroot=$(cd -P "${MOTHER_WORKER_ROOT:-${HOME:-}/.mother-worker}/$wid" 2>/dev/null && pwd -P) || wroot=""
+            case "$mwd" in */../*|*/..|*/./*|*//*) mwd="" ;; esac
+            [ -z "$mwd" ] || mwd=$(cd -P "$mwd" 2>/dev/null && pwd -P) || mwd=""
             case "$mwd" in
-                "${MOTHER_WORKER_ROOT:-${HOME:-}/.mother-worker}/$wid/"*) ;;
+                "$wroot"/*) [ -n "$wroot" ] || mwd="" ;;
                 *) mwd="" ;;
             esac
         fi

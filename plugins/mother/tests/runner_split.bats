@@ -1099,3 +1099,27 @@ LOG
     [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
     grep -qF "\"job_id\":\"$id\"" "$RS_C/metrics/runs.jsonl"
 }
+
+# --- work_dir is never a path the worker can aim at ------------------------------------
+
+@test "work_dir: a worktree job takes the mirror's path only when it resolves under the worker's own root" {
+    local ok="rs-wd-ok" bad="rs-wd-escape" id
+    for id in "$ok" "$bad"; do _rs_pr_seed "$id" '.isolation = "worktree" | .work_dir = null'; done
+    mkdir -p "$MOTHER_WORKER_ROOT/local/worktrees/$ok" "$MOTHER_WORKER_ROOT/local/worktrees/$bad" "$BATS_TEST_TMPDIR/elsewhere"
+    jq --arg w "$MOTHER_WORKER_ROOT/local/worktrees/$ok" '.work_dir = $w' "$MOTHER_WORKER_ROOT/local/jobs/$ok.json" > "$BATS_TEST_TMPDIR/m" \
+        && mv "$BATS_TEST_TMPDIR/m" "$MOTHER_WORKER_ROOT/local/jobs/$ok.json"
+    jq --arg w "$MOTHER_WORKER_ROOT/local/worktrees/$bad/../../../../elsewhere" '.work_dir = $w' "$MOTHER_WORKER_ROOT/local/jobs/$bad.json" > "$BATS_TEST_TMPDIR/m" \
+        && mv "$BATS_TEST_TMPDIR/m" "$MOTHER_WORKER_ROOT/local/jobs/$bad.json"
+    run _rs_stream "$ok"
+    run _rs_stream "$bad"
+    [ "$(_rs_field "$RS_C" "$ok" work_dir)" = "$(cd -P "$MOTHER_WORKER_ROOT/local/worktrees/$ok" && pwd -P)" ]
+    [ "$(jq -r '.work_dir // "null"' "$RS_C/jobs/$bad.json")" = "null" ]
+}
+
+@test "work_dir: a main-dir job gets the canonical repo_path, whatever the mirror says" {
+    local id="rs-wd-main"
+    _rs_pr_seed "$id" '.work_dir = null'
+    jq '.work_dir = "/etc"' "$MOTHER_WORKER_ROOT/local/jobs/$id.json" > "$BATS_TEST_TMPDIR/m" && mv "$BATS_TEST_TMPDIR/m" "$MOTHER_WORKER_ROOT/local/jobs/$id.json"
+    run _rs_stream "$id"
+    [ "$(_rs_field "$RS_C" "$id" work_dir)" = "$RS_C/work/repo-$id" ]
+}
