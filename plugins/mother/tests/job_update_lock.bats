@@ -17,11 +17,16 @@ teardown() { teardown_mother_env; }
 # _await_during_update <helper-script> — run a delayed update in the background, `mother await` while it is
 # between its read and its write, then wait for both.
 _await_during_update() {
-    local id="$1" updater="$2"
+    local id="$1" updater="$2" t0 t1
+    t0=$(date +%s)
     ( MOTHER_TEST_JOB_UPDATE_DELAY_S=3 bash -c "$updater" _ "$id" ) & local bg=$!
     sleep 1
     MOTHER_JOB_ID="$id" mother await --question "need clarification" >/dev/null 2>&1 || true
     wait "$bg"
+    t1=$(date +%s)
+    # Not vacuous: the updater must really have slept in the read-to-write window (the seam exists), or the
+    # bad interleaving was never forced and a pass proves nothing (on main, without the seam, it "passes").
+    [ $(( t1 - t0 )) -ge 3 ] || { echo "the test seam MOTHER_TEST_JOB_UPDATE_DELAY_S did not delay the update" >&2; return 1; }
 }
 
 @test "supervisor _job_update racing an in-agent mother await: the await is not lost" {
@@ -44,4 +49,21 @@ _await_during_update() {
         mother_job_update "$1" ".live_cost_usd = 2.5"'
     [ "$(jq -r .state "$JOBS_DIR/$id.json")" = "awaiting" ]
     [ "$(jq -r .live_cost_usd "$JOBS_DIR/$id.json")" = "2.5" ]
+}
+
+@test "supervisor _job_update that cannot get the lock: dropped loudly (stderr and a job_update_lock_failed event), within its try bound" {
+    local id="ju-wedge"
+    make_job "$id" running
+    mkdir "$JOBS_DIR/$id.json.lockdir"
+    echo "$$" > "$JOBS_DIR/$id.json.lockdir/owner"   # a live holder (this shell) that never lets go
+    run bash -c '
+        export SOURCE_ONLY=1
+        source "'"$MOTHER_RUN_JOB"'" 2>/dev/null || true
+        id="'"$id"'"; job_file="$JOBS_DIR/$id.json"
+        _job_update_n 3 ".live_cost_usd = 9"'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"lock not acquired after 3 tries"* ]]
+    grep -q '"kind":"job_update_lock_failed"' "$EVENTS_DIR/$id.jsonl"
+    [ "$(jq -r '.live_cost_usd // "unset"' "$JOBS_DIR/$id.json")" != "9" ]
+    rmdir "$JOBS_DIR/$id.json.lockdir" 2>/dev/null || { rm -f "$JOBS_DIR/$id.json.lockdir/owner"; rmdir "$JOBS_DIR/$id.json.lockdir"; }
 }

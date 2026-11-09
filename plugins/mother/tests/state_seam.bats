@@ -378,10 +378,17 @@ _ss_norm_job() {
 }
 
 # _ss_norm_events <file> — the event stream as a normalised JSON array. `final_result_observed` is a
-# poll-loop race, not part of the contract (the contract recorder drops it too).
+# poll-loop race, not part of the contract (the contract recorder drops it too). `worker_spawned` is appended by
+# the supervisor after it starts the worker (and after three job writes); the in-agent `mother await` fixture
+# answers in milliseconds, so its `awaiting_input` can land first. A real claude takes seconds, so this is a
+# mock-speed race, not a product ordering bug: when (and only when) `awaiting_input` precedes `worker_spawned`,
+# the two are swapped into the canonical order. Every other event keeps its position and is compared.
 _ss_norm_events() {
     jq -S -s --argjson subs "$(_ss_subs)" \
-        "map(select(.kind != \"final_result_observed\")) | $(_ss_norm_filter)" "$1"
+        "map(select(.kind != \"final_result_observed\"))
+         | (map(.kind) | index(\"worker_spawned\")) as \$w | (map(.kind) | index(\"awaiting_input\")) as \$a
+         | (if \$w != null and \$a != null and \$a < \$w then .[\$a] as \$x | .[\$a] = .[\$w] | .[\$w] = \$x else . end)
+         | $(_ss_norm_filter)" "$1"
 }
 
 # _ss_norm_rows <job> <metrics-file> — this job's usage rows as a normalised JSON array.

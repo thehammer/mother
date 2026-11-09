@@ -89,6 +89,8 @@ setup() {
 # Stop everything this test started, by exact pid / recorded process group only.
 teardown() {
     local kind n
+    # Release a gated mock claude first, so a test that failed before its own release never leaves it waiting.
+    [ -n "${CW_CLAUDE_DIR:-}" ] && [ -d "$CW_CLAUDE_DIR" ] && : > "$CW_CLAUDE_DIR/release"
     if [ -f "${CW_PIDS:-/nonexistent}" ]; then
         while read -r kind n; do
             case "$kind" in
@@ -156,6 +158,13 @@ _cw_wait_for() {
 # _cw_dump — everything useful for triage, to stderr.
 _cw_dump() {
     local f
+    # The known open bug (not hidden, not skipped): under CPU load the coordinator can drop the worker's
+    # connection ("send queue full") and the lease then never reaches released.
+    if grep -qs "send queue full; dropping the connection" "$CW_C/coord.out" "$CW_C/worker.out" "$CW_W/worker.out" 2>/dev/null; then
+        echo "*** KNOWN BUG: 'send queue full; dropping the connection' was logged: this failure is the open" >&2
+        echo "*** stuck-lease bug, see .claude/bugs/open/2026-11-09-stuck-lease-after-send-queue-full-under-cpu-load.md" >&2
+        echo "*** (local bug inbox of the main mother checkout). The test is NOT skipped; it fails on purpose." >&2
+    fi
     echo "--- coord.out" >&2;   tail -n 40 "$CW_C/coord.out" >&2 2>/dev/null || true
     echo "--- worker.out" >&2;  tail -n 40 "$CW_C/worker.out" >&2 2>/dev/null || true
     echo "--- leases" >&2;      cat "$CW_C"/runner/leases/*.json >&2 2>/dev/null || true
@@ -592,7 +601,7 @@ _cw_same() {
 @test "worker daemon restarts while its supervisor keeps running: the job is re-adopted, finishes once, no duplicate events" {
     local id="cw-workerrestart" sup wpid wpgid
     CW_TTL=6
-    _cw_boot "$id" 24
+    _cw_boot "$id" gate
     _cw_dispatch "$id"
     _cw_must 30 "the job's claude to start" _cw_claude_started
     _cw_must 20 "the supervisor to be tracked in children/" \
@@ -608,6 +617,9 @@ _cw_same() {
     _cw_alive "$sup"
     _cw_must 20 "the restarted worker to reconnect" _cw_connected
 
+    # The daemon is back and re-adopted the supervisor: now let the job finish.
+    _cw_alive "$sup"
+    : > "$CW_CLAUDE_DIR/release"
     _cw_must 90 "the lease to be released" _cw_lease_is "$id" released
     _cw_mirror_state_is "$id" succeeded
     [ "$(cat "$CW_CLAUDE_DIR/ge-count")" = "1" ]
