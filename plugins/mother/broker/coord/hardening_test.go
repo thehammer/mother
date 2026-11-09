@@ -1981,9 +1981,9 @@ func TestRejectedOfferFreesTheSlotIsRetriedAndHeldAfterThreeRejections(t *testin
 		if int(*offers[0].Epoch) != attempt {
 			t.Fatalf("attempt %d offered under epoch %d", attempt, *offers[0].Epoch)
 		}
-		h.ack(offers[0], hxCmdID(t, offers[0]), "rejected", "no_slot")
+		h.ack(offers[0], hxCmdID(t, offers[0]), "rejected", "mirror_failed")
 		r := h.rec("j1")
-		if r.State != "revoked" || r.EndReason != "offer_rejected:no_slot" {
+		if r.State != "revoked" || r.EndReason != "offer_rejected:mirror_failed" {
 			t.Fatalf("attempt %d: lease record %+v", attempt, r)
 		}
 		h.s.mu.Lock()
@@ -2003,7 +2003,7 @@ func TestRejectedOfferFreesTheSlotIsRetriedAndHeldAfterThreeRejections(t *testin
 	}
 	reject(3)
 	m := hxDispatchFile(t, h, "j1")
-	if m["rejects"] != float64(3) || m["held"] != "offer_rejected:no_slot" {
+	if m["rejects"] != float64(3) || m["held"] != "offer_rejected:mirror_failed" {
 		t.Fatalf("after 3 rejections the request is not held: %v", m)
 	}
 	if !strings.Contains(fmt.Sprint(m["wait_reason"]), "held") {
@@ -2019,6 +2019,36 @@ func TestRejectedOfferFreesTheSlotIsRetriedAndHeldAfterThreeRejections(t *testin
 	}
 	if n := hxCountCode(t, h.s, "offer_rejected"); n != 3 {
 		t.Fatalf("%d offer_rejected audit lines, want 3", n)
+	}
+}
+
+// no_slot is the worker's slot lagging the coordinator's release by a moment: it never counts toward the hold.
+func TestNoSlotRejectionIsAWaitNotAStrike(t *testing.T) {
+	h := newHarness(t)
+	hxConnect(h, "w1", 1)
+	h.writeJob("j1", nil)
+	if err := os.WriteFile(h.s.dispatchPath("j1"), []byte(`{"job":"j1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 6; attempt++ {
+		h.s.mu.Lock()
+		h.s.dispatchPass()
+		h.s.mu.Unlock()
+		offers := ofType(h.frames(), workerproto.TypeLeaseOffer)
+		if len(offers) != 1 {
+			t.Fatalf("attempt %d: %d offers, want 1", attempt, len(offers))
+		}
+		h.ack(offers[0], hxCmdID(t, offers[0]), "rejected", "no_slot")
+		m := hxDispatchFile(t, h, "j1")
+		if m["held"] != nil && m["held"] != "" {
+			t.Fatalf("attempt %d: a no_slot rejection held the request: %v", attempt, m)
+		}
+		if m["rejects"] != nil && m["rejects"] != float64(0) {
+			t.Fatalf("attempt %d: a no_slot rejection counted as a strike: %v", attempt, m)
+		}
+		if m["wait_reason"] != waitBusy {
+			t.Fatalf("attempt %d: wait_reason = %v, want %s", attempt, m["wait_reason"], waitBusy)
+		}
 	}
 }
 

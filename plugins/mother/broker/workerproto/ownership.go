@@ -21,6 +21,10 @@ var (
 		"resume_not_yet_acted_on", "gates", "review_wave", "limiter_hold", "live_cost_usd", "live_tokens",
 		"current_run", "cost_cap_breached_at", "token_alert_at",
 		"rwx_sandbox", "resume_session_id", "resume_kind", "limiter_resume_prompt", "attention", "decision",
+		"attempt_run",
+		// The pre-ready adherence review (`mother adherence-review --pre-ready`, run by the wave under the worker's
+		// supervisor) records its verdict on the job: a legacy run leaves these on the job, so a worker run must too.
+		"adherence_status", "adherence_attempts", "adherence_pending", "adherence_notes", "adherence_sha_runs", "adherence_reviewed_sha",
 	}
 	// CoordinatorDerivedKeys are completion evidence. A worker can claim anything here, so none of it is
 	// accepted from job.set: the coordinator writes these itself, after its own remote-commit/PR check
@@ -71,6 +75,9 @@ var keyKinds = map[string]valKind{
 	"live_cost_usd": kNum, "live_tokens": kUint, "current_run": kObject, "cost_cap_breached_at": kTS,
 	"token_alert_at": kTS, "rwx_sandbox": kObject, "resume_session_id": kID, "resume_kind": kToken,
 	"limiter_resume_prompt": kText, "attention": kArray, "decision": kObject,
+	"attempt_run":      kObject,
+	"adherence_status": kToken, "adherence_attempts": kUint, "adherence_pending": kBool, "adherence_notes": kText,
+	"adherence_sha_runs": kUint, "adherence_reviewed_sha": kID,
 }
 
 // CheckJobSet returns every violation in a job.set payload (nil when clean), judged against the job's

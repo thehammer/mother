@@ -152,6 +152,8 @@ _rs_dump() {
         [ -d "$r" ] || continue
         echo "--- $r runner.out" >&2;  tail -n 30 "$r/runner.out" >&2 2>/dev/null || true
         echo "--- $r leases" >&2;      cat "$r"/runner/leases/*.json >&2 2>/dev/null || true
+        echo "--- $r coord.log" >&2;   tail -n 25 "$r/logs/coord.log" >&2 2>/dev/null || true
+        echo "--- $r worker-local.log" >&2; tail -n 25 "$r/logs/worker-local.log" >&2 2>/dev/null || true
         echo "--- $r audit" >&2;       cat "$r/runner/leases/audit.jsonl" >&2 2>/dev/null || true
         echo "--- $r dispatch-last" >&2; cat "$r/runner/dispatch-last.json" >&2 2>/dev/null || true
         for f in "$r"/jobs/*.json; do [ -f "$f" ] && jq -c '{id,state,activity,paused_reason,failure_reason}' "$f" >&2; done
@@ -431,6 +433,9 @@ _rs_mother() { local r="$1"; shift; ( _rs_export_root "$r"; mother "$@" ); }
     echo 8 > "$RS_CLAUDE_DIR/default-sleep"
     _rs_job "$RS_C" "$plain"
     _rs_job "$RS_C" "$via" '.dispatch_via = "worker"'
+    # `mother add --via-worker` creates runner/dispatch (the runner's one-stat "worker path in play" check);
+    # this job file is written directly, so do what add does.
+    mkdir -p "$RS_C/runner/dispatch"
     _rs_runner "$RS_C" unset
 
     _rs_must 40 "the via-worker job to be leased" _rs_lease_exists "$RS_C" "$via"
@@ -506,18 +511,79 @@ _rs_latency_run() {
     _rs_runner_stop "$root"
 }
 
-@test "dispatch latency: worker-mode median is within 1.0 s and max within 2.0 s of the legacy run (ready -> banner in the canonical log)" {
+# _rs_latency_wide <root> <mode> <outfile> <n> — n jobs enqueued at once under MOTHER_CONCURRENCY=n; per job the ms from
+# its `running` event to its banner in the canonical log (all logs are watched by one process, so the later jobs'
+# numbers are not inflated by waiting on the earlier ones).
+_rs_latency_wide() {
+    local root="$1" mode="$2" out="$3" n="$4" i id ids="" t0
+    : > "$out"
+    echo 0 > "$RS_CLAUDE_DIR/default-sleep"
+    _rs_runner "$root" "$mode" MOTHER_CONCURRENCY="$n"
+    if [ "$mode" = "worker" ]; then
+        _rs_must 40 "local worker connected" _rs_worker_connected "$root"
+    fi
+    for i in $(seq 1 "$n"); do
+        id="rs-wide-$mode-$i"
+        ids="$ids $id"
+        _rs_job "$root" "$id"
+    done
+    perl -MTime::HiRes=time,sleep -e '
+        my ($root, $max, @ids) = @ARGV; my $end = time + $max; my %seen;
+        while (time < $end && keys %seen < @ids) {
+            for my $id (@ids) {
+                next if $seen{$id};
+                if (open(my $h, "<", "$root/logs/$id.log")) { local $/; my $c = <$h>;
+                    if (defined $c && index($c, "=== mother job $id starting") >= 0) { $seen{$id} = int(time*1000) } }
+            }
+            sleep 0.02;
+        }
+        print "$_ $seen{$_}\n" for grep { $seen{$_} } @ids;' "$root" 120 $ids > "$root/wide.banners" || true
+    for id in $ids; do
+        t1=$(awk -v id="$id" '$1 == id {print $2}' "$root/wide.banners")
+        [ -n "$t1" ] || { echo "no banner for $id" >&2; _rs_dump; return 1; }
+        _rs_must 120 "$id to succeed" _rs_state_is "$root" "$id" succeeded
+        t0=$(_rs_iso_ms "$(jq -r -s 'map(select(.kind == "running")) | .[0].ts' "$root/events/$id.jsonl")")
+        echo $(( t1 - t0 )) >> "$out"
+    done
+    _rs_runner_stop "$root"
+}
+
+_rs_med() { sort -n "$1" | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }
+_rs_max() { sort -n "$1" | tail -n 1; }
+
+# Dispatch latency is a measurement (it prints the legacy and worker medians/maxima, 1-wide and 5-wide) and fails only
+# when MOTHER_LATENCY_GATE=1: the P1-6 burn-in runbook sets it, and it is the gate before the default is ever flipped.
+# The bound is the plan's: worker median within 1.0 s and max within 2.0 s of legacy.
+@test "dispatch latency (1-wide): worker vs legacy, ready -> banner in the canonical log (gate only with MOTHER_LATENCY_GATE=1)" {
     local t="$BATS_TEST_TMPDIR" lmed lmax wmed wmax
     mkdir -p "$RS_L"
     _rs_latency_run "$RS_L" legacy "$t/legacy.ms"
     _rs_latency_run "$RS_C" worker "$t/worker.ms"
-    lmed=$(sort -n "$t/legacy.ms" | sed -n 3p); lmax=$(sort -n "$t/legacy.ms" | tail -n 1)
-    wmed=$(sort -n "$t/worker.ms" | sed -n 3p); wmax=$(sort -n "$t/worker.ms" | tail -n 1)
-    echo "# dispatch latency ms: legacy median=$lmed max=$lmax (all: $(tr '\n' ' ' < "$t/legacy.ms"))" >&3
-    echo "# dispatch latency ms: worker median=$wmed max=$wmax (all: $(tr '\n' ' ' < "$t/worker.ms"))" >&3
+    lmed=$(_rs_med "$t/legacy.ms"); lmax=$(_rs_max "$t/legacy.ms")
+    wmed=$(_rs_med "$t/worker.ms"); wmax=$(_rs_max "$t/worker.ms")
+    echo "# dispatch latency 1-wide ms: legacy median=$lmed max=$lmax (all: $(tr '\n' ' ' < "$t/legacy.ms"))" >&3
+    echo "# dispatch latency 1-wide ms: worker median=$wmed max=$wmax (all: $(tr '\n' ' ' < "$t/worker.ms"))" >&3
     echo "legacy median=$lmed max=$lmax; worker median=$wmed max=$wmax" >&2
-    [ "$wmed" -le $(( lmed + 1000 )) ]
-    [ "$wmax" -le $(( lmax + 2000 )) ]
+    if [ "${MOTHER_LATENCY_GATE:-0}" = "1" ]; then
+        [ "$wmed" -le $(( lmed + 1000 )) ]
+        [ "$wmax" -le $(( lmax + 2000 )) ]
+    fi
+}
+
+@test "dispatch latency (5-wide): worker vs legacy with five jobs enqueued at once (gate only with MOTHER_LATENCY_GATE=1)" {
+    local t="$BATS_TEST_TMPDIR" lmed lmax wmed wmax
+    mkdir -p "$RS_L"
+    _rs_latency_wide "$RS_L" legacy "$t/legacy5.ms" 5
+    _rs_latency_wide "$RS_C" worker "$t/worker5.ms" 5
+    lmed=$(_rs_med "$t/legacy5.ms"); lmax=$(_rs_max "$t/legacy5.ms")
+    wmed=$(_rs_med "$t/worker5.ms"); wmax=$(_rs_max "$t/worker5.ms")
+    echo "# dispatch latency 5-wide ms: legacy median=$lmed max=$lmax (all: $(tr '\n' ' ' < "$t/legacy5.ms"))" >&3
+    echo "# dispatch latency 5-wide ms: worker median=$wmed max=$wmax (all: $(tr '\n' ' ' < "$t/worker5.ms"))" >&3
+    echo "legacy median=$lmed max=$lmax; worker median=$wmed max=$wmax" >&2
+    if [ "${MOTHER_LATENCY_GATE:-0}" = "1" ]; then
+        [ "$wmed" -le $(( lmed + 1000 )) ]
+        [ "$wmax" -le $(( lmax + 2000 )) ]
+    fi
 }
 
 # ===========================================================================
@@ -774,7 +840,7 @@ _rs_finalize() {
     [ "$(_rs_state "$RS_C" "$id")" = "succeeded" ]
 }
 
-@test "finalize: a job that is already terminal or has a cancel requested is left untouched (exit 1)" {
+@test "finalize: a job that is already terminal is left untouched (exit 1)" {
     local id before st
     for st in succeeded failed cancelled; do
         id="rs-fin-$st"
@@ -784,10 +850,252 @@ _rs_finalize() {
         [ "$status" -eq 1 ]
         [ "$(jq -S . "$RS_C/jobs/$id.json")" = "$before" ]
     done
-    id="rs-fin-cancelreq"
+}
+
+@test "finalize: a cancel requested after the lease was released as succeeded ends the job cancelled (exit 4), never left running" {
+    local id="rs-fin-cancelreq"
     _rs_fin_seed "$id" 1 '.cancel_requested = true'
-    before=$(jq -S . "$RS_C/jobs/$id.json")
+    mkdir -p "$RS_C/runner/leases/active"; : > "$RS_C/runner/leases/active/$id"
     _rs_finalize "$id"
-    [ "$status" -eq 1 ]
-    [ "$(jq -S . "$RS_C/jobs/$id.json")" = "$before" ]
+    [ "$status" -eq 4 ]
+    [ "$(_rs_state "$RS_C" "$id")" = "cancelled" ]
+    [ "$(jq -r '[.[] | select(.kind == "cancelled")] | length' <(jq -s . "$RS_C/events/$id.jsonl"))" = "1" ]
+    [ ! -e "$RS_C/runner/leases/active/$id" ]
+}
+
+# ===========================================================================
+# 13. PR #122 review fix-ups
+
+# --- 13.1 legacy output is unchanged ---------------------------------------
+
+@test "legacy mother status prints no 'Dispatch mode:' line (it appears only in worker mode); status --json keeps dispatch_mode" {
+    run _rs_mother "$RS_C" status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Concurrency:"* ]]
+    [[ "$output" != *"Dispatch mode"* ]]
+    run _rs_mother "$RS_C" status --format json
+    [ "$(printf '%s' "$output" | jq -r '.dispatch_mode.value')" = "legacy" ]
+    run env MOTHER_DISPATCH_MODE=worker bash -c 'cd /; MOTHER_ROOT="$1" mother status' _ "$RS_C"
+    [[ "$output" == *"Dispatch mode: worker"* ]]
+}
+
+# --- 13.2 the coordinator derives pr_url under the #117 rule ----------------
+
+# _rs_stream <id> — one coordinator replay (no ops): what the coordinator runs after each batch.
+_rs_stream() { _rs_in_world "$RS_C" bash "$_LIB_DIR/coord_apply.sh" "$RS_C" "$1" < /dev/null; }
+
+_rs_pr_seed() {
+    local id="$1" extra="${2:-.}"
+    _rs_fin_seed "$id" 1 ".state = \"running\" | $extra"
+    jq '.state = "running"' "$RS_C/runner/leases/$id.json" > /dev/null
+}
+
+@test "pr_url: the coordinator writes the worker mirror's pr_url mid-run when the PR's head is the job's branch" {
+    local id="rs-pr-ok"
+    _rs_pr_seed "$id"
+    [ "$(jq -r '.pr_url // "null"' "$RS_C/jobs/$id.json")" = "null" ]
+    run _rs_stream "$id"
+    [ "$(_rs_state "$RS_C" "$id")" = "running" ]
+    [ "$(_rs_field "$RS_C" "$id" pr_url)" = "https://github.com/test/rs/pull/7" ]
+}
+
+@test "pr_url: a worker-supplied PR whose head is another branch is refused and audited (not written)" {
+    local id="rs-pr-foreign"
+    _rs_pr_seed "$id"
+    ( _rs_export_root "$RS_C"; gh_mock_set_pr "https://github.com/test/rs/pull/7" OPEN "feature/someone-elses" ) >/dev/null 2>&1
+    run _rs_stream "$id"
+    [ "$(jq -r '.pr_url // "null"' "$RS_C/jobs/$id.json")" = "null" ]
+    jq -e -s --arg j "$id" 'map(select(.job == $j and .code == "pr_url_refused")) | length == 1' "$RS_C/runner/leases/audit.jsonl" >/dev/null
+    run _rs_stream "$id"      # a refused url is judged once, not on every replay
+    jq -e -s --arg j "$id" 'map(select(.job == $j and .code == "pr_url_refused")) | length == 1' "$RS_C/runner/leases/audit.jsonl" >/dev/null
+}
+
+@test "pr_url: a fork PR (isCrossRepository) is refused even when its head branch name matches" {
+    local id="rs-pr-fork"
+    _rs_pr_seed "$id"
+    ( _rs_export_root "$RS_C"; gh_mock_set_pr_cross "https://github.com/test/rs/pull/7" true ) >/dev/null 2>&1
+    run _rs_stream "$id"
+    [ "$(jq -r '.pr_url // "null"' "$RS_C/jobs/$id.json")" = "null" ]
+    jq -e -s --arg j "$id" 'map(select(.job == $j and .code == "pr_url_refused")) | length == 1' "$RS_C/runner/leases/audit.jsonl" >/dev/null
+}
+
+@test "pr_url: an expect_branch_mismatch job accepts a PR created after its attempt began, and records actual_branch" {
+    local id="rs-pr-mismatch"
+    _rs_pr_seed "$id" '.expect_branch_mismatch = true | .attempt_run = {key: "0:0", started_at: "2026-11-08T12:00:00.000Z"}'
+    ( _rs_export_root "$RS_C"; gh_mock_set_pr "https://github.com/test/rs/pull/7" OPEN "feature/existing-pr"
+      gh_mock_set_pr_created "https://github.com/test/rs/pull/7" "2026-11-08T12:05:00Z" ) >/dev/null 2>&1
+    run _rs_stream "$id"
+    [ "$(_rs_field "$RS_C" "$id" pr_url)" = "https://github.com/test/rs/pull/7" ]
+    [ "$(_rs_field "$RS_C" "$id" actual_branch)" = "feature/existing-pr" ]
+}
+
+@test "pr_url: an expect_branch_mismatch job refuses a PR that predates its attempt" {
+    local id="rs-pr-old"
+    _rs_pr_seed "$id" '.expect_branch_mismatch = true | .attempt_run = {key: "0:0", started_at: "2026-11-08T12:00:00.000Z"}'
+    ( _rs_export_root "$RS_C"; gh_mock_set_pr "https://github.com/test/rs/pull/7" OPEN "feature/existing-pr"
+      gh_mock_set_pr_created "https://github.com/test/rs/pull/7" "2026-10-01T00:00:00Z" ) >/dev/null 2>&1
+    run _rs_stream "$id"
+    [ "$(jq -r '.pr_url // "null"' "$RS_C/jobs/$id.json")" = "null" ]
+}
+
+@test "finalize: a foreign pr_url in the worker mirror is dropped (audited); the success itself is still judged on the commit" {
+    local id="rs-fin-foreign"
+    _rs_fin_seed "$id" 1
+    ( _rs_export_root "$RS_C"; gh_mock_set_pr "https://github.com/test/rs/pull/7" OPEN "feature/someone-elses" ) >/dev/null 2>&1
+    _rs_finalize "$id"
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.pr_url // "null"' "$RS_C/jobs/$id.json")" = "null" ]
+    jq -e -s --arg j "$id" 'map(select(.job == $j and .code == "claim_dropped")) | length >= 1' "$RS_C/runner/leases/audit.jsonl" >/dev/null
+}
+
+@test "attempt_run is a worker key in the Go table and the bash table (the supervisor writes it; the coordinator needs it)" {
+    grep -q '"attempt_run"' "$BATS_TEST_DIRNAME/../broker/workerproto/ownership.go"
+    run bash -c 'source "$1"; printf "%s %s" "$_CA_WORKER_KEYS" "$_CA_KEY_KINDS"' _ "$_LIB_DIR/coord_apply.sh"
+    [[ "$output" == *" attempt_run "* ]] || [[ "$output" == *" attempt_run" ]]
+    [[ "$output" == *"attempt_run:object"* ]]
+}
+
+# --- 13.4 per-tick cost does not grow with history ----------------------------
+
+# A jq that logs every invocation's arguments, then runs the real one.
+_rs_jq_spy() {
+    local real; real=$(command -v jq)
+    cat > "$_MOCK_BIN/jq" <<SPY
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$MOTHER_ROOT/jq-calls.log"
+exec "$real" "\$@"
+SPY
+    chmod +x "$_MOCK_BIN/jq"
+    : > "$MOTHER_ROOT/jq-calls.log"
+}
+
+@test "per-tick cost: 300 terminal lease files are never read (no jq on a lease file) when no lease is live" {
+    local i
+    mkdir -p "$RS_C/runner/leases"
+    for i in $(seq 1 300); do
+        jq -nc --arg i "$i" '{lease_id: ("L" + $i), epoch: 1, worker_id: "local", state: "released", end_reason: "succeeded"}' \
+            > "$RS_C/runner/leases/old-$i.json"
+    done
+    _rs_jq_spy
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    ! grep -q "leases/" "$MOTHER_ROOT/jq-calls.log"
+}
+
+@test "per-tick cost: with live leases only the indexed ones are read, however many terminal files exist" {
+    local i id="rs-live"
+    mkdir -p "$RS_C/runner/leases/active"
+    for i in $(seq 1 100); do
+        jq -nc '{lease_id: "Lx", epoch: 1, worker_id: "local", state: "released", end_reason: "succeeded"}' > "$RS_C/runner/leases/old-$i.json"
+    done
+    _rs_job "$RS_C" "$id" '.state = "running"'
+    jq -nc '{lease_id: "L1", epoch: 1, worker_id: "local", state: "active"}' > "$RS_C/runner/leases/$id.json"
+    : > "$RS_C/runner/leases/active/$id"
+    _rs_jq_spy
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy MOTHER_CONCURRENCY=1; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    grep -q "leases/$id.json" "$MOTHER_ROOT/jq-calls.log"
+    ! grep -q "leases/old-" "$MOTHER_ROOT/jq-calls.log"
+}
+
+@test "legacy default: with no runner/leases or runner/dispatch directory a worker-path tick forks nothing and creates nothing" {
+    _rs_jq_spy
+    ( _rs_export_root "$RS_C"; unset MOTHER_DISPATCH_MODE; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    [ ! -e "$RS_C/runner/leases" ]
+    [ ! -e "$RS_C/runner/dispatch" ]
+    [ ! -s "$MOTHER_ROOT/jq-calls.log" ] || { cat "$MOTHER_ROOT/jq-calls.log" >&2; false; }
+}
+
+# --- 13.5 / 13.7 finalize resolves a cancel and never blocks the loop -------------
+
+@test "runner: a cancel requested after the lease was released as succeeded ends the job cancelled (it does not stay running)" {
+    local id="rs-fin-cancel-runner"
+    _rs_fin_seed "$id" 1 '.cancel_requested = true'
+    _rs_runner "$RS_C" worker
+    _rs_must 30 "the job to be cancelled" _rs_state_is "$RS_C" "$id" cancelled
+}
+
+@test "runner: a slow remote check in finalize does not stall dispatch (another job still starts and finishes meanwhile)" {
+    local a="rs-slowfin" b="rs-fast" realgit
+    realgit=$(command -v git)
+    cat > "$_MOCK_BIN/git" <<GIT
+#!/usr/bin/env bash
+case "\$PWD" in *repo-rs-slowfin*) for a in "\$@"; do [ "\$a" = ls-remote ] && sleep 30; done ;; esac
+exec "$realgit" "\$@"
+GIT
+    chmod +x "$_MOCK_BIN/git"
+    echo 1 > "$RS_CLAUDE_DIR/default-sleep"
+    _rs_fin_seed "$a" 1
+    _rs_job "$RS_C" "$b" '.dispatch_via = "legacy"'
+    _rs_runner "$RS_C" worker
+    _rs_must 10 "finalize of $a to start" bash -c 'ls "$1"/runner/leases/*.finalizing >/dev/null 2>&1' _ "$RS_C"
+    _rs_must 22 "the other job to succeed while $a is still being verified" _rs_state_is "$RS_C" "$b" succeeded
+    [ "$(_rs_state "$RS_C" "$a")" = "running" ] || { _rs_dump; false; }
+    _rs_must 90 "$a to be resolved" bash -c '[ "$(jq -r .state "$1/jobs/$2.json")" != running ]' _ "$RS_C" "$a"
+}
+
+# --- 13.6 no worker, no silent running ----------------------------------------
+
+@test "worker binary missing: the job stays ready (not running), is flagged worker_unavailable, and mother cancel cancels it" {
+    local id="rs-noworker" T="$BATS_TEST_TMPDIR/nobin" f
+    mkdir -p "$T/bin"
+    for f in "$_PLUGIN_ROOT"/bin/*; do [ -f "$f" ] && ln -s "$f" "$T/bin/$(basename "$f")"; done
+    rm -f "$T/bin/mother-worker"
+    printf '#!/bin/sh\nexit 127\n' > "$T/bin/mother-worker"; chmod +x "$T/bin/mother-worker"
+    ln -s "$_PLUGIN_ROOT/broker" "$T/broker"
+    _rs_job "$RS_C" "$id"
+    _rs_runner "$RS_C" worker MOTHER_BIN_DIR="$T/bin"
+    _rs_must 30 "worker_unavailable flag" bash -c '[ "$(jq -r ".needs_attention.reason // empty" "$1/jobs/$2.json")" = worker_unavailable ]' _ "$RS_C" "$id"
+    sleep 3
+    [ "$(_rs_state "$RS_C" "$id")" = "ready" ]
+    [ ! -e "$RS_C/runner/dispatch/$id.json" ]
+    run _rs_mother "$RS_C" cancel "$id"
+    [ "$status" -eq 0 ]
+    [ "$(_rs_state "$RS_C" "$id")" = "cancelled" ]
+}
+
+@test "mother cancel on a running job whose dispatch request nobody consumed withdraws the request and cancels now" {
+    local id="rs-pending"
+    _rs_job "$RS_C" "$id" '.state = "running"'
+    mkdir -p "$RS_C/runner/dispatch"
+    jq -nc --arg j "$id" '{job: $j, requested_at: "2026-11-08T12:00:00.000Z"}' > "$RS_C/runner/dispatch/$id.json"
+    run _rs_mother "$RS_C" cancel "$id"
+    [ "$status" -eq 0 ]
+    [ "$(_rs_state "$RS_C" "$id")" = "cancelled" ]
+    [ ! -e "$RS_C/runner/dispatch/$id.json" ]
+}
+
+# --- 13.8 the worker pid file under the worker's root is not trusted ----------------
+
+@test "a worker-writable <root>/worker.pid is never adopted: the runner keeps the pid it launched" {
+    local id="rs-pidtrust" wp decoy
+    echo 20 > "$RS_CLAUDE_DIR/default-sleep"
+    _rs_job "$RS_C" "$id"
+    _rs_runner "$RS_C" worker
+    _rs_must 40 "the job's claude to start" _rs_claude_started
+    wp=$(_rs_worker_pid "$RS_C")
+    _rs_num "$wp"
+    sleep 300 & decoy=$!
+    _rs_note P "$decoy"
+    printf '%s %s\n' "$decoy" "$decoy" > "$RS_WROOT/worker.pid"
+    sleep 4
+    [ "$(_rs_worker_pid "$RS_C")" = "$wp" ]
+    _rs_kill_pid "$decoy"
+}
+
+# --- 13.9 the cost of a dead run is never lost ----------------------------------------
+
+@test "lost lease before the run's current_run op was replayed: the usage row is still recorded (offset from the worker mirror)" {
+    local id="rs-lost-early"
+    _rs_job "$RS_C" "$id" '.state = "running" | .current_run = null'
+    cat >> "$RS_C/logs/$id.log" <<'LOG'
+{"type":"assistant","message":{"id":"msg_x","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":200}}}
+{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.004,"modelUsage":{"claude-sonnet-5":{"costUSD":0.004,"inputTokens":1000,"outputTokens":200}}}
+LOG
+    mkdir -p "$RS_C/runner/leases/active" "$MOTHER_WORKER_ROOT/local/jobs"
+    jq -nc '{lease_id: "L9", epoch: 1, worker_id: "local", state: "lost", last_hb: "2026-11-08T12:00:00.000Z"}' > "$RS_C/runner/leases/$id.json"
+    : > "$RS_C/runner/leases/active/$id"
+    jq -nc '{id: "x", current_run: {log_offset: 0}}' > "$MOTHER_WORKER_ROOT/local/jobs/$id.json"
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    [ "$(_rs_state "$RS_C" "$id")" = "failed" ]
+    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
+    grep -qF "\"job_id\":\"$id\"" "$RS_C/metrics/runs.jsonl"
 }

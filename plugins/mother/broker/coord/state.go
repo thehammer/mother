@@ -48,6 +48,7 @@ type jobLease struct {
 	cmds        []cmdEntry
 	dirty       bool
 	applying    bool
+	ackAnchor   *workerproto.Frame // a duplicate/gap frame is owed one coalesced re-ack (sent on the next flush tick)
 	lastPersist time.Time
 }
 

@@ -53,20 +53,7 @@ type mother_ensure_worker_marker >/dev/null 2>&1 && mother_ensure_worker_marker
 # fractional seconds, which silently breaks job display. Uses /usr/bin/perl
 # (universal on macOS, Time::HiRes in core) with an absolute path so
 # subshells with restricted PATH still get timestamps.
-#
-# bash 5 has the clock built in ($EPOCHREALTIME, printf %()T): no process is exec'd, which matters because
-# this runs on every state write and a perl start-up costs 50 ms or more on a laptop with endpoint
-# security (worker-mode dispatch latency, cluster P1-5). The result is byte-identical to the perl path,
-# which stays as the fallback (bash 3.2, a locale that prints a decimal comma).
 _iso_now() {
-    local _e="${EPOCHREALTIME:-}" _f
-    case "$_e" in
-        [0-9]*.[0-9]*)
-            case "$_e" in *[!0-9.]*) ;; *)
-                _f="${_e#*.}000"
-                ( export TZ=UTC; printf '%(%Y-%m-%dT%H:%M:%S)T.%sZ\n' "${_e%.*}" "${_f:0:3}" 2>/dev/null ) && return 0 ;;
-            esac ;;
-    esac
     /usr/bin/perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
         my ($s, $us) = gettimeofday();
         my @t = gmtime($s);
@@ -76,6 +63,35 @@ _iso_now() {
             int($us / 1000);
     '
 }
+
+# Worker mode only (cluster P1-5): the same timestamp from bash's own clock ($EPOCHREALTIME, printf %()T) with no
+# process exec'd per call; every state write calls it and a perl start-up costs 50 ms or more on a laptop with
+# endpoint security (most of worker-mode dispatch latency). Defined only when worker mode is on, so the default
+# (legacy) path keeps the perl implementation above unchanged. bash 3.2 (no EPOCHREALTIME) or a decimal-comma
+# locale falls through to perl.
+if mother_worker_mode_active 2>/dev/null; then
+    _iso_now_perl() {
+    /usr/bin/perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
+        my ($s, $us) = gettimeofday();
+        my @t = gmtime($s);
+        printf "%sT%s.%03dZ\n",
+            strftime("%Y-%m-%d", @t),
+            strftime("%H:%M:%S", @t),
+            int($us / 1000);
+    '
+    }
+    _iso_now() {
+        local _e="${EPOCHREALTIME:-}" _f
+        case "$_e" in
+            [0-9]*.[0-9]*)
+                case "$_e" in *[!0-9.]*) ;; *)
+                    _f="${_e#*.}000"
+                    ( export TZ=UTC; printf '%(%Y-%m-%dT%H:%M:%S)T.%sZ\n' "${_e%.*}" "${_f:0:3}" 2>/dev/null ) && return 0 ;;
+                esac ;;
+        esac
+        _iso_now_perl
+    }
+fi
 
 # Second-precision RFC 3339 timestamp N hours in the past (UTC). Used as an
 # age floor for the hook's event feed. Second precision is deliberate and
@@ -214,7 +230,7 @@ _mother_job_update_locked() {
 # Usage: mother_job_write_doc <job-file> <merged-json>
 mother_job_write_doc() {
     local _jf="$1" _merged="$2" _before="" _jid
-    if mother_outbox_enabled && [ -r "$_jf" ]; then _before=$(<"$_jf"); fi
+    mother_outbox_enabled && _before=$(cat "$_jf" 2>/dev/null)
     _atomic_write "$_jf" "$_merged" || return 1
     if mother_outbox_enabled; then
         _jid="${_jf##*/}"; _jid="${_jid%.json}"
@@ -520,7 +536,7 @@ _switch_with_lock() {
     # variable, never exported, so child processes (exec'd commands, `mother ... &`) still contend
     # normally; a backgrounded *function* subshell would inherit it, and none takes locks.
     case "${_MOTHER_HELD_LOCKDIRS:-}" in *"|$lockdir|"*) "$@"; return $? ;; esac
-    [ -d "${lockdir%/*}" ] || mkdir -p "${lockdir%/*}" 2>/dev/null
+    mkdir -p "$(dirname "$lockdir")" 2>/dev/null
     while ! mkdir "$lockdir" 2>/dev/null; do
         # Identity of the lockdir we are judging: inode, owner, mtime (read in this order).
         ino=$(ls -di "$lockdir" 2>/dev/null | awk '{print $1}')

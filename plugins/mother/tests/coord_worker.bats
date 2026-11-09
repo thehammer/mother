@@ -44,7 +44,7 @@ load 'gh_mock'
 
 # The job keys a worker may set (docs/worker-protocol.md section 8) plus the canonical cost recompute: the part of
 # the job document a distributed run must reproduce on C exactly as a legacy run leaves it.
-CW_WORKER_KEYS='["activity","session_id","worker_pid","paused_reason","paused_at","question","final_result_at","started_at","continuation_count","resume_not_yet_acted_on","gates","review_wave","limiter_hold","live_cost_usd","live_tokens","current_run","cost_cap_breached_at","token_alert_at","rwx_sandbox","resume_session_id","resume_kind","limiter_resume_prompt","attention","decision","actual_cost_usd"]'
+CW_WORKER_KEYS='["activity","session_id","worker_pid","paused_reason","paused_at","question","final_result_at","started_at","continuation_count","resume_not_yet_acted_on","gates","review_wave","limiter_hold","live_cost_usd","live_tokens","current_run","cost_cap_breached_at","token_alert_at","rwx_sandbox","resume_session_id","resume_kind","limiter_resume_prompt","attention","decision","attempt_run","adherence_status","adherence_attempts","adherence_pending","adherence_notes","adherence_sha_runs","adherence_reviewed_sha","actual_cost_usd"]'
 
 # ---------------------------------------------------------------------------
 # Environment

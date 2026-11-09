@@ -792,6 +792,8 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
     local via_worker_json="false"
     if [ "$via_worker_flag" -eq 1 ] || [ "$(_parse_via_worker "$plan_file")" = "true" ]; then
         via_worker_json="true"
+        # The runner's cheap per-tick check for "is the worker path in play" is the existence of this directory.
+        mkdir -p "$RUNNER_DIR/dispatch" 2>/dev/null || true
     fi
 
     # Parse the pipeline config (optional; absent -> non-pipeline job).
@@ -1380,8 +1382,10 @@ _status_overview() {
     fi
 
     echo "Concurrency: $(printf '%s' "$conc" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
-    echo "Dispatch mode: $(printf '%s' "$dmode" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
     _status_rust_dirs_line "$rust_dirs"
+    # Legacy output is unchanged from before the cluster work: the line appears only in worker mode.
+    [ "$(printf '%s' "$dmode" | jq -r .value)" = "legacy" ] || \
+        echo "Dispatch mode: $(printf '%s' "$dmode" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
     jq -r 'select(type == "object" and .at) | "Last snapshot thin: \(.at), freed \(.freed_gb) GB (thinned \(.thinned))\(if .exit != 0 then " [tmutil exit \(.exit)]" else "" end)"' \
         "$RUNNER_DIR/snapshot-thin.json" 2>/dev/null || true
     _limiter_text "$limiter" compact
@@ -2119,7 +2123,15 @@ _cancel_locked() {
         running)        # Leave a cancel request; runner picks it up
                         _job_update "$id" '.cancel_requested = true'
                         _append_event "$id" "cancel_requested" '{}'
-                        echo "cancel requested; runner will stop on next tick"
+                        if [ -f "$RUNNER_DIR/dispatch/$id.json" ]; then
+                            # Worker path: the job was handed to the coordinator but no worker has taken it
+                            # (the request is consumed when a lease is offered). Nothing runs, so withdraw the
+                            # request and cancel now instead of leaving it `running` forever.
+                            rm -f "$RUNNER_DIR/dispatch/$id.json"
+                            _job_transition "$id" cancelled '{"reason":"user"}'
+                        else
+                            echo "cancel requested; runner will stop on next tick"
+                        fi
                         ;;
         *) _die "cannot cancel job in state: $state" ;;
     esac

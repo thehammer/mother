@@ -79,7 +79,8 @@ _pidfile_alive() {
 if command -v mother >/dev/null 2>&1; then
     _dm=$(mother status --format json 2>/dev/null | jq -r '.dispatch_mode | "\(.value) (source: \(.source))"' 2>/dev/null)
     _dmv=$(mother status --format json 2>/dev/null | jq -r '.dispatch_mode.value // empty' 2>/dev/null)
-    [ -z "$_dm" ] || {
+    # Legacy (the default) prints nothing: doctor output is unchanged until the mode or a worker is in play.
+    [ -z "$_dm" ] || { [ "$_dmv" = "legacy" ] && [ ! -d "$_drunner/leases" ] && [ ! -d "$_drunner/dispatch" ]; } || {
         echo "dispatch:"
         printf '  • %-12s %s\n' "mode" "$_dm"
         _coord=$(_pidfile_alive "$_drunner/coord.pid") || _coord=""

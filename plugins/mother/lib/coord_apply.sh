@@ -66,8 +66,8 @@
 # needs_attention item, exactly as the local hardening does, plus an audit line; `succeeded` is never written.
 # As in the local hardening, a check with nothing to check against (no checkout, no origin remote) is skipped
 # and audited as `verify_skipped`; a remote that exists whose final commit cannot be resolved is a refusal.
-# Exit: 0 finalized as succeeded, 3 refused (job failed unpushed_commit), 1 nothing to do (not running, not a
-# released-succeeded lease, cancel requested).
+# Exit: 0 finalized as succeeded, 3 refused (job failed unpushed_commit), 4 cancelled (a cancel was requested),
+# 1 nothing to do (not running, not a released-succeeded lease).
 #
 # Prints the last applied seq on stdout. Exit: 0 all applied, 1 stopped (gap, transient failure, lock,
 # unknown job: ops remain), 3 done but some op(s) were quarantined, 4 a time/op budget ended the call.
@@ -76,7 +76,7 @@
 # --- ownership table: copies of broker/workerproto/ownership.go --------------------------------
 
 # WorkerKeys: job keys the worker side may set or delete.
-_CA_WORKER_KEYS='activity session_id worker_pid paused_reason paused_at question final_result_at started_at continuation_count resume_not_yet_acted_on gates review_wave limiter_hold live_cost_usd live_tokens current_run cost_cap_breached_at token_alert_at rwx_sandbox resume_session_id resume_kind limiter_resume_prompt attention decision'
+_CA_WORKER_KEYS='activity session_id worker_pid paused_reason paused_at question final_result_at started_at continuation_count resume_not_yet_acted_on gates review_wave limiter_hold live_cost_usd live_tokens current_run cost_cap_breached_at token_alert_at rwx_sandbox resume_session_id resume_kind limiter_resume_prompt attention decision attempt_run adherence_status adherence_attempts adherence_pending adherence_notes adherence_sha_runs adherence_reviewed_sha'
 # CoordinatorDerivedKeys: completion evidence; refused from a worker.
 _CA_DERIVED_KEYS='pr_url actual_branch finished_at exit_code failure_reason'
 # SyncDownKeys: flow coordinator to worker; refused from a worker (pending_answer may be nulled).
@@ -84,7 +84,7 @@ _CA_SYNCDOWN_KEYS='cancel_requested pause_requested pending_answer max_cost_usd 
 # StateValues: what a worker may set `state` to ("succeeded" is the coordinator's).
 _CA_STATE_VALUES='running awaiting failed cancelled'
 # keyKinds: key:kind for every WorkerKey.
-_CA_KEY_KINDS='activity:token session_id:id worker_pid:uint paused_reason:token paused_at:ts question:text final_result_at:ts started_at:ts continuation_count:uint resume_not_yet_acted_on:bool gates:object review_wave:object limiter_hold:object live_cost_usd:num live_tokens:uint current_run:object cost_cap_breached_at:ts token_alert_at:ts rwx_sandbox:object resume_session_id:id resume_kind:token limiter_resume_prompt:text attention:array decision:object'
+_CA_KEY_KINDS='activity:token session_id:id worker_pid:uint paused_reason:token paused_at:ts question:text final_result_at:ts started_at:ts continuation_count:uint resume_not_yet_acted_on:bool gates:object review_wave:object limiter_hold:object live_cost_usd:num live_tokens:uint current_run:object cost_cap_breached_at:ts token_alert_at:ts rwx_sandbox:object resume_session_id:id resume_kind:token limiter_resume_prompt:text attention:array decision:object attempt_run:object adherence_status:token adherence_attempts:uint adherence_pending:bool adherence_notes:text adherence_sha_runs:uint adherence_reviewed_sha:id'
 # workerproto limits.
 _CA_MAX_TEXT=8192
 _CA_MAX_STRUCT=65536
@@ -588,7 +588,13 @@ coord_apply_stream() {
     mkdir -p "$(dirname "$af")" 2>/dev/null || return 1
     # Per-job apply lock (owner pid recorded by _switch_with_lock): two replays can never double-apply.
     # A lock timeout prints its own message and returns 1.
-    _with_lock "$af" _ca_stream_locked "$job"
+    local rc=0
+    _with_lock "$af" _ca_stream_locked "$job" || rc=$?
+    # The coordinator, not the worker, writes the keys a worker may not (pr_url, work_dir): derived from the
+    # worker's mirror and checked here, on every replay, so the canonical job shows what a legacy job shows
+    # while it runs, gates, awaits or fails.
+    _ca_derive_midrun "$job" || true
+    return "$rc"
 }
 
 # --- success derivation (cluster P1-5) -----------------------------------------------------------
@@ -666,15 +672,133 @@ _ca_pr_url_matches_origin() {
     return 1
 }
 
+# _ca_need_prdetect — source prdetect.sh once (mother_remote_contains_commit, prd_pr_contains_sha).
+_ca_need_prdetect() {
+    declare -F mother_remote_contains_commit >/dev/null || [ ! -r "$MOTHER_LIB_DIR/prdetect.sh" ] \
+        || source "$MOTHER_LIB_DIR/prdetect.sh"
+}
+
+# _ca_accept_pr_url <job-file> <pr-url> — the mother #117 adoption rule, applied by the coordinator to a PR url
+# the worker's mirror claims. Accepted only on GitHub-side evidence it is the job's own: it is in the origin's
+# repository, not a fork (isCrossRepository), and its head branch is the job's branch; an
+# expect_branch_mismatch job also accepts a PR created since this attempt began or one containing the job's own
+# commit. Returns 0 accepted (_CA_PR_HEAD = the PR's head branch), 1 refused (_CA_PR_REASON), 2 indeterminate
+# (gh missing or failing: nothing is written, the next replay tries again).
+_ca_accept_pr_url() {
+    local jf="$1" url="$2" row state head cross created branch started ce se repo final rc
+    _CA_PR_REASON=""; _CA_PR_HEAD=""
+    _ca_pr_url_matches_origin "$jf" "$url" || { _CA_PR_REASON="foreign_repository"; return 1; }
+    command -v gh >/dev/null 2>&1 || { _CA_PR_REASON="gh_unavailable"; return 2; }
+    row=$(gh pr view "$url" --json state,headRefName,createdAt,isCrossRepository \
+        --jq '[.state, .headRefName, ((.isCrossRepository // false) | tostring), (.createdAt // "-")] | join("\t")' 2>/dev/null || true)
+    [ -n "$row" ] || { _CA_PR_REASON="pr_unresolved"; return 2; }
+    IFS=$'\t' read -r state head cross created <<CA_PRV_EOF
+$row
+CA_PRV_EOF
+    [ -n "$state" ] && [ -n "$head" ] || { _CA_PR_REASON="pr_unresolved"; return 2; }
+    [ "$cross" != "true" ] || { _CA_PR_REASON="cross_repository"; return 1; }
+    branch=$(jq -r '.branch // empty' "$jf" 2>/dev/null)
+    if [ "$head" = "$branch" ]; then _CA_PR_HEAD="$head"; return 0; fi
+    if [ "$(jq -r '.expect_branch_mismatch // false' "$jf" 2>/dev/null)" != "true" ]; then
+        _CA_PR_REASON="head_branch_mismatch"; return 1
+    fi
+    started=$(jq -r '.attempt_run.started_at // .current_run.spawned_at // empty' "$jf" 2>/dev/null)
+    if [ -n "$created" ] && [ "$created" != "-" ] && [ -n "$started" ]; then
+        ce=$(_iso_to_epoch "$created"); se=$(_iso_to_epoch "$started")
+        if [ "${ce:-0}" -gt 0 ] && [ "${se:-0}" -gt 0 ] && [ "$ce" -ge "$se" ]; then _CA_PR_HEAD="$head"; return 0; fi
+    fi
+    _ca_need_prdetect
+    repo=$(jq -r '.repo_path // empty' "$jf" 2>/dev/null)
+    final=""
+    [ -n "$repo" ] && [ -n "$branch" ] && final=$(cd "$repo" 2>/dev/null && git rev-parse --verify -q "refs/heads/$branch" 2>/dev/null)
+    if [ -n "$final" ] && declare -F prd_pr_contains_sha >/dev/null; then
+        prd_pr_contains_sha "$url" "$final"; rc=$?
+        case "$rc" in
+            0) _CA_PR_HEAD="$head"; return 0 ;;
+            2) _CA_PR_REASON="evidence_indeterminate"; return 2 ;;
+        esac
+    fi
+    _CA_PR_REASON="pr_predates_run"
+    return 1
+}
+
+# _ca_derive_midrun <job> — coordinator-derived keys taken from the worker's mirror while the job is not terminal:
+#   pr_url   only when _ca_accept_pr_url accepts it (a refusal is audited once per url, `pr_url_refused`; a
+#            transient failure is retried after 30 s); `actual_branch` is set when the PR's head differs from the job's branch.
+#   work_dir the canonical checkout (repo_path) for a main-dir job, never a path the worker names; for a
+#            worktree job the mirror's path only when it lies under the local worker's root.
+# A no-op (no jq, no gh) unless the mirror shows something new.
+_ca_derive_midrun() {
+    local job="$1" jf wid mirror row murl mwd cur_url cur_wd iso marker mu me now_s ok rc
+    jf=$(_job_path "$job")
+    [ -f "$jf" ] || return 0
+    wid=$(_ca_lease_field "$job" worker_id)
+    mirror=$(_ca_mirror_doc "$wid" "$job")
+    [ -n "$mirror" ] || return 0
+    # Unit separator, not tab: a tab is IFS whitespace, so an empty pr_url would swallow the field and shift work_dir.
+    row=$(jq -r '"\(.pr_url // "")\u001f\(.work_dir // "")"' "$mirror" 2>/dev/null) || return 0
+    IFS=$'\037' read -r murl mwd <<CA_MR_EOF
+$row
+CA_MR_EOF
+    # --- work_dir
+    cur_wd=$(jq -r '.work_dir // empty' "$jf" 2>/dev/null)
+    if [ -z "$cur_wd" ] && [ -n "$mwd" ]; then
+        iso=$(jq -r '.isolation // "worktree"' "$jf" 2>/dev/null)
+        if [ "$iso" = "main-dir" ]; then
+            mwd=$(jq -r '.repo_path // empty' "$jf" 2>/dev/null)
+        else
+            case "$mwd" in
+                "${MOTHER_WORKER_ROOT:-${HOME:-}/.mother-worker}/$wid/"*) ;;
+                *) mwd="" ;;
+            esac
+        fi
+        [ -z "$mwd" ] || _job_update "$job" ".work_dir = $(jq -nc --arg v "$mwd" '$v')" || return 0
+    fi
+    # --- pr_url
+    [ -n "$murl" ] || return 0
+    printf '%s' "$murl" | jq -Re 'test("\\Ahttps://[A-Za-z0-9._:-]+/[A-Za-z0-9._/-]+/pull/[0-9]+\\z")' >/dev/null 2>&1 || return 0
+    cur_url=$(jq -r '.pr_url // empty' "$jf" 2>/dev/null)
+    [ "$murl" != "$cur_url" ] || return 0
+    marker="$MOTHER_ROOT/runner/leases/$job.pr-check"
+    read -r mu me ok 2>/dev/null < "$marker" || mu=""
+    now_s=$(date +%s)
+    if [ "$mu" = "$murl" ]; then
+        [ "$ok" = "refused" ] && return 0
+        [ $((now_s - ${me:-0})) -ge 30 ] || return 0
+    fi
+    _ca_need_prdetect
+    rc=0; _ca_accept_pr_url "$jf" "$murl" || rc=$?
+    case "$rc" in
+        0)
+            printf '%s %s ok\n' "$murl" "$now_s" > "$marker" 2>/dev/null
+            _job_update "$job" ".pr_url = $(jq -nc --arg v "$murl" '$v')
+                | (if $(jq -nc --arg h "$_CA_PR_HEAD" '$h') != (.branch // \"\") then .actual_branch = $(jq -nc --arg h "$_CA_PR_HEAD" '$h') else . end)" ;;
+        1)
+            printf '%s %s refused\n' "$murl" "$now_s" > "$marker" 2>/dev/null
+            _ca_audit "$job" pr_url_refused "$(jq -nc --arg r "$_CA_PR_REASON" '["pr_url: " + $r]')" ;;
+        *)
+            printf '%s %s retry\n' "$murl" "$now_s" > "$marker" 2>/dev/null ;;
+    esac
+    return 0
+}
+
 # coord_apply_finalize <job> — see the header. Prints nothing; exit codes: 0 succeeded, 3 refused, 1 nothing to do.
 coord_apply_finalize() {
-    local job="$1" jf st lstate lreason wid mirror claims rbranch claimed_branch pr_url no_pr note now fin_filter
+    local job="$1" jf st lstate lreason wid mirror claims rbranch claimed_branch pr_url no_pr note now fin_filter claim_url rc
     jf=$(_job_path "$job")
     [ -f "$jf" ] || return 1
     [ "$(jq -r '.state // empty' "$jf" 2>/dev/null)" = "running" ] || return 1
-    [ "$(jq -r '.cancel_requested // false' "$jf" 2>/dev/null)" != "true" ] || return 1
     lstate=$(_ca_lease_field "$job" state); lreason=$(_ca_lease_field "$job" end_reason)
     [ "$lstate" = "released" ] && [ "$lreason" = "succeeded" ] || return 1
+    if [ "$(jq -r '.cancel_requested // false' "$jf" 2>/dev/null)" = "true" ]; then
+        # The operator cancelled while the worker was finishing: the job ends `cancelled`, exactly as a legacy
+        # supervisor leaves it (never succeeded, never left running with a released lease). The lease drops
+        # out of the runner's active index so nothing waits on it.
+        _job_transition "$job" cancelled '{"reason":"user"}' || return 2
+        rm -f "$MOTHER_ROOT/runner/leases/active/$job"
+        type mother_recompute_job_cost >/dev/null 2>&1 && mother_recompute_job_cost "$job"
+        return 4
+    fi
     wid=$(_ca_lease_field "$job" worker_id)
     mirror=$(_ca_mirror_doc "$wid" "$job")
     claims=$(_ca_claims_json "$mirror")
@@ -688,10 +812,16 @@ coord_apply_finalize() {
     else
         claims=$(printf '%s' "$claims" | jq -c 'del(.actual_branch)')
     fi
-    # A claimed PR url must belong to the job's own repository when that can be told (a github.com origin).
-    if ! _ca_pr_url_matches_origin "$jf" "$(printf '%s' "$claims" | jq -r '.pr_url // empty')"; then
-        _ca_audit "$job" claim_dropped '["pr_url: not in the origin repository"]'
-        claims=$(printf '%s' "$claims" | jq -c 'del(.pr_url)')
+    # A claimed PR url is taken only under the #117 rule (same repository, not a fork, the job's head branch or
+    # evidence it is the job's own); one the canonical job already carries was derived under it mid-run.
+    claim_url=$(printf '%s' "$claims" | jq -r '.pr_url // empty')
+    if [ -n "$claim_url" ] && [ "$claim_url" != "$(jq -r '.pr_url // empty' "$jf")" ]; then
+        _ca_need_prdetect
+        rc=0; _ca_accept_pr_url "$jf" "$claim_url" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            _ca_audit "$job" claim_dropped "$(jq -nc --arg r "${_CA_PR_REASON:-unverified}" '["pr_url: " + $r]')"
+            claims=$(printf '%s' "$claims" | jq -c 'del(.pr_url)')
+        fi
     fi
     pr_url=$(printf '%s' "$claims" | jq -r '.pr_url // empty')
     [ -n "$pr_url" ] || pr_url=$(jq -r '.pr_url // empty' "$jf")
