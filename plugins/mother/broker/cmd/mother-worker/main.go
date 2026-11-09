@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -105,9 +106,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "mother-worker:", err)
 		os.Exit(1)
 	}
+	finalWait := envDur("MOTHER_CHECKPOINT_FINAL_TIMEOUT_S")
+	if finalWait <= 0 {
+		finalWait = 30 * time.Second
+	}
 	d, err := worker.New(worker.Config{
 		Secret: secret, ID: *id, Root: absRoot, CoordSock: *sock, Slots: *slots, BinDir: binDir, LibDir: libDir,
 		BackoffMax: envDur("MOTHER_WORKER_BACKOFF_MAX_S"), Logf: logf,
+		CkptInterval: checkpointInterval(binDir, absRoot, logf), CkptFinalWait: finalWait,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "mother-worker:", err)
@@ -117,9 +123,39 @@ func main() {
 		fmt.Fprintln(os.Stderr, "mother-worker:", err)
 		os.Exit(1)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
+	// SIGTERM/SIGINT: stop every supervisor (each takes its final checkpoint), keep shipping until the
+	// outboxes drain, then exit with no child left (cluster P1-6). A SIGKILL leaves them to be re-adopted.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	logf("started (root %s, coordinator %s, slots %d)", absRoot, *sock, *slots)
-	_ = d.Run(ctx)
-	// Exiting leaves every supervisor running: they are re-adopted by the next start.
+	done := make(chan struct{})
+	go func() { _ = d.Run(ctx); close(done) }()
+	select {
+	case sig := <-sigs:
+		logf("%s: stopping supervisors and shipping their final checkpoints", sig)
+		d.GracefulStop(finalWait + 15*time.Second)
+		cancel()
+		<-done
+	case <-done:
+	}
+}
+
+// checkpointInterval is the cadence `mother checkpoint interval` prints (0 when the CLI cannot say, which
+// disables the cadence: the supervisors still checkpoint at their own boundaries and exits).
+func checkpointInterval(binDir, root string, logf func(string, ...any)) time.Duration {
+	cmd := exec.Command(filepath.Join(binDir, "mother"), "checkpoint", "interval")
+	cmd.Env = append(os.Environ(), "MOTHER_ROOT="+root)
+	out, err := cmd.Output()
+	if err != nil {
+		logf("checkpoint interval unavailable (%v); the periodic checkpoint is off", err)
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || n < 1 {
+		logf("checkpoint interval %q is not usable; the periodic checkpoint is off", strings.TrimSpace(string(out)))
+		return 0
+	}
+	return time.Duration(n) * time.Second
 }

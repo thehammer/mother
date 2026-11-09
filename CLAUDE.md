@@ -1032,9 +1032,9 @@ published as `dispatch_mode` / `dispatch_mode_source` in `runner/effective-confi
   hardening; an existing remote with an unresolvable final commit is a refusal, and the commit is never one the worker reports.
   Completion evidence (`pr_url`, `actual_branch`, `exit_code`) is read from the worker's mirror only then and only when
   well formed: `actual_branch` for an `expect_branch_mismatch` job, `pr_url` inside the origin's repo when that is github.com.
-- **Lost lease**: `_recover_lost_leases` records the run's usage row and fails the job `worker_lost {worker, lease_epoch,
-  last_heartbeat_at}` once per lease (`runner/leases/<job>.lost-handled`); failure routing handles it like `runner_died`.
-  P1-6 replaces this with a resume.
+- **Lost lease** (P1-6 replaced P1-5's `failed worker_lost`): `_recover_lost_leases` records the run's usage row and a
+  `worker_lost {worker, lease_epoch, last_heartbeat_at, reason}` event once per lease (`runner/leases/<job>.lost-handled`),
+  then resumes the job from its checkpoint or fails it `no_checkpoint_restorable` (see "Failover and resume").
 - **Surfaces**: `mother workers [--json]` (name, kind `laptop`, approved classes `personal company phi`, connection, heartbeat age,
   jobs; `coordinator not running (dispatch mode: legacy)` otherwise), `worker: local (lease e<epoch>, hb Ns ago)` and
   `waiting: <reason>` in `mother status <id>`. No job JSON key is added apart from the optional `dispatch_via`.
@@ -1074,6 +1074,33 @@ published as `dispatch_mode` / `dispatch_mode_source` in `runner/effective-confi
   (`_maybe_pause_running`, `_orphan_lost_lease`) write job documents without the job lock (pre-existing; the
   `fix/cluster-bats-deflake` branch does not close it). A worker started by a runner from before the `.start` file existed is
   not adopted (a second one starts).
+
+## Failover and resume (cluster P1-6)
+
+Worker mode never loses a job's work when its worker stops. Details: `docs/worker-protocol.md` section 15, runbook
+`docs/runbooks/cluster-p1-burn-in.md`.
+
+- **Checkpoints.** The worker daemon runs `mother checkpoint take <job> --ship` per live lease every
+  `mother checkpoint interval` (120 s; `MOTHER_TEST_CHECKPOINT_INTERVAL_S` may go below the 30 s floor, only with
+  `MOTHER_TEST_ROOT=1`). `mother-run-job` calls `_ckpt_final <reason>` (worker mode only; `_transition` for
+  succeeded/failed/cancelled, the awaiting/hold/park/quota/cost-cap writes, phase boundaries, SIGTERM) before the state
+  write, and `mother await` checkpoints before it writes `awaiting`. `take` numbers itself under the checkpoint lock
+  (`MOTHER_CHECKPOINT_AUTO_N`); `--ship` puts the artifacts and `checkpoint.taken` into the outbox. `coord_apply.sh`
+  writes `checkpoints/<job>/{latest.json,index.jsonl,transcript/<session>.jsonl}`; `latest.json` only for a pushed
+  checkpoint with a verified transcript.
+- **Resume, never restart.** `_orphan_lost_lease` (`mother-runner`) handles a lost lease, or one released while the job is
+  still `running` (SIGTERM): event `worker_lost`, then `_resume_lost_lease` (job `ready`, `runner/resume/<job>.json`
+  merged into the dispatch request as `resume_from`, `.worker_resume_count`), or `failed no_checkpoint_restorable`
+  (`why` says what is missing) / `worker_resume_exhausted` after `MOTHER_WORKER_RESUME_MAX` (3). Both reasons are the
+  `hold` failure class: they are never escalated into a fresh run. The new supervisor restores into
+  `<worktree>-e<epoch>` (`_restore_from_checkpoint`), emits `resumed_from_checkpoint` and re-enters the same session
+  with `templates/resume-elsewhere.md` (`--resume`); a loss during gates or the review wave re-runs that step.
+- **Fenced worker.** A worker that learns its lease is gone stops its supervisor and pushes
+  `refs/mother/wip-salvage/<job>/lease-<epoch>` from a snapshot of its mirror, then sends the `salvage` control frame;
+  the coordinator audits it and the runner emits `worker_salvaged`. It never writes the job's state or the main wip ref.
+- **SIGTERM** to the daemon: `GracefulStop` (supervisors are SIGTERMed by pid, final checkpoint within
+  `MOTHER_CHECKPOINT_FINAL_TIMEOUT_S`, lease released as `worker_stopping`, no child left).
+- Legacy mode takes no checkpoints and pushes no `refs/mother/*` ref (`_ckpt_enabled` needs worker mode).
 
 ## Internals reference (lazy-loaded)
 

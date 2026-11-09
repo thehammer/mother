@@ -10,7 +10,8 @@
 # Every git call goes through _ckpt_git: hardened against repo-controlled config (hooks, fsmonitor,
 # filter/textconv drivers, signing, credential helpers, upload/receive-pack overrides), bounded by the
 # take's deadline, and killed as a process group when it hangs.
-# No runtime path calls this library yet (P1-6 wires it). Sourced under `set -u`, bash 3.2: no
+# Callers: `mother checkpoint take|restore` (bin/mother), driven by the worker daemon's cadence and
+# bin/mother-run-job's boundaries and exits (cluster P1-6). Sourced under `set -u`, bash 3.2: no
 # `declare -A`, no `mapfile`. Needs lib/state.sh (_bounded_run, _switch_with_lock, _iso_now,
 # safe_rm_tree) and jq.
 
@@ -38,6 +39,14 @@ _ckpt_mktemp() {
 # watchdog <= 300 s). Anything not an integer in 30..240 falls back to 120 with one stderr line.
 mother_checkpoint_interval_s() {
     local v="${MOTHER_CHECKPOINT_INTERVAL_S:-}"
+    # Test-only: seconds below the 30 s floor so failover tests run in seconds. Never honoured outside the
+    # test harness (MOTHER_TEST_ROOT=1), whatever the environment says.
+    if [ "${MOTHER_TEST_ROOT:-}" = "1" ]; then
+        case "${MOTHER_TEST_CHECKPOINT_INTERVAL_S:-}" in
+            ''|*[!0-9]*|0) ;;
+            *) echo "$MOTHER_TEST_CHECKPOINT_INTERVAL_S"; return 0 ;;
+        esac
+    fi
     if [ -z "$v" ] && type mother_config_get >/dev/null 2>&1; then
         v=$(mother_config_get MOTHER_CHECKPOINT_INTERVAL_S 2>/dev/null) || v=""
     fi
@@ -332,6 +341,22 @@ _ckpt_take_fail() {
 _ckpt_take_locked() {
     local job_file="$1" out_dir="$2" parent="$3" salvage="$4" final="$5" expect_flag="$6"
     local job wd branch base_sha session
+    # Auto numbering (`mother checkpoint take` without --out): the next n and the previous manifest are decided
+    # HERE, under the checkpoint lock, so two takers (the worker's cadence and the supervisor's boundary or
+    # final take) can never share a number or diff against a stale previous manifest.
+    if [ "${MOTHER_CHECKPOINT_AUTO_N:-0}" = "1" ]; then
+        local _last=0 _d _n
+        for _d in "$parent"/*/; do
+            [ -s "${_d}manifest.json" ] || continue
+            _n=$(basename "$_d")
+            case "$_n" in ''|*[!0-9]*) continue ;; esac
+            [ "$_n" -gt "$_last" ] && _last="$_n"
+        done
+        MOTHER_CHECKPOINT_PREV_MANIFEST=""
+        [ "$_last" -gt 0 ] && MOTHER_CHECKPOINT_PREV_MANIFEST="$parent/$_last/manifest.json"
+        out_dir="$parent/$((_last + 1))"
+        mkdir -p "$out_dir" || return 1
+    fi
     job=$(jq -r '.id // ""' "$job_file") || return 1
     wd=$(jq -r '.work_dir // ""' "$job_file")
     branch=$(jq -r '.branch // ""' "$job_file")
@@ -350,6 +375,9 @@ _ckpt_take_locked() {
     local head
     head=$(_ckpt_git "$wd" rev-parse --verify -q HEAD) || { _ckpt_take_fail unborn_head "no commit at HEAD in $wd (an unborn HEAD cannot be checkpointed)"; return 1; }
     _ckpt_sha_ok "$head" || { _ckpt_take_fail unborn_head "HEAD did not resolve in $wd"; return 1; }
+    # A job whose base did not resolve at `mother add` has no base_sha; the wire manifest requires one, and a
+    # refused frame would stall the job's stream. The head stands in (informational for the restore).
+    _ckpt_sha_ok "$base_sha" || base_sha="$head"
 
     # 1. Transcript: copied ONCE; size, sha256 and the delta all come from this copy.
     local tdir tfile="" tcopy tsize=0 tsha t_trunc=false tcap_mb="${MOTHER_CHECKPOINT_MAX_TRANSCRIPT_MB:-256}" tcap
@@ -371,13 +399,26 @@ _ckpt_take_locked() {
     fi
 
     # 2. WIP tree from a temp copy of the index; the worktree and its index are never written.
-    local idx tmpidx skipfile tree
+    local idx tmpidx skipfile tree head_after attempt=0
     idx=$(_ckpt_git_path "$wd" index) || { _ckpt_take_fail snapshot_failed "could not locate the index"; return 1; }
     tmpidx=$(_ckpt_mktemp) || return 1
     skipfile=$(_ckpt_mktemp) || return 1
-    if [ -f "$idx" ]; then cp "$idx" "$tmpidx" || return 1; else rm -f "$tmpidx"; fi
-    tree=$(_ckpt_tree_of "$wd" "$tmpidx" "$skipfile") || { rm -f "$skipfile.paths"; _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
-    [ -n "$tree" ] || { _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
+    # The snapshot is not atomic: the agent keeps working while the tree is built. HEAD is read before it and
+    # again after; if a commit landed in between, the manifest would pair the OLD head with a tree that already
+    # contains that commit's content (restorable, but the commit would come back as an unstaged change). So a
+    # moved HEAD means: read HEAD again and redo the snapshot (three tries; after that the content is still all
+    # in the tree, and the next checkpoint is consistent).
+    while :; do
+        attempt=$((attempt + 1))
+        if [ -f "$idx" ]; then cp "$idx" "$tmpidx" || return 1; else rm -f "$tmpidx"; fi
+        tree=$(_ckpt_tree_of "$wd" "$tmpidx" "$skipfile") || { rm -f "$skipfile.paths"; _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
+        [ -n "$tree" ] || { _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
+        head_after=$(_ckpt_git "$wd" rev-parse --verify -q HEAD) || head_after=""
+        [ -z "$head_after" ] || [ "$head_after" = "$head" ] && break
+        _ckpt_sha_ok "$head_after" || break
+        head="$head_after"
+        [ "$attempt" -lt 3 ] || break
+    done
 
     local prev="${MOTHER_CHECKPOINT_PREV_MANIFEST:-$out_dir/manifest.json}"
     local prev_n=0 prev_head="" prev_wip="" prev_tbytes=0 prev_tsha="" prev_pushed=false
@@ -521,6 +562,22 @@ _ckpt_push_branch() {
     else
         echo diverged
     fi
+}
+
+# mother_checkpoint_ship <job> <manifest-json>: worker mode only (a no-op elsewhere). Puts one finished take
+# into the job's ordered outbox: the transcript delta and the manifest as artifact.put (checkpoints/<job>/<n>/),
+# then the checkpoint.taken op, so the coordinator has every earlier op, the delta and the manifest before it
+# hears of the checkpoint. The subagent transcript directory is not shipped.
+mother_checkpoint_ship() {
+    local job="$1" manifest="$2" n data f
+    mother_outbox_enabled || return 0
+    n=$(printf '%s' "$manifest" | jq -r '.n // empty') || return 1
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    for f in transcript.delta manifest.json; do
+        mother_outbox_artifact "$job" "checkpoints/$job/$n/$f" || return 1
+    done
+    data=$(jq -nc --argjson m "$manifest" '{manifest: $m}') || return 1
+    _OUTBOX_TRUSTED=1 mother_outbox_emit "$job" checkpoint.taken "$data"
 }
 
 # --- restore -------------------------------------------------------------------------------------

@@ -46,6 +46,46 @@
 #   MOCK_CLAUDE_TURN_LOG       if set, one line per step is appended: "hook_start <n>", "hook_done <n>",
 #                              "turn_start <n>", "turn_end <n>", "term in_turn=<yes|no>" (SIGTERM seen).
 
+#   ---- Scripted mode (opt-in; failover/resume tests, tests/failover_resume.bats) ----
+#   MOCK_CLAUDE_SCRIPT        steps to run in the job's work dir (cwd), as a file path or literal text, one step per
+#                             line (blank lines and `#` comments skipped). Which script runs for invocation n (n = the
+#                             count of "---" blocks in MOCK_CLAUDE_ARGS_FILE, so 1 for the first spawn): the first of
+#                             MOCK_CLAUDE_SCRIPT_<n>, then MOCK_CLAUDE_RESUME_SCRIPT (only when argv has --resume),
+#                             then MOCK_CLAUDE_SCRIPT. No script at all = the legacy behaviour below.
+#       edit <file> <text>    append a line to <file> (created with its directories when missing); uncommitted
+#       write <file> <text>   overwrite <file> with one line
+#       untracked <file>      create a new file (a tracked-nothing, untracked path)
+#       commit <msg>          git add -A, then git commit -m <msg> (identity from GIT_* env, else a fixed fallback)
+#       push                  git push origin HEAD:refs/heads/<current branch> (the branch is found even when HEAD is detached)
+#       pr                    run `gh pr create` (whatever gh stand-in is on PATH; the shared gh_mock has no pr create)
+#                             AND register the PR fixtures for the current branch in every dir of
+#                             MOCK_CLAUDE_GH_DIRS (colon-separated, default $MOTHER_LIVE_ROOT/gh), so `gh pr list --head`
+#                             and `gh pr view` find it. The URL is stable per branch (a resumed run opens the same PR) and lives
+#                             in the repo named by origin's github.com/<owner>/<name> URL (test/failover when there is none).
+#                             Mother only consults gh for a remote whose URL contains "github.com/": a test that wants a PR
+#                             puts its bare origin in a directory called github.com.
+#       sleep <secs>          interruptible (a TERM lands at once: "term" marker, exit 143)
+#       wait-file <path> [s]  wait until <path> exists (poll 0.2 s, default cap 300 s): a gate the test opens
+#       hook                  one tool-call boundary: run every PreToolUse hook command of the --settings file with a
+#                             payload (own tool_use_id), wait for them (a held hook parks the mock right here), then the
+#                             PostToolUse hooks. This is what the limiter's boundary hold blocks on.
+#       await <question>      run `mother await --question <question>` (the caller's MOTHER_JOB_ID/root apply)
+#       exit <code>           stop the script and exit with <code> at once (no result event is printed)
+#     Every step appends a JSON line to the fake transcript, so transcript deltas are never empty.
+#     When the script ends (not via `exit`) and the run printed no canned stdout of its own, a stream-json
+#     assistant + result event is printed (MOCK_CLAUDE_NO_RESULT=1 suppresses it), then the legacy
+#     MOCK_CLAUDE_SLEEP / MOCK_CLAUDE_EXIT tail runs.
+#   MOCK_CLAUDE_RESUME_SCRIPT  script used instead of MOCK_CLAUDE_SCRIPT when argv has `--resume <session>`.
+#   MOCK_CLAUDE_STEP_LOG      directory of marker files so a test waits for "step n done" instead of guessing sleeps:
+#                             inv<k>.started (mode, session, physical cwd), inv<k>.step<n> (the step text, written when
+#                             step n of invocation k completed), inv<k>.term (a TERM was seen), inv<k>.done (ending).
+#   MOCK_CLAUDE_TRANSCRIPTS=1 Fake Claude session transcripts (implied by any script variable). Needs
+#                             MOTHER_CLAUDE_PROJECTS_DIR. `--session-id <sid>` creates
+#                             $MOTHER_CLAUDE_PROJECTS_DIR/<encoded cwd>/<sid>.jsonl; `--resume <sid>` appends to the
+#                             same file and FAILS LOUDLY (stderr message, exit 97) when it is not there, exactly as
+#                             real `claude --resume` fails on an unknown session. The encoded cwd is the physical
+#                             cwd with "/" and "." replaced by "-" (lib/checkpoint.sh _ckpt_encode_path).
+#
 args_file="${MOCK_CLAUDE_ARGS_FILE:-/tmp/mock-claude-args}"
 exit_code="${MOCK_CLAUDE_EXIT:-0}"
 
@@ -71,6 +111,64 @@ fi
 # Record the full argument list.
 printf '%s\n' "$@" >> "$args_file"
 echo "---" >> "$args_file"
+
+# ---------------------------------------------------------------------------
+# Scripted mode / fake transcripts (opt-in, see the header). Nothing below runs unless one of the
+# MOCK_CLAUDE_SCRIPT* / MOCK_CLAUDE_TRANSCRIPTS variables is set.
+_mc_inv=$(grep -c '^---$' "$args_file" 2>/dev/null || true)
+case "$_mc_inv" in ''|*[!0-9]*) _mc_inv=1 ;; esac
+_mc_sid=""; _mc_mode=fresh; _mc_settings=""; _mc_prev=""
+for _mc_arg in "$@"; do
+    case "$_mc_prev" in
+        --session-id) _mc_sid="$_mc_arg" ;;
+        --resume)     _mc_sid="$_mc_arg"; _mc_mode=resume ;;
+        --settings)   _mc_settings="$_mc_arg" ;;
+    esac
+    _mc_prev="$_mc_arg"
+done
+_mc_var="MOCK_CLAUDE_SCRIPT_$_mc_inv"
+_mc_src=""
+if [ -n "${!_mc_var-}" ]; then _mc_src="${!_mc_var}"
+elif [ "$_mc_mode" = resume ] && [ -n "${MOCK_CLAUDE_RESUME_SCRIPT:-}" ]; then _mc_src="$MOCK_CLAUDE_RESUME_SCRIPT"
+elif [ -n "${MOCK_CLAUDE_SCRIPT:-}" ]; then _mc_src="$MOCK_CLAUDE_SCRIPT"
+fi
+_mc_active=0
+{ [ -n "$_mc_src" ] || [ "${MOCK_CLAUDE_TRANSCRIPTS:-0}" = "1" ] || [ -n "${MOCK_CLAUDE_RESUME_SCRIPT:-}" ]; } && _mc_active=1
+
+_mc_tfile=""
+_mc_child=""
+_mc_note() {   # <name> [content] — a marker file in MOCK_CLAUDE_STEP_LOG
+    [ -n "${MOCK_CLAUDE_STEP_LOG:-}" ] || return 0
+    printf '%s\n' "${2:-}" > "$MOCK_CLAUDE_STEP_LOG/inv$_mc_inv.$1" 2>/dev/null
+    return 0
+}
+_mc_tline() {  # <json> — one line on the fake transcript
+    [ -n "$_mc_tfile" ] && printf '%s\n' "$1" >> "$_mc_tfile"
+    return 0
+}
+
+if [ "$_mc_active" = 1 ]; then
+    [ -z "${MOCK_CLAUDE_STEP_LOG:-}" ] || mkdir -p "$MOCK_CLAUDE_STEP_LOG"
+    if [ -n "$_mc_sid" ]; then
+        if [ -z "${MOTHER_CLAUDE_PROJECTS_DIR:-}" ]; then
+            echo "mock_claude: MOTHER_CLAUDE_PROJECTS_DIR is not set; fake transcripts need it" >&2
+            exit 97
+        fi
+        _mc_enc="$(pwd -P)"; _mc_enc="${_mc_enc//\//-}"; _mc_enc="${_mc_enc//./-}"
+        _mc_tdir="$MOTHER_CLAUDE_PROJECTS_DIR/$_mc_enc"
+        if [ "$_mc_mode" = resume ]; then
+            if [ ! -f "$_mc_tdir/$_mc_sid.jsonl" ]; then
+                echo "mock_claude: cannot --resume session $_mc_sid: no transcript at $_mc_tdir/$_mc_sid.jsonl" >&2
+                exit 97
+            fi
+        else
+            mkdir -p "$_mc_tdir" && : >> "$_mc_tdir/$_mc_sid.jsonl" || exit 97
+        fi
+        _mc_tfile="$_mc_tdir/$_mc_sid.jsonl"
+        _mc_tline "{\"type\":\"mock\",\"event\":\"start\",\"mode\":\"$_mc_mode\",\"invocation\":$_mc_inv,\"session\":\"$_mc_sid\"}"
+    fi
+    _mc_note started "$_mc_mode $_mc_sid $(pwd -P)"
+fi
 
 # Turn mode (opt-in): see MOCK_CLAUDE_TURNS above.
 _turn_log() { [ -n "${MOCK_CLAUDE_TURN_LOG:-}" ] && printf '%s\n' "$*" >> "$MOCK_CLAUDE_TURN_LOG"; return 0; }
@@ -150,6 +248,117 @@ elif [ -n "${MOCK_CLAUDE_STDOUT:-}" ]; then
     printf '%s\n' "$MOCK_CLAUDE_STDOUT"
 fi
 [ -n "${MOCK_CLAUDE_STDERR:-}" ] && printf '%s\n' "$MOCK_CLAUDE_STDERR" >&2
+
+# Scripted steps (see the header). Run after the canned stdout, before the legacy sleep/exit tail.
+_mc_sleep() { sleep "$1" & _mc_child=$!; wait "$_mc_child" 2>/dev/null; _mc_child=""; }
+_mc_on_term() {
+    [ -n "$_mc_child" ] && kill "$_mc_child" 2>/dev/null
+    _mc_note term "$(date +%s)"
+    _mc_tline '{"type":"mock","event":"term"}'
+    exit 143
+}
+_mc_branch() {
+    local b
+    b=$(git symbolic-ref --short -q HEAD 2>/dev/null) && [ -n "$b" ] && { printf '%s' "$b"; return 0; }
+    git for-each-ref --points-at HEAD --format='%(refname:short)' refs/heads/ 2>/dev/null | head -n 1
+}
+_mc_hooks() {  # <PreToolUse|PostToolUse> <n> — run the settings file's hook commands for one tool call
+    local ev="$1" n="$2" cmds cmd
+    [ -n "$_mc_settings" ] && [ -f "$_mc_settings" ] || return 0
+    cmds=$(jq -r --arg ev "$ev" '(.hooks[$ev] // [])[] | .hooks[]? | select(.type == "command") | .command' "$_mc_settings" 2>/dev/null)
+    while IFS= read -r cmd; do
+        [ -n "$cmd" ] || continue
+        printf '{"tool_name":"Bash","tool_use_id":"toolu_s%s","tool_input":{"command":"true"}}' "$n" | bash -c "$cmd" >/dev/null 2>&1 &
+        _mc_child=$!
+        wait "$_mc_child" 2>/dev/null
+        _mc_child=""
+    done <<MCHOOKS
+$cmds
+MCHOOKS
+}
+_mc_pr() {
+    local br url key num dir
+    br=$(_mc_branch)
+    num=$(( $(printf '%s' "$br" | cksum | awk '{print $1}') % 9000 + 1000 ))
+    # The PR lives in the origin's own repo when origin looks like a GitHub remote (Mother only asks gh about those, and the
+    # coordinator accepts a pr_url only inside the origin's repo): owner/name is whatever follows "github.com/" in the URL.
+    local ghrepo
+    ghrepo=$(git remote get-url origin 2>/dev/null | sed 's/\.git$//' | sed -n 's|.*github\.com[:/]\(.*\)|\1|p')
+    url="https://github.com/${ghrepo:-test/failover}/pull/$num"
+    gh pr create --title "mock $br" --body "mock" --head "$br" </dev/null >/dev/null 2>&1 || true
+    local dirs="${MOCK_CLAUDE_GH_DIRS:-${MOTHER_LIVE_ROOT:-${MOTHER_ROOT:-/nonexistent}}/gh}" oldifs="$IFS"
+    IFS=:
+    for dir in $dirs; do
+        IFS="$oldifs"
+        mkdir -p "$dir/pr" "$dir/pr-list"
+        key=$(printf '%s' "$url" | tr -c 'a-zA-Z0-9' '_')
+        jq -nc --arg h "$br" '{state:"OPEN",headRefName:$h,commits:[],isDraft:false,body:""}' > "$dir/pr/$key.json"
+        key=$(printf '%s' "$br" | tr -c 'a-zA-Z0-9' '_')
+        jq -nc --arg u "$url" '[{url:$u}]' > "$dir/pr-list/$key.json"
+        IFS=:
+    done
+    IFS="$oldifs"
+    printf '%s\n' "$url"
+}
+
+if [ -n "$_mc_src" ]; then
+    trap '_mc_on_term' TERM INT
+    if [ -f "$_mc_src" ]; then _mc_text=$(cat "$_mc_src"); else _mc_text="$_mc_src"; fi
+    _mc_lines=()
+    while IFS= read -r _mc_l; do _mc_lines+=("$_mc_l"); done <<MCTEXT
+$_mc_text
+MCTEXT
+    _mc_n=0
+    for _mc_l in "${_mc_lines[@]}"; do
+        case "$_mc_l" in ''|'#'*) continue ;; esac
+        _mc_n=$((_mc_n + 1))
+        _mc_cmd="${_mc_l%% *}"; _mc_rest=""
+        [ "$_mc_cmd" = "$_mc_l" ] || _mc_rest="${_mc_l#* }"
+        _mc_tline "$(jq -nc --argjson n "$_mc_n" --arg s "$_mc_l" '{type:"mock",event:"step",n:$n,step:$s}')"
+        case "$_mc_cmd" in
+            edit)
+                _mc_f="${_mc_rest%% *}"; _mc_t=""; [ "$_mc_f" = "$_mc_rest" ] || _mc_t="${_mc_rest#* }"
+                mkdir -p "$(dirname "$_mc_f")"; printf '%s\n' "$_mc_t" >> "$_mc_f" ;;
+            write)
+                _mc_f="${_mc_rest%% *}"; _mc_t=""; [ "$_mc_f" = "$_mc_rest" ] || _mc_t="${_mc_rest#* }"
+                mkdir -p "$(dirname "$_mc_f")"; printf '%s\n' "$_mc_t" > "$_mc_f" ;;
+            untracked)
+                mkdir -p "$(dirname "$_mc_rest")"; printf 'untracked %s\n' "$_mc_rest" > "$_mc_rest" ;;
+            commit)
+                git add -A </dev/null >/dev/null 2>&1
+                git -c user.name=mock-claude -c user.email=mock-claude@example.com commit -q -m "$_mc_rest" </dev/null >/dev/null 2>&1 \
+                    || echo "mock_claude: commit failed" >&2 ;;
+            push)
+                git push -q origin "HEAD:refs/heads/$(_mc_branch)" </dev/null >/dev/null 2>&1 \
+                    || echo "mock_claude: push failed" >&2 ;;
+            pr)      _mc_pr >/dev/null ;;
+            sleep)   _mc_sleep "${_mc_rest:-1}" ;;
+            wait-file)
+                _mc_f="${_mc_rest%% *}"; _mc_cap=300; [ "$_mc_f" = "$_mc_rest" ] || _mc_cap="${_mc_rest#* }"
+                _mc_w=0
+                while [ ! -e "$_mc_f" ] && [ "$_mc_w" -lt $((_mc_cap * 5)) ]; do _mc_sleep 0.2; _mc_w=$((_mc_w + 1)); done ;;
+            hook)
+                _mc_hooks PreToolUse "$_mc_n"; _mc_hooks PostToolUse "$_mc_n" ;;
+            await)
+                mother await --question "$_mc_rest" </dev/null >/dev/null 2>"${MOCK_CLAUDE_STEP_LOG:-/dev/null}/inv$_mc_inv.await.err" \
+                    || echo "mock_claude: mother await failed" >&2 ;;
+            exit)
+                _mc_note "step$_mc_n" "$_mc_l"; _mc_note done "exit ${_mc_rest:-0}"
+                trap - TERM INT
+                exit "${_mc_rest:-0}" ;;
+            *) echo "mock_claude: unknown script step: $_mc_l" >&2 ;;
+        esac
+        _mc_note "step$_mc_n" "$_mc_l"
+    done
+    trap - TERM INT
+    # A run that printed no canned stdout of its own ends the way a real one does: with a result event.
+    if [ -z "$agent_reply" ] && [ -z "${MOCK_CLAUDE_STDOUT_FILE:-}" ] && [ -z "${MOCK_CLAUDE_STDOUT:-}" ] \
+        && [ "${MOCK_CLAUDE_NO_RESULT:-0}" != "1" ]; then
+        printf '%s\n' '{"type":"assistant","message":{"id":"msg_mock","model":"claude-sonnet-5","parent_tool_use_id":null,"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":200}}}'
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.004,"modelUsage":{"claude-sonnet-5":{"costUSD":0.004,"inputTokens":1000,"outputTokens":200}}}'
+    fi
+    _mc_note done "end"
+fi
 
 if [ -n "${MOCK_CLAUDE_SLEEP:-}" ] && [ "${MOCK_CLAUDE_SLEEP:-0}" != "0" ]; then
     sleep "$MOCK_CLAUDE_SLEEP"

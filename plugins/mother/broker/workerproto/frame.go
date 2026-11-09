@@ -54,6 +54,10 @@ const (
 	TypeSyncFile    = "sync.file"
 
 	TypeCmdAck = "cmd.ack"
+
+	// TypeSalvage is a worker's report that it pushed a salvage ref after losing a lease (P1-6). It is a
+	// control frame: not seq-numbered, because a fenced worker's stream is refused.
+	TypeSalvage = "salvage"
 )
 
 // Error codes (spec section 10).
@@ -126,7 +130,7 @@ var (
 	}
 	controlTypes = map[string]bool{
 		TypeHello: true, TypeWelcome: true, TypeRefuse: true, TypeHb: true, TypeAck: true,
-		TypeBye: true, TypeCmdAck: true,
+		TypeBye: true, TypeCmdAck: true, TypeSalvage: true,
 	}
 )
 

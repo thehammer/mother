@@ -355,3 +355,33 @@ Everything here is additive inside `data` (section 5: additive data fields are a
   released and no longer heartbeated, so the coordinator's TTL decides. The wire (and hence P1-5) still refuses `succeeded` from a worker.
 - Known gap for P1-6: a job re-leased to a worker that has no outbox for it restarts its outbox seq at 1 while the coordinator's `applied_seq` is higher; a resume
   onto a different worker needs the outbox seeded from the coordinator's `applied_seq`.
+
+## 15. Failover and resume (P1-6)
+
+- **Cadence.** The worker daemon runs `mother checkpoint take <job> --ship` for each live lease every
+  `mother checkpoint interval` seconds (not while the mirror says `awaiting` or terminal). `--ship` puts the take into the job's
+  ordered outbox: `artifact.put` for `checkpoints/<job>/<n>/transcript.delta` and `manifest.json`, then `checkpoint.taken{manifest}`.
+  The coordinator applies it (`lib/coord_apply.sh`): the delta is appended to `checkpoints/<job>/transcript/<session>.jsonl`
+  (replaced when `reset` or when the delta is the whole file), verified against the manifest's sha256, every manifest is appended to
+  `checkpoints/<job>/index.jsonl`, and `latest.json` advances only for a checkpoint that is `pushed:true` with a verified transcript.
+  The supervisor takes the same checkpoint at phase boundaries and before every exit or awaiting/terminal state write
+  (`_ckpt_final`); takes serialise on the checkpoint lock and number themselves under it.
+- **`salvage` control frame** (worker to coordinator, not seq-numbered, envelope job/lease/epoch of the fenced lease):
+  `{ref, wip_sha}` with `ref` = `refs/mother/wip-salvage/<job>/lease-<epoch>` exactly. A fenced worker's stream is refused, so the
+  report cannot ride it. The coordinator accepts it only for a lease that is superseded or no longer live, records it in
+  `runner/leases/audit.jsonl` (`code: salvage`) and as `runner/leases/<job>.salvage.<epoch>.json`; the runner turns that into the
+  job event `worker_salvaged`. Salvage never touches `refs/mother/wip/<job>` or the job's canonical state.
+- **Graceful stop.** SIGTERM to the worker daemon sends SIGTERM to each supervisor (the pid, not the group). A supervisor stops its
+  claude, takes its final checkpoint (bounded by `MOTHER_CHECKPOINT_FINAL_TIMEOUT_S`), and exits with the job still `running`; the
+  daemon keeps shipping until the outboxes drain (or the coordinator has been unreachable for 5 s), releases the lease
+  (`lease.release{reason: worker_stopping}`) and exits with no child left.
+- **Resume.** A `running` job whose lease is `lost`, or `released` without success while the job is still `running`, gets
+  `worker_lost {worker, lease_epoch, last_heartbeat_at, reason}`. If `checkpoints/<job>/latest.json` exists and its wip ref is on the
+  remote the runner sets the job `ready` (`reason: worker_lost_resume`) and the next dispatch request carries
+  `resume_from {manifest, transcript, from_worker, lost_work_s, ...}`; the lease offer's `checkpoint` field passes it to the worker,
+  which stages it under `<root>/resume/<job>/e<epoch>/`. Otherwise `failed no_checkpoint_restorable` (a held class, never a fresh
+  start). After `MOTHER_WORKER_RESUME_MAX` resumes: `worker_resume_exhausted`.
+- **A restarted worker** that still holds an active lease whose supervisor is gone fences it (salvage under that lease's own epoch)
+  when the coordinator offers the job again.
+- Limitations: the checkpoint paths in `resume_from` are coordinator-side paths (local carrier only); the subagent transcript
+  directory is not shipped; a main-dir job cannot be resumed (it fails `no_checkpoint_restorable`, `why: main_dir_job`).

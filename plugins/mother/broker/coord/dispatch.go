@@ -178,6 +178,7 @@ func (s *Server) offer(job string, req dispatchReq, w *workerConn) error {
 	offer := workerproto.LeaseOffer{
 		CmdID: newID("c-"), JobDoc: jobDoc, Plan: string(plan), CrewBundle: crew, Checkpoint: ckpt,
 		Repo: repoName(repoPath, jsonString(doc["repo"])), RepoPath: repoPath, Attempt: attempt,
+		AppliedSeq: s.truthApplied(&jobLease{job: job}),
 	}
 	now := s.now()
 	l, err := s.leases.Offer(job, newID("L-"), w.id, now)

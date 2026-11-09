@@ -23,6 +23,12 @@
 #                  canonical cost recompute (the canonical side owns cost).
 #   event.append   one event object on one line, size-capped.
 #   record.append  one usage row for this job, size-capped; followed by the canonical cost recompute.
+#   checkpoint.taken  (P1-6) a worker checkpoint. Its manifest and transcript delta arrived as artifact.put
+#                  ops just before (checkpoints/<job>/<n>/); the delta is appended to the reassembled transcript
+#                  checkpoints/<job>/transcript/<session>.jsonl (replacing it when `reset`, or when the delta is
+#                  the whole file), the transcript is verified against the manifest's sha256, every manifest is
+#                  appended to checkpoints/<job>/index.jsonl, and checkpoints/<job>/latest.json is advanced only
+#                  for a checkpoint that is pushed:true AND whose transcript verified.
 #   artifact.put   offset-addressed into crew/<job>/ or checkpoints/<job>/ only; `final` needs a
 #                  sha256 and is verified; per-file and per-job byte caps.
 #
@@ -435,6 +441,76 @@ _ca_apply_artifact() {
     return "$rc"
 }
 
+# --- checkpoint.taken ---------------------------------------------------------------------------
+
+# $1 job, $2 op line. Idempotent: replaying the same op changes nothing (the delta is only appended when the
+# reassembled file is exactly where the manifest says it was before this delta).
+_ca_apply_checkpoint() {
+    local job="$1" line="$2" ck n sess pushed bytes sha reset dsz cur tfile okflag=true
+    ck="$MOTHER_ROOT/checkpoints/$job"
+    n=$(printf '%s' "$line" | jq -r '.data.manifest.n // empty')
+    sess=$(printf '%s' "$line" | jq -r '.data.manifest.session_id // empty')
+    case "$n" in ''|*[!0-9]*) _ca_log "checkpoint.taken: bad n"; return 1 ;; esac
+    [ "$(printf '%s' "$line" | jq -r '.data.manifest.job // empty')" = "$job" ] \
+        || { _ca_log "checkpoint.taken: manifest names another job"; return 1; }
+    printf '%s' "$sess" | grep -Eq '^[A-Za-z0-9._:-]{1,128}$' && [ "${sess#*..}" = "$sess" ] \
+        || { _ca_log "checkpoint.taken: bad session_id"; return 1; }
+    pushed=$(printf '%s' "$line" | jq -r '.data.manifest.pushed == true')
+    bytes=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.bytes // empty')
+    sha=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.sha256 // empty')
+    reset=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.reset == true')
+    case "$bytes" in ''|*[!0-9]*) _ca_log "checkpoint.taken: bad transcript bytes"; return 1 ;; esac
+    mkdir -p "$ck/transcript" || return 2
+    tfile="$ck/transcript/$sess.jsonl"
+    if [ -f "$ck/$n/transcript.delta" ]; then
+        dsz=$(wc -c < "$ck/$n/transcript.delta" | tr -d ' ')
+        cur=$(wc -c < "$tfile" 2>/dev/null | tr -d ' '); : "${cur:=0}"
+        if [ "$reset" = true ] || [ "$dsz" -eq "$bytes" ]; then
+            # The delta is the whole transcript: replace (idempotent).
+            cp "$ck/$n/transcript.delta" "$tfile.tmp.$$" && mv "$tfile.tmp.$$" "$tfile" || return 2
+        elif [ "$cur" -eq $((bytes - dsz)) ]; then
+            cat "$ck/$n/transcript.delta" >> "$tfile" || return 2
+        elif [ "$cur" -lt "$bytes" ]; then
+            _ca_log "checkpoint.taken: transcript is at $cur bytes, expected $((bytes - dsz)) before checkpoint $n"
+            okflag=false
+        fi
+    else
+        _ca_log "checkpoint.taken: no transcript delta for checkpoint $n"
+        okflag=false
+    fi
+    # The first $bytes of the reassembled file must hash to the manifest's value.
+    if [ "$okflag" = true ]; then
+        [ "$(head -c "$bytes" "$tfile" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)" = "$sha" ] || okflag=false
+    fi
+    _with_lock "$ck/.index" _ca_checkpoint_record "$ck" "$n" "$pushed" "$okflag" "$sess" "$line" || return 2
+}
+
+# Under the lock on checkpoints/<job>/.index.
+_ca_checkpoint_record() {
+    local ck="$1" n="$2" pushed="$3" okflag="$4" sess="$5" line="$6" entry now
+    now=$(_iso_now)
+    entry=$(printf '%s' "$line" | jq -c --arg now "$now" --argjson ok "$okflag" '
+        .data.manifest as $m
+        | {n: $m.n, at: $m.at, received_at: $now, lease: $m.lease, epoch: $m.epoch, head_sha: $m.head_sha,
+           wip_sha: $m.wip_sha, wip_ref: $m.wip_ref, pushed: $m.pushed, session_id: $m.session_id,
+           transcript_bytes: $m.transcript.bytes, transcript_ok: $ok}
+          + (if $m.push_error then {push_error: $m.push_error} else {} end)') || return 1
+    if ! { [ -f "$ck/index.jsonl" ] && grep -qF "\"n\":$n,\"at\":" "$ck/index.jsonl" \
+            && grep -F "\"n\":$n,\"at\":" "$ck/index.jsonl" | grep -qF "\"wip_sha\":\"$(printf '%s' "$line" | jq -r '.data.manifest.wip_sha')\""; }; then
+        printf '%s\n' "$entry" >> "$ck/index.jsonl" || return 1
+    fi
+    if [ "$pushed" = true ] && [ "$okflag" = true ]; then
+        # Only ever forward: a replayed older checkpoint never replaces a newer latest.
+        local cur_n; cur_n=$(jq -r '.n // 0' "$ck/latest.json" 2>/dev/null); : "${cur_n:=0}"
+        if [ "$n" -ge "$cur_n" ]; then
+            printf '%s' "$line" | jq -c --arg now "$now" --arg tf "checkpoints/$(basename "$ck")/transcript/$sess.jsonl" '
+                .data.manifest + {received_at: $now, transcript_file: $tf, transcript_ok: true}' \
+                > "$ck/latest.json.tmp.$$" && mv "$ck/latest.json.tmp.$$" "$ck/latest.json" || return 1
+        fi
+    fi
+    return 0
+}
+
 # Unfinished .part files nobody has resumed for MOTHER_APPLY_PART_MAX_AGE_MIN (1440) minutes.
 _ca_sweep_parts() {
     local job="$1" d
@@ -457,6 +533,7 @@ _ca_apply_op() {
         event.append)  _ca_apply_event "$job" "$line" ;;
         record.append) _ca_apply_record "$job" "$line" ;;
         artifact.put)  _ca_apply_artifact "$job" "$line" ;;
+        checkpoint.taken) _ca_apply_checkpoint "$job" "$line" ;;
         *) _ca_log "cannot apply op type '$t'"; return 1 ;;
     esac
 }

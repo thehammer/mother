@@ -804,6 +804,8 @@ func (s *Server) handleLine(w *workerConn, line []byte) bool {
 		s.onHb(w, f, adm)
 	case workerproto.TypeCmdAck:
 		s.onCmdAck(w, f)
+	case workerproto.TypeSalvage:
+		s.onSalvage(w, f)
 	default:
 		s.onStream(w, f, adm.Verdict)
 	}
@@ -957,7 +959,8 @@ func (s *Server) flushAll() {
 }
 
 func isOp(t string) bool {
-	return t == workerproto.TypeJobSet || t == workerproto.TypeEventAppend || t == workerproto.TypeRecordAppend || t == workerproto.TypeArtifactPut
+	return t == workerproto.TypeJobSet || t == workerproto.TypeEventAppend || t == workerproto.TypeRecordAppend ||
+		t == workerproto.TypeArtifactPut || t == workerproto.TypeCheckpointTaken
 }
 
 // flushJob applies the contiguous run of pending frames: ops as one coord_apply batch, log chunks
@@ -1555,5 +1558,40 @@ func (s *Server) syncFilePass() {
 		for _, w := range s.workers {
 			s.sendSyncFile(w, p, cur)
 		}
+	}
+}
+
+// salvageMarkerPath is runner/leases/<job>.salvage.<epoch>.json: the coordinator's record of a fenced
+// worker's salvage push. The runner turns it into the job event worker_salvaged (the coordinator never
+// writes the events file itself) and removes it.
+func (s *Server) salvageMarkerPath(job string, epoch int64) string {
+	return filepath.Join(s.leasesDir(), fmt.Sprintf("%s.salvage.%d.json", job, epoch))
+}
+
+// onSalvage records a fenced worker's salvage push (control frame, not part of the refused stream). Only a
+// lease that has been superseded or is no longer live can be salvaged, and the ref must be the one derived
+// from the job and epoch (workerproto.Validate); one record per (job, epoch).
+func (s *Server) onSalvage(w *workerConn, f workerproto.Frame) {
+	var sv workerproto.Salvage
+	_ = json.Unmarshal(f.Data, &sv)
+	job, lease, epoch := *f.Job, *f.Lease, *f.Epoch
+	if l, ok := s.leases.Get(job); ok && l.Epoch == epoch && (l.State == workerproto.LeaseActive || l.State == workerproto.LeaseOffered) {
+		s.auditRefusal(w.id, job, lease, epoch, "salvage_of_live_lease")
+		return
+	}
+	marker := s.salvageMarkerPath(job, epoch)
+	if _, err := os.Stat(marker); err == nil {
+		return
+	}
+	rec, _ := json.Marshal(map[string]any{"job": job, "lease": lease, "epoch": epoch, "worker": w.id,
+		"ref": sv.Ref, "wip_sha": sv.WipSHA, "at": workerproto.Timestamp(s.now())})
+	if err := writeFileAtomic(marker, append(rec, '\n'), false); err != nil {
+		s.logf("salvage %s: %v", job, err)
+		return
+	}
+	line, _ := json.Marshal(map[string]any{"ts": workerproto.Timestamp(s.now()), "worker_id": w.id, "job": job,
+		"lease": lease, "epoch": epoch, "code": "salvage", "ref": sv.Ref, "wip_sha": sv.WipSHA})
+	if err := appendLine(s.auditPath(), line); err != nil {
+		s.logf("audit: %v", err)
 	}
 }

@@ -125,6 +125,7 @@ func (d *Daemon) runSession(ctx context.Context) (welcomed bool, err error) {
 	d.sess = s
 	d.rebase(w.Jobs)
 	d.sendHb(s)
+	d.sendSalvages(s)
 	d.mu.Unlock()
 	d.logf("connected to the coordinator (%d lease(s) resumed)", len(w.Jobs))
 
