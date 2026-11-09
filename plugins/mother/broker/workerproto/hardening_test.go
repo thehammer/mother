@@ -520,6 +520,13 @@ func TestCmdAckNeedsEnvelope(t *testing.T) {
 func TestStaleWorkerCannotAckCommands(t *testing.T) {
 	a, tb := newAdmitter()
 	tb.Offer("j", "L1", "w1", t0)
+	// An applied ack activates only the lease.offer the coordinator really issued for this lease.
+	if _, err := a.Admit("w1", ackFrame(t, "j", "L1", 1, OutcomeApplied, TypeLeaseOffer), t0); ErrorCode(err) != CodeInvalid {
+		t.Fatalf("ack of a never-issued offer must not activate: %v", err)
+	}
+	offer := mustFrame(t, TypeLeaseOffer, LeaseOffer{CmdID: "c1", JobDoc: raw("{}"), Repo: "o/r", Attempt: 1})
+	offer.Job, offer.Lease, offer.Epoch = Str("j"), Str("L1"), Int(1)
+	a.Issued(offer)
 	if _, err := a.Admit("w1", ackFrame(t, "j", "L1", 1, OutcomeApplied, TypeLeaseOffer), t0); err != nil {
 		t.Fatalf("offer ack activates: %v", err)
 	}

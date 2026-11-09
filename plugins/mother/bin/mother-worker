@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+# --- mother plugin path resolver (prepended during port) ---
+# Resolves symlinks so the plugin works when installed via `ln -s` into a bin dir.
+_MOTHER_RAW="${BASH_SOURCE[0]}"
+while [ -L "$_MOTHER_RAW" ]; do
+    _link="$(readlink "$_MOTHER_RAW")"
+    case "$_link" in
+        /*) _MOTHER_RAW="$_link" ;;
+        *)  _MOTHER_RAW="$(dirname "$_MOTHER_RAW")/$_link" ;;
+    esac
+done
+_MOTHER_SELF="$(cd "$(dirname "$_MOTHER_RAW")" && pwd -P)"
+: "${MOTHER_BIN_DIR:=$_MOTHER_SELF}"
+: "${MOTHER_LIB_DIR:=$_MOTHER_SELF/../lib}"
+# -----------------------------------------------------------
+
+# mother-worker — thin launcher for the Go worker daemon (cluster Phase 1, P1-4).
+#
+# Locates the compiled binary (plugins/mother/broker/bin/mother-worker), points it at this plugin's bin and lib
+# dirs (it finds mother-run-job and coord_apply.sh/worker_sync.sh through them) and execs it. Build the binary
+# first with scripts/build-broker.sh; if it is missing this prints a clear message and exits 127.
+
+set -u
+
+_BIN="$MOTHER_BIN_DIR/../broker/bin/mother-worker"
+
+if [ ! -x "$_BIN" ]; then
+    echo "mother-worker: binary not found at $_BIN" >&2
+    echo "mother-worker: build it with: $MOTHER_BIN_DIR/../scripts/build-broker.sh" >&2
+    exit 127
+fi
+
+export MOTHER_BIN_DIR MOTHER_LIB_DIR
+
+exec "$_BIN" "$@"

@@ -2443,9 +2443,35 @@ _install_core_job_helpers() {
         if _outbox_on; then mother_outbox_job_set "$_jid" "$_before" "$_merged" || return 1; fi
         return 0
     }
-    _job_update() {
+    # Read-modify-write under the job-file lock (re-entrant in this shell, so callers that already hold it
+    # are fine). Unlocked, a poll-loop write could read the document, let the worker's `mother await` land,
+    # then write the stale document back over state=awaiting: the await is lost and the job finishes succeeded.
+    _job_update() { _job_update_n 200 "$1"; }
+    # _job_update_n <tries> <filter>: the poll loop passes a small bound so a wedged live lock holder costs it
+    # seconds, not ~27 s per call. A failed acquire is never silent: stderr line, plus a job event (at most
+    # one a minute, so a wedged holder does not flood the log). No behaviour change while the lock is free.
+    _job_update_n() {
+        local _tries="$1" _filter="$2" _rc
+        _ju_ran=0
+        _with_lock_tries "$_tries" "$job_file" _job_update_locked "$_filter"; _rc=$?
+        if [ "$_rc" -ne 0 ] && [ "$_ju_ran" -eq 0 ]; then
+            local _now; _now=$(date +%s)
+            echo "mother-run-job: job $id: job-file lock not acquired after $_tries tries; update dropped" >&2
+            if [ $(( _now - ${_ju_fail_event_epoch:-0} )) -ge 60 ]; then
+                _ju_fail_event_epoch=$_now
+                _append_event "job_update_lock_failed" "$(jq -nc --argjson t "$_tries" '{tries: $t, dropped: true}')" 2>/dev/null || true
+            fi
+        fi
+        return $_rc
+    }
+    _job_update_locked() {
         local filter="$1"
+        _ju_ran=1
         local merged; merged=$(jq "$filter" "$job_file") || return 1
+        # Test seam (MOTHER_TEST_ROOT=1 only): widen the read-to-write window.
+        if [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ -n "${MOTHER_TEST_JOB_UPDATE_DELAY_S:-}" ]; then
+            sleep "$MOTHER_TEST_JOB_UPDATE_DELAY_S"
+        fi
         _job_write_doc "$merged"
     }
     _transition() {
@@ -2670,7 +2696,7 @@ _hold_park() {
     fi
     # The state write is a read-modify-write under the job-file lock (as cancel and the runner's resume
     # take it); the lock is released before any event or other write, so it is never nested. _with_lock
-    # fails after 10 s (and for good with a stale .lockdir), so the result is not trusted: re-read the job
+    # fails after its 200 tries (~27 s under load; and for good with a stale .lockdir), so the result is not trusted: re-read the job
     # and require this park's own awaiting state before anything is recorded or the caller stops the worker.
     park_ts=$(iso_now)
     if ! _with_lock "$job_file" _hold_park_write "$q" "$preason" "$park_ts" \
@@ -3332,7 +3358,7 @@ WRAP
         if [ "$(jq -r '.pause_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
             _pause_reason=$(jq -r '.paused_reason // "system"' "$job_file" 2>/dev/null)
             _pause_resume_at=$(jq -r '.auto_resume_at // 0'    "$job_file" 2>/dev/null)
-            _job_update '.state = "awaiting"
+            _job_update_n 40 '.state = "awaiting"
                 | .question = "Mother paused this job because the quota cap was reached. Auto-resumes when the blocking window resets."
                 | .pause_requested = null'
             _append_event "paused_for_quota" \
@@ -3407,7 +3433,7 @@ WRAP
                 if tail -c "+$((log_offset_at_spawn + 1))" "$log_path" 2>/dev/null \
                     | grep -Eq '"type"[[:space:]]*:[[:space:]]*"result"' 2>/dev/null; then
                     final_result_epoch=$(date +%s)
-                    _job_update ".final_result_at = \"$(iso_now)\""
+                    _job_update_n 40 ".final_result_at = \"$(iso_now)\""
                     _append_event "final_result_observed" "{}"
                 fi
             fi
@@ -3424,12 +3450,12 @@ WRAP
 $(mother_usage_check_live "$id" "$log_path" "$log_offset_at_spawn" "$usage_state_file" "$prior_spend" "$prior_tokens" "$usage_main_actor")
 USAGE_EOF
             : "${job_spend:=$prior_spend}" "${job_tokens:=$prior_tokens}"
-            _job_update ".live_cost_usd = ${job_spend:-0} | .live_tokens = ${job_tokens:-0}"
+            _job_update_n 40 ".live_cost_usd = ${job_spend:-0} | .live_tokens = ${job_tokens:-0}"
 
             _token_alert_threshold="${MOTHER_TOKEN_ALERT_THRESHOLD:-100000000}"
             if [ "${job_tokens:-0}" -gt "$_token_alert_threshold" ] \
                 && [ -z "$(jq -r '.token_alert_at // empty' "$job_file" 2>/dev/null)" ]; then
-                _job_update ".token_alert_at = \"$(iso_now)\""
+                _job_update_n 40 ".token_alert_at = \"$(iso_now)\""
                 _append_event "token_alert" "$(jq -nc --argjson tokens "${job_tokens:-0}" --arg cost "${job_spend:-0}" --argjson threshold "$_token_alert_threshold" '{tokens: $tokens, cost_usd: ($cost | tonumber), threshold: $threshold}')"
                 echo "job $id: TOKEN ALERT — ${job_tokens} tokens (threshold ${_token_alert_threshold}), cost \$${job_spend}"
             fi
@@ -3456,7 +3482,7 @@ USAGE_EOF
                         && _cap_red=$(mother_gates_red_json "$job_file" | jq -r 'join(", ")' 2>/dev/null)
                     [ -z "$_cap_red" ] || _cap_summary="$_cap_summary Gates red: $_cap_red."
                     printf '%s\n' "$_cap_summary" > "$cost_cap_flag"
-                    _job_update ".cost_cap_breached_at = \"$(iso_now)\""
+                    _job_update_n 40 ".cost_cap_breached_at = \"$(iso_now)\""
                     _append_event "cost_cap_breached" "$(jq -nc --argjson cap "$max_cost_usd" --arg spent "${job_spend:-0}" --argjson by_actor "$_cap_by_actor" --argjson by_model "$_cap_by_model" '{max_cost_usd: $cap, spent_usd: ($spent | tonumber), by_actor: $by_actor, by_model: $by_model}')"
                 fi
             fi

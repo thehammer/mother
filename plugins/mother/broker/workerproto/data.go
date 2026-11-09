@@ -53,10 +53,24 @@ type Hello struct {
 }
 
 type Welcome struct {
-	Proto       int      `json:"proto"`
-	Caps        []string `json:"caps"`
-	HbIntervalS int      `json:"hb_interval_s"`
-	LeaseTTLS   int      `json:"lease_ttl_s"`
+	Proto       int          `json:"proto"`
+	Caps        []string     `json:"caps"`
+	HbIntervalS int          `json:"hb_interval_s"`
+	LeaseTTLS   int          `json:"lease_ttl_s"`
+	Jobs        []WelcomeJob `json:"jobs,omitempty"`
+}
+
+// WelcomeJob is what the coordinator has persisted for one of the connecting worker's live leases, so the
+// worker resumes shipping exactly there: AppliedSeq is the last outbox op applied (coord_apply's seq),
+// WireSeq the last stream seq committed (the next frame is WireSeq+1) and LogOffset the size of the
+// canonical job log (the next log.append starts there). Additive data fields are allowed within v1.
+type WelcomeJob struct {
+	Job        string `json:"job"`
+	Lease      string `json:"lease"`
+	Epoch      int64  `json:"epoch"`
+	AppliedSeq int64  `json:"applied_seq"`
+	WireSeq    int64  `json:"wire_seq"`
+	LogOffset  int64  `json:"log_offset"`
 }
 
 type Refuse struct {
@@ -70,6 +84,9 @@ type HbJob struct {
 	Lease   string `json:"lease"`
 	Epoch   int64  `json:"epoch"`
 	LastSeq int64  `json:"last_seq"`
+	// Degraded (additive) names why this lease's outbox can no longer be shipped faithfully (an op was
+	// lost); empty when healthy. The coordinator audits it and flags the job for the operator.
+	Degraded string `json:"degraded,omitempty"`
 }
 
 type Hb struct {
@@ -135,6 +152,7 @@ type LeaseOffer struct {
 	CrewBundle json.RawMessage `json:"crew_bundle,omitempty"`
 	Checkpoint json.RawMessage `json:"checkpoint,omitempty"`
 	Repo       string          `json:"repo"`
+	RepoPath   string          `json:"repo_path,omitempty"`
 	Attempt    int             `json:"attempt"`
 }
 
@@ -446,7 +464,7 @@ func Validate(f Frame) error {
 			return protoErr(CodeInvalid, "hb: %d jobs, limit %d", len(h.Jobs), MaxHbJobs)
 		}
 		for _, j := range h.Jobs {
-			if !IDOK(j.Job) || !IDOK(j.Lease) || j.Epoch < 1 || j.LastSeq < 0 {
+			if !IDOK(j.Job) || !IDOK(j.Lease) || j.Epoch < 1 || j.LastSeq < 0 || !textOK(j.Degraded, MaxKindLen*3) {
 				return protoErr(CodeInvalid, "hb: bad job entry")
 			}
 		}
