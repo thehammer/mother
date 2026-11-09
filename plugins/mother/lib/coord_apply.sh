@@ -55,15 +55,17 @@
 #
 # Called by mother-runner for a job whose lease is `released` with end_reason `succeeded` while the canonical
 # job is still `running`. It never trusts the worker's claim: unless the job is `no_pr` with no PR url, the
-# job's final commit (the local branch tip in the job's repo, else a worker-reported one) must be contained in
+# job's final commit (the local branch tip in the job's own repo; never one the worker reports) must be contained in
 # the live head of the remote branch (`mother_remote_contains_commit`, the pr-detection-hardening helper:
 # live ls-remote, then fetch, then merge-base; a hung remote is a refusal, never a success). Verified: the
 # job becomes `succeeded` with the same bookkeeping a legacy success writes (failure_reason, finished_at,
 # force_start, backoff fields), the completion-evidence keys (pr_url, actual_branch, exit_code) are taken from
-# the worker's mirror only now and only when well formed, and the cost is recomputed. Refused: the job becomes
-# `failed` with reason `unpushed_commit` and a needs_attention item, exactly as the local hardening does, plus
-# an audit line; `succeeded` is never written. As in the local hardening, a check that cannot apply (no
-# checkout, no origin remote, no resolvable final commit) is skipped and audited as `verify_skipped`.
+# the worker's mirror only now and only when well formed (an `actual_branch` only for a job that declared
+# expect_branch_mismatch, a `pr_url` only inside the origin's repository when that is a github.com remote),
+# and the cost is recomputed. Refused: the job becomes `failed` with reason `unpushed_commit` and a
+# needs_attention item, exactly as the local hardening does, plus an audit line; `succeeded` is never written.
+# As in the local hardening, a check with nothing to check against (no checkout, no origin remote) is skipped
+# and audited as `verify_skipped`; a remote that exists whose final commit cannot be resolved is a refusal.
 # Exit: 0 finalized as succeeded, 3 refused (job failed unpushed_commit), 1 nothing to do (not running, not a
 # released-succeeded lease, cancel requested).
 #
@@ -608,13 +610,14 @@ _ca_mirror_doc() {
 # _ca_verify_success <job> <remote-branch> — 0 verified (or the check cannot apply, audited), 1 refused.
 # Reads the canonical job; never writes it.
 _ca_verify_success() {
-    local job="$1" rbranch="$2" jf repo branch iso wd final reported rc
+    local job="$1" rbranch="$2" jf repo branch iso wd final rc
     jf=$(_job_path "$job")
     repo=$(jq -r '.repo_path // empty' "$jf" 2>/dev/null)
     branch=$(jq -r '.branch // empty' "$jf" 2>/dev/null)
     iso=$(jq -r '.isolation // "worktree"' "$jf" 2>/dev/null)
     wd=$(jq -r '.work_dir // empty' "$jf" 2>/dev/null)
-    reported=$(_ca_lease_field "$job" final_sha)
+    # Nothing to check against when the job's checkout or its origin remote does not exist (the local
+    # hardening skips the same case); a remote that exists is always checked.
     if [ -z "$repo" ] || [ ! -d "$repo" ] || ! (cd "$repo" && git remote get-url origin >/dev/null 2>&1); then
         _ca_audit "$job" verify_skipped '["no checkout or no origin remote"]'
         return 0
@@ -624,10 +627,11 @@ _ca_verify_success() {
     if [ -z "$final" ] && [ "$iso" != "main-dir" ] && [ -n "$wd" ] && [ -d "$wd" ]; then
         final=$(cd "$wd" && git rev-parse --verify -q HEAD 2>/dev/null)
     fi
-    [ -n "$final" ] || final="$reported"
+    # The commit comes from the canonical checkout only, never from what the worker reports. A remote that
+    # exists but a final commit that cannot be resolved here is a refusal, not a skip.
     case "$final" in
-        '') _ca_audit "$job" verify_skipped '["final commit not resolvable"]'; return 0 ;;
-        *[!0-9a-f]*) _ca_audit "$job" verify_skipped '["final commit not resolvable"]'; return 0 ;;
+        '') _ca_audit "$job" verify_refused '["final commit not resolvable in the canonical checkout"]'; return 1 ;;
+        *[!0-9a-f]*) _ca_audit "$job" verify_refused '["final commit not resolvable in the canonical checkout"]'; return 1 ;;
     esac
     declare -F mother_remote_contains_commit >/dev/null || return 1
     mother_remote_contains_commit "$repo" "$rbranch" "$final"; rc=$?
@@ -644,9 +648,27 @@ _ca_claims_json() {
         | (if (.exit_code | type) == "number" and .exit_code >= 0 and .exit_code == (.exit_code | floor) then . else del(.exit_code) end)' "$1" 2>/dev/null || echo '{}'
 }
 
+# _ca_pr_url_matches_origin <job-file> <pr-url> — 0 when the url is empty, when the origin is not a github.com
+# remote (nothing to compare with), or when the url's owner/repo is the origin's; 1 otherwise.
+_ca_pr_url_matches_origin() {
+    local jf="$1" url="$2" repo origin slug
+    [ -n "$url" ] || return 0
+    repo=$(jq -r '.repo_path // empty' "$jf" 2>/dev/null)
+    [ -n "$repo" ] && [ -d "$repo" ] || return 0
+    origin=$(cd "$repo" && git remote get-url origin 2>/dev/null) || return 0
+    case "$origin" in
+        *github.com[:/]*) slug="${origin#*github.com[:/]}"; slug="${slug%.git}"; slug="${slug%/}" ;;
+        *) return 0 ;;
+    esac
+    case "$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')" in
+        "https://github.com/$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')/pull/"*) return 0 ;;
+    esac
+    return 1
+}
+
 # coord_apply_finalize <job> — see the header. Prints nothing; exit codes: 0 succeeded, 3 refused, 1 nothing to do.
 coord_apply_finalize() {
-    local job="$1" jf st lstate lreason wid mirror claims rbranch pr_url no_pr note now fin_filter
+    local job="$1" jf st lstate lreason wid mirror claims rbranch claimed_branch pr_url no_pr note now fin_filter
     jf=$(_job_path "$job")
     [ -f "$jf" ] || return 1
     [ "$(jq -r '.state // empty' "$jf" 2>/dev/null)" = "running" ] || return 1
@@ -656,8 +678,21 @@ coord_apply_finalize() {
     wid=$(_ca_lease_field "$job" worker_id)
     mirror=$(_ca_mirror_doc "$wid" "$job")
     claims=$(_ca_claims_json "$mirror")
-    rbranch=$(printf '%s' "$claims" | jq -r '.actual_branch // empty')
-    [ -n "$rbranch" ] || rbranch=$(jq -r '.actual_branch // .branch // empty' "$jf")
+    # The remote branch to check is the canonical job's. The worker's claim of another branch is honoured
+    # only for a job that declared it (expect_branch_mismatch); otherwise it is dropped, never verified.
+    rbranch=$(jq -r '.actual_branch // .branch // empty' "$jf")
+    claimed_branch=$(printf '%s' "$claims" | jq -r '.actual_branch // empty')
+    if [ -n "$claimed_branch" ] && [ "$claimed_branch" != "$rbranch" ] \
+        && [ "$(jq -r '.expect_branch_mismatch // false' "$jf")" = "true" ]; then
+        rbranch="$claimed_branch"
+    else
+        claims=$(printf '%s' "$claims" | jq -c 'del(.actual_branch)')
+    fi
+    # A claimed PR url must belong to the job's own repository when that can be told (a github.com origin).
+    if ! _ca_pr_url_matches_origin "$jf" "$(printf '%s' "$claims" | jq -r '.pr_url // empty')"; then
+        _ca_audit "$job" claim_dropped '["pr_url: not in the origin repository"]'
+        claims=$(printf '%s' "$claims" | jq -c 'del(.pr_url)')
+    fi
     pr_url=$(printf '%s' "$claims" | jq -r '.pr_url // empty')
     [ -n "$pr_url" ] || pr_url=$(jq -r '.pr_url // empty' "$jf")
     no_pr=$(jq -r '.no_pr // false' "$jf")

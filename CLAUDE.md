@@ -997,8 +997,10 @@ published as `dispatch_mode` / `dispatch_mode_source` in `runner/effective-confi
   `coord_apply.sh --finalize <root> <job>` for a lease `released` with `end_reason: succeeded` on a still-`running` job: unless the
   job is `no_pr` with no PR url, its final commit (the local tip of `refs/heads/<branch>`) must be in the live head of the remote
   branch (`mother_remote_contains_commit`), else `failed` / `unpushed_commit` + `needs_attention` + audit line (`finalize_refused`).
-  A check that cannot apply (no checkout, no origin, no resolvable commit) is skipped and audited (`verify_skipped`), as in the
-  local hardening. Completion evidence (`pr_url`, `actual_branch`, `exit_code`) is read from the worker's mirror only then.
+  A check with nothing to check against (no checkout, no origin remote) is skipped and audited (`verify_skipped`), as in the local
+  hardening; an existing remote with an unresolvable final commit is a refusal, and the commit is never one the worker reports.
+  Completion evidence (`pr_url`, `actual_branch`, `exit_code`) is read from the worker's mirror only then and only when
+  well formed: `actual_branch` for an `expect_branch_mismatch` job, `pr_url` inside the origin's repo when that is github.com.
 - **Lost lease**: `_recover_lost_leases` records the run's usage row and fails the job `worker_lost {worker, lease_epoch,
   last_heartbeat_at}` once per lease (`runner/leases/<job>.lost-handled`); failure routing handles it like `runner_died`.
   P1-6 replaces this with a resume.
