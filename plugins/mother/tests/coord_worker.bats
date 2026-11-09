@@ -89,6 +89,8 @@ setup() {
 # Stop everything this test started, by exact pid / recorded process group only.
 teardown() {
     local kind n
+    # Release a gated mock claude first, so a test that failed before its own release never leaves it waiting.
+    [ -n "${CW_CLAUDE_DIR:-}" ] && [ -d "$CW_CLAUDE_DIR" ] && : > "$CW_CLAUDE_DIR/release"
     if [ -f "${CW_PIDS:-/nonexistent}" ]; then
         while read -r kind n; do
             case "$kind" in
@@ -126,6 +128,12 @@ cat <<'EOF'
 {"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.004,"modelUsage":{"claude-sonnet-5":{"costUSD":0.004,"inputTokens":1000,"outputTokens":200}}}
 EOF
 [ "$SLEEP" = "0" ] || sleep "$SLEEP"
+# GATE=1: hold the run until the test creates $ROOT/release (capped at 150 s), so a test that needs the job
+# alive across several steps waits on observable state, not on a fixed sleep that a loaded host can outrun.
+if [ "${GATE:-}" = "1" ]; then
+    _g=0
+    while [ ! -e "$ROOT/release" ] && [ "$_g" -lt 600 ]; do sleep 0.25; _g=$(( _g + 1 )); done
+fi
 exit "$EXIT"
 CLAUDE
     chmod +x "$_MOCK_BIN/claude"
@@ -150,11 +158,21 @@ _cw_wait_for() {
 # _cw_dump — everything useful for triage, to stderr.
 _cw_dump() {
     local f
+    # The known open bug (not hidden, not skipped): under CPU load the coordinator can drop the worker's
+    # connection ("send queue full") and the lease then never reaches released.
+    if grep -qs "send queue full; dropping the connection" "$CW_C/coord.out" "$CW_C/worker.out" "$CW_W/worker.out" 2>/dev/null; then
+        echo "*** KNOWN BUG: 'send queue full; dropping the connection' was logged: this failure is the open" >&2
+        echo "*** stuck-lease bug, see .claude/bugs/open/2026-11-09-stuck-lease-after-send-queue-full-under-cpu-load.md" >&2
+        echo "*** (local bug inbox of the main mother checkout). The test is NOT skipped; it fails on purpose." >&2
+    fi
     echo "--- coord.out" >&2;   tail -n 40 "$CW_C/coord.out" >&2 2>/dev/null || true
     echo "--- worker.out" >&2;  tail -n 40 "$CW_C/worker.out" >&2 2>/dev/null || true
     echo "--- leases" >&2;      cat "$CW_C"/runner/leases/*.json >&2 2>/dev/null || true
     echo "--- audit" >&2;       cat "$CW_C/runner/leases/audit.jsonl" >&2 2>/dev/null || true
     echo "--- status" >&2;      cat "$CW_C/runner/coord-status.json" >&2 2>/dev/null || true
+    echo "--- mirror jobs (state)" >&2; for f in "$CW_W"/jobs/*.json; do [ -f "$f" ] && jq -c '{id, state, activity, paused_reason, finished_at}' "$f" >&2; done 2>/dev/null
+    echo "--- outbox last seq / release flag" >&2; cat "$CW_W"/outbox/*.seq >&2 2>/dev/null; ls "$CW_CLAUDE_DIR" >&2 2>/dev/null
+    echo "--- run-job.out" >&2; tail -n 15 "$CW_W/run-job.out" "$CW_C"/runner/*.out >&2 2>/dev/null || true
     for f in "$CW_W"/logs/*.log; do [ -f "$f" ] && { echo "--- $f" >&2; tail -n 15 "$f" >&2; }; done
     true
 }
@@ -260,7 +278,11 @@ _cw_prepare() {
            }'
     mkdir -p "$CW_CLAUDE_DIR"
     touch "$CW_CLAUDE_DIR/ge-no-pr-url"
-    printf 'SLEEP=%s\n' "$sleep_s" > "$CW_CLAUDE_DIR/ge-behave.1"
+    if [ "$sleep_s" = "gate" ]; then
+        printf 'SLEEP=0\nGATE=1\n' > "$CW_CLAUDE_DIR/ge-behave.1"
+    else
+        printf 'SLEEP=%s\n' "$sleep_s" > "$CW_CLAUDE_DIR/ge-behave.1"
+    fi
 }
 
 _cw_run_job() { mother-run-job "$1" > "$MOTHER_ROOT/run-job.out" 2>&1; }
@@ -442,7 +464,7 @@ _cw_subs() {
 # _cw_norm_job <file> — the worker-settable part of the job document (plus the canonical cost), normalised.
 _cw_norm_job() {
     jq -S --argjson subs "$(_cw_subs)" --argjson wk "$CW_WORKER_KEYS" \
-        "$(_cw_norm_filter) | with_entries(select(.key as \$k | \$wk | index(\$k)))" "$1"
+        "del(.live_cost_usd, .live_tokens) | $(_cw_norm_filter) | with_entries(select(.key as \$k | \$wk | index(\$k)))" "$1"
 }
 
 _cw_norm_events() {
@@ -534,7 +556,7 @@ _cw_same() {
 @test "coordinator restarts mid-job, once briefly and once for longer than the lease TTL: no events lost or doubled and the lease is never lost" {
     local id="cw-coordrestart" hb
     CW_TTL=6
-    _cw_boot "$id" 28
+    _cw_boot "$id" gate
     _cw_dispatch "$id"
     _cw_must 30 "the job's claude to start" _cw_claude_started
     _cw_must 20 "the lease to be active" _cw_lease_is "$id" active
@@ -554,6 +576,9 @@ _cw_same() {
     _cw_start_coord
     _cw_must 25 "a heartbeat to reach the coordinator after the long outage" _cw_hb_moved "$id" "$hb"
 
+    # Both outages are over and the lease was active throughout: now let the job finish.
+    _cw_lease_is "$id" active
+    : > "$CW_CLAUDE_DIR/release"
     _cw_must 90 "the lease to be released" _cw_lease_is "$id" released
     _cw_mirror_state_is "$id" succeeded
     [ "$(cat "$CW_CLAUDE_DIR/ge-count")" = "1" ]
@@ -576,7 +601,7 @@ _cw_same() {
 @test "worker daemon restarts while its supervisor keeps running: the job is re-adopted, finishes once, no duplicate events" {
     local id="cw-workerrestart" sup wpid wpgid
     CW_TTL=6
-    _cw_boot "$id" 24
+    _cw_boot "$id" gate
     _cw_dispatch "$id"
     _cw_must 30 "the job's claude to start" _cw_claude_started
     _cw_must 20 "the supervisor to be tracked in children/" \
@@ -592,6 +617,9 @@ _cw_same() {
     _cw_alive "$sup"
     _cw_must 20 "the restarted worker to reconnect" _cw_connected
 
+    # The daemon is back and re-adopted the supervisor: now let the job finish.
+    _cw_alive "$sup"
+    : > "$CW_CLAUDE_DIR/release"
     _cw_must 90 "the lease to be released" _cw_lease_is "$id" released
     _cw_mirror_state_is "$id" succeeded
     [ "$(cat "$CW_CLAUDE_DIR/ge-count")" = "1" ]
