@@ -35,6 +35,15 @@ mother_usage_available() {
 # ---------------------------------------------------------------------------
 
 _usage_iso_now() {
+    # Same clock-in-bash fast path as state.sh's _iso_now (no process to exec).
+    local _e="${EPOCHREALTIME:-}" _f
+    case "$_e" in
+        [0-9]*.[0-9]*)
+            case "$_e" in *[!0-9.]*) ;; *)
+                _f="${_e#*.}000"
+                ( export TZ=UTC; printf '%(%Y-%m-%dT%H:%M:%S)T.%sZ\n' "${_e%.*}" "${_f:0:3}" 2>/dev/null ) && return 0 ;;
+            esac ;;
+    esac
     /usr/bin/perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
         my ($s, $us) = gettimeofday();
         my @t = gmtime($s);

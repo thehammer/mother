@@ -346,6 +346,19 @@ seed_live_job() {
     fi
 }
 
+@test "(b3) recording through the coordinator and the local worker (--dispatch worker) is byte-identical to the committed fixtures" {
+    need_go
+    local out="$BATS_TEST_TMPDIR/via-worker" f
+    run env -i HOME="$_MOTHER_TEST_REAL_HOME" PATH="$_CONTRACT_ORIG_PATH" PYTHONIOENCODING=utf-8 \
+        ${TMPDIR:+TMPDIR="$TMPDIR"} ${GOPATH:+GOPATH="$GOPATH"} ${GOCACHE:+GOCACHE="$GOCACHE"} \
+        ${GOMODCACHE:+GOMODCACHE="$GOMODCACHE"} ${GOROOT:+GOROOT="$GOROOT"} ${LANG:+LANG="$LANG"} ${LC_ALL:+LC_ALL="$LC_ALL"} \
+        "$PLUGIN/scripts/record-contract-fixtures.sh" --dispatch worker --out "$out"
+    [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+    for f in $SCENARIOS; do
+        cmp -s "$out/$f.ndjson" "$FIX/$f.ndjson" || { diff "$FIX/$f.ndjson" "$out/$f.ndjson" | head -10 >&2; false; }
+    done
+}
+
 @test "(b2) recording from a shell with session and focus variables set is identical to the committed fixtures" {
     need_go
     local out="$BATS_TEST_TMPDIR/polluted"

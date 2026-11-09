@@ -68,6 +68,18 @@ source "$MOTHER_LIB_DIR/config.sh"
 mother_config_load
 MOTHER_CONCURRENCY_SOURCE=$(mother_config_source MOTHER_CONCURRENCY)
 MOTHER_MIN_FREE_GB_SOURCE=$(mother_config_source MOTHER_MIN_FREE_GB)
+MOTHER_DISPATCH_MODE_SOURCE=$(mother_config_source MOTHER_DISPATCH_MODE)
+
+# Dispatch mode (cluster P1-5): `legacy` forks mother-run-job as it always has; `worker` leases jobs to the local
+# worker through the coordinator. Anything else is legacy plus one stderr line (control characters stripped).
+case "${MOTHER_DISPATCH_MODE:-legacy}" in
+    legacy|worker) ;;
+    *)
+        printf 'mother-runner: unrecognized MOTHER_DISPATCH_MODE "%s"; using legacy\n' \
+            "$(printf '%s' "$MOTHER_DISPATCH_MODE" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-40)" >&2
+        MOTHER_DISPATCH_MODE=legacy ;;
+esac
+MOTHER_DISPATCH_MODE="${MOTHER_DISPATCH_MODE:-legacy}"
 
 MOTHER_CONCURRENCY="${MOTHER_CONCURRENCY:-2}"
 MOTHER_POLL_INTERVAL="${MOTHER_POLL_INTERVAL:-2}"
@@ -111,12 +123,24 @@ export MOTHER_TEMP_ORPHAN_MINUTES="${MOTHER_TEMP_ORPHAN_MINUTES:-60}"
 PIDFILE="$RUNNER_DIR/runner.pid"
 CHILDREN_DIR="$RUNNER_DIR/children"
 BROKER_PIDFILE="$RUNNER_DIR/broker.pid"
+COORD_PIDFILE="$RUNNER_DIR/coord.pid"
+WORKER_PIDFILE="$RUNNER_DIR/worker-local.pid"
+DISPATCH_DIR="$RUNNER_DIR/dispatch"
+LEASES_DIR="$RUNNER_DIR/leases"
+COORD_SOCK="$RUNNER_DIR/coord/worker.sock"
+COORD_REG_FIFO="$RUNNER_DIR/coord-reg.fifo"
+WORKER_SECRET_FILE="$RUNNER_DIR/coord/worker-local.secret"
 mkdir -p "$CHILDREN_DIR"
 
 # Broker restart backoff state (seconds). Reset to 1 whenever the broker is
 # observed alive; doubled (capped) on each restart attempt.
 _BROKER_BACKOFF=1
 _BROKER_NEXT_RESTART=0
+# Same state for the coordinator and the local worker (cluster P1-5).
+_COORD_BACKOFF=1
+_COORD_NEXT_RESTART=0
+_WORKER_BACKOFF=1
+_WORKER_NEXT_RESTART=0
 
 SHUTDOWN=0
 
@@ -150,8 +174,10 @@ _publish_effective_config() {
         --argjson pid "$$" --arg at "$(_iso_now)" \
         --arg c "$MOTHER_CONCURRENCY" --arg src "$MOTHER_CONCURRENCY_SOURCE" \
         --arg mf "$MOTHER_MIN_FREE_GB" --arg mfsrc "$MOTHER_MIN_FREE_GB_SOURCE" \
+        --arg dm "$MOTHER_DISPATCH_MODE" --arg dmsrc "$MOTHER_DISPATCH_MODE_SOURCE" \
         '{pid: $pid, started_at: $at, concurrency: ($c | tonumber? // $c), concurrency_source: $src,
-          min_free_gb: ($mf | tonumber? // $mf), min_free_gb_source: $mfsrc}')"
+          min_free_gb: ($mf | tonumber? // $mf), min_free_gb_source: $mfsrc,
+          dispatch_mode: $dm, dispatch_mode_source: $dmsrc}')"
 }
 
 _remove_pidfile() {
@@ -214,8 +240,41 @@ _reap_children() {
     done
 }
 
-_count_running_children() {
+# Supervisors this daemon forked itself (legacy dispatch). _drain waits on these only.
+_count_forked_children() {
     find "$CHILDREN_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Slots in use: forked supervisors plus leased jobs (see _leased_job_ids).
+_count_running_children() {
+    echo $(( $(_count_forked_children) + $(_leased_job_ids | wc -l | tr -d ' ') ))
+}
+
+# _leased_job_ids: one job id per line for every job a worker holds or is about to hold: a lease in `offered` or
+# `active`, or a dispatch request the coordinator has not turned into a lease yet. The coordinator owns their
+# liveness, so they occupy a slot exactly like a forked supervisor does.
+_leased_job_ids() {
+    local f
+    {
+        for f in "$LEASES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            case "$(jq -r '.state // empty' "$f" 2>/dev/null)" in
+                offered|active) basename "$f" .json ;;
+            esac
+        done
+        for f in "$DISPATCH_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            basename "$f" .json
+        done
+    } | sort -u
+}
+
+_job_is_leased() {
+    [ -f "$DISPATCH_DIR/$1.json" ] && return 0
+    case "$(jq -r '.state // empty' "$LEASES_DIR/$1.json" 2>/dev/null)" in
+        offered|active) return 0 ;;
+    esac
+    return 1
 }
 
 # Supervisor liveness check, used by the reaper to avoid racing the
@@ -230,6 +289,7 @@ _count_running_children() {
 # write — sometimes leaving the job stuck in `failed: runner_died`
 # despite the work being committed.
 _supervisor_alive_for_job() {
+    _job_is_leased "$1" && return 0
     _supervisor_pid_for_job "$1" >/dev/null
 }
 
@@ -340,6 +400,249 @@ _reap_broker() {
     _BROKER_NEXT_RESTART=$((now + _BROKER_BACKOFF))
     _BROKER_BACKOFF=$((_BROKER_BACKOFF * 2))
     [ "$_BROKER_BACKOFF" -gt 30 ] && _BROKER_BACKOFF=30
+}
+
+# ---------- coordinator + local worker supervision (cluster P1-5) ----------
+#
+# With MOTHER_DISPATCH_MODE=worker (or for a job with dispatch_via "worker") jobs do not get a forked
+# mother-run-job: the runner writes runner/dispatch/<job>.json and the coordinator (mother-coord) leases the job
+# to the laptop's own worker (mother-worker --id local), which runs the supervisor in worker mode and ships
+# everything back (docs/worker-protocol.md). Both daemons are supervised like the broker: nohup, pidfile,
+# doubling restart backoff. They start only when something needs them (worker mode, a worker-path job, or a
+# lease/dispatch request still in flight, so flipping the switch back never strands a running job).
+#
+# The coordinator only accepts workers registered over its --secrets-fd: a fifo this runner owns (fresh on every
+# coordinator start, so no registration outlives its coordinator) carries `local=<worker pid>=<secret>`. The
+# secret is random per worker start and lives in runner/coord/ (0700) as a 0600 file, so a restarted runner can
+# re-register a worker that outlived it (MC-16); it is never in an environment variable or argv.
+#
+# _drain stops the coordinator like the broker but NOT the worker: jobs keep running through a runner restart.
+
+_coord_pid() { { cat "$COORD_PIDFILE" 2>/dev/null || true; } | tr -dc '0-9'; }
+
+_coord_alive() {
+    local p; p=$(_coord_pid)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+_worker_pid() { { cat "$WORKER_PIDFILE" 2>/dev/null || true; } | tr -dc '0-9'; }
+
+_worker_alive() {
+    local p; p=$(_worker_pid)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+_worker_root() { printf '%s/local' "${MOTHER_WORKER_ROOT:-$HOME/.mother-worker}"; }
+
+# _job_uses_worker <job_id>: the per-job override wins over the mode.
+_job_uses_worker() {
+    case "$(jq -r '.dispatch_via // empty' "$JOBS_DIR/$1.json" 2>/dev/null)" in
+        worker) return 0 ;;
+        legacy) return 1 ;;
+    esac
+    [ "$MOTHER_DISPATCH_MODE" = "worker" ]
+}
+
+# _worker_path_needed: should the coordinator and the local worker be running?
+_worker_path_needed() {
+    [ "$MOTHER_DISPATCH_MODE" = "worker" ] && return 0
+    [ -n "$(_leased_job_ids)" ] && return 0
+    local f
+    for f in $(grep -lE '"dispatch_via"[[:space:]]*:[[:space:]]*"worker"' "$JOBS_DIR"/*.json 2>/dev/null); do
+        case "$(jq -r '.state // empty' "$f" 2>/dev/null)" in
+            succeeded|failed|cancelled|'') ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# _register_local_worker: tell a running coordinator the worker's real pid and secret. Idempotent; the fifo is
+# opened read-write so the write never blocks, and the coordinator reads it for its whole life.
+_register_local_worker() {
+    _coord_alive || return 0
+    local wpid secret
+    wpid=$(_worker_pid)
+    secret=$(cat "$WORKER_SECRET_FILE" 2>/dev/null || true)
+    [ -n "$wpid" ] && [ -n "$secret" ] && [ -p "$COORD_REG_FIFO" ] || return 0
+    printf 'local=%s=%s\n' "$wpid" "$secret" 1<>"$COORD_REG_FIFO" 2>/dev/null || true
+}
+
+_start_coord() {
+    _coord_alive && return 0
+    mkdir -p "$RUNNER_DIR/coord" "$DISPATCH_DIR" && chmod 700 "$RUNNER_DIR/coord" 2>/dev/null
+    rm -f "$COORD_REG_FIFO"
+    mkfifo -m 600 "$COORD_REG_FIFO" 2>/dev/null || { _log "cannot create $COORD_REG_FIFO; coordinator not started"; return 1; }
+    # Same detach as the broker: nohup + background + disown; the process group survives the runner through
+    # AbandonProcessGroup. fd 4 is the registration fifo (read-write, so the open never blocks).
+    nohup "$MOTHER_BIN_DIR/mother-coord" --secrets-fd 4 </dev/null >>"$LOGS_DIR/coord.log" 2>&1 4<>"$COORD_REG_FIFO" &
+    local pid=$!
+    disown 2>/dev/null || true
+    echo "$pid" > "$COORD_PIDFILE"
+    _log "started coordinator (pid $pid)"
+    _register_local_worker
+}
+
+_stop_coord() {
+    local p; p=$(_coord_pid)
+    [ -n "$p" ] || return 0
+    if kill -0 "$p" 2>/dev/null; then
+        kill -TERM "$p" 2>/dev/null || true
+        local i=0
+        while kill -0 "$p" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+        _log "stopped coordinator (pid $p)"
+    fi
+    rm -f "$COORD_PIDFILE"
+}
+
+_reap_coord() {
+    _worker_path_needed || return 0
+    if _coord_alive; then
+        _COORD_BACKOFF=1
+        return 0
+    fi
+    local now; now=$(date +%s)
+    [ "$now" -ge "$_COORD_NEXT_RESTART" ] || return 0
+    _log "coordinator not running — starting (backoff=${_COORD_BACKOFF}s)"
+    _start_coord
+    _COORD_NEXT_RESTART=$((now + _COORD_BACKOFF))
+    _COORD_BACKOFF=$((_COORD_BACKOFF * 2))
+    [ "$_COORD_BACKOFF" -gt 30 ] && _COORD_BACKOFF=30
+    return 0
+}
+
+_start_local_worker() {
+    _worker_alive && return 0
+    local root secret
+    root=$(_worker_root)
+    mkdir -p "$root" "$RUNNER_DIR/coord" && chmod 700 "$RUNNER_DIR/coord" 2>/dev/null
+    secret=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    ( umask 077; printf '%s\n' "$secret" > "$WORKER_SECRET_FILE" ) || { _log "cannot write the worker secret; worker not started"; return 1; }
+    # The worker takes MOTHER_ROOT from --root (it scrubs the rest of the environment for its children).
+    nohup env -u MOTHER_ROOT -u MOTHER_LIVE_ROOT -u JOBS_DIR -u EVENTS_DIR -u LOGS_DIR -u DRAFTS_DIR -u CURSORS_DIR \
+        -u RUNNER_DIR -u ARCHIVE_DIR -u TEARDOWN_DIR MOTHER_ROOT="$root" \
+        "$MOTHER_BIN_DIR/mother-worker" --id local --root "$root" --coord-sock "$COORD_SOCK" \
+        --slots "$MOTHER_CONCURRENCY" --secret-fd 4 \
+        4< <(printf '%s\n' "$secret") </dev/null >>"$LOGS_DIR/worker-local.log" 2>&1 &
+    local pid=$!
+    disown 2>/dev/null || true
+    echo "$pid" > "$WORKER_PIDFILE"
+    _log "started local worker (pid $pid, root $root)"
+    _register_local_worker
+}
+
+# The worker writes its real pid (and process group) to <root>/worker.pid; keep our pidfile and the
+# coordinator's registration on it should the launched pid ever differ.
+_sync_worker_pid() {
+    local real
+    real=$(awk 'NR == 1 {print $1}' "$(_worker_root)/worker.pid" 2>/dev/null | tr -dc '0-9')
+    [ -n "$real" ] && [ "$real" != "$(_worker_pid)" ] && kill -0 "$real" 2>/dev/null || return 0
+    echo "$real" > "$WORKER_PIDFILE"
+    _register_local_worker
+}
+
+_reap_local_worker() {
+    _worker_path_needed || return 0
+    if _worker_alive; then
+        _WORKER_BACKOFF=1
+        _sync_worker_pid
+        return 0
+    fi
+    local now; now=$(date +%s)
+    [ "$now" -ge "$_WORKER_NEXT_RESTART" ] || return 0
+    _log "local worker not running — starting (backoff=${_WORKER_BACKOFF}s)"
+    _start_local_worker
+    _WORKER_NEXT_RESTART=$((now + _WORKER_BACKOFF))
+    _WORKER_BACKOFF=$((_WORKER_BACKOFF * 2))
+    [ "$_WORKER_BACKOFF" -gt 30 ] && _WORKER_BACKOFF=30
+    return 0
+}
+
+# _write_dispatch_request <job_id>: hand a job to the coordinator (atomic).
+_write_dispatch_request() {
+    mkdir -p "$DISPATCH_DIR"
+    _atomic_write "$DISPATCH_DIR/$1.json" "$(jq -nc --arg j "$1" --arg at "$(_iso_now)" '{job: $j, requested_at: $at}')"
+}
+
+# _lease_state <job_id>: the lease file's state ("" when none).
+_lease_state() { jq -r '.state // empty' "$LEASES_DIR/$1.json" 2>/dev/null; }
+
+# _lease_awaits_finalize <job_id>: the worker released the lease as succeeded; the coordinator still has to
+# derive the canonical success.
+_lease_awaits_finalize() {
+    [ "$(_lease_state "$1")" = "released" ] || return 1
+    [ "$(jq -r '.end_reason // empty' "$LEASES_DIR/$1.json" 2>/dev/null)" = "succeeded" ]
+}
+
+# _finalize_released_leases: the coordinator derives `succeeded` (a worker can never write it). A lease the
+# worker released as succeeded while the canonical job is still `running` is verified against the remote by
+# `coord_apply.sh --finalize`, which writes succeeded or fails the job unpushed_commit.
+_finalize_released_leases() {
+    local f id root rc
+    root="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
+    for f in "$LEASES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        id=$(basename "$f" .json)
+        _lease_awaits_finalize "$id" || continue
+        [ -f "$JOBS_DIR/$id.json" ] || continue
+        [ "$(jq -r '.state // empty' "$JOBS_DIR/$id.json" 2>/dev/null)" = "running" ] || continue
+        _log "finalizing $id (lease released as succeeded)"
+        rc=0
+        bash "$MOTHER_LIB_DIR/coord_apply.sh" --finalize "$root" "$id" >/dev/null 2>&1 || rc=$?
+        case "$rc" in
+            0) _log "$id: success verified" ;;
+            3) _log "$id: success refused (unpushed_commit)" ;;
+        esac
+    done
+}
+
+# _recover_lost_leases: a lease the coordinator declared lost (TTL expired) on a job that is still `running`.
+# Interim behaviour until P1-6 resumes it: record the usage row of the dead run, fail the job `worker_lost`
+# and let failure routing take it from there. Handled once per lease (marker keyed by lease id).
+_recover_lost_leases() {
+    local f id lease_id st jf lost=0
+    for f in "$LEASES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        id=$(basename "$f" .json)
+        jf="$JOBS_DIR/$id.json"
+        [ -f "$jf" ] || continue
+        st=$(jq -r '.state // empty' "$f" 2>/dev/null)
+        lost=0
+        [ "$st" = "lost" ] && lost=1
+        if [ "$lost" -eq 0 ] && [ -f "$LEASES_DIR/$id.lost" ]; then
+            case "$st" in offered|active|released) ;; *) lost=1 ;; esac
+        fi
+        [ "$lost" -eq 1 ] || continue
+        [ "$(jq -r '.state // empty' "$jf" 2>/dev/null)" = "running" ] || continue
+        lease_id=$(jq -r '.lease_id // empty' "$f" 2>/dev/null)
+        [ "$(cat "$LEASES_DIR/$id.lost-handled" 2>/dev/null)" = "$lease_id" ] && continue
+        _orphan_lost_lease "$id" "$jf" "$f" "$lease_id"
+    done
+}
+
+_orphan_lost_lease() {
+    local id="$1" jf="$2" lf="$3" lease_id="$4" terminal detail offset ophase ostage outcome=failed
+    if [ "$(jq -r '.cancel_requested // false' "$jf" 2>/dev/null)" = "true" ]; then
+        terminal=cancelled; outcome=cancelled; detail='{"reason":"user"}'
+    else
+        terminal=failed
+        detail=$(jq -nc --arg w "$(jq -r '.worker_id // empty' "$lf")" \
+            --argjson e "$(jq -c '.epoch // null' "$lf")" --arg hb "$(jq -r '.last_hb // empty' "$lf")" \
+            '{reason: "worker_lost", worker: $w, lease_epoch: $e, last_heartbeat_at: $hb}')
+    fi
+    _log "marking $id $terminal (lease $lease_id lost)"
+    if type mother_record_run_usage >/dev/null 2>&1; then
+        offset=$(jq -r '.current_run.log_offset // empty' "$jf" 2>/dev/null)
+        if [ -n "$offset" ]; then
+            ophase=$(jq -r '.pipeline.phase // empty' "$jf" 2>/dev/null)
+            ostage="${ophase:-cody}"
+            mother_record_run_usage "$id" "$outcome" "$LOGS_DIR/$id.log" "$offset" "" "$ostage" "${ostage}-main" "worker" \
+                "$(jq -nc '{failure_reason: "worker_lost"}')"
+        fi
+    fi
+    _job_transition "$id" "$terminal" "$detail"
+    _job_update "$id" 'if .activity == "gating" or .activity == "gate_fix" then .activity = null else . end'
+    printf '%s\n' "$lease_id" > "$LEASES_DIR/$id.lost-handled"
 }
 
 # ---------- ready-job selection ----------
@@ -589,6 +892,14 @@ _spawn_job() {
     # the next daemon restart's orphan recovery will mark it failed.
     _job_transition "$job_id" running '{"spawned_by":"daemon"}'
 
+    # Worker path (cluster P1-5): same transition and events as above, then hand the job to the coordinator
+    # instead of forking a supervisor. The coordinator leases it to the local worker and owns its liveness.
+    if _job_uses_worker "$job_id"; then
+        _write_dispatch_request "$job_id"
+        _log "dispatched job $job_id to the worker path"
+        return 0
+    fi
+
     # Detach via nohup + background + stdin/out/err redirection. mother-run-job
     # tees its own log. NOTE: nohup + disown does NOT create a new process
     # group or session — `disown` only drops the job from this shell's job
@@ -777,6 +1088,11 @@ _recover_orphans() {
         state=$(jq -r '.state' "$f" 2>/dev/null) || continue
         [ "$state" = "running" ] || continue
         id=$(jq -r '.id' "$f")
+        # The coordinator owns the liveness of a leased job (offered/active lease, a pending dispatch request,
+        # or a released lease awaiting its success derivation); _recover_lost_leases handles a lost one.
+        if _job_is_leased "$id" || _lease_awaits_finalize "$id"; then
+            continue
+        fi
         pid=$(jq -r '.worker_pid // empty' "$f")
         window=$(jq -r '.tmux_window // ""' "$f")
         cancel_req=$(jq -r '.cancel_requested // false' "$f")
@@ -1583,10 +1899,16 @@ _maybe_pause_running() {
     mother_limiter_enforcing && holding=1
 
     local f pid job_id job_file fr ar cr pr merged
+    # Forked supervisors and leased jobs alike (cluster P1-5). For a leased job the canonical writes below
+    # (pause_requested, paused_reason, auto_resume_at) and the .hold flag reach the worker through the
+    # coordinator's downlink.
+    local candidates=""
     for f in "$CHILDREN_DIR"/*.json; do
         [ -f "$f" ] || continue
-        pid=$(basename "$f" .json)
-        job_id=$(jq -r '.job_id // empty' "$f" 2>/dev/null)
+        candidates="$candidates $(jq -r '.job_id // empty' "$f" 2>/dev/null)"
+    done
+    candidates="$candidates $(_leased_job_ids | tr '\n' ' ')"
+    for job_id in $candidates; do
         [ -n "$job_id" ] || continue
         job_file="$JOBS_DIR/$job_id.json"
         [ -f "$job_file" ] || continue
@@ -2311,8 +2633,9 @@ _write_dispatch_last() {
         --argjson low "$([ "$3" = 1 ] && echo true || echo false)" \
         --arg spawned "$4" --arg skipped "$5" \
         --argjson enforcing "$([ "${6:-0}" = 1 ] && echo true || echo false)" \
+        --argjson leased "$(_leased_job_ids | wc -l | tr -d ' ')" --arg mode "$MOTHER_DISPATCH_MODE" \
         '{ts: $ts, running: $running, ceiling: $ceiling, ratelimit_paused: $paused, quota_over_cap: $over,
-          low_disk: $low, enforcing: $enforcing, spawned: ($spawned | split(" ") | map(select(length > 0))),
+          low_disk: $low, enforcing: $enforcing, leased: $leased, mode: $mode, spawned: ($spawned | split(" ") | map(select(length > 0))),
           skipped: ($skipped | split(" ") | map(select(length > 0)))}' \
         > "$RUNNER_DIR/dispatch-last.json.tmp.$$" 2>/dev/null \
         && mv "$RUNNER_DIR/dispatch-last.json.tmp.$$" "$RUNNER_DIR/dispatch-last.json" \
@@ -2377,6 +2700,10 @@ _loop() {
     while [ "$SHUTDOWN" -eq 0 ]; do
         _reap_children
         _reap_broker
+        _reap_coord
+        _reap_local_worker
+        _recover_lost_leases
+        _finalize_released_leases
         _recover_orphans "$MOTHER_ORPHAN_GRACE"
         # Auto-resume system-paused jobs whose window has rolled over
         # BEFORE _promote_ready, so resumed jobs are eligible for the
@@ -2414,17 +2741,20 @@ _loop() {
 
 _drain() {
     _stop_broker
+    # The coordinator stops with the runner; the local worker deliberately does not: its jobs keep running
+    # through a restart and the next runner re-registers it (MC-16). Leased jobs are not drained for.
+    _stop_coord
     _log "drain: waiting up to ${MOTHER_SHUTDOWN_GRACE}s for ${MOTHER_CONCURRENCY} slots to clear"
     local elapsed=0
     while [ "$elapsed" -lt "$MOTHER_SHUTDOWN_GRACE" ]; do
         _reap_children
-        local running; running=$(_count_running_children)
+        local running; running=$(_count_forked_children)
         [ "$running" -eq 0 ] && { _log "drain complete"; return 0; }
         sleep 1
         elapsed=$((elapsed + 1))
     done
     _reap_children
-    local remaining; remaining=$(_count_running_children)
+    local remaining; remaining=$(_count_forked_children)
     if [ "$remaining" -gt 0 ]; then
         _log "drain grace expired — $remaining child(ren) still running; exiting anyway (jobs continue as detached worker processes)"
     fi

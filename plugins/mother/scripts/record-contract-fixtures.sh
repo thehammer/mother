@@ -2,12 +2,18 @@
 # record-contract-fixtures.sh — record the headless-crew client-contract fixtures from REAL runs.
 #
 # Usage:
-#   record-contract-fixtures.sh [--out DIR] [--report FILE]
+#   record-contract-fixtures.sh [--out DIR] [--report FILE] [--dispatch legacy|worker]
 #
 #   --out DIR      where the three fixtures are written
 #                  (default: plugins/mother/tests/fixtures/contract)
 #   --report FILE  JSON describing what the scenarios seeded, so a test can prove its sentinel
 #                  check is real: {"sentinel": "...", "side_files": {"<scenario>": [paths with it]}}
+#   --dispatch M   legacy (default): the supervisor (mother-run-job) runs in this shell.
+#                  worker: cluster P1-5. mother-coord and mother-worker run against the scratch roots, the job is
+#                  handed over with runner/dispatch/<job>.json instead, and the same end condition is awaited
+#                  (lease released); a lease released as succeeded is then finalized with
+#                  `coord_apply.sh --finalize`, which is what mother-runner does. The result must be
+#                  byte-identical to the committed fixtures (the broker contract does not change).
 #
 # Each scenario gets a temp MOTHER_ROOT, a temp git repo (its basename is in MOTHER_PHI_REPOS) with an
 # enforce-mode .mother/crew.yml, a fake gh and a scripted `claude`, and the REAL broker binary. A python
@@ -35,6 +41,7 @@ set -u
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 OUT="$PLUGIN/tests/fixtures/contract"
 REPORT=""
+DISPATCH="legacy"
 SENTINEL="SENTINEL-PHI-42"
 # A gate command that prints the sentinel. Assembled at run time so the literal never appears in the
 # check's `run` text (which legitimately travels in the job's crew snapshot): only real gate OUTPUT has it.
@@ -44,10 +51,13 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --out) OUT="$2"; shift 2 ;;
         --report) REPORT="$2"; shift 2 ;;
+        --dispatch) DISPATCH="${2:-}"; shift 2 ;;
         -h|--help) sed -n '2,12p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "record-contract-fixtures: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+case "$DISPATCH" in legacy|worker) ;; *) echo "record-contract-fixtures: --dispatch must be legacy or worker" >&2; exit 2 ;; esac
 
 for tool in go python3 jq git; do
     command -v "$tool" >/dev/null 2>&1 || { echo "record-contract-fixtures: $tool is required" >&2; exit 2; }
@@ -153,7 +163,7 @@ install_claude() {
     {
         printf '#!/usr/bin/env bash\nMOCK_CLAUDE_BIN=%q\n' "$PLUGIN/tests/mock_claude"
         cat <<'CLAUDE'
-ROOT="${MOTHER_LIVE_ROOT:-${MOTHER_ROOT:-}}"
+ROOT="${MOTHER_REC_ROOT:-${MOTHER_LIVE_ROOT:-${MOTHER_ROOT:-}}}"
 agent=""; prev=""
 for a in "$@"; do
     if [ "$prev" = "--agent" ]; then agent="$a"; break; fi
@@ -235,6 +245,10 @@ new_scenario() {
     install_claude
     install_rwx
     mkdir -p "$MOTHER_ROOT/rv" "$MOTHER_ROOT/plans"
+    # The scripted claude reads its behaviour files from the canonical root even when it runs inside the
+    # worker (whose own MOTHER_ROOT is the worker root).
+    export MOTHER_REC_ROOT="$MOTHER_ROOT"
+    [ "$DISPATCH" != "worker" ] || start_worker_path
 
     ORIGIN="$MOTHER_ROOT/origin.git"
     REPO="$MOTHER_ROOT/work/admin-portal"
@@ -267,6 +281,42 @@ new_scenario() {
 }
 
 die() { echo "record-contract-fixtures: $SCN: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# --dispatch worker: the coordinator and the local worker, started the way mother-runner starts them
+# (registration over an inherited fd, the worker's secret over another).
+
+WORKER_ROOT=""
+start_worker_path() {
+    local reg secret pid
+    WORKER_ROOT="$MOTHER_WORKER_ROOT/local"
+    mkdir -p "$WORKER_ROOT" "$MOTHER_ROOT/runner/coord" "$MOTHER_ROOT/runner/dispatch"
+    chmod 700 "$MOTHER_ROOT/runner/coord"
+    reg="$SCRATCH/$SCN.reg.fifo"; rm -f "$reg"; mkfifo -m 600 "$reg"
+    secret=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    # The worker's own root has its own gh stand-in fixtures (it runs the supervisor against that root).
+    ( MOTHER_ROOT="$WORKER_ROOT"; gh_mock_install ) >/dev/null 2>&1
+    ( cd / && exec mother-coord --secrets-fd 4 ) 4<>"$reg" >>"$SCRATCH/$SCN.coord.log" 2>&1 3>&- &
+    BG_PIDS="$BG_PIDS $!"
+    wait_for 200 '[ -S "$MOTHER_ROOT/runner/coord/worker.sock" ]' || die "coordinator socket did not appear"
+    ( cd / && exec env -u JOBS_DIR -u EVENTS_DIR -u LOGS_DIR -u DRAFTS_DIR -u CURSORS_DIR -u RUNNER_DIR \
+        -u ARCHIVE_DIR -u TEARDOWN_DIR MOTHER_ROOT="$WORKER_ROOT" \
+        mother-worker --id local --root "$WORKER_ROOT" --coord-sock "$MOTHER_ROOT/runner/coord/worker.sock" \
+        --slots 2 --secret-fd 4 ) 4< <(printf '%s\n' "$secret") >>"$SCRATCH/$SCN.worker.log" 2>&1 3>&- &
+    pid=$!
+    BG_PIDS="$BG_PIDS $pid"
+    printf 'local=%s=%s\n' "$pid" "$secret" 1<>"$reg"
+    wait_for 300 'mother-coord --status-json 2>/dev/null | jq -e "[.workers[]? | select(.id == \"local\" and .connected == true)] | length == 1" >/dev/null' \
+        || die "the local worker did not connect to the coordinator"
+}
+
+# stop_worker_path — before the tree is deleted: the worker root carries a marker safe_rm_tree refuses.
+stop_worker_path() {
+    [ -z "$WORKER_ROOT" ] || rm -f "$WORKER_ROOT/.mother-worker-live"
+}
+
+# lease_state — the job's lease state ("" before the coordinator wrote one).
+lease_state() { jq -r '.state // empty' "$MOTHER_ROOT/runner/leases/$JOB.json" 2>/dev/null; }
 
 # wait_for <tries> <shell-test> — poll every 0.1s.
 wait_for() {
@@ -362,15 +412,33 @@ PY
     bash -c 'source "$MOTHER_LIB_DIR/state.sh"; _promote_ready' >/dev/null 2>&1
     [ "$(job_field .state)" = ready ] || die "job $JOB did not become ready"
     gh_mock_set_pr "$PR_URL" OPEN "feature/rec-$SCN"
+    [ "$DISPATCH" != "worker" ] || ( MOTHER_ROOT="$WORKER_ROOT"; gh_mock_set_pr "$PR_URL" OPEN "feature/rec-$SCN" )
 }
 
 # run_job_bg — the real supervisor, in the background.
 run_job_bg() {
+    if [ "$DISPATCH" = "worker" ]; then
+        # Same hand-over mother-runner makes, except the job stays `ready`: the supervisor makes the
+        # ready -> running transition itself, as it does here in legacy mode.
+        printf '{"job":"%s"}\n' "$JOB" > "$MOTHER_ROOT/runner/dispatch.tmp.$JOB"
+        mv "$MOTHER_ROOT/runner/dispatch.tmp.$JOB" "$MOTHER_ROOT/runner/dispatch/$JOB.json"
+        return 0
+    fi
     mother-run-job "$JOB" >"$SCRATCH/$SCN.run-job.out" 2>&1 3>&- &
     RUN_PID=$!
     BG_PIDS="$BG_PIDS $RUN_PID"
 }
-wait_run() { wait "$RUN_PID" 2>/dev/null; true; }
+wait_run() {
+    if [ "$DISPATCH" = "worker" ]; then
+        wait_for 6000 '[ "$(lease_state)" = released ] || [ "$(lease_state)" = lost ]' || die "the lease was never released"
+        # What mother-runner does for a released-as-succeeded lease: derive `succeeded` after verifying the remote.
+        if [ "$(jq -r '.end_reason // empty' "$MOTHER_ROOT/runner/leases/$JOB.json")" = succeeded ]; then
+            bash "$PLUGIN/lib/coord_apply.sh" --finalize "$MOTHER_ROOT" "$JOB" || die "finalize refused the job"
+        fi
+        return 0
+    fi
+    wait "$RUN_PID" 2>/dev/null; true
+}
 
 # worker_behave <n> <snippet> / hold_worker <n> / release_worker <n>
 worker_behave() { printf '%s\n' "$2" > "$MOTHER_ROOT/behave.$1"; }
@@ -391,6 +459,7 @@ finish() {
     grep -rlF "$SENTINEL" "$MOTHER_ROOT/crew/$JOB" "$MOTHER_ROOT/checklists" 2>/dev/null \
         | sed "s|^$MOTHER_ROOT/||; s|/$JOB/|/<job>/|; s|$JOB|<job>|" | sort > "$SCRATCH/$SCN.sidefiles" || true
     _stop_all
+    stop_worker_path
     teardown_mother_env
 }
 
