@@ -369,8 +369,13 @@ _ss_subs() {
         | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t"))'
 }
 
-# _ss_norm_job <file> — the job document, normalised.
-_ss_norm_job() { jq -S --argjson subs "$(_ss_subs)" "$(_ss_norm_filter)" "$1"; }
+# _ss_norm_job <file> — the job document, normalised. The supervisor's usage poll writes live_cost_usd /
+# live_tokens (and the progress observer's progress / last_progress_at) on its own clock, so whether a poll
+# landed before the run ended is timing, not contract: dropped from BOTH documents. Every other key is compared.
+_ss_norm_job() {
+    jq -S --argjson subs "$(_ss_subs)" \
+        "del(.live_cost_usd, .live_tokens, .progress, .last_progress_at) | $(_ss_norm_filter)" "$1"
+}
 
 # _ss_norm_events <file> — the event stream as a normalised JSON array. `final_result_observed` is a
 # poll-loop race, not part of the contract (the contract recorder drops it too).

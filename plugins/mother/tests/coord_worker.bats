@@ -126,6 +126,12 @@ cat <<'EOF'
 {"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.004,"modelUsage":{"claude-sonnet-5":{"costUSD":0.004,"inputTokens":1000,"outputTokens":200}}}
 EOF
 [ "$SLEEP" = "0" ] || sleep "$SLEEP"
+# GATE=1: hold the run until the test creates $ROOT/release (capped at 150 s), so a test that needs the job
+# alive across several steps waits on observable state, not on a fixed sleep that a loaded host can outrun.
+if [ "${GATE:-}" = "1" ]; then
+    _g=0
+    while [ ! -e "$ROOT/release" ] && [ "$_g" -lt 600 ]; do sleep 0.25; _g=$(( _g + 1 )); done
+fi
 exit "$EXIT"
 CLAUDE
     chmod +x "$_MOCK_BIN/claude"
@@ -155,6 +161,9 @@ _cw_dump() {
     echo "--- leases" >&2;      cat "$CW_C"/runner/leases/*.json >&2 2>/dev/null || true
     echo "--- audit" >&2;       cat "$CW_C/runner/leases/audit.jsonl" >&2 2>/dev/null || true
     echo "--- status" >&2;      cat "$CW_C/runner/coord-status.json" >&2 2>/dev/null || true
+    echo "--- mirror jobs (state)" >&2; for f in "$CW_W"/jobs/*.json; do [ -f "$f" ] && jq -c '{id, state, activity, paused_reason, finished_at}' "$f" >&2; done 2>/dev/null
+    echo "--- outbox last seq / release flag" >&2; cat "$CW_W"/outbox/*.seq >&2 2>/dev/null; ls "$CW_CLAUDE_DIR" >&2 2>/dev/null
+    echo "--- run-job.out" >&2; tail -n 15 "$CW_W/run-job.out" "$CW_C"/runner/*.out >&2 2>/dev/null || true
     for f in "$CW_W"/logs/*.log; do [ -f "$f" ] && { echo "--- $f" >&2; tail -n 15 "$f" >&2; }; done
     true
 }
@@ -260,7 +269,11 @@ _cw_prepare() {
            }'
     mkdir -p "$CW_CLAUDE_DIR"
     touch "$CW_CLAUDE_DIR/ge-no-pr-url"
-    printf 'SLEEP=%s\n' "$sleep_s" > "$CW_CLAUDE_DIR/ge-behave.1"
+    if [ "$sleep_s" = "gate" ]; then
+        printf 'SLEEP=0\nGATE=1\n' > "$CW_CLAUDE_DIR/ge-behave.1"
+    else
+        printf 'SLEEP=%s\n' "$sleep_s" > "$CW_CLAUDE_DIR/ge-behave.1"
+    fi
 }
 
 _cw_run_job() { mother-run-job "$1" > "$MOTHER_ROOT/run-job.out" 2>&1; }
@@ -442,7 +455,7 @@ _cw_subs() {
 # _cw_norm_job <file> — the worker-settable part of the job document (plus the canonical cost), normalised.
 _cw_norm_job() {
     jq -S --argjson subs "$(_cw_subs)" --argjson wk "$CW_WORKER_KEYS" \
-        "$(_cw_norm_filter) | with_entries(select(.key as \$k | \$wk | index(\$k)))" "$1"
+        "del(.live_cost_usd, .live_tokens) | $(_cw_norm_filter) | with_entries(select(.key as \$k | \$wk | index(\$k)))" "$1"
 }
 
 _cw_norm_events() {
@@ -534,7 +547,7 @@ _cw_same() {
 @test "coordinator restarts mid-job, once briefly and once for longer than the lease TTL: no events lost or doubled and the lease is never lost" {
     local id="cw-coordrestart" hb
     CW_TTL=6
-    _cw_boot "$id" 28
+    _cw_boot "$id" gate
     _cw_dispatch "$id"
     _cw_must 30 "the job's claude to start" _cw_claude_started
     _cw_must 20 "the lease to be active" _cw_lease_is "$id" active
@@ -554,6 +567,9 @@ _cw_same() {
     _cw_start_coord
     _cw_must 25 "a heartbeat to reach the coordinator after the long outage" _cw_hb_moved "$id" "$hb"
 
+    # Both outages are over and the lease was active throughout: now let the job finish.
+    _cw_lease_is "$id" active
+    : > "$CW_CLAUDE_DIR/release"
     _cw_must 90 "the lease to be released" _cw_lease_is "$id" released
     _cw_mirror_state_is "$id" succeeded
     [ "$(cat "$CW_CLAUDE_DIR/ge-count")" = "1" ]

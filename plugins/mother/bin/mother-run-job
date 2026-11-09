@@ -2443,9 +2443,19 @@ _install_core_job_helpers() {
         if _outbox_on; then mother_outbox_job_set "$_jid" "$_before" "$_merged" || return 1; fi
         return 0
     }
+    # Read-modify-write under the job-file lock (re-entrant in this shell, so callers that already hold it
+    # are fine). Unlocked, a poll-loop write could read the document, let the worker's `mother await` land,
+    # then write the stale document back over state=awaiting: the await is lost and the job finishes succeeded.
     _job_update() {
+        _with_lock "$job_file" _job_update_locked "$1"
+    }
+    _job_update_locked() {
         local filter="$1"
         local merged; merged=$(jq "$filter" "$job_file") || return 1
+        # Test seam (MOTHER_TEST_ROOT=1 only): widen the read-to-write window.
+        if [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ -n "${MOTHER_TEST_JOB_UPDATE_DELAY_S:-}" ]; then
+            sleep "$MOTHER_TEST_JOB_UPDATE_DELAY_S"
+        fi
         _job_write_doc "$merged"
     }
     _transition() {
@@ -3183,7 +3193,7 @@ export MOTHER_LIVE_ROOT="$MOTHER_ROOT"
 unset MOTHER_ROOT
 $worker_mode_export
 # Docker Compose reads COMPOSE_PROJECT_NAME automatically, so any
-# `docker compose up` the worker runs lands in a job-scoped project with
+# "docker compose up" the worker runs lands in a job-scoped project with
 # zero convention-following required by the plan or the agent. Mother tears
 # this project down once the job's PR is merged/closed (see lib/teardown.sh).
 export COMPOSE_PROJECT_NAME="$compose_project"

@@ -178,20 +178,20 @@ mother_job_update() {
     local _jobpath merged
     _jobpath=$(_job_path "$id")
     [ -f "$_jobpath" ] || { echo "mother: no such job: $id" >&2; return 1; }
-    if mother_outbox_enabled; then
-        # Read, merge, write and diff under the job lock: the op shipped is the diff against what
-        # is really on disk, so a concurrent writer's change can neither be reverted nor lost.
-        _with_lock "$_jobpath" _mother_job_update_locked "$_jobpath" "$filter" "$@"
-        return $?
-    fi
-    merged=$(jq "$@" "$filter" "$_jobpath") || return 1
-    _atomic_write "$_jobpath" "$merged"
+    # Always under the job lock: the read, merge and write of the whole document must not interleave with
+    # another writer's, or the later write puts the earlier writer's change back (a lost `mother await`).
+    # In worker mode the op shipped is also the diff against what is really on disk.
+    _with_lock "$_jobpath" _mother_job_update_locked "$_jobpath" "$filter" "$@"
 }
 
 _mother_job_update_locked() {
     local _jobpath="$1" filter="$2" merged
     shift 2
     merged=$(jq "$@" "$filter" "$_jobpath") || return 1
+    # Test seam (MOTHER_TEST_ROOT=1 only): widen the read-to-write window.
+    if [ "${MOTHER_TEST_ROOT:-}" = "1" ] && [ -n "${MOTHER_TEST_JOB_UPDATE_DELAY_S:-}" ]; then
+        sleep "$MOTHER_TEST_JOB_UPDATE_DELAY_S"
+    fi
     mother_job_write_doc "$_jobpath" "$merged"
 }
 
