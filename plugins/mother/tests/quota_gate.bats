@@ -121,6 +121,9 @@ _fake_run_job() {
     printf '#!/usr/bin/env bash\necho "$*" >> "%s/run-job-calls"\nexit 0\n' "$MOTHER_ROOT" > "$FAKE_BIN/mother-run-job"
     chmod +x "$FAKE_BIN/mother-run-job"
     export MOTHER_POSTURE_ENABLED=0 MOTHER_CONCURRENCY=3
+    # These tests count the supervisors the runner FORKS (the stand-in above): the legacy seam, whatever the
+    # worker-mode CI job (MOTHER_TEST_DISPATCH_MODE=worker) exports.
+    export MOTHER_DISPATCH_MODE=legacy
 }
 
 # Fail fast (instead of letting mother-runner start a real daemon loop) when a test entry point is missing.
@@ -1036,6 +1039,7 @@ _job_state() { jq -r .state "$JOBS_DIR/$1.json"; }
     printf '#!/usr/bin/env bash\necho "$*" >> "%s/run-job-calls"\nexit 0\n' "$MOTHER_ROOT" > "$fake/mother-run-job"
     chmod +x "$fake/mother-run-job"
     export MOTHER_POSTURE_ENABLED=0 MOTHER_CONCURRENCY=2
+    export MOTHER_DISPATCH_MODE=legacy   # counts the supervisors the runner forks (see _fake_run_job)
     make_job gated-1 ready ".repo_path = \"$MOTHER_ROOT\""
     MOTHER_BIN_DIR="$fake" mother-runner --dispatch-tick >/dev/null 2>&1 || true
     [ "$(_job_state gated-1)" = "ready" ]

@@ -81,6 +81,16 @@ setup_mother_env() {
     # (limiter_*.bats, contract.bats) opt back in with `unset MOTHER_LIMITER_MODE` after this setup.
     export MOTHER_LIMITER_MODE=off
 
+    # Dispatch mode (cluster P1-5). The worker root is ALWAYS a temp dir inside the test tree, never $HOME,
+    # so a test (or a runner it starts) can never create ~/.mother-worker. MOTHER_TEST_DISPATCH_MODE=worker
+    # runs the suite's lifecycle files through the coordinator and the local worker (the CI worker-mode job);
+    # anything else leaves MOTHER_DISPATCH_MODE unset, i.e. legacy.
+    unset MOTHER_DISPATCH_MODE
+    export MOTHER_WORKER_ROOT="$MOTHER_ROOT/worker-root"
+    if [ "${MOTHER_TEST_DISPATCH_MODE:-}" = "worker" ]; then
+        export MOTHER_DISPATCH_MODE=worker
+    fi
+
     # Default: mock_claude exits 0
     export MOCK_CLAUDE_EXIT=0
     # Default: mock_claude records args to this file

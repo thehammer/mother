@@ -98,24 +98,46 @@ _outbox_max_file() { printf '%s' "${MOTHER_OUTBOX_MAX_BYTES:-536870912}"; }
 # line + 1: the file is the one source of truth, so a failed side write can never reuse a seq) and
 # append one op line. A file whose last byte is not a newline (a torn earlier append) is terminated
 # first so the new op never shares a line with the wreckage.
-# The op's data arrives on stdin (never argv: artifact chunks exceed the per-argument limit).
+# The op's data arrives on stdin (never argv: artifact chunks exceed the per-argument limit), or, for
+# the callers that built it with `jq -c` themselves (job.set, event.append, record.append), in
+# $_OUTBOX_DATA with $_OUTBOX_TRUSTED=1: one compact line of valid JSON, so the op line is assembled by
+# string concatenation instead of one more jq. This runs on every state write of a worker-mode job, so
+# it spends as few processes as it can (worker-mode dispatch latency, cluster P1-5).
 _outbox_emit_locked() {
-    local ndjson="$1" seqfile="$2" type="$3" ts="$4" seq=0 line size
+    local ndjson="$1" seqfile="$2" type="$3" ts="$4" seq=0 line size last repaired=0
     if [ -s "$ndjson" ]; then
-        if [ -n "$(tail -c 1 "$ndjson" | tr -d '\n')" ]; then
+        # $(...) strips the newline: anything left means the last byte was not one.
+        if [ -n "$(tail -c 1 "$ndjson")" ]; then
             printf '\n' >> "$ndjson" || { echo "cannot repair torn outbox tail" >&2; return 1; }
+            repaired=1
         fi
-        seq=$(tail -n 50 "$ndjson" | jq -Rr 'fromjson? | select(type == "object") | .seq | select(type == "number")' 2>/dev/null | tail -n 1)
+        # Our own lines start {"seq":N, — trust the last line unless a torn tail was just terminated.
+        if [ "$repaired" -eq 0 ]; then
+            last=$(tail -n 1 "$ndjson")
+            case "$last" in
+                '{"seq":'[0-9]*,*) seq="${last#\{\"seq\":}"; seq="${seq%%,*}" ;;
+            esac
+            case "$seq" in ''|*[!0-9]*) seq="" ;; esac
+        else
+            seq=""
+        fi
         if [ -z "$seq" ]; then
-            seq=$(jq -Rr 'fromjson? | select(type == "object") | .seq | select(type == "number")' "$ndjson" 2>/dev/null | tail -n 1)
+            seq=$(tail -n 50 "$ndjson" | jq -Rr 'fromjson? | select(type == "object") | .seq | select(type == "number")' 2>/dev/null | tail -n 1)
+            if [ -z "$seq" ]; then
+                seq=$(jq -Rr 'fromjson? | select(type == "object") | .seq | select(type == "number")' "$ndjson" 2>/dev/null | tail -n 1)
+            fi
         fi
         case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
     fi
     seq=$((seq + 1))
-    line=$(jq -c --argjson seq "$seq" --arg t "$type" --arg ts "$ts" \
-        '{seq: $seq, t: $t, ts: $ts, data: .}') || { echo "jq could not build the op" >&2; return 1; }
+    if [ "${_OUTBOX_TRUSTED:-0}" = "1" ]; then
+        line="{\"seq\":$seq,\"t\":\"$type\",\"ts\":\"$ts\",\"data\":$_OUTBOX_DATA}"
+    else
+        line=$(jq -c --argjson seq "$seq" --arg t "$type" --arg ts "$ts" \
+            '{seq: $seq, t: $t, ts: $ts, data: .}') || { echo "jq could not build the op" >&2; return 1; }
+    fi
     [ -n "$line" ] || { echo "empty op" >&2; return 1; }
-    if [ "$(printf '%s' "$line" | wc -c | tr -d ' ')" -gt "$(_outbox_max_op)" ]; then
+    if [ "$(_outbox_bytes "$line")" -gt "$(_outbox_max_op)" ]; then
         echo "op larger than MOTHER_OUTBOX_MAX_OP_BYTES" >&2; return 1
     fi
     size=$(wc -c < "$ndjson" 2>/dev/null | tr -d ' ')
@@ -127,6 +149,9 @@ _outbox_emit_locked() {
     { printf '%s' "$seq" > "${seqfile}.tmp.$$" && mv "${seqfile}.tmp.$$" "$seqfile"; } 2>/dev/null || true
     return 0
 }
+
+# Byte length of a string with no process: the C locale makes ${#} count bytes.
+_outbox_bytes() { local LC_ALL=C; printf '%s' "${#1}"; }
 
 # mother_outbox_emit <job> <type> [<data-json>|-]
 # Appends one op. Data is the 3rd argument, or stdin when it is "-" or omitted.
@@ -141,25 +166,26 @@ mother_outbox_emit() {
         echo "mother: outbox for $job is degraded; not shipping $type op" >&2
         return 1
     fi
-    mkdir -p "$dir" 2>/dev/null && [ -d "$dir" ] && [ -w "$dir" ] \
+    { [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null; } && [ -d "$dir" ] && [ -w "$dir" ] \
         || { _outbox_fail "$job" "$type" "outbox dir $dir is not a writable directory"; return 1; }
     ndjson="$dir/$job.ndjson"
     ts=$(_iso_now)
-    err=$(mktemp "${TMPDIR:-/tmp}/outbox-err.XXXXXX" 2>/dev/null) || err=/dev/null
+    # The locked step's stderr is captured by the substitution (no temp file to make and remove).
     if [ "$data" = "-" ]; then
-        _switch_with_lock "${ndjson}.lockdir" "$ndjson" 200 \
-            _outbox_emit_locked "$ndjson" "$dir/$job.seq" "$type" "$ts" 2>"$err"
+        err=$(_switch_with_lock "${ndjson}.lockdir" "$ndjson" 200 \
+            _outbox_emit_locked "$ndjson" "$dir/$job.seq" "$type" "$ts" 2>&1)
+    elif [ "${_OUTBOX_TRUSTED:-0}" = "1" ]; then
+        err=$(_OUTBOX_DATA="$data" _switch_with_lock "${ndjson}.lockdir" "$ndjson" 200 \
+            _outbox_emit_locked "$ndjson" "$dir/$job.seq" "$type" "$ts" 2>&1)
     else
-        printf '%s' "$data" | _switch_with_lock "${ndjson}.lockdir" "$ndjson" 200 \
-            _outbox_emit_locked "$ndjson" "$dir/$job.seq" "$type" "$ts" 2>"$err"
+        err=$(printf '%s' "$data" | _switch_with_lock "${ndjson}.lockdir" "$ndjson" 200 \
+            _outbox_emit_locked "$ndjson" "$dir/$job.seq" "$type" "$ts" 2>&1)
     fi
     rc=$?
     if [ "$rc" -ne 0 ]; then
-        _outbox_fail "$job" "$type" "$(head -c 200 "$err" 2>/dev/null | tr '\n' ' ')"
-        [ "$err" = /dev/null ] || rm -f "$err"
+        _outbox_fail "$job" "$type" "$(printf '%s' "$err" | head -c 200 | tr '\n' ' ')"
         return 1
     fi
-    [ "$err" = /dev/null ] || rm -f "$err"
     return 0
 }
 
@@ -168,7 +194,7 @@ mother_outbox_event() {
     mother_outbox_enabled || return 0
     local job="$1" data
     data=$(jq -nc --arg l "$2" '{line: $l}') || { _outbox_fail "$job" event.append "jq could not build the op"; return 1; }
-    mother_outbox_emit "$job" event.append "$data"
+    _OUTBOX_TRUSTED=1 mother_outbox_emit "$job" event.append "$data"
 }
 
 # mother_outbox_record <job> <stream> <row-line> — record.append for one usage-stream row.
@@ -176,7 +202,7 @@ mother_outbox_record() {
     mother_outbox_enabled || return 0
     local job="$1" data
     data=$(jq -nc --arg s "$2" --arg l "$3" '{stream: $s, line: $l}') || { _outbox_fail "$job" record.append "jq could not build the op"; return 1; }
-    mother_outbox_emit "$job" record.append "$data"
+    _OUTBOX_TRUSTED=1 mother_outbox_emit "$job" record.append "$data"
 }
 
 # mother_outbox_job_set <job> <before-json> <after-json>
@@ -194,7 +220,7 @@ mother_outbox_job_set() {
         | if (.set | length) == 0 and (.del | length) == 0 then empty else . end') \
         || { _outbox_fail "$job" job.set "jq could not diff the job documents"; return 1; }
     [ -n "$data" ] || return 0
-    mother_outbox_emit "$job" job.set "$data"
+    _OUTBOX_TRUSTED=1 mother_outbox_emit "$job" job.set "$data"
 }
 
 # mother_outbox_artifact <job> <relpath>

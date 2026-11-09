@@ -338,6 +338,31 @@ print("false")
 PYEOF
 }
 
+# _parse_via_worker <plan_file>
+# Returns "true" if the plan's YAML block contains `via_worker: true` (cluster P1-5: send this job through the
+# coordinator and the local worker even while MOTHER_DISPATCH_MODE is legacy), else "false".
+_parse_via_worker() {
+    local plan_file="$1"
+    python3 - "$plan_file" <<'PYEOF' 2>/dev/null || echo "false"
+import sys, re
+try:
+    import yaml
+except ImportError:
+    print("false"); sys.exit(0)
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    content = f.read()
+
+blocks = re.findall(r'```yaml\n(.*?)```', content, re.DOTALL)
+for block in blocks:
+    if 'suggested_config' in block:
+        data = yaml.safe_load(block.strip()) or {}
+        print("true" if data.get("via_worker", False) is True else "false")
+        sys.exit(0)
+print("false")
+PYEOF
+}
+
 # _plan_target_branch <plan_file>
 # Extracts the branch named on a "- **Branch:** ..." line inside the plan's
 # `## Target` section, or empty if there is no Target section or no Branch
@@ -634,7 +659,7 @@ cmd_add() {
     local format="text" title=""
     local origin_label="" origin_project_override="" origin_session=""
     local origin_focus="" origin_focus_name=""
-    local expect_branch_mismatch_flag=0 priority_flag=""
+    local expect_branch_mismatch_flag=0 priority_flag="" via_worker_flag=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -655,6 +680,7 @@ cmd_add() {
             --origin-focus)     origin_focus="$2"; shift 2 ;;
             --origin-focus-name) origin_focus_name="$2"; shift 2 ;;
             --expect-branch-mismatch) expect_branch_mismatch_flag=1; shift ;;
+            --via-worker)       via_worker_flag=1; shift ;;
             --priority)         [ $# -ge 2 ] || _die "add: --priority needs a value"; priority_flag="$2"; shift 2 ;;
             *) _die "unknown flag for add: $1" ;;
         esac
@@ -767,6 +793,17 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         expect_branch_mismatch_flag_str="false"
     fi
 
+    # dispatch_via: "worker" from --via-worker or the plan's `via_worker: true` (optional, additive: absent
+    # for every other job, so job JSON is unchanged).
+    local via_worker_json="false"
+    if [ "$via_worker_flag" -eq 1 ] || [ "$(_parse_via_worker "$plan_file")" = "true" ]; then
+        via_worker_json="true"
+        # The runner's cheap per-tick check for "is the worker path in play" is the existence of this directory.
+        mkdir -p "$RUNNER_DIR/dispatch" 2>/dev/null || true
+        # Tells the runner a worker-path job may be waiting (it removes the marker when none is live).
+        : > "$RUNNER_DIR/worker-jobs" 2>/dev/null || true
+    fi
+
     # Parse the pipeline config (optional; absent -> non-pipeline job).
     local pipeline_config_json is_pipeline
     pipeline_config_json=$(_parse_pipeline_config "$plan_file")
@@ -859,6 +896,7 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         --argjson suggested_config "$suggested_config_json" \
         --argjson no_pr "$no_pr_json" \
         --argjson expect_branch_mismatch "$expect_branch_mismatch_flag_str" \
+        --argjson via_worker "$via_worker_json" \
         --arg cost_model "$cost_model" \
         --arg origin_cwd "$origin_cwd" \
         --arg origin_project "$origin_project" \
@@ -888,7 +926,7 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
             current_tier: "tier_0",
             escalation_count: 0,
             adherence_attempts: 0
-        }')
+        } + (if $via_worker then {dispatch_via: "worker"} else {} end)')
     # Acceptance-criteria checklist (HC-10). The source is fixed here for life.
     mother_criteria_seed "$id" "$plan_file" || _die "could not seed checklist for $id"
     job_json=$(printf '%s' "$job_json" | jq '. + {criteria_source: "checklist"}')
@@ -1227,6 +1265,43 @@ _effective_concurrency() {
     )
 }
 
+# _effective_dispatch_mode: {value, source, daemon} — the runner's published mode when it is running, else
+# resolved from this shell (env, then config.env, else legacy) the way the runner would.
+_effective_dispatch_mode() {
+    local f="$RUNNER_DIR/effective-config.json" pid
+    if [ -f "$f" ]; then
+        pid=$(jq -r '.pid // 0' "$f" 2>/dev/null)
+        if [ "${pid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null \
+            && [ "$(jq -r '.dispatch_mode // empty' "$f" 2>/dev/null)" != "" ]; then
+            jq -c '{value: .dispatch_mode, source: .dispatch_mode_source, daemon: true}' "$f" 2>/dev/null && return 0
+        fi
+    fi
+    (
+        mother_config_load
+        local v="${MOTHER_DISPATCH_MODE:-legacy}"
+        case "$v" in legacy|worker) ;; *) v=legacy ;; esac
+        jq -nc --arg v "$v" --arg s "$(mother_config_source MOTHER_DISPATCH_MODE)" '{value: $v, source: $s, daemon: false}'
+    )
+}
+
+# _status_worker_lines <id> <job_file>: MC-1 / MC-2 (local form), CLI only. A leased job names its worker, the
+# lease epoch and the heartbeat age; a job waiting on a dispatch request says why. Job JSON is untouched.
+_status_worker_lines() {
+    local id="$1" lf="$RUNNER_DIR/leases/$1.json" df="$RUNNER_DIR/dispatch/$1.json" line wait_reason
+    if [ -f "$lf" ]; then
+        line=$(jq -r --argjson now "$(date +%s)" '
+            def epoch: sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null;
+            "worker: \(.worker_id // "?") (lease e\(.epoch // "?")"
+            + (if (.last_hb // "") != "" and ((.last_hb | epoch) != null) then ", hb \($now - (.last_hb | epoch))s ago" else "" end)
+            + (if (.state // "") != "" and (.state | IN("offered","active") | not) then ", \(.state)" else "" end) + ")"' "$lf" 2>/dev/null)
+        [ -z "$line" ] || echo "$line"
+    fi
+    if [ -f "$df" ]; then
+        wait_reason=$(jq -r '.wait_reason // empty' "$df" 2>/dev/null)
+        [ -z "$wait_reason" ] || echo "waiting: $wait_reason"
+    fi
+}
+
 # "Rust build dirs: ..." status line from the cargo-targets.json cache (only
 # when it lists any dirs).
 _status_rust_dirs_line() {
@@ -1301,6 +1376,7 @@ _status_overview() {
                auto_resumes: ((.paused_reason // "") | (startswith("quota_") or . == "limiter_hold"))})')
 
     local conc; conc=$(_effective_concurrency)
+    local dmode; dmode=$(_effective_dispatch_mode)
     local limiter; limiter=$(_limiter_block_json)
     # Rust build-dir inventory written by `mother gc` (lib/gc.sh); null when absent.
     local rust_dirs
@@ -1308,14 +1384,17 @@ _status_overview() {
     [ -n "$rust_dirs" ] || rust_dirs="null"
     if [ "$format" = "json" ]; then
         jq -nc --argjson counts "$counts" --argjson awaiting "$awaiting" --argjson na "$items" \
-            --argjson conc "$conc" --argjson rust "$rust_dirs" --argjson lim "$limiter" \
-            '{counts: $counts, awaiting: $awaiting, needs_attention: $na, concurrency: $conc, limiter: $lim, rust_build_dirs: $rust}'
+            --argjson conc "$conc" --argjson rust "$rust_dirs" --argjson lim "$limiter" --argjson dm "$dmode" \
+            '{counts: $counts, awaiting: $awaiting, needs_attention: $na, concurrency: $conc, dispatch_mode: $dm, limiter: $lim, rust_build_dirs: $rust}'
         return 0
     fi
 
     mother_drain_status_line
     echo "Concurrency: $(printf '%s' "$conc" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
     _status_rust_dirs_line "$rust_dirs"
+    # Legacy output is unchanged from before the cluster work: the line appears only in worker mode.
+    [ "$(printf '%s' "$dmode" | jq -r .value)" = "legacy" ] || \
+        echo "Dispatch mode: $(printf '%s' "$dmode" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
     jq -r 'select(type == "object" and .at) | "Last snapshot thin: \(.at), freed \(.freed_gb) GB (thinned \(.thinned))\(if .exit != 0 then " [tmutil exit \(.exit)]" else "" end)"' \
         "$RUNNER_DIR/snapshot-thin.json" 2>/dev/null || true
     _limiter_text "$limiter" compact
@@ -1474,6 +1553,7 @@ cmd_status() {
         fi
         local _lw; _lw=$(jq -r 'if (.state == "ready" or .state == "queued") and (.limiter.wait.reason // "") != "" then .limiter.wait.reason else empty end' "$job_file" 2>/dev/null) || _lw=""
         [ -z "$_lw" ] || echo "Waiting: $_lw"
+        _status_worker_lines "$id" "$job_file"
         _status_limiter_hold "$job_file"
         if [ "$activity" = "adherence_blocked" ]; then
             echo ""
@@ -2052,7 +2132,15 @@ _cancel_locked() {
         running)        # Leave a cancel request; runner picks it up
                         _job_update "$id" '.cancel_requested = true'
                         _append_event "$id" "cancel_requested" '{}'
-                        echo "cancel requested; runner will stop on next tick"
+                        if [ -f "$RUNNER_DIR/dispatch/$id.json" ]; then
+                            # Worker path: the job was handed to the coordinator but no worker has taken it
+                            # (the request is consumed when a lease is offered). Nothing runs, so withdraw the
+                            # request and cancel now instead of leaving it `running` forever.
+                            rm -f "$RUNNER_DIR/dispatch/$id.json"
+                            _job_transition "$id" cancelled '{"reason":"user"}'
+                        else
+                            echo "cancel requested; runner will stop on next tick"
+                        fi
                         ;;
         *) _die "cannot cancel job in state: $state" ;;
     esac
@@ -5483,6 +5571,8 @@ Usage:
                                               acked until the condition clears and returns. Operator-only)
   mother quota status [--json]               (quota gate: state, feed source/age, per-window used %/cap/reset)
   mother quota on|off|off-until-reset        (off passes everything; off-until-reset until the first 5h/7d reset)
+  mother workers [--json]                    (cluster: the local worker, its caps, approved data classes, connection,
+                                              heartbeat age and jobs; "coordinator not running" in legacy mode)
   mother limiter mode [observe|enforce|off] [--source cli]   (no argument prints it; setting is human-only and audited.
                                               enforce lets the limiter control admission of NEW work)
   mother limiter [status] [--json]           (backpressure limiter: allowed vs effective concurrency, burn vs
@@ -5570,6 +5660,9 @@ Add options:
                           then \$NOSTROMO_PTY_ID); invalid values are dropped
   --origin-focus-name N  display name for the focus, cleaned and capped at 120 chars
                           (default: \$MOTHER_ORIGIN_FOCUS_NAME)
+  --via-worker         run this job through the coordinator and the local worker even while
+                       MOTHER_DISPATCH_MODE is legacy (burn-in); also `via_worker: true` in the plan's
+                       suggested_config block. Sets dispatch_via: "worker" on the job.
   --expect-branch-mismatch  the worker is deliberately targeting a branch
                             other than --branch (e.g. landing on an existing
                             PR); also settable via the plan's suggested_config
@@ -5613,6 +5706,13 @@ Daemon env vars:
                                                  survives `mother daemon install`.
                                                  `mother status` shows the effective value
                                                  and where it came from.
+  MOTHER_DISPATCH_MODE         (default: legacy) legacy forks mother-run-job per job as always; worker
+                                                 leases jobs through the coordinator to the local worker
+                                                 (mother-worker --id local, root $MOTHER_WORKER_ROOT/local,
+                                                 default ~/.mother-worker/local). Also settable in config.env.
+                                                 A job's dispatch_via ("worker" via `mother add --via-worker`,
+                                                 or "legacy") overrides it per job. `mother status`, `mother
+                                                 workers` and `mother doctor` show the mode and its source.
   MOTHER_POLL_INTERVAL         (default: 2)    seconds between ticks
   MOTHER_SHUTDOWN_GRACE        (default: 30)   seconds to wait for children on stop
   MOTHER_ESCALATION_ENABLED    (default: 1)    auto-escalate failed jobs (0 to disable)
@@ -6215,6 +6315,59 @@ cmd_ack() {
     echo "$id: acknowledged $reason"
 }
 
+# ---------- workers (cluster P1-5) ----------
+
+# mother workers [--json]  (MC-5, local form)
+# From `mother-coord --status-json` plus the lease files: the one local worker, its kind, the data classes it is
+# approved for (Phase 1: the laptop default personal company phi), connection state, heartbeat age and jobs.
+cmd_workers() {
+    local format="text" st running workers_json
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) format="json"; shift ;;
+            --format) format="$2"; shift 2 ;;
+            *) _die "unknown flag for workers: $1 (usage: mother workers [--json])" ;;
+        esac
+    done
+    st=$("$MOTHER_BIN_DIR/mother-coord" --status-json 2>/dev/null) || st=""
+    printf '%s' "$st" | jq -e 'type == "object"' >/dev/null 2>&1 || st='{"running":false,"workers":[],"leases":[]}'
+    running=$(printf '%s' "$st" | jq -r '.running // false')
+    if [ "$running" != "true" ]; then
+        if [ "$format" = "json" ]; then
+            echo '{"coordinator":{"running":false},"workers":[]}'
+        else
+            echo "coordinator not running (dispatch mode: $(_effective_dispatch_mode | jq -r .value))"
+        fi
+        return 0
+    fi
+    workers_json=$(printf '%s' "$st" | jq -c '
+        . as $st
+        | [ $st.workers[]? as $w
+            | ([ $st.leases[]? | select(.worker_id == $w.id and (.state | IN("offered", "active"))) ]) as $live
+            | { id: $w.id,
+                name: $w.id,
+                kind: "laptop",
+                connected: ($w.connected // false),
+                state: (if ($w.connected // false) then "connected" else "disconnected" end),
+                data_classes: ["personal", "company", "phi"],
+                caps: ($w.caps // []),
+                slots: ($w.slots // null),
+                free: ($w.free // null),
+                last_heartbeat_age_s: (if ($live | length) == 0 then null else ([$live[].hb_age_s] | min | floor) end),
+                jobs: [ $live[].job ] } ]')
+    if [ "$format" = "json" ]; then
+        jq -nc --argjson w "$workers_json" '{coordinator: {running: true}, workers: $w}'
+        return 0
+    fi
+    printf '%s' "$workers_json" | jq -r '
+        def pad($n): . + (" " * ([$n - length, 1] | max));
+        (["NAME" | pad(10), "KIND" | pad(8), "STATE" | pad(14), "HB" | pad(8), "CLASSES" | pad(24), "JOBS"] | join("")),
+        (.[] | [ (.name | pad(10)), (.kind | pad(8)), (.state | pad(14)),
+                 ((if .last_heartbeat_age_s == null then "-" else "\(.last_heartbeat_age_s)s" end) | pad(8)),
+                 ((.data_classes | join(",")) | pad(24)),
+                 (if (.jobs | length) == 0 then "-" else (.jobs | join(",")) end) ] | join(""))'
+}
+
 # ---------- dispatch ----------
 
 main() {
@@ -6232,6 +6385,7 @@ main() {
         ack)               cmd_ack "$@" ;;
         quota)             cmd_quota "$@" ;;
         limiter)           cmd_limiter "$@" ;;
+        workers)           cmd_workers "$@" ;;
         priority)          cmd_priority "$@" ;;
         force-start)       cmd_force_start "$@" ;;
         drain)             cmd_drain "$@" ;;

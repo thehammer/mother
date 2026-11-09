@@ -640,6 +640,7 @@ func (s *Server) register(w *workerConn, welcome *workerproto.Welcome) {
 			continue
 		}
 		jl.pending = map[int64]workerproto.Frame{}
+		jl.session++
 		s.adm.SetApplied(jl.job, jl.rec.LeaseID, jl.rec.Epoch, jl.rec.WireSeq)
 		welcome.Jobs = append(welcome.Jobs, workerproto.WelcomeJob{
 			Job: jl.job, Lease: jl.rec.LeaseID, Epoch: jl.rec.Epoch,
@@ -689,8 +690,34 @@ func (s *Server) enqueue(w *workerConn, b []byte) {
 	select {
 	case w.out <- b:
 	default:
-		s.logf("worker %s: send queue full; dropping the connection", w.id)
+		s.logf("worker %s: send queue full (%s); dropping the connection", w.id, queueProfile(w.out))
 		w.close()
+	}
+}
+
+// queueProfile drains a full send queue (its connection is being dropped, and every frame in it is redelivered or
+// re-derived on reconnect) and counts the frames by type, so the log says what flooded it.
+func queueProfile(q chan []byte) string {
+	counts := map[string]int{}
+	for {
+		select {
+		case b := <-q:
+			t := "?"
+			var f struct {
+				T string `json:"t"`
+			}
+			if json.Unmarshal(b, &f) == nil && f.T != "" {
+				t = f.T
+			}
+			counts[t]++
+		default:
+			parts := make([]string, 0, len(counts))
+			for k, n := range counts {
+				parts = append(parts, fmt.Sprintf("%s=%d", k, n))
+			}
+			sort.Strings(parts)
+			return strings.Join(parts, " ")
+		}
 	}
 }
 
@@ -881,13 +908,34 @@ func (s *Server) onStream(w *workerConn, f workerproto.Frame, v workerproto.Verd
 		jl.pending[*f.Seq] = f
 		jl.dirty = true
 		if v == workerproto.Gap {
-			s.sendAck(w, jl, f)
+			s.oweAck(jl, f)
 		}
 		if len(jl.pending) >= s.cfg.FlushOps {
 			s.flushJob(jl)
 		}
 	default: // Duplicate: already applied (or already buffered); re-ack so the worker's window trims.
-		s.sendAck(w, jl, f)
+		s.oweAck(jl, f)
+	}
+}
+
+// oweAck records that a duplicate or out-of-order frame wants a re-ack. The ack is sent once per flush tick per
+// job (see flushAll), whatever number of such frames arrived: a worker that retransmits its window while a slow
+// apply is in progress used to draw one ack per retransmitted frame, which filled the 4096-frame send queue
+// within seconds at five concurrent jobs and dropped the connection in a loop.
+func (s *Server) oweAck(jl *jobLease, f workerproto.Frame) {
+	jl.ackAnchor = &f
+}
+
+func (s *Server) sendOwedAcks() {
+	for _, jl := range s.sortedJobs() {
+		if jl.ackAnchor == nil {
+			continue
+		}
+		f := *jl.ackAnchor
+		jl.ackAnchor = nil
+		if w := s.workers[jl.rec.WorkerID]; w != nil && live(jl.rec.State) {
+			s.sendAck(w, jl, f)
+		}
 	}
 }
 
@@ -905,6 +953,7 @@ func (s *Server) flushAll() {
 			s.flushJob(jl)
 		}
 	}
+	s.sendOwedAcks()
 }
 
 func isOp(t string) bool {
@@ -915,13 +964,16 @@ func isOp(t string) bool {
 // directly, then (apply, persist, commit, ack) in that order. A stalled op (applier error, gap) leaves
 // the rest pending for the next tick.
 func (s *Server) flushJob(jl *jobLease) {
+	if !live(jl.rec.State) {
+		if !jl.applying {
+			jl.pending = map[int64]workerproto.Frame{}
+			jl.dirty = false
+		}
+		return
+	}
+	s.writeEarlyLogs(jl)
 	if jl.applying {
 		return // another flush of this job is in its (unlocked) apply; the next tick continues
-	}
-	if !live(jl.rec.State) {
-		jl.pending = map[int64]workerproto.Frame{}
-		jl.dirty = false
-		return
 	}
 	anchor := workerproto.Frame{Job: workerproto.Str(jl.job), Lease: workerproto.Str(jl.rec.LeaseID), Epoch: workerproto.Int(jl.rec.Epoch)}
 	d, err := s.adm.AckFor(anchor)
@@ -982,7 +1034,7 @@ func (s *Server) flushJob(jl *jobLease) {
 	if len(ops) > 0 {
 		// The applier can take seconds (it execs a script): run it with the mutex released, so heartbeats
 		// and other workers' frames keep flowing and no healthy lease expires behind a slow apply.
-		leaseID, epoch := jl.rec.LeaseID, jl.rec.Epoch
+		leaseID, epoch, session := jl.rec.LeaseID, jl.rec.Epoch, jl.session
 		jl.applying = true
 		s.mu.Unlock()
 		a, aerr := s.cfg.Applier.Apply(jl.job, ops)
@@ -995,6 +1047,17 @@ func (s *Server) flushJob(jl *jobLease) {
 		if jl.rec.LeaseID != leaseID || jl.rec.Epoch != epoch || !live(jl.rec.State) {
 			jl.dirty = len(jl.pending) > 0
 			return // the lease ended while applying; coord_apply tracks what landed
+		}
+		if jl.session != session {
+			// The worker was welcomed again during the apply (at the wire seq committed before it) and numbers its
+			// frames from there: committing the old session's wire seqs would make the new frames with the same
+			// numbers look like duplicates and lose their ops. The ops that landed are remembered by coord_apply
+			// (its applied seq is the authority); the new session resends what it was not told is applied.
+			if applied > jl.rec.AppliedSeq {
+				jl.rec.AppliedSeq = applied
+			}
+			jl.dirty = len(jl.pending) > 0
+			return
 		}
 	}
 	committed := 0
@@ -1041,6 +1104,39 @@ func (s *Server) flushJob(jl *jobLease) {
 	jl.dirty = len(jl.pending) > 0
 	if w := s.workers[jl.rec.WorkerID]; w != nil && committed > 0 && live(jl.rec.State) {
 		s.sendAck(w, jl, anchor)
+	}
+}
+
+// writeEarlyLogs writes the log chunks already pending, contiguous from the ack point, without waiting for the
+// ops ahead of them to be applied (an apply is a script exec that takes a second or more). The job's log is a
+// display stream: its bytes are placed by offset (writeLog skips what is already there and never writes past a
+// gap), so writing a chunk early and reaching it again in order later is idempotent, and the ack/commit order of
+// the frames is untouched. This is what puts the banner and the first output in front of the operator at once
+// instead of after the job's start-up ops (dispatch latency, cluster P1-5).
+func (s *Server) writeEarlyLogs(jl *jobLease) {
+	if len(jl.pending) == 0 {
+		return
+	}
+	anchor := workerproto.Frame{Job: workerproto.Str(jl.job), Lease: workerproto.Str(jl.rec.LeaseID), Epoch: workerproto.Int(jl.rec.Epoch)}
+	d, err := s.adm.AckFor(anchor)
+	if err != nil {
+		return
+	}
+	for seq, n := d.Seq+1, 0; n < 256; seq, n = seq+1, n+1 {
+		f, ok := jl.pending[seq]
+		if !ok {
+			return
+		}
+		if f.T != workerproto.TypeLogAppend {
+			continue
+		}
+		var la workerproto.LogAppend
+		if json.Unmarshal(f.Data, &la) != nil || la.Offset > s.logSize(jl.job) {
+			return // a gap is the in-order path's to report
+		}
+		if !s.writeLog(jl, la) {
+			return
+		}
 	}
 }
 
@@ -1172,12 +1268,14 @@ func (s *Server) expire() {
 		if jl == nil || jl.rec.LeaseID != l.ID {
 			continue
 		}
-		s.endLease(jl, workerproto.LeaseLost, "lost")
-		s.audit(l.Worker, l.Job, l.ID, l.Epoch, "lease_lost")
+		// The marker and the audit line come first: the lease record saying `lost` is what readers (the runner, a
+		// test) act on, and they expect the marker to exist by then.
 		note, _ := json.Marshal(map[string]any{"job": l.Job, "lease_id": l.ID, "epoch": l.Epoch, "worker_id": l.Worker, "at": fmtTime(s.now()), "last_hb": fmtTime(l.LastHB)})
 		if err := writeFileAtomic(s.lostPath(l.Job), append(note, '\n'), false); err != nil {
 			s.logf("write lost marker %s: %v", l.Job, err)
 		}
+		s.audit(l.Worker, l.Job, l.ID, l.Epoch, "lease_lost")
+		s.endLease(jl, workerproto.LeaseLost, "lost")
 	}
 }
 

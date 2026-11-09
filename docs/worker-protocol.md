@@ -189,9 +189,9 @@ The coordinator is the sole writer of job JSON; a worker's `job.set` is a reques
 - **Worker-settable** (and deletable) within its lease: `activity`, `session_id`, `worker_pid`, `paused_reason`, `paused_at`, `question`,
   `final_result_at`, `started_at`, `continuation_count`, `resume_not_yet_acted_on`, `gates`, `review_wave`, `limiter_hold`, `live_cost_usd`,
   `live_tokens`, `current_run`, `cost_cap_breached_at`, `token_alert_at`, `rwx_sandbox`, `resume_session_id`, `resume_kind`,
-  `limiter_resume_prompt`, `attention`, `decision`. Each has a kind and bound: timestamps and tokens are short strings, `session_id` and
+  `limiter_resume_prompt`, `attention`, `decision`, `adherence_status`/`adherence_attempts`/`adherence_pending`/`adherence_notes`/`adherence_sha_runs`/`adherence_reviewed_sha` (the verdict of the pre-ready adherence review the wave runs under the supervisor: a token, counts, a bool, text of at most 8 KiB and a commit id), `attempt_run` (the supervisor-written `{key, started_at}` of the escalation/retry attempt; the clock the coordinator uses to judge a PR as created by this attempt). Each has a kind and bound: timestamps and tokens are short strings, `session_id` and
   `resume_session_id` are ids, `worker_pid`/`continuation_count`/`live_tokens` non-negative integers, `live_cost_usd` a non-negative number,
-  `resume_not_yet_acted_on` a boolean, `gates`/`review_wave`/`limiter_hold`/`current_run`/`rwx_sandbox`/`decision` objects and `attention` an
+  `resume_not_yet_acted_on` a boolean, `gates`/`review_wave`/`limiter_hold`/`current_run`/`rwx_sandbox`/`decision`/`attempt_run` objects and `attention` an
   array (each at most 64 KiB), `question` and `limiter_resume_prompt` text of at most 8 KiB with no control characters other than newline and
   tab, and no C1 or bidirectional formatting controls (U+200E/F, U+202A-E, U+2066-9). `event.append`/`record.append` lines (arbitrary worker output)
 get only the laxer C0-control check. `null` clears a key. A wrong kind or size is `invalid`.

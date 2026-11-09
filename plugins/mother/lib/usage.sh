@@ -45,6 +45,35 @@ _usage_iso_now() {
     ' 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S.000Z
 }
 
+# Worker mode only (cluster P1-5): the same timestamp from bash's own clock ($EPOCHREALTIME, printf %()T) with no
+# process exec'd per call; every state write calls it and a perl start-up costs 50 ms or more on a laptop with
+# endpoint security (most of worker-mode dispatch latency). Defined only when worker mode is on, so the default
+# (legacy) path keeps the perl implementation above unchanged. bash 3.2 (no EPOCHREALTIME) or a decimal-comma
+# locale falls through to perl.
+if mother_worker_mode_active 2>/dev/null; then
+    _usage_iso_now_perl() {
+    /usr/bin/perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
+        my ($s, $us) = gettimeofday();
+        my @t = gmtime($s);
+        printf "%sT%s.%03dZ\n",
+            strftime("%Y-%m-%d", @t),
+            strftime("%H:%M:%S", @t),
+            int($us / 1000);
+    ' 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S.000Z
+    }
+    _usage_iso_now() {
+        local _e="${EPOCHREALTIME:-}" _f
+        case "$_e" in
+            [0-9]*.[0-9]*)
+                case "$_e" in *[!0-9.]*) ;; *)
+                    _f="${_e#*.}000"
+                    ( export TZ=UTC; printf '%(%Y-%m-%dT%H:%M:%S)T.%sZ\n' "${_e%.*}" "${_f:0:3}" 2>/dev/null ) && return 0 ;;
+                esac ;;
+        esac
+        _usage_iso_now_perl
+    }
+fi
+
 # The job file is shared with other writers that hold <job>.json.lockdir (reviewers writing their slot,
 # the supervisor): an unlocked read-modify-write here silently drops their update. Take the same lock
 # when the caller's environment has _with_lock (state.sh / mother-run-job); never call this under it.

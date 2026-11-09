@@ -3,6 +3,8 @@
 #   go         broker gofmt / vet (native + GOOS=darwin) / build / go test         (ubuntu)
 #   shard-plan coverage guard: every tests/*.bats file is in exactly one shard      (ubuntu)
 #   bats       the bats suite, SHARDS shards in parallel                            (macos-15)
+#   bats-worker-mode  the curated lifecycle files (plugins/mother/tests/worker-mode-files.txt) again, with
+#              MOTHER_TEST_DISPATCH_MODE=worker: every job goes through the coordinator and the local worker (macos-15)
 #   ci-ok      the ONE required check: green only if all of the above are green     (ubuntu)
 #
 # Design notes (see CLAUDE.md "Tests"):
@@ -166,9 +168,73 @@ jobs:
           path: ${{ runner.temp }}/bats-out/timings.tsv
           if-no-files-found: warn
 
+  # Cluster P1-5: the same lifecycle tests with MOTHER_DISPATCH_MODE=worker, so jobs run through mother-coord
+  # and mother-worker instead of a forked supervisor. The file list lives in tests/worker-mode-files.txt.
+  bats-worker-mode:
+    name: bats (worker mode)
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 45
+    env:
+      MOTHER_TEST_DISPATCH_MODE: worker
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shard output dir
+        run: echo "MOTHER_TEST_OUT=$RUNNER_TEMP/bats-out" >> "$GITHUB_ENV"
+      - name: Homebrew bash and fzf
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install bash fzf
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+      - name: Go version from .tool-versions
+        id: gover
+        run: echo "version=$(awk '$1 == "golang" { print $2 }' plugins/mother/broker/.tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.gover.outputs.version }}
+          cache-dependency-path: plugins/mother/broker/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: plugins/mother/requirements-ci.txt
+      - name: Install PyYAML
+        run: pip install -r plugins/mother/requirements-ci.txt
+      - name: Install bats-core
+        run: |
+          git clone --depth 1 --branch v1.13.0 https://github.com/bats-core/bats-core "$RUNNER_TEMP/bats"
+          "$RUNNER_TEMP/bats/install.sh" "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Git defaults
+        run: git config --global init.defaultBranch main
+      - name: Guard (before)
+        run: |
+          if [ -e "$HOME/.mother" ] || [ -e "$HOME/.mother-worker" ]; then echo "::error::~/.mother or ~/.mother-worker exists before the run"; exit 1; fi
+      - name: Run the curated lifecycle files in worker mode
+        run: |
+          files=()
+          while IFS= read -r f; do
+            case "$f" in ''|'#'*) continue ;; esac
+            files+=("plugins/mother/tests/$f")
+          done < plugins/mother/tests/worker-mode-files.txt
+          ./plugins/mother/scripts/run-tests.sh "${files[@]}"
+      - name: Guard (after)
+        if: always()
+        run: |
+          rc=0
+          if [ -e "$HOME/.mother" ]; then echo "::error::the run created $HOME/.mother"; rc=1; fi
+          if [ -e "$HOME/.mother-worker" ]; then echo "::error::the run created $HOME/.mother-worker (the worker root must come from the harness)"; rc=1; fi
+          if [ -e /nonexistent-guard ]; then echo "::error::the run created /nonexistent-guard"; rc=1; fi
+          exit "$rc"
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bats-worker-mode
+          path: ${{ runner.temp }}/bats-out
+          if-no-files-found: warn
+
   ci-ok:
     name: ci-ok
-    needs: [go, shard-plan, bats]
+    needs: [go, shard-plan, bats, bats-worker-mode]
     if: always()
     runs-on: ubuntu-latest
     steps:

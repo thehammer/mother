@@ -1007,6 +1007,74 @@ Rules for new code: write a job document only through `mother_job_update`, `moth
 `crew/<id>/`. `tests/state_seam_lint.bats` enforces this by function name. Not verified yet: a real worker process against a
 real coordinator (P1-4).
 
+## Dispatch mode: coordinator and local worker (cluster P1-5)
+
+`MOTHER_DISPATCH_MODE` (env, then `config.env`; `legacy` default, `worker`, anything else is `legacy` plus one stderr line) is
+published as `dispatch_mode` / `dispatch_mode_source` in `runner/effective-config.json` and shown by `mother status` and
+`mother doctor`. Only the owner changes it. Per job, `dispatch_via` (optional; `mother add --via-worker` or plan `via_worker: true`
+= `"worker"`, `"legacy"` = escape hatch) overrides the mode.
+
+- **Supervision** (`bin/mother-runner`, modelled on the broker): `_reap_coord` / `_reap_local_worker` start `mother-coord` and
+  `mother-worker --id local --root ${MOTHER_WORKER_ROOT:-~/.mother-worker}/local --slots $MOTHER_CONCURRENCY` when the mode is
+  `worker`, a worker-path job is not terminal, or a lease/dispatch request is in flight. The coordinator's registration fifo
+  (`runner/coord-reg.fifo`, fresh per coordinator start) carries `local=<pid>=<secret>`; the secret is per worker start, in
+  `runner/coord/worker-local.secret` (0600, 0700 dir) so a restarted runner can re-register a surviving worker, and on the worker's
+  fd only. `_drain` stops the coordinator, never the worker (MC-16). Tests export a temp `MOTHER_WORKER_ROOT` (`setup_mother_env`).
+- **Dispatch**: `_spawn_job` does the legacy `running {"spawned_by":"daemon"}` transition, then atomically writes
+  `runner/dispatch/<job>.json` `{job, requested_at}`; no `_track_child`. `_count_running_children` = forked children + leases
+  `offered|active` + pending dispatch requests; `_supervisor_alive_for_job` is true for those too; `_recover_orphans` skips them
+  and a lease released as succeeded awaiting its finalize.
+- **Success is coordinator-derived.** The protocol refuses `succeeded` from a worker. `_finalize_released_leases` runs
+  `coord_apply.sh --finalize <root> <job>` for a lease `released` with `end_reason: succeeded` on a still-`running` job: unless the
+  job is `no_pr` with no PR url, its final commit (the local tip of `refs/heads/<branch>`) must be in the live head of the remote
+  branch (`mother_remote_contains_commit`), else `failed` / `unpushed_commit` + `needs_attention` + audit line (`finalize_refused`).
+  A check with nothing to check against (no checkout, no origin remote) is skipped and audited (`verify_skipped`), as in the local
+  hardening; an existing remote with an unresolvable final commit is a refusal, and the commit is never one the worker reports.
+  Completion evidence (`pr_url`, `actual_branch`, `exit_code`) is read from the worker's mirror only then and only when
+  well formed: `actual_branch` for an `expect_branch_mismatch` job, `pr_url` inside the origin's repo when that is github.com.
+- **Lost lease**: `_recover_lost_leases` records the run's usage row and fails the job `worker_lost {worker, lease_epoch,
+  last_heartbeat_at}` once per lease (`runner/leases/<job>.lost-handled`); failure routing handles it like `runner_died`.
+  P1-6 replaces this with a resume.
+- **Surfaces**: `mother workers [--json]` (name, kind `laptop`, approved classes `personal company phi`, connection, heartbeat age,
+  jobs; `coordinator not running (dispatch mode: legacy)` otherwise), `worker: local (lease e<epoch>, hb Ns ago)` and
+  `waiting: <reason>` in `mother status <id>`. No job JSON key is added apart from the optional `dispatch_via`.
+- **CI**: the `bats (worker mode)` job runs `tests/worker-mode-files.txt` with `MOTHER_TEST_DISPATCH_MODE=worker`.
+- **Legacy is untouched (review fix-ups).** The default path must cost and print what it did before this feature. One stat decides:
+  `_worker_path_possible` = mode `worker`, or `runner/leases/` or `runner/dispatch/` exists (`mother add --via-worker` creates the
+  latter). Without it `_worker_path_tick`, `_leased_job_ids`, `_job_uses_worker`, `_recover_orphans`'s lease checks and
+  `_write_dispatch_last` do no `jq`/`grep`/fork and create nothing; `dispatch-last.json` gains `leased`/`mode` only when it is true.
+  `mother status` prints `Dispatch mode:` and `mother doctor` its `dispatch:` block only in worker mode (`status --json` always has
+  `dispatch_mode`). The worker-mode clock (`_iso_now`/`_usage_iso_now` from `$EPOCHREALTIME`) is defined only when worker mode is on.
+- **Active-lease index.** Lease files in `runner/leases/` are history and are never scanned each tick. `runner/leases/active/<job>`
+  exists from dispatch until the job leaves `running` (`_prune_active`); every per-tick loop (`_recover_lost_leases`,
+  `_finalize_released_leases`, slot counting) walks only that set. `_rebuild_active_index` re-creates it once at runner start.
+  Test entry: `mother-runner --worker-tick`.
+- **The coordinator writes what the worker cannot.** After every replay (`coord_apply_stream`) `_ca_derive_midrun` takes `pr_url`
+  from the worker's mirror and writes it to the canonical job only under the mother #117 rule (`_ca_accept_pr_url`: same repo, not
+  a fork, head branch = the job's branch; an `expect_branch_mismatch` job also a PR created since `attempt_run.started_at` or
+  containing the job's commit; `actual_branch` is set when the head differs). A refusal is audited once (`pr_url_refused`); `gh`
+  failure retries after 30 s. `work_dir` is the canonical `repo_path` for a main-dir job, never a path the worker names (a
+  worktree job: the mirror's path only under the worker root). `attempt_run` is a **worker key** (object, 64 KiB cap; the supervisor
+  writes it), added to Go `WorkerKeys` and the bash table. `finalize` re-applies the same rule to a mirror `pr_url`.
+- **Finalize.** Runs in the background per job (`runner/leases/<job>.finalizing` holds the pid and is the lock); a slow remote never
+  stalls dispatch. A cancel requested after the lease was released as succeeded ends the job `cancelled` (`coord_apply.sh --finalize`
+  exits 4) and drops it from the index; nothing is left `running` with a released lease.
+- **No worker, no silent running.** A worker-path job is dispatched only while `mother-coord --status-json` shows a connected
+  worker; otherwise it stays `ready` with `needs_attention.reason: worker_unavailable` (cleared on dispatch). `mother cancel` on a
+  `running` job whose `runner/dispatch/<job>.json` was never consumed removes the request and cancels at once. A worker's
+  `no_slot` rejection of an offer is a wait (`all_workers_busy`), not a strike toward the hold.
+- **The worker pid is the launcher's.** `_start_local_worker` records `$!` and its start time (`worker-local.pid`, `.start`);
+  `<worker-root>/worker.pid` (writable by an agent under the worker) is never read by the runner. A dead or unverifiable worker
+  loses its secret file (`_forget_local_worker`).
+- **Log chunks do not wait for ops.** The coordinator writes pending `log.append` chunks (by offset, idempotent) before the ops
+  ahead of them are applied, so the banner is visible at once (`writeEarlyLogs`). The latency test (`runner_split.bats`) prints the
+  median/max and fails only with `MOTHER_LATENCY_GATE=1` (set by the P1-6 burn-in runbook, the gate before the default is flipped).
+- **Known gaps (carried forward).** `repo_path` is handed to the local worker in the lease offer: strip it before any network
+  carrier (MC-28). The degraded-outbox flag report is still open from the P1-1 follow-ups todo. The runner's own writers
+  (`_maybe_pause_running`, `_orphan_lost_lease`) write job documents without the job lock (pre-existing; the
+  `fix/cluster-bats-deflake` branch does not close it). A worker started by a runner from before the `.start` file existed is
+  not adopted (a second one starts).
+
 ## Internals reference (lazy-loaded)
 
 Resource teardown (worktrees/containers), PR detection (`lib/prdetect.sh`,

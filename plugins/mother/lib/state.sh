@@ -64,6 +64,35 @@ _iso_now() {
     '
 }
 
+# Worker mode only (cluster P1-5): the same timestamp from bash's own clock ($EPOCHREALTIME, printf %()T) with no
+# process exec'd per call; every state write calls it and a perl start-up costs 50 ms or more on a laptop with
+# endpoint security (most of worker-mode dispatch latency). Defined only when worker mode is on, so the default
+# (legacy) path keeps the perl implementation above unchanged. bash 3.2 (no EPOCHREALTIME) or a decimal-comma
+# locale falls through to perl.
+if mother_worker_mode_active 2>/dev/null; then
+    _iso_now_perl() {
+    /usr/bin/perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
+        my ($s, $us) = gettimeofday();
+        my @t = gmtime($s);
+        printf "%sT%s.%03dZ\n",
+            strftime("%Y-%m-%d", @t),
+            strftime("%H:%M:%S", @t),
+            int($us / 1000);
+    '
+    }
+    _iso_now() {
+        local _e="${EPOCHREALTIME:-}" _f
+        case "$_e" in
+            [0-9]*.[0-9]*)
+                case "$_e" in *[!0-9.]*) ;; *)
+                    _f="${_e#*.}000"
+                    ( export TZ=UTC; printf '%(%Y-%m-%dT%H:%M:%S)T.%sZ\n' "${_e%.*}" "${_f:0:3}" 2>/dev/null ) && return 0 ;;
+                esac ;;
+        esac
+        _iso_now_perl
+    }
+fi
+
 # Second-precision RFC 3339 timestamp N hours in the past (UTC). Used as an
 # age floor for the hook's event feed. Second precision is deliberate and
 # safe: every consumer compares timestamps lexicographically, and a floor

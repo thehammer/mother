@@ -1,0 +1,14 @@
+# Lifecycle files the CI job `bats (worker mode)` runs with MOTHER_TEST_DISPATCH_MODE=worker (cluster P1-5).
+# One file name per line (relative to plugins/mother/tests). Each must pass unmodified, or with a mode-aware
+# helper change; see the P1-5 PR body.
+worker_lifecycle.bats
+resume_continuity.bats
+cost_cap.bats
+gates_enforce.bats
+review_wave.bats
+limiter_holds.bats
+quota_gate.bats
+awaiting_notify.bats
+dependencies.bats
+orphan_recovery.bats
+contract.bats

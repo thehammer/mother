@@ -48,6 +48,8 @@ type jobLease struct {
 	cmds        []cmdEntry
 	dirty       bool
 	applying    bool
+	session     int                // bumped when the worker is welcomed again: wire seqs of an older session mean other frames
+	ackAnchor   *workerproto.Frame // a duplicate/gap frame is owed one coalesced re-ack (sent on the next flush tick)
 	lastPersist time.Time
 }
 

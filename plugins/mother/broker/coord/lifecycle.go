@@ -97,6 +97,17 @@ func (s *Server) rejectOffer(jl *jobLease, why string) {
 	if json.Unmarshal(raw, &m) != nil {
 		return
 	}
+	// no_slot is not a defect of the offer: the worker frees a finished job's slot a moment after the
+	// coordinator records the release, so a job dispatched in that window is simply early. It never counts
+	// toward the hold (three instant retries used to strand the job `running` with a held request); the
+	// request waits as all_workers_busy and the next poll offers it again.
+	if why == "no_slot" {
+		m["wait_reason"], _ = json.Marshal(waitBusy)
+		if b, err := json.Marshal(m); err == nil {
+			_ = writeFileAtomic(s.dispatchPath(jl.job), append(b, '\n'), false)
+		}
+		return
+	}
 	var n int
 	_ = json.Unmarshal(m["rejects"], &n)
 	n++
