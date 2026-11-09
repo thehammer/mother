@@ -80,6 +80,12 @@ source "$MOTHER_LIB_DIR/config.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/gates.sh" ]         && source "$MOTHER_LIB_DIR/gates.sh"
 [ -r "$MOTHER_LIB_DIR/backup.sh" ]        && source "$MOTHER_LIB_DIR/backup.sh"
+# shellcheck source=/dev/null
+[ -r "$MOTHER_LIB_DIR/drain.sh" ]         && source "$MOTHER_LIB_DIR/drain.sh"
+# Fail CLOSED: if drain.sh is missing or lacks the predicate, every start path treats dispatch as drained.
+type mother_drain_active >/dev/null 2>&1 || mother_drain_active() {
+    echo "mother: lib/drain.sh is missing or broken; treating dispatch as DRAINED" >&2; return 0; }
+type mother_drain_status_line >/dev/null 2>&1 || mother_drain_status_line() { return 0; }
 [ -r "$MOTHER_LIB_DIR/checkpoint.sh" ]    && source "$MOTHER_LIB_DIR/checkpoint.sh"
 # shellcheck source=/dev/null
 [ -r "$MOTHER_LIB_DIR/preview.sh" ]       && source "$MOTHER_LIB_DIR/preview.sh"
@@ -1307,6 +1313,7 @@ _status_overview() {
         return 0
     fi
 
+    mother_drain_status_line
     echo "Concurrency: $(printf '%s' "$conc" | jq -r '"\(.value) (source: \(.source)\(if .daemon then "" else "; daemon not running, resolved from this shell" end))"')"
     _status_rust_dirs_line "$rust_dirs"
     jq -r 'select(type == "object" and .at) | "Last snapshot thin: \(.at), freed \(.freed_gb) GB (thinned \(.thinned))\(if .exit != 0 then " [tmutil exit \(.exit)]" else "" end)"' \
@@ -2136,6 +2143,9 @@ cmd_force_start() {
     done
 
     [ -n "$id" ] || _die "force-start: <id> required"
+    if mother_drain_active; then
+        _die "force-start: dispatch is draining ($(jq -r '.reason // ""' "$RUNNER_DIR/drain.json" 2>/dev/null)); nothing starts until \`mother undrain\`"
+    fi
     _job_exists "$id" || _die "no such job: $id"
 
     local job_file; job_file=$(_job_path "$id")
@@ -4425,6 +4435,9 @@ cmd_run() {
         esac
     done
     [ "$once" -eq 1 ] || _die "run: only --once is supported in phase 1 (daemon comes in phase 2)"
+    if mother_drain_active; then
+        _die "run: dispatch is draining ($(jq -r '.reason // ""' "$RUNNER_DIR/drain.json" 2>/dev/null)); nothing starts until \`mother undrain\`"
+    fi
 
     # Promote queued jobs whose dependencies are all satisfied (each
     # succeeded AND its PR merged, or a no_pr job) to ready.
@@ -4466,6 +4479,7 @@ _daemon_start() {
     if _daemon_pid_alive; then
         local pid; pid=$(cat "$RUNNER_DIR/runner.pid")
         echo "already running (pid $pid)"
+        ! mother_drain_active || echo "note: dispatch is DRAINING (run \`mother undrain\` to resume)"
         return 0
     fi
 
@@ -4490,6 +4504,8 @@ _daemon_start() {
         _die "daemon failed to start (no pidfile after 2s; check $RUNNER_DIR/runner.log)"
     fi
     echo "started (pid $(cat "$RUNNER_DIR/runner.pid"))"
+    ! mother_drain_active || echo "note: dispatch is DRAINING (drain flag persists; run \`mother undrain\` to resume)"
+    return 0
 }
 
 _daemon_stop() {
@@ -5449,6 +5465,11 @@ Usage:
                                               (--priority raise|lower|normal: raise is owner-only, at a terminal)
   mother priority ID raise|lower|normal       (queued/ready job; the limiter orders by data class shifted by this.
                                               raise is refused from a worker, an agent session or a non-TTY stdin)
+  mother drain [--reason TEXT] [--wait [--timeout SECS]] | --status
+                                              (maintenance mode: no new job starts; running jobs untouched. Owner-only)
+  mother undrain                              (owner-only)
+  mother upgrade [--timeout SECS] [--dry-run] [--resume] [--restart-with-running] [--undrain]
+                                              (drain, wait idle, git pull --ff-only, rebuild broker, restart daemon, undrain)
   mother list [--state STATE] [--repo REPO] [--project NAME] [--label LABEL] [--format json|table]
   mother status [ID] [--format json|text]     (no ID: queue overview, awaiting jobs, needs-attention list)
   mother logs ID [--follow]
@@ -6213,6 +6234,9 @@ main() {
         limiter)           cmd_limiter "$@" ;;
         priority)          cmd_priority "$@" ;;
         force-start)       cmd_force_start "$@" ;;
+        drain)             cmd_drain "$@" ;;
+        undrain)           cmd_undrain "$@" ;;
+        upgrade)           cmd_upgrade "$@" ;;
         retry)             cmd_retry "$@" ;;
         escalate)          cmd_escalate "$@" ;;
         reconcile)         cmd_reconcile "$@" ;;
