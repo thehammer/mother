@@ -2794,8 +2794,9 @@ _write_dispatch_last() {
         --argjson low "$([ "$3" = 1 ] && echo true || echo false)" \
         --arg spawned "$4" --arg skipped "$5" \
         --argjson enforcing "$([ "${6:-0}" = 1 ] && echo true || echo false)" \
+        --argjson drained "$([ "${7:-0}" = 1 ] && echo true || echo false)" \
         '{ts: $ts, running: $running, ceiling: $ceiling, ratelimit_paused: $paused, quota_over_cap: $over,
-          low_disk: $low, enforcing: $enforcing, spawned: ($spawned | split(" ") | map(select(length > 0))),
+          low_disk: $low, enforcing: $enforcing, drained: $drained, spawned: ($spawned | split(" ") | map(select(length > 0))),
           skipped: ($skipped | split(" ") | map(select(length > 0)))}' \
         > "$RUNNER_DIR/dispatch-last.json.tmp.$$" 2>/dev/null \
         && mv "$RUNNER_DIR/dispatch-last.json.tmp.$$" "$RUNNER_DIR/dispatch-last.json" \
@@ -2811,8 +2812,21 @@ _dispatch_last_worker_fields() {
         '. + {leased: $leased, mode: $mode}' "$f" > "$f.tmp.$$" 2>/dev/null && mv "$f.tmp.$$" "$f" || rm -f "$f.tmp.$$"
 }
 
+# _dispatch_drained: maintenance mode (`mother drain`). True while $RUNNER_DIR/drain.json exists; the
+# spawn loop then starts nothing (ready, retried, resumed and promoted jobs all wait in place). Only the
+# spawn loop is gated: the quota pause of running jobs and dispatch-last.json keep running. Running jobs,
+# in-flight reviews, teardown and archive are untouched. One stat, no forks.
+_DRAIN_ANNOUNCED=0
+_dispatch_drained() {
+    [ -f "$RUNNER_DIR/drain.json" ] || { _DRAIN_ANNOUNCED=0; return 1; }
+    [ "$_DRAIN_ANNOUNCED" = "1" ] || _log "drain: dispatch is draining; no new job will start (running jobs untouched)"
+    _DRAIN_ANNOUNCED=1
+    return 0
+}
+
 _dispatch_ready_jobs() {
-    local picker=_pick_next_ready over_cap=0 next paused=0 low_disk=0 spawned="" skipped=""
+    local picker=_pick_next_ready over_cap=0 next paused=0 low_disk=0 spawned="" skipped="" drained=0
+    _dispatch_drained && drained=1
     local limit="$MOTHER_CONCURRENCY" enforcing=0 allowed
     _DISPATCH_SKIP=""
     _LIMITER_ADMIT=""
@@ -2841,7 +2855,7 @@ _dispatch_ready_jobs() {
         [ "$enforcing" -eq 0 ] || picker=_pick_next_limiter_forced_ready
         over_cap=1
     fi
-    while [ "$paused" -eq 0 ] && [ "$(_count_running_children)" -lt "$limit" ]; do
+    while [ "$paused" -eq 0 ] && [ "$drained" -eq 0 ] && [ "$(_count_running_children)" -lt "$limit" ]; do
         next=$($picker)
         if [ -z "$next" ]; then
             _disk_recheck_idle
@@ -2868,7 +2882,7 @@ _dispatch_ready_jobs() {
     done
     _DISPATCH_SKIP=""
     _LIMITER_ADMIT=""
-    _write_dispatch_last "$paused" "$over_cap" "$low_disk" "$spawned" "$skipped" "$enforcing" || true
+    _write_dispatch_last "$paused" "$over_cap" "$low_disk" "$spawned" "$skipped" "$enforcing" "$drained" || true
     [ "$over_cap" -eq 1 ] && _maybe_pause_running
     return 0
 }
@@ -2944,6 +2958,7 @@ main() {
     _publish_effective_config
     trap '_on_signal' TERM INT
     _log "mother-runner started (pid $$, concurrency=$MOTHER_CONCURRENCY [$MOTHER_CONCURRENCY_SOURCE], poll=${MOTHER_POLL_INTERVAL}s)"
+    [ ! -f "$RUNNER_DIR/drain.json" ] || _log "drain flag present: dispatch stays DRAINING until \`mother undrain\`"
     _recover_stale_locks
     _prune_temps_startup
     _rebuild_active_index

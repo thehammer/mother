@@ -1515,3 +1515,11 @@ _ss_emit() {
     ! ls "$SS_L/jobs" | grep -q '\.tmp\.'
     [ ! -e "$SS_L/outbox" ]
 }
+
+@test "mother-run-job's unquoted WRAP heredoc has no unescaped backtick (it would run as a command, e.g. docker)" {
+    # A backtick inside the unquoted heredoc is a command substitution run on every worker start; one in a
+    # comment once invoked `docker compose up` (CI: "docker: command not found" in a worker-mode run).
+    run awk '/<<WRAP$/ {f = 1; next} /^WRAP$/ {f = 0} f && /(^|[^\\])`/ {print NR ": " $0}' "$_BIN_DIR/mother-run-job"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}

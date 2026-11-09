@@ -121,6 +121,36 @@ _attention_low_disk_items() {
                   + (if $cargo then "; `mother gc` reclaims idle worktree target/ dirs automatically" else "" end))}' "$f" 2>/dev/null
 }
 
+# drain_stuck (info): a drain that has been on for more than MOTHER_DRAIN_STUCK_S (default 3600), or a
+# drain flag that cannot be read (corrupt: its age is unknown, so say so instead of staying silent).
+_attention_drain_items() {
+    local f="$RUNNER_DIR/drain.json" t
+    [ -f "$f" ] || return 0
+    t=$(jq -r '(.since // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch empty' "$f" 2>/dev/null)
+    if [ -z "$t" ]; then
+        # First-seen time lives beside the flag (the corrupt file cannot hold it) so it stays stable across reads.
+        local seen="$f.unreadable-since" since
+        since=$(cat "$seen" 2>/dev/null)
+        if [ -z "$since" ]; then
+            since=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf '%s\n' "$since" > "$seen" 2>/dev/null || true
+        fi
+        jq -nc --arg since "$since" '
+            {kind: "drain_stuck", job_id: "", repo: "", branch: "",
+             reason: "drain flag unreadable: dispatch is drained but its age is unknown",
+             since: $since, detail: {level: "info", unreadable: true},
+             hint: "inspect the runner drain.json; `mother undrain` removes it and resumes dispatch"}'
+        return 0
+    fi
+    rm -f "$f.unreadable-since" 2>/dev/null
+    jq -c --argjson now "$(date +%s)" --argjson lim "${MOTHER_DRAIN_STUCK_S:-3600}" --argjson t "$t" '
+        select(($now - $t) > $lim)
+        | {kind: "drain_stuck", job_id: "", repo: "", branch: "",
+           reason: ("dispatch has been draining for " + ((($now - $t) / 60) | floor | tostring) + " min"
+                    + (if (.reason // "") != "" then " (" + .reason + ")" else "" end)),
+           since: .since, detail: {level: "info"},
+           hint: "no new job starts while draining; `mother undrain` resumes dispatch (or finish `mother upgrade`)"}' "$f" 2>/dev/null
+}
+
 _attention_job_items() {
     local f
     for f in "$JOBS_DIR"/*.json; do
@@ -399,6 +429,7 @@ mother_attention_items() {
     { _attention_teardown_items
       _attention_residue_items
       _attention_low_disk_items
+      _attention_drain_items
       _attention_job_items
       _attention_reason_items
       _attention_adherence_loop_items

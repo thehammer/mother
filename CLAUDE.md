@@ -556,6 +556,37 @@ hook also drops any event older than `MOTHER_EVENTS_MAX_AGE_HOURS` (default 6,
 checkout; plugin versions are bumped so `claude plugin update` refreshes it.
 
 
+## Maintenance mode: drain, undrain, upgrade
+
+`mother drain [--reason T]` writes `$RUNNER_DIR/drain.json` (0600, `{since, by, reason}`); `lib/drain.sh` holds the CLI side
+(`cmd_drain`, `cmd_undrain`, `cmd_upgrade`) and `_dispatch_drained` (`bin/mother-runner`) is the one gate: `_dispatch_ready_jobs`
+returns before starting anything while the file exists (ready, promoted, retried, resumed jobs wait; `mother force-start` refuses
+with "draining"). **Not touched:** running jobs/supervisors/workers, in-flight adherence reviews, teardown, archive. The flag
+survives a runner restart (`mother daemon start` notes it); only `undrain` or a finished `mother upgrade` removes it. No flag =
+unchanged behaviour (one `stat`).
+
+- `drain --wait [--timeout S]` (default 900) polls `$RUNNER_DIR/children` for live supervisors (the pid's command line must be a
+  `mother-run-job`; a reused pid doesn't count) and treats an `adherence-review.lockdir` / `pipeline-driver.lockdir` as in-flight work (a lockdir left by a crashed runner makes the wait time out until the next runner start clears it); prints
+  what is running every 30s; exit 0 idle, 3 timeout (drain stays on). Never signals a job. Test knobs: `MOTHER_DRAIN_POLL_S`, `MOTHER_DRAIN_PRINT_S`.
+- **Only the spawn loop is gated** (`_dispatch_ready_jobs`): the quota pause of running jobs and `dispatch-last.json` (now with `drained`) still run.
+  Start paths: `_spawn_job` (only caller: the gated loop), `mother run --once` (refuses while drained), `mother force-start` (refuses), and a direct `mother-run-job <id>` call (pre-existing, NOT gated: it is an operator/test entry point, not a dispatch path);
+  resume/auto-resume/retry/escalate/limiter and quota release only set `ready` and wait for the loop. The predicate fails CLOSED:
+  `bin/mother` defines `mother_drain_active` as "drained" if `lib/drain.sh` is missing.
+- **Owner-only is accident prevention, not a security boundary.** `drain`, `undrain` and `upgrade` refuse a Mother worker (ancestor walk,
+  `MOTHER_JOB_ID`), an agent session and a non-TTY stdin, but `env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT`, a pty wrapper or editing
+  `drain.json` bypass it. A real Mother worker is still caught by the ancestor walk.
+- `drain_stuck` attention item (info) when `since` is older than `MOTHER_DRAIN_STUCK_S` (3600), or when the flag is unreadable ("drain flag
+  unreadable", also shown by `mother status`); gone after undrain.
+- `mother upgrade [--timeout S] [--dry-run] [--resume] [--restart-with-running] [--undrain]` on `$MOTHER_CODE_ROOT/mother` (main, tracked files clean, fetch
+  ok; refuses when that checkout is not the one `$MOTHER_BIN_DIR` runs from): drain, wait, `git merge --ff-only` of the exact `origin/main`
+  commit listed, `build-broker.sh` if Go/broker files changed since the recorded start commit, `daemon stop`/`start` (verified: new live pid,
+  still alive after `MOTHER_UPGRADE_SETTLE_S` (3), a "mother-runner started" line in `runner.log`, `status` answers), undrain (a manual drain already on when the upgrade started is adopted and left ON, with a printed note, unless `--undrain` is given). The drain flag
+  records `upgrade: {old_sha, step}`; `--resume` (or any re-run while that flag exists) continues from there, so a failure after the merge
+  never reads as "nothing new". One at a time (`$RUNNER_DIR/upgrade.lockdir`, owner pid); INT/TERM name the step and leave the drain ON; a kill
+  or failure from the start of `daemon stop` until the new runner is verified says the daemon is STOPPED and how to start it. Timeout exits 3 with drain ON; failures name the step and
+  show the git/daemon error text and leave drain ON. `MOTHER_UPGRADE_CLI` overrides the `mother` it calls for daemon/status (tests).
+- Safe manual sequence: `mother drain --wait`, `git pull --ff-only`, `mother daemon stop && mother daemon start`, `mother undrain`.
+
 ## Backpressure limiter
 
 Observe by default (L1; L2 added the surfaces below; L3 added enforcement of **admission of new work**; L4 added boundary
