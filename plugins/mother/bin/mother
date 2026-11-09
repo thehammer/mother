@@ -794,6 +794,8 @@ $(_crew_error_lines "$repo" "$crew_json")" ;;
         via_worker_json="true"
         # The runner's cheap per-tick check for "is the worker path in play" is the existence of this directory.
         mkdir -p "$RUNNER_DIR/dispatch" 2>/dev/null || true
+        # Tells the runner a worker-path job may be waiting (it removes the marker when none is live).
+        : > "$RUNNER_DIR/worker-jobs" 2>/dev/null || true
     fi
 
     # Parse the pipeline config (optional; absent -> non-pipeline job).

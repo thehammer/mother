@@ -678,6 +678,30 @@ _ca_need_prdetect() {
         || source "$MOTHER_LIB_DIR/prdetect.sh"
 }
 
+# _ca_gh_bounded <timeout_s> <gh args...> — gh's stdout, or exit 124 when it outlives the timeout (the gh process and its
+# children are killed by exact pid; macOS has no timeout(1)). stderr is discarded.
+_ca_gh_bounded() {
+    local t="$1" out pid kid waited=0 rc
+    shift
+    out=$(mktemp "${TMPDIR:-/tmp}/cagh.XXXXXX") || return 1
+    gh "$@" >"$out" 2>/dev/null </dev/null &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge $((t * 10)) ]; then
+            for kid in $(pgrep -P "$pid" 2>/dev/null); do kill -KILL "$kid" 2>/dev/null; done
+            kill -KILL "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            rm -f "$out"
+            return 124
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    wait "$pid" 2>/dev/null; rc=$?
+    cat "$out"; rm -f "$out"
+    return "$rc"
+}
+
 # _ca_accept_pr_url <job-file> <pr-url> — the mother #117 adoption rule, applied by the coordinator to a PR url
 # the worker's mirror claims. Accepted only on GitHub-side evidence it is the job's own: it is in the origin's
 # repository, not a fork (isCrossRepository), and its head branch is the job's branch; an
@@ -689,8 +713,9 @@ _ca_accept_pr_url() {
     _CA_PR_REASON=""; _CA_PR_HEAD=""
     _ca_pr_url_matches_origin "$jf" "$url" || { _CA_PR_REASON="foreign_repository"; return 1; }
     command -v gh >/dev/null 2>&1 || { _CA_PR_REASON="gh_unavailable"; return 2; }
-    row=$(gh pr view "$url" --json state,headRefName,createdAt,isCrossRepository \
-        --jq '[.state, .headRefName, ((.isCrossRepository // false) | tostring), (.createdAt // "-")] | join("\t")' 2>/dev/null || true)
+    # Bounded: a hung gh must not stall the replay. A timeout, like any failure, is "not derived yet" (rc 2).
+    row=$(_ca_gh_bounded "${MOTHER_CA_GH_TIMEOUT:-20}" pr view "$url" --json state,headRefName,createdAt,isCrossRepository \
+        --jq '[.state, .headRefName, ((.isCrossRepository // false) | tostring), (.createdAt // "-")] | join("\t")' || true)
     [ -n "$row" ] || { _CA_PR_REASON="pr_unresolved"; return 2; }
     IFS=$'\t' read -r state head cross created <<CA_PRV_EOF
 $row
@@ -702,7 +727,10 @@ CA_PRV_EOF
     if [ "$(jq -r '.expect_branch_mismatch // false' "$jf" 2>/dev/null)" != "true" ]; then
         _CA_PR_REASON="head_branch_mismatch"; return 1
     fi
-    started=$(jq -r '.attempt_run.started_at // .current_run.spawned_at // empty' "$jf" 2>/dev/null)
+    # The attempt start is the coordinator's own record (the lease's offer time), never the worker-written
+    # attempt_run/current_run: a lying worker cannot move it. (A later lease, e.g. after a resume, only makes the
+    # "created since" test stricter; a PR that long predates the run still can be adopted by commit containment.)
+    started=$(_ca_lease_field "$(basename "$jf" .json)" offered_at)
     if [ -n "$created" ] && [ "$created" != "-" ] && [ -n "$started" ]; then
         ce=$(_iso_to_epoch "$created"); se=$(_iso_to_epoch "$started")
         if [ "${ce:-0}" -gt 0 ] && [ "${se:-0}" -gt 0 ] && [ "$ce" -ge "$se" ]; then _CA_PR_HEAD="$head"; return 0; fi

@@ -898,8 +898,11 @@ _ss_go_list() {
     # keyKinds: "key": kind pairs; Go's kText kToken kID kTS kUint kNum kBool kObject kArray -> text token id ts uint num bool object array.
     local gk
     gk=$(awk '/^var keyKinds = map/ { on = 1; next } on && /^\}/ { exit } on { print }' "$SS_GO_OWNERSHIP" \
-        | grep -o '"[a-z_]*": k[A-Za-z]*' | sed -e 's/"\([a-z_]*\)": k\(.*\)/\1:\2/' \
+        | grep -oE '"[a-z_]+": *k[A-Za-z]+' | sed -e 's/"\([a-z_]*\)": *k\(.*\)/\1:\2/' \
         | awk -F: '{ k = tolower($2); print $1 ":" k }' | tr '\n' ' ' | sed 's/ $//')
+    # Fail loudly if the parse silently dropped keys (the gofmt-padding regression): a sane table has many entries.
+    local gkn; gkn=$(wc -w <<< "$gk")
+    [ "$gkn" -ge 20 ] || { echo "parsed only $gkn keyKinds entries from ownership.go" >&2; return 1; }
     [ "${lines[4]}" = "$gk" ]
     # Limits.
     local mt ms mk mc

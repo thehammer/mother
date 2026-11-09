@@ -612,14 +612,14 @@ _cw_same() {
     _cw_must 30 "the job's claude to start" _cw_claude_started
     _cw_must 30 "the canonical job to show running" _cw_canon_state_is "$id" running
     _cw_must 20 "the lease to be active" _cw_lease_is "$id" active
-    # Let the startup ops that are still in flight land, so "untouched" is judged against a settled document.
-    local i after
+    # Let the startup ops that are still in flight land, so "untouched" is judged against a settled document
+    # (three equal reads a second apart; a loaded machine takes longer than an idle one).
+    local i after same=0
     before=$(jq -S . "$CW_C/jobs/$id.json")
-    for i in 1 2 3 4 5 6 7 8; do
+    for i in $(seq 1 20); do
         sleep 1
         after=$(jq -S . "$CW_C/jobs/$id.json")
-        [ "$after" = "$before" ] && break
-        before="$after"
+        if [ "$after" = "$before" ]; then same=$((same + 1)); [ "$same" -ge 3 ] && break; else same=0; before="$after"; fi
     done
 
     read -r wpid wpgid < "$CW_W/worker.pid"
@@ -627,12 +627,16 @@ _cw_same() {
     kill -9 -- "-$wpgid"
 
     _cw_must 30 "the lease to be lost" _cw_lease_is "$id" lost
-    [ -e "$CW_C/runner/leases/$id.lost" ]
+    # The coordinator writes the marker before it records `lost`; the wait only covers a slow filesystem.
+    _cw_must 10 "the .lost marker" test -e "$CW_C/runner/leases/$id.lost"
     _cw_audit_has ".job == \"$id\" and ((.code // \"\") | test(\"lost\"))"
 
-    # Losing a lease does not rewrite the job: P1-5's runner decides what happens next.
+    # Losing a lease does not rewrite the job: P1-5's runner decides what happens next. Judged on everything the
+    # coordinator owns (the keys a worker may write are excluded: ops the worker shipped just before it was
+    # killed are legitimately applied after the kill, and under load that can be after the snapshot above).
     _cw_canon_state_is "$id" running
-    [ "$(jq -S . "$CW_C/jobs/$id.json")" = "$before" ]
+    [ "$(jq -S --argjson wk "$CW_WORKER_KEYS" 'delpaths([($wk + ["actual_tokens","actual_cost_complete"])[] | [.]])' "$CW_C/jobs/$id.json")" \
+        = "$(printf '%s' "$before" | jq -S --argjson wk "$CW_WORKER_KEYS" 'delpaths([($wk + ["actual_tokens","actual_cost_complete"])[] | [.]])')" ]
 }
 
 # ===========================================================================

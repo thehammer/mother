@@ -126,6 +126,10 @@ BROKER_PIDFILE="$RUNNER_DIR/broker.pid"
 COORD_PIDFILE="$RUNNER_DIR/coord.pid"
 WORKER_PIDFILE="$RUNNER_DIR/worker-local.pid"
 DISPATCH_DIR="$RUNNER_DIR/dispatch"
+# Exists while a not-yet-finished `dispatch_via: worker` job may exist; `mother add --via-worker` touches it, the runner
+# removes it (after a grace period) once no such job is live, so a legacy tick after worker use does no grep (see
+# _worker_path_needed).
+WORKER_JOBS_MARKER="$RUNNER_DIR/worker-jobs"
 LEASES_DIR="$RUNNER_DIR/leases"
 # Only live leases are scanned each tick: leases/active/<job> exists from dispatch until the job leaves `running`
 # (terminal lease files are never read again, so tick cost does not grow with history).
@@ -492,6 +496,8 @@ _worker_path_needed() {
     [ "$MOTHER_DISPATCH_MODE" = "worker" ] && return 0
     [ -n "$(_leased_job_ids)" ] && return 0
     [ -d "$ACTIVE_DIR" ] && [ -n "$(_active_ids)" ] && return 0
+    # No marker: no worker-path job can be waiting, so there is nothing to grep for (the legacy steady state).
+    [ -e "$WORKER_JOBS_MARKER" ] || return 1
     local f
     for f in $(grep -lE '"dispatch_via"[[:space:]]*:[[:space:]]*"worker"' "$JOBS_DIR"/*.json 2>/dev/null); do
         case "$(jq -r '.state // empty' "$f" 2>/dev/null)" in
@@ -499,6 +505,9 @@ _worker_path_needed() {
             *) return 0 ;;
         esac
     done
+    # None live. Drop the marker once it is older than a minute (`mother add` touches it just before it writes the
+    # job file, so a brand-new marker may precede its job).
+    [ -n "$(find "$WORKER_JOBS_MARKER" -mmin +1 2>/dev/null)" ] && rm -f "$WORKER_JOBS_MARKER"
     return 1
 }
 
@@ -2923,6 +2932,8 @@ main() {
     _recover_stale_locks
     _prune_temps_startup
     _rebuild_active_index
+    # A runner started with worker-path state on disk (or upgraded from before the marker): one grep pass decides.
+    if [ -d "$DISPATCH_DIR" ] || [ -d "$LEASES_DIR" ]; then : > "$WORKER_JOBS_MARKER"; fi
     _recover_orphans
     type mother_publish_rates >/dev/null 2>&1 && mother_publish_rates
     _start_broker

@@ -172,3 +172,48 @@ func TestRegisteredWorkerPidConnectionIsNotEvictedByAPreHelloFlood(t *testing.T)
 		t.Fatal("a pre-hello connection from the registered worker pid was evicted by the flood")
 	}
 }
+
+// A worker that reconnects while an apply of its frames is in flight has been told (welcome) the wire seq the
+// coordinator had committed BEFORE that apply, and numbers its next frames from it. The in-flight apply must
+// not then commit the old session's frames: wire seq N of the new session is a different frame, so a
+// stale commit would make the coordinator drop the new frame as a duplicate and lose its outbox op (the
+// "gap in the outbox" stall seen in coord_worker.bats under load).
+func TestAReconnectDuringAnInFlightApplyDoesNotCommitTheOldSessionsFrames(t *testing.T) {
+	h := newHarness(t)
+	g := newGate()
+	t.Cleanup(g.open)
+	h.s.cfg.Applier = g
+	hxConnect(h, "w1", 1)
+	lease, epoch := h.lease("j1")
+	h.event("j1", lease, epoch, 1, 1)
+	flushed := make(chan struct{})
+	go func() {
+		h.s.mu.Lock()
+		h.s.flushAll()
+		h.s.mu.Unlock()
+		close(flushed)
+	}()
+	<-g.entered
+	hxConnect(h, "w1", 1) // the worker daemon restarted: a new session, welcome says wire seq 0
+	g.open()
+	select {
+	case <-flushed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("flush never finished")
+	}
+	if r := h.rec("j1"); r.WireSeq != 0 {
+		t.Fatalf("the old session's wire seq 1 was committed after the worker was welcomed at 0 (WireSeq=%d)", r.WireSeq)
+	}
+	h.s.mu.Lock()
+	d, err := h.s.adm.AckFor(workerproto.Frame{Job: workerproto.Str("j1"), Lease: workerproto.Str(lease), Epoch: workerproto.Int(epoch)})
+	h.s.mu.Unlock()
+	if err != nil || d.Seq != 0 {
+		t.Fatalf("stream applied seq = %d (err %v), want 0", d.Seq, err)
+	}
+	// The new session's frame 1 is accepted, not dropped as a duplicate.
+	h.event("j1", lease, epoch, 1, 2)
+	h.flush()
+	if r := h.rec("j1"); r.WireSeq != 1 {
+		t.Fatalf("the new session's frame 1 was not committed (WireSeq=%d)", r.WireSeq)
+	}
+}

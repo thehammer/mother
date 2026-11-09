@@ -640,6 +640,7 @@ func (s *Server) register(w *workerConn, welcome *workerproto.Welcome) {
 			continue
 		}
 		jl.pending = map[int64]workerproto.Frame{}
+		jl.session++
 		s.adm.SetApplied(jl.job, jl.rec.LeaseID, jl.rec.Epoch, jl.rec.WireSeq)
 		welcome.Jobs = append(welcome.Jobs, workerproto.WelcomeJob{
 			Job: jl.job, Lease: jl.rec.LeaseID, Epoch: jl.rec.Epoch,
@@ -1033,7 +1034,7 @@ func (s *Server) flushJob(jl *jobLease) {
 	if len(ops) > 0 {
 		// The applier can take seconds (it execs a script): run it with the mutex released, so heartbeats
 		// and other workers' frames keep flowing and no healthy lease expires behind a slow apply.
-		leaseID, epoch := jl.rec.LeaseID, jl.rec.Epoch
+		leaseID, epoch, session := jl.rec.LeaseID, jl.rec.Epoch, jl.session
 		jl.applying = true
 		s.mu.Unlock()
 		a, aerr := s.cfg.Applier.Apply(jl.job, ops)
@@ -1046,6 +1047,17 @@ func (s *Server) flushJob(jl *jobLease) {
 		if jl.rec.LeaseID != leaseID || jl.rec.Epoch != epoch || !live(jl.rec.State) {
 			jl.dirty = len(jl.pending) > 0
 			return // the lease ended while applying; coord_apply tracks what landed
+		}
+		if jl.session != session {
+			// The worker was welcomed again during the apply (at the wire seq committed before it) and numbers its
+			// frames from there: committing the old session's wire seqs would make the new frames with the same
+			// numbers look like duplicates and lose their ops. The ops that landed are remembered by coord_apply
+			// (its applied seq is the authority); the new session resends what it was not told is applied.
+			if applied > jl.rec.AppliedSeq {
+				jl.rec.AppliedSeq = applied
+			}
+			jl.dirty = len(jl.pending) > 0
+			return
 		}
 	}
 	committed := 0
@@ -1256,12 +1268,14 @@ func (s *Server) expire() {
 		if jl == nil || jl.rec.LeaseID != l.ID {
 			continue
 		}
-		s.endLease(jl, workerproto.LeaseLost, "lost")
-		s.audit(l.Worker, l.Job, l.ID, l.Epoch, "lease_lost")
+		// The marker and the audit line come first: the lease record saying `lost` is what readers (the runner, a
+		// test) act on, and they expect the marker to exist by then.
 		note, _ := json.Marshal(map[string]any{"job": l.Job, "lease_id": l.ID, "epoch": l.Epoch, "worker_id": l.Worker, "at": fmtTime(s.now()), "last_hb": fmtTime(l.LastHB)})
 		if err := writeFileAtomic(s.lostPath(l.Job), append(note, '\n'), false); err != nil {
 			s.logf("write lost marker %s: %v", l.Job, err)
 		}
+		s.audit(l.Worker, l.Job, l.ID, l.Epoch, "lease_lost")
+		s.endLease(jl, workerproto.LeaseLost, "lost")
 	}
 }
 

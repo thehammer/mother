@@ -938,6 +938,33 @@ _rs_pr_seed() {
     [ "$(jq -r '.pr_url // "null"' "$RS_C/jobs/$id.json")" = "null" ]
 }
 
+@test "pr_url: a hung gh cannot stall the replay: it is killed after MOTHER_CA_GH_TIMEOUT, nothing is written, and the next replay retries" {
+    local id="rs-pr-hang" t0 t1
+    _rs_pr_seed "$id"
+    cat > "$_MOCK_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+sleep 300
+GH
+    chmod +x "$_MOCK_BIN/gh"
+    t0=$(date +%s)
+    MOTHER_CA_GH_TIMEOUT=2 run _rs_stream "$id"
+    t1=$(date +%s)
+    [ $((t1 - t0)) -lt 30 ]
+    [ "$(jq -r '.pr_url // "null"' "$RS_C/jobs/$id.json")" = "null" ]
+    # Not refused (that would be permanent): the marker says "retry", so a working gh later derives it.
+    [ "$(awk '{print $3}' "$RS_C/runner/leases/$id.pr-check")" = "retry" ]
+    ! jq -e -s --arg j "$id" 'map(select(.job == $j and .code == "pr_url_refused")) | length > 0' "$RS_C/runner/leases/audit.jsonl" >/dev/null 2>&1
+}
+
+@test "pr_url: a lying worker's attempt_run.started_at does not make an old PR count as created during the attempt (the coordinator's lease time decides)" {
+    local id="rs-pr-lie"
+    _rs_pr_seed "$id" '.expect_branch_mismatch = true | .attempt_run = {key: "0:0", started_at: "2020-01-01T00:00:00.000Z"} | .current_run = {spawned_at: "2020-01-01T00:00:00.000Z"}'
+    ( _rs_export_root "$RS_C"; gh_mock_set_pr "https://github.com/test/rs/pull/7" OPEN "feature/existing-pr"
+      gh_mock_set_pr_created "https://github.com/test/rs/pull/7" "2026-10-01T00:00:00Z" ) >/dev/null 2>&1
+    run _rs_stream "$id"
+    [ "$(jq -r '.pr_url // "null"' "$RS_C/jobs/$id.json")" = "null" ]
+}
+
 @test "finalize: a foreign pr_url in the worker mirror is dropped (audited); the success itself is still judged on the commit" {
     local id="rs-fin-foreign"
     _rs_fin_seed "$id" 1
@@ -1004,6 +1031,46 @@ SPY
     [ ! -s "$MOTHER_ROOT/jq-calls.log" ] || { cat "$MOTHER_ROOT/jq-calls.log" >&2; false; }
 }
 
+# A grep that logs every invocation, then runs the real one.
+_rs_grep_spy() {
+    local real; real=$(command -v grep)
+    cat > "$_MOCK_BIN/grep" <<SPY
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$MOTHER_ROOT/grep-calls.log"
+exec "$real" "\$@"
+SPY
+    chmod +x "$_MOCK_BIN/grep"
+    : > "$MOTHER_ROOT/grep-calls.log"
+}
+
+@test "per-tick cost: after a worker job has finished (dispatch/ and leases/ left behind) a legacy tick runs no grep and no jq" {
+    local id="rs-done-worker"
+    mkdir -p "$RS_C/runner/dispatch" "$RS_C/runner/leases"
+    _rs_job "$RS_C" "$id" '.state = "succeeded" | .dispatch_via = "worker"'
+    # No runner/worker-jobs marker: the legacy steady state once the last worker job is over.
+    _rs_jq_spy
+    _rs_grep_spy
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    [ ! -s "$MOTHER_ROOT/grep-calls.log" ] || { cat "$MOTHER_ROOT/grep-calls.log" >&2; false; }
+    [ ! -s "$MOTHER_ROOT/jq-calls.log" ] || { cat "$MOTHER_ROOT/jq-calls.log" >&2; false; }
+}
+
+@test "worker-jobs marker: kept while a worker job is live, dropped (after the grace minute) once none is, and a fresh one survives" {
+    local id="rs-marker-job" m="$RS_C/runner/worker-jobs"
+    mkdir -p "$RS_C/runner/dispatch" "$RS_C/runner/leases"
+    _rs_job "$RS_C" "$id" '.state = "ready" | .dispatch_via = "worker"'
+    : > "$m"; touch -t 202001010000 "$m"
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    [ -e "$m" ]   # a live worker job keeps it
+    jq '.state = "succeeded"' "$RS_C/jobs/$id.json" > "$RS_C/jobs/$id.tmp" && mv "$RS_C/jobs/$id.tmp" "$RS_C/jobs/$id.json"
+    : > "$m"      # fresh marker (a `mother add` may be about to write its job): survives
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    [ -e "$m" ]
+    touch -t 202001010000 "$m"
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    [ ! -e "$m" ]
+}
+
 # --- 13.5 / 13.7 finalize resolves a cancel and never blocks the loop -------------
 
 @test "runner: a cancel requested after the lease was released as succeeded ends the job cancelled (it does not stay running)" {
@@ -1030,6 +1097,51 @@ GIT
     _rs_must 22 "the other job to succeed while $a is still being verified" _rs_state_is "$RS_C" "$b" succeeded
     [ "$(_rs_state "$RS_C" "$a")" = "running" ] || { _rs_dump; false; }
     _rs_must 90 "$a to be resolved" bash -c '[ "$(jq -r .state "$1/jobs/$2.json")" != running ]' _ "$RS_C" "$a"
+}
+
+# --- 13.4b the local worker's pid and secret ---------------------------------
+
+# _rs_stub_bin <dir> — a bin dir whose mother-worker and mother-coord record their start and exit at once.
+_rs_stub_bin() {
+    local T="$1" f
+    mkdir -p "$T/bin"
+    for f in "$_PLUGIN_ROOT"/bin/*; do [ -f "$f" ] && ln -s "$f" "$T/bin/$(basename "$f")"; done
+    rm -f "$T/bin/mother-worker" "$T/bin/mother-coord"
+    printf '#!/bin/sh\necho started >> "%s/worker-starts"\nexit 0\n' "$RS_C" > "$T/bin/mother-worker"
+    printf '#!/bin/sh\nexit 0\n' > "$T/bin/mother-coord"
+    chmod +x "$T/bin/mother-worker" "$T/bin/mother-coord"
+    ln -s "$_PLUGIN_ROOT/broker" "$T/broker"
+}
+
+@test "worker secret: when the worker has died its secret is removed (a fresh worker gets a fresh one; the stale one is gone)" {
+    local T="$BATS_TEST_TMPDIR/stub" dead
+    _rs_stub_bin "$T"
+    mkdir -p "$RS_C/runner/coord"
+    ( sleep 0 ) & dead=$!; wait "$dead" 2>/dev/null || true
+    echo "$dead" > "$RS_C/runner/worker-local.pid"
+    echo "Thu Jan  1 00:00:00 1970" > "$RS_C/runner/worker-local.pid.start"
+    echo "STALE-SECRET" > "$RS_C/runner/coord/worker-local.secret"
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=worker MOTHER_BIN_DIR="$T/bin"; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    _rs_must 10 "a fresh worker to be started" test -s "$RS_C/worker-starts"
+    [ "$(wc -l < "$RS_C/worker-starts" | tr -d ' ')" = "1" ]
+    ! grep -q STALE-SECRET "$RS_C/runner/coord/worker-local.secret"
+}
+
+@test "worker pid: a live process whose start time differs from the recorded one (a recycled pid) is not taken for the worker, and is left alone" {
+    local T="$BATS_TEST_TMPDIR/stub2" other
+    _rs_stub_bin "$T"
+    mkdir -p "$RS_C/runner/coord"
+    sleep 120 & other=$!
+    echo "$other" > "$RS_C/runner/worker-local.pid"
+    echo "Thu Jan  1 00:00:00 1970" > "$RS_C/runner/worker-local.pid.start"
+    echo "STALE-SECRET" > "$RS_C/runner/coord/worker-local.secret"
+    ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=worker MOTHER_BIN_DIR="$T/bin"; mother-runner --worker-tick ) >/dev/null 2>&1 || true
+    local alive=0; kill -0 "$other" 2>/dev/null && alive=1
+    kill "$other" 2>/dev/null; wait "$other" 2>/dev/null || true
+    [ "$alive" = "1" ]                                              # never signalled
+    _rs_must 10 "a fresh worker to be started" test -s "$RS_C/worker-starts"   # a real worker was started instead
+    ! grep -q STALE-SECRET "$RS_C/runner/coord/worker-local.secret"
+    [ "$(tr -dc '0-9' < "$RS_C/runner/worker-local.pid")" != "$other" ]
 }
 
 # --- 13.6 no worker, no silent running ----------------------------------------
