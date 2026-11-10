@@ -1095,8 +1095,8 @@ Worker mode never loses a job's work when its worker stops. Details: `docs/worke
   `hold` failure class: they are never escalated into a fresh run. The new supervisor restores into
   `<worktree>-e<epoch>` (`_restore_from_checkpoint`), emits `resumed_from_checkpoint` and re-enters the same session
   with `templates/resume-elsewhere.md` (`--resume`); a loss during gates or the review wave re-runs that step.
-- **Restore point = a manifest the coordinator holds.** A take pushes `refs/mother/wip-ckpt/<job>/<epoch>-<n>` before the rolling
-  `refs/mother/wip/<job>`, and the manifest travels the async outbox, so the rolling ref can be ahead of `latest.json` after a kill.
+- **Restore point = a manifest the coordinator holds.** A take pushes `refs/mother/wip-ckpt/<job>/<epoch>-<n>` and the rolling
+  `refs/mother/wip/<job>` in one push (git, not us, decides the write order), and the manifest travels the async outbox, so the rolling ref can be ahead of `latest.json` after a kill.
   `_resume_lost_lease` trusts the immutable ref its own manifest names (rolling ref only if it equals `wip_sha`; any other sha is
   refused); restore sets the new lease's push expectation to the remote's current rolling ref. `latest.json` orders by `(epoch, n)`,
   the epoch checked against `runner/leases/<job>.history.jsonl`; a new worker numbers on from the offered manifest. Details:
