@@ -201,22 +201,43 @@ func fmtTime(t time.Time) string { return workerproto.Timestamp(t) }
 
 func parseTime(v string) (time.Time, error) { return time.Parse("2006-01-02T15:04:05.000Z", v) }
 
+// Lease history is bounded: past historyMaxLines the file is rewritten to its newest historyKeepLines. Epochs only ever grow,
+// so what is dropped is the oldest grants (a job would need hundreds of leases to reach this); a salvage or a manifest naming a
+// dropped epoch is refused as unknown, which is the safe direction.
+const (
+	historyMaxLines  = 256
+	historyKeepLines = 128
+)
+
 // leaseHistoryAppend records a granted lease (job, epoch, id, worker) in runner/leases/<job>.history.jsonl.
 // The lease table keeps only each job's latest lease, so this is the coordinator's own record of who
-// held which epoch: salvage frames are checked against it, never against what the worker claims.
+// held which epoch: salvage frames and checkpoint manifests are checked against it, never against what the worker claims.
 func (s *Server) leaseHistoryAppend(l workerproto.Lease) {
 	line, _ := json.Marshal(map[string]any{"job": l.Job, "epoch": l.Epoch, "id": l.ID, "worker": l.Worker})
 	if err := appendLine(s.historyPath(l.Job), line); err != nil {
 		s.logf("lease history %s: %v", l.Job, err)
+		return
+	}
+	b, err := os.ReadFile(s.historyPath(l.Job))
+	if err != nil || strings.Count(string(b), "\n") <= historyMaxLines {
+		return
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	keep := strings.Join(lines[len(lines)-historyKeepLines:], "\n") + "\n"
+	if err := writeFileAtomic(s.historyPath(l.Job), []byte(keep), false); err != nil {
+		s.logf("lease history %s: prune: %v", l.Job, err)
 	}
 }
 
-// leaseHistoryLookup returns the lease the coordinator granted for (job, epoch).
+// leaseHistoryLookup returns the lease the coordinator granted for (job, epoch). If an epoch ever appears twice the LAST grant
+// wins (a later grant supersedes an earlier one); it is never the first match.
 func (s *Server) leaseHistoryLookup(job string, epoch int64) (workerproto.Lease, bool) {
 	b, err := os.ReadFile(s.historyPath(job))
 	if err != nil {
 		return workerproto.Lease{}, false
 	}
+	var found workerproto.Lease
+	ok := false
 	for _, ln := range strings.Split(string(b), "\n") {
 		var r struct {
 			Job    string `json:"job"`
@@ -225,8 +246,8 @@ func (s *Server) leaseHistoryLookup(job string, epoch int64) (workerproto.Lease,
 			Worker string `json:"worker"`
 		}
 		if json.Unmarshal([]byte(ln), &r) == nil && r.Job == job && r.Epoch == epoch && r.ID != "" {
-			return workerproto.Lease{Job: job, Epoch: epoch, ID: r.ID, Worker: r.Worker}, true
+			found, ok = workerproto.Lease{Job: job, Epoch: epoch, ID: r.ID, Worker: r.Worker}, true
 		}
 	}
-	return workerproto.Lease{}, false
+	return found, ok
 }

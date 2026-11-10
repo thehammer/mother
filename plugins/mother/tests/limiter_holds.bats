@@ -599,9 +599,11 @@ _in_turn_terms() { grep -c '^term in_turn=yes' "$MOCK_CLAUDE_TURN_LOG" 2>/dev/nu
     export MOCK_CLAUDE_TURNS=3 MOCK_CLAUDE_TURN_SLEEP=3 MOTHER_LIMITER_HOLD_GRACE_S=3 MOTHER_LIMITER_QUIET_S=1 MOTHER_LIMITER_HOOK_MAX_S=2
     _make_job fx1
     _start_job fx1
-    _wait_for 10 _marker_present
+    # Startup and three 3 s turns take far longer than their nominal 10 s under CPU load (a supervisor start alone can take tens of
+    # seconds), so the waits are wide; the assertions below do not depend on how long they take.
+    _wait_for 60 _marker_present
     _hold_flag fx1 backoff "cut"
-    _wait_for 30 _supervisor_gone
+    _wait_for 120 _supervisor_gone
     [ "$(_in_turn_terms)" = "0" ]
     ! _turn_log_has "^term"
     [ "$(grep -c '^turn_end' "$MOCK_CLAUDE_TURN_LOG")" = "3" ]

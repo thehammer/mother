@@ -443,6 +443,14 @@ _ca_apply_artifact() {
 
 # --- checkpoint.taken ---------------------------------------------------------------------------
 
+# _ca_epoch_granted <job> <epoch>: the coordinator's lease history (runner/leases/<job>.history.jsonl) lists the epoch.
+_ca_epoch_granted() {
+    local hist="$MOTHER_ROOT/runner/leases/$1.history.jsonl"
+    case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ -f "$hist" ] || return 0
+    jq -e -s --argjson e "$2" --arg j "$1" 'any(.[]; .job == $j and .epoch == $e)' "$hist" >/dev/null 2>&1
+}
+
 # $1 job, $2 op line. Idempotent: replaying the same op changes nothing (the delta is only appended when the
 # reassembled file is exactly where the manifest says it was before this delta).
 _ca_apply_checkpoint() {
@@ -465,6 +473,11 @@ _ca_apply_checkpoint() {
         || { _ca_audit "$job" manifest_refused '["branch"]'; _ca_log "checkpoint.taken: manifest branch '$mbranch' is not the job's branch '$jbranch'"; return 1; }
     [ "$mref" = "refs/mother/wip/$job" ] \
         || { _ca_audit "$job" manifest_refused '["wip_ref"]'; _ca_log "checkpoint.taken: manifest wip_ref '$mref' is not refs/mother/wip/$job"; return 1; }
+    # The epoch orders restore points, so it must be one the coordinator granted for this job (its lease history, written at
+    # offer time and never by a worker). The Go coordinator already refuses a manifest whose (epoch, lease) it did not grant
+    # to the sending worker; this is the replay's own check. No history file (a root the coordinator never ran in) = skipped.
+    _ca_epoch_granted "$job" "$(printf '%s' "$line" | jq -r '.data.manifest.epoch // empty')" \
+        || { _ca_audit "$job" manifest_refused '["epoch"]'; _ca_log "checkpoint.taken: epoch was not granted for this job"; return 1; }
     pushed=$(printf '%s' "$line" | jq -r '.data.manifest.pushed == true')
     bytes=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.bytes // empty')
     sha=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.sha256 // empty')
@@ -505,14 +518,22 @@ _ca_checkpoint_record() {
            wip_sha: $m.wip_sha, wip_ref: $m.wip_ref, pushed: $m.pushed, session_id: $m.session_id,
            transcript_bytes: $m.transcript.bytes, transcript_ok: $ok}
           + (if $m.push_error then {push_error: $m.push_error} else {} end)') || return 1
-    if ! { [ -f "$ck/index.jsonl" ] && grep -qF "\"n\":$n,\"at\":" "$ck/index.jsonl" \
-            && grep -F "\"n\":$n,\"at\":" "$ck/index.jsonl" | grep -qF "\"wip_sha\":\"$(printf '%s' "$line" | jq -r '.data.manifest.wip_sha')\""; }; then
+    local m_epoch m_wip
+    m_epoch=$(printf '%s' "$line" | jq -r '.data.manifest.epoch // empty'); m_wip=$(printf '%s' "$line" | jq -r '.data.manifest.wip_sha // empty')
+    case "$m_epoch" in ''|*[!0-9]*) _ca_log "checkpoint.taken: bad epoch"; return 1 ;; esac
+    # The index is ordered by (epoch, n): a replay of the same (epoch, n, wip_sha) is the only duplicate.
+    if ! { [ -f "$ck/index.jsonl" ] && jq -e -s --argjson n "$n" --argjson e "$m_epoch" --arg w "$m_wip" \
+            'any(.[]; .n == $n and .epoch == $e and .wip_sha == $w)' "$ck/index.jsonl" >/dev/null 2>&1; }; then
         printf '%s\n' "$entry" >> "$ck/index.jsonl" || return 1
     fi
     if [ "$pushed" = true ] && [ "$okflag" = true ]; then
-        # Only ever forward: a replayed older checkpoint never replaces a newer latest.
-        local cur_n; cur_n=$(jq -r '.n // 0' "$ck/latest.json" 2>/dev/null); : "${cur_n:=0}"
-        if [ "$n" -ge "$cur_n" ]; then
+        # Only ever forward in (epoch, n): a later lease (a failover to another machine) numbers from its own start, so n alone
+        # would freeze latest.json at the first lease's last checkpoint. The epoch was vetted against the coordinator's lease
+        # history (_ca_epoch_granted), never taken on the worker's word alone.
+        local cur_n cur_e
+        cur_n=$(jq -r '.n // 0' "$ck/latest.json" 2>/dev/null); : "${cur_n:=0}"
+        cur_e=$(jq -r '.epoch // 0' "$ck/latest.json" 2>/dev/null); : "${cur_e:=0}"
+        if [ "$m_epoch" -gt "$cur_e" ] || { [ "$m_epoch" -eq "$cur_e" ] && [ "$n" -ge "$cur_n" ]; }; then
             printf '%s' "$line" | jq -c --arg now "$now" --arg tf "checkpoints/$(basename "$ck")/transcript/$sess.jsonl" '
                 .data.manifest + {received_at: $now, transcript_file: $tf, transcript_ok: true}' \
                 > "$ck/latest.json.tmp.$$" && mv "$ck/latest.json.tmp.$$" "$ck/latest.json" || return 1

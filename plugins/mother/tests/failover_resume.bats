@@ -210,7 +210,8 @@ _fr_wait_for() {
     "$@" >/dev/null 2>&1
 }
 
-_fr_dump() {
+# A subshell: `set +e` here must never leak into the caller (it once silently disabled errexit for the rest of the test).
+_fr_dump() (
     local f
     set +e   # a diagnostic dump must never stop at the first missing file (bats runs with -e)
     {
@@ -230,7 +231,7 @@ _fr_dump() {
         echo "--- origin refs";   [ -n "$FR_ORIGIN" ] && git --git-dir="$FR_ORIGIN" for-each-ref 2>/dev/null
     } >&2
     true
-}
+)
 
 # Every wait is scaled (default x2): a loaded CI or laptop runs a bare supervisor start in tens of seconds.
 _fr_must() {
@@ -472,6 +473,19 @@ _fr_interval() { echo "${MOTHER_TEST_CHECKPOINT_INTERVAL_S:-120}"; }
 # ===========================================================================
 # 0. The harness itself (passes today: it guards the scripted mock and the world the tests below stand on)
 
+@test "meta: a failing assertion after a helper that dumps diagnostics still FAILS the test (_fr_dump must not disable errexit)" {
+    # The bug this guards: _fr_dump ran `set +e` in the caller's shell, so after any failed _fr_must/_fr_fail the rest of the
+    # test ran without errexit and a false assertion passed.
+    run bash -c "set -e; FR_C=/nonexistent-fr FR_STEPS=/nonexistent FR_W=/nonexistent FR_ID=x FR_ORIGIN=
+        $(declare -f _fr_dump _fr_fail _fr_must _fr_wait_for)
+        _fr_fail boom || true
+        _fr_must 0 'never true' false || true
+        [ 1 = 2 ]
+        echo SURVIVED"
+    [ "$status" -ne 0 ]
+    [[ "$output" != *SURVIVED* ]]
+}
+
 @test "harness: a scripted worktree job runs through the worker, commits, pushes and opens its PR (no failure injected)" {
     local id="fr-sanity"
     _fr_world "$id"
@@ -679,12 +693,47 @@ _fr_tamper_failure() { # <jq-edit-of-latest.json | ""> <origin-edit-cmd...> — 
     [ "$(_fr_ev_count resumed_from_checkpoint)" = "0" ]
 }
 
-_fr_origin_wip_to_other_sha() { # point the wip ref at a different, valid commit (the repo's base commit)
-    git --git-dir="$FR_ORIGIN" update-ref "$(_fr_wip_ref)" "$(git --git-dir="$FR_ORIGIN" rev-parse "$(git --git-dir="$FR_ORIGIN" for-each-ref --format='%(refname)' refs/heads | head -1)")"
+_fr_other_sha() { git --git-dir="$FR_ORIGIN" rev-parse "$(git --git-dir="$FR_ORIGIN" for-each-ref --format='%(refname)' refs/heads | head -1)"; }
+_fr_ckpt_ref() { printf 'refs/mother/wip-ckpt/%s/%s-%s' "$FR_ID" "$(_fr_latest .epoch)" "$(_fr_latest .n)"; }
+
+_fr_origin_wip_refs_to_other_sha() { # BOTH the rolling ref and the latest checkpoint's own ref point at an unrelated commit
+    git --git-dir="$FR_ORIGIN" update-ref "$(_fr_wip_ref)" "$(_fr_other_sha)"
+    git --git-dir="$FR_ORIGIN" update-ref "$(_fr_ckpt_ref)" "$(_fr_other_sha)"
 }
 
-@test "kill -9, then the wip ref on origin points at another sha than the checkpoint's wip_sha: the job fails no_checkpoint_restorable (a ref that moved is not the checkpoint)" {
-    _fr_tamper_failure fr-wrongsha "" "not the checkpoint's wip_sha" _fr_origin_wip_to_other_sha
+@test "kill -9, then every ref on origin that could hold the checkpoint points at an unrelated sha: the job fails no_checkpoint_restorable (an unrelated sha is never trusted)" {
+    _fr_tamper_failure fr-wrongsha "" "not the checkpoint's wip_sha" _fr_origin_wip_refs_to_other_sha
+}
+
+# The worker pushes the wip ref first and the manifest travels the async outbox afterwards, so a worker that dies in between
+# leaves the rolling ref AHEAD of the newest manifest the coordinator holds. That is routine, not tampering: the coordinator
+# restores from the point whose manifest it holds (its own immutable ref), losing nothing it had a record of.
+@test "kill -9 after a push whose manifest never landed (the rolling ref is ahead of latest.json): the job resumes from the newest checkpoint the coordinator knows" {
+    local id="fr-ahead" ahead tree head n epoch new_wd
+    _fr_world "$id"
+    export MOCK_CLAUDE_SCRIPT=$(_fr_first_run_script) MOCK_CLAUDE_RESUME_SCRIPT=$(_fr_resume_script)
+    _fr_runner worker
+    _fr_must 60 "the first run's work steps" _fr_step_done 1 4
+    _fr_must 40 "a pushed checkpoint" _fr_ckpt_has_file scratch/untracked.txt
+    _fr_kill9_worker "$FR_W"
+    sleep 1
+    n=$(_fr_latest .n); epoch=$(_fr_latest .epoch); head=$(_fr_latest .head_sha)
+    # What a take that got as far as the push and no further leaves: a newer wip commit under the rolling ref and under the
+    # checkpoint's own immutable ref, and no manifest for it at the coordinator.
+    tree=$(_fr_ref_tree "$(_fr_latest .wip_sha)")
+    ahead=$(git --git-dir="$FR_ORIGIN" commit-tree "$tree" -p "$head" -m "ahead of the manifest")
+    git --git-dir="$FR_ORIGIN" update-ref "$(_fr_wip_ref)" "$ahead"
+    git --git-dir="$FR_ORIGIN" update-ref "refs/mother/wip-ckpt/$id/$epoch-$((n + 1))" "$ahead"
+    [ "$(_fr_origin_ref "$(_fr_wip_ref)")" != "$(_fr_latest .wip_sha)" ]
+
+    _fr_must 90 "the resumed_from_checkpoint event" _fr_ev_has resumed_from_checkpoint
+    [ "$(_fr_ev_count failed)" = "0" ]
+    [ "$(_fr_ev_detail resumed_from_checkpoint .wip_sha)" = "$(_fr_latest .wip_sha)" ]
+    _fr_must 60 "the second mock run to start" _fr_inv_started 2
+    new_wd=$(_fr_inv_field 2 cwd)
+    grep -qx 'untracked scratch/untracked.txt' "$new_wd/scratch/untracked.txt"
+    : > "$FR_GATES/resume-gate"
+    _fr_must 90 "the job to succeed" _fr_state_is succeeded
 }
 
 @test "kill -9, then the canonical checkpoint says pushed:false (an unpushed wip ref): the job fails no_checkpoint_restorable" {
@@ -1079,6 +1128,96 @@ pr")
     [ "$(_fr_ev_count worker_spawned)" = "2" ]
     [ "$(_fr_origin_ref "refs/heads/$FR_BRANCH")" = "$(git -C "$new_wd" rev-parse HEAD)" ]
     _fr_no_dup_events
+}
+
+@test "failover to another machine, then a second loss: latest.json advances to the second lease's checkpoints (ordered by epoch, numbering continues) and the third lease resumes from them" {
+    local id="fr-twice" old_epoch zwpid zwpgid n1 n2 wd3
+    _fr_world "$id"
+    export MOCK_CLAUDE_SCRIPT=$(_fr_first_run_script)
+    export MOCK_CLAUDE_RESUME_SCRIPT=$(_fr_script twice "edit w2-only.txt written-on-the-second-machine
+wait-file $FR_GATES/finish-gate
+commit last run: finish
+push
+pr")
+    _fr_runner worker
+    _fr_must 60 "the first run's work steps" _fr_step_done 1 4
+    _fr_must 40 "a pushed checkpoint holding the untracked file" _fr_ckpt_has_file scratch/untracked.txt
+    _fr_start_w2
+    _fr_must 20 "w2 to be connected" _fr_w2_connected
+    old_epoch=$(_fr_lease epoch)
+    read -r zwpid zwpgid < "$FR_W/worker.pid"
+    _fr_num "$zwpgid" && [ "$zwpgid" != "$(_fr_mypgid)" ]
+    n1=$(_fr_latest .n)
+    [ "$(_fr_latest .epoch)" = "$old_epoch" ]
+
+    # Machine 1 freezes; the job moves to w2 (an empty checkpoints directory of its own).
+    kill -STOP -- "-$zwpgid"
+    _fr_must 60 "the second lease to be active" _fr_lease_active_epoch $((old_epoch + 1))
+    [ "$(_fr_lease worker_id)" = "w2" ]
+    _fr_must 60 "w2's run to start" _fr_inv_started 2
+    _fr_must 60 "w2's own checkpoint to become latest.json (epoch $((old_epoch + 1)))" bash -c '[ "$(jq -r .epoch "$1/latest.json")" = "$2" ]' _ "$(_fr_ckpt_dir)" $((old_epoch + 1))
+    _fr_must 40 "a checkpoint of the second machine holding its own edit" _fr_ckpt_has_file w2-only.txt
+    n2=$(_fr_latest .n)
+    # Numbering continues from the offered manifest instead of restarting at 1 on the new machine.
+    [ "$n2" -gt "$n1" ] || _fr_fail "the second lease numbered its checkpoint $n2, not past the first lease's $n1"
+
+    # Machine 2 dies for good (and so does the frozen machine 1: nothing can interfere); the runner restarts the local worker.
+    _fr_kill9_worker "$FR_W2"
+    kill -9 -- "-$zwpgid" 2>/dev/null || true
+    _fr_must 90 "the third lease to be active" _fr_lease_active_epoch $((old_epoch + 2))
+    _fr_must 60 "the third run to start" _fr_inv_started 3
+    [ "$(_fr_field worker_resume_count)" = "2" ]
+    [ "$(_fr_ev_count failed)" = "0" ]
+    # It resumed from the SECOND lease's checkpoint: that line's file is in its worktree.
+    jq -e -s --arg s "$(_fr_ev_detail resumed_from_checkpoint .wip_sha)" --argjson e "$((old_epoch + 1))" \
+        'map(select(.epoch == $e and .wip_sha == $s)) | length > 0' "$(_fr_ckpt_dir)/index.jsonl" >/dev/null \
+        || _fr_fail "the third lease did not resume from a checkpoint of epoch $((old_epoch + 1))"
+    wd3=$(_fr_inv_field 3 cwd)
+    [ -f "$wd3/w2-only.txt" ]
+    [ -f "$wd3/scratch/untracked.txt" ]
+    : > "$FR_GATES/finish-gate"
+    _fr_must 90 "the job to succeed" _fr_state_is succeeded
+}
+
+# latest.json is what a restore reads: it must be exactly Go's (validated) manifest plus the coordinator's own fields, never
+# the worker's bytes (case-variant or duplicate keys parse differently in Go and jq).
+@test "latest.json is the Go Manifest re-serialisation: the keys of the wire manifest in order, then the coordinator's received_at, transcript_file, transcript_ok" {
+    local id="fr-wire"
+    _fr_world "$id"
+    export MOCK_CLAUDE_SCRIPT=$(_fr_first_run_script)
+    _fr_runner worker
+    _fr_must 60 "the first run's work steps" _fr_step_done 1 4
+    _fr_must 40 "a pushed checkpoint" _fr_ckpt_has_file scratch/untracked.txt
+    jq -e 'keys_unsorted[0:13] == ["v","job","lease","epoch","n","at","head_sha","branch","base_sha","wip_sha","wip_ref","pushed","session_id"]' \
+        "$(_fr_ckpt_dir)/latest.json" >/dev/null || _fr_fail "latest.json key order: $(jq -c 'keys_unsorted' "$(_fr_ckpt_dir)/latest.json")"
+    jq -e 'keys_unsorted[-3:] == ["received_at","transcript_file","transcript_ok"]' "$(_fr_ckpt_dir)/latest.json" >/dev/null \
+        || _fr_fail "latest.json does not end with the coordinator's fields: $(jq -c 'keys_unsorted' "$(_fr_ckpt_dir)/latest.json")"
+}
+
+# The resume entry runs the same session with `_spawn_and_wait resume ... || true`: a session that cannot be re-entered (here the
+# mock exits 97 as real `claude --resume` does for an unknown session) must end the job failed with a stated reason, never start a
+# fresh run (the job would redo work already done) and never report success.
+@test "a resume that cannot re-enter the session fails the job with a defined reason: no fresh run, never succeeded" {
+    local id="fr-noreenter" why
+    _fr_world "$id"
+    export MOCK_CLAUDE_SCRIPT=$(_fr_first_run_script)
+    export MOCK_CLAUDE_RESUME_SCRIPT=$(_fr_script noreenter "exit 97")
+    _fr_runner worker
+    _fr_must 60 "the first run's work steps" _fr_step_done 1 4
+    _fr_must 40 "a pushed checkpoint" _fr_ckpt_has_file scratch/untracked.txt
+    _fr_kill9_worker "$FR_W"
+    _fr_must 90 "the resumed run to start" _fr_inv_started 2
+    _fr_must 90 "the job to fail" _fr_state_is failed
+    _fr_must 60 "the failed event" _fr_ev_has failed
+    sleep 5
+    [ "$(_fr_state)" = "failed" ]
+    [ "$(_fr_mock_runs)" = "2" ]
+    [ "$(_fr_ev_count succeeded)" = "0" ]
+    [ "$(_fr_ev_count worker_spawned)" -le 2 ]
+    # The stated reason is on the failed event (a worker never writes failure_reason itself: the coordinator derives it).
+    why="$(_fr_field failure_reason) $(_fr_ev_detail failed .reason)"
+    [[ "$why" =~ [a-z_] ]] && [[ "$why" != *unspecified* ]] || _fr_fail "no defined failure reason: [$why] events: $(cat "$(_fr_events)" 2>&1 | head -c 1500)"
+    [ "$(_fr_inv_field 2 mode)" = "resume" ]
 }
 
 # ===========================================================================

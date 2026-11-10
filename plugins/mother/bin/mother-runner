@@ -865,15 +865,25 @@ _resume_lost_lease() {
     repo=$(jq -r '.repo_path // empty' "$jf" 2>/dev/null)
     if [ -z "$repo" ] || [ ! -d "$repo" ]; then _resume_fail "$id" "repository missing: ${repo:-unknown}"; return 0; fi
     tmp=$(mktemp "${TMPDIR:-/tmp}/mother-lsr.XXXXXX") || { _resume_fail "$id" "no scratch space"; return 0; }
+    # The checkpoint's own immutable ref (named from the manifest's epoch and n, which the coordinator vetted against its lease
+    # history) is what proves the point. The rolling ref is only a
+    # fallback (a pruned or older checkpoint) and counts only when it equals wip_sha: it runs ahead of the manifest the coordinator
+    # holds whenever a worker dies between its push and the manifest landing, so a different sha there is expected and not an
+    # error by itself. No ref at wip_sha (unrelated sha, gone) means the point is refused.
+    local mep ckref="" ckrsha=""
+    mep=$(jq -r '.epoch // empty' "$latest")
+    case "$mep$n" in ''|*[!0-9]*) ;; *) ckref="refs/mother/wip-ckpt/$id/$mep-$n" ;; esac
     local lsrc=0 lsstart=$SECONDS
-    _bounded_run "${MOTHER_GIT_REMOTE_TIMEOUT:-60}" "$tmp" git -C "$repo" ls-remote origin -- "$wipref" || lsrc=$?
+    _bounded_run "${MOTHER_GIT_REMOTE_TIMEOUT:-60}" "$tmp" git -C "$repo" ls-remote origin -- "$wipref" ${ckref:+"$ckref"} || lsrc=$?
     if [ "$lsrc" -ne 0 ]; then
         rm -f "$tmp"; _resume_fail "$id" "remote unreachable: could not verify the wip ref (git ls-remote exit $lsrc after $((SECONDS - lsstart))s)"; return 0
     fi
-    rsha=$(awk -v r="$wipref" '$2 == r {print $1; exit}' "$tmp"); rm -f "$tmp"
-    if [ -z "$rsha" ]; then _resume_fail "$id" "wip ref missing on remote"; return 0; fi
-    if [ "$rsha" != "$wipsha" ]; then
-        _resume_fail "$id" "wip ref on the remote is at ${rsha:0:12}, not the checkpoint's wip_sha ${wipsha:0:12}"; return 0
+    rsha=$(awk -v r="$wipref" '$2 == r {print $1; exit}' "$tmp")
+    [ -z "$ckref" ] || ckrsha=$(awk -v r="$ckref" '$2 == r {print $1; exit}' "$tmp")
+    rm -f "$tmp"
+    if [ "$ckrsha" != "$wipsha" ] && [ "$rsha" != "$wipsha" ]; then
+        if [ -z "$rsha" ] && [ -z "$ckrsha" ]; then _resume_fail "$id" "wip ref missing on remote"; return 0; fi
+        _resume_fail "$id" "wip ref on the remote is at ${ckrsha:0:12}${ckrsha:+ (checkpoint ref)}${ckrsha:+, }${rsha:0:12}${rsha:+ (rolling ref)}, not the checkpoint's wip_sha ${wipsha:0:12}"; return 0
     fi
     # The transcript the new session continues: the first <bytes> bytes of the reassembled file, verified.
     tfile="$root/$(jq -r '.transcript_file // empty' "$latest")"

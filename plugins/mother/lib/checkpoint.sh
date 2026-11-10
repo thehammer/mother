@@ -446,7 +446,7 @@ _ckpt_take_locked() {
         || { _ckpt_take_fail commit_failed "could not create the wip commit"; return 1; }
 
     # 4. Push with fencing.
-    local pushed=false push_error="" branch_push="" rc=0 pout wip_ref="refs/mother/wip/$job" target expect="" state_file marker
+    local pushed=false push_error="" branch_push="" rc=0 pout wip_ref="refs/mother/wip/$job" ckpt_ref="" target expect="" state_file marker
     state_file="$parent/.last-pushed"
     marker=$(_ckpt_git_path "$wd" mother-wip-expect) || marker=""
     pout=$(_ckpt_mktemp) || return 1
@@ -460,9 +460,20 @@ _ckpt_take_locked() {
         elif [ -n "$marker" ] && [ -s "$marker" ]; then expect=$(cat "$marker")
         else expect=$(_ckpt_ls_remote_ref "$wd" "$target" || true)
         fi
-        # No "+" on the refspec: a "+" overrides the lease check, so a moved ref would be overwritten.
-        # The explicit lease alone allows the non-fast-forward update when the ref is where we left it.
-        _ckpt_push "$wd" "$pout" origin "$wip:$target" "--force-with-lease=$target:$expect" || rc=$?
+        # The per-checkpoint ref goes FIRST. The name is unique to this lease (epoch) and take number, so only this lease's
+        # worker ever writes it; "+" lets a take that died after the push and before its manifest (same n, new commit)
+        # be redone. The coordinator trusts a ref only when its sha equals its own manifest's wip_sha. The rolling ref moves before the coordinator hears of the manifest
+        # (the manifest travels the async outbox), so after a kill the rolling ref can be ahead of the newest manifest the
+        # coordinator holds; the coordinator restores from the immutable ref its own manifest names and never needs the
+        # rolling ref to equal anything. Namespace refs/mother/wip-ckpt/<job>/<epoch>-<n> has no D/F conflict with
+        # refs/mother/wip/<job>.
+        ckpt_ref="refs/mother/wip-ckpt/$job/$epoch-$n"
+        _ckpt_push "$wd" "$pout" origin "+$wip:$ckpt_ref" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            # No "+" on the refspec: a "+" overrides the lease check, so a moved ref would be overwritten.
+            # The explicit lease alone allows the non-fast-forward update when the ref is where we left it.
+            _ckpt_push "$wd" "$pout" origin "$wip:$target" "--force-with-lease=$target:$expect" || rc=$?
+        fi
     fi
     local exit_code=0 cur
     if [ "$rc" -eq 0 ]; then
@@ -480,6 +491,15 @@ _ckpt_take_locked() {
         push_error="fenced"; exit_code=3
     else
         push_error="push failed (exit $rc)"
+    fi
+
+    # Bounded history of immutable refs: keep the newest MOTHER_CHECKPOINT_KEEP_REFS (default 20) of this epoch; best effort.
+    if [ "$pushed" = true ] && [ -z "$salvage" ] && [ -n "$ckpt_ref" ]; then
+        local keep="${MOTHER_CHECKPOINT_KEEP_REFS:-20}"
+        case "$keep" in ''|*[!0-9]*|0) keep=20 ;; esac
+        if [ "$n" -gt "$keep" ]; then
+            _ckpt_push "$wd" "$pout" origin ":refs/mother/wip-ckpt/$job/$epoch-$((n - keep))" >/dev/null 2>&1 || true
+        fi
     fi
 
     # Committed work also goes to the job branch (fast-forward only, never forced), unless this worker
@@ -647,8 +667,17 @@ mother_checkpoint_restore() {
     [ -z "$_CKPT_REFUSE" ] || { echo "mother: checkpoint restore: refusing $repo: $_CKPT_REFUSE" >&2; return 1; }
 
     # 1. The wip commit: fetch it, or use the object already in a shared store.
-    local ref="refs/mother/wip/$job" source=origin
-    _ckpt_git "$repo" fetch --no-tags --no-recurse-submodules --upload-pack=git-upload-pack origin "+$ref:$ref" >/dev/null || source=local_object
+    # The immutable ref of this very checkpoint first (the manifest's own epoch and n), the rolling ref as the fallback
+    # (older workers; a pruned immutable ref). Whichever ref supplies the object, the sha must be the manifest's wip_sha.
+    local ref="refs/mother/wip/$job" source=origin mep mn ckref=""
+    mep=$(jq -r '.epoch // empty' "$manifest" 2>/dev/null); mn=$(jq -r '.n // empty' "$manifest" 2>/dev/null)
+    case "$mep$mn" in ''|*[!0-9]*) ;; *) ckref="refs/mother/wip-ckpt/$job/$mep-$mn" ;; esac
+    if [ -n "$ckref" ] && _ckpt_git "$repo" fetch --no-tags --no-recurse-submodules --upload-pack=git-upload-pack origin "+$ckref:$ckref" >/dev/null 2>&1 \
+        && [ "$(_ckpt_git "$repo" rev-parse --verify -q "$ckref^{commit}" 2>/dev/null)" = "$wip" ]; then
+        :
+    else
+        _ckpt_git "$repo" fetch --no-tags --no-recurse-submodules --upload-pack=git-upload-pack origin "+$ref:$ref" >/dev/null || source=local_object
+    fi
     _ckpt_git "$repo" cat-file -e "$wip^{commit}" >/dev/null 2>&1 || { _ckpt_restore_fail wip_missing; return $?; }
     _ckpt_git "$repo" cat-file -e "$head^{commit}" >/dev/null 2>&1 || { _ckpt_restore_fail head_missing; return $?; }
     local wip_tree parents
@@ -697,7 +726,14 @@ mother_checkpoint_restore() {
         && _ckpt_git "$repo" merge-base --is-ancestor "$base_sha" "$head" >/dev/null 2>&1; then
         base_moved=false
     fi
-    local mk; mk=$(_ckpt_git_path "$newwd" mother-wip-expect) && printf '%s' "$wip" >"$mk" 2>/dev/null
+    # The new lease's first push may replace whatever the rolling ref holds NOW: the dead worker can have pushed after the
+    # checkpoint this restore used (a take that died before its manifest landed), and expecting the manifest's wip_sha would
+    # fence the legitimate new lease on its very first take. The remote's current value is what the lease replaces; an
+    # unreadable remote falls back to the checkpoint's own wip_sha.
+    local mk cur_remote; mk=$(_ckpt_git_path "$newwd" mother-wip-expect) || mk=""
+    cur_remote=$(_ckpt_ls_remote_ref "$newwd" "refs/mother/wip/$job" 2>/dev/null) || cur_remote=""
+    _ckpt_sha_ok "$cur_remote" || cur_remote="$wip"
+    [ -z "$mk" ] || printf '%s' "$cur_remote" >"$mk" 2>/dev/null
     jq -n -c --arg head "$head" --arg wip "$wip" --arg tsha "$tsha_want" --arg src "$source" \
         --arg bs "$branch_state" --argjson det "$detached" --arg base "$base_sha" --argjson bm "$base_moved" \
         --slurpfile m "$manifest" '

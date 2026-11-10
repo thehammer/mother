@@ -3907,6 +3907,18 @@ _restore_from_checkpoint() {
     fi
     rm -f "$errf"
     _tm_exclude_path "$new"
+    # Continue numbering from the offered manifest: this worker's own checkpoints dir is empty after a failover to another machine, and a
+    # take numbers itself from the newest manifest it finds there (and diffs the transcript against it). Seed it, unless a newer one exists.
+    local sn sdir="$MOTHER_ROOT/checkpoints/$id" last=0 d dn
+    # An earlier lease on this machine left its last-pushed value here; the restore just wrote the new lease's own expectation.
+    rm -f "$sdir/.last-pushed"
+    sn=$(jq -r '.n // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)
+    case "$sn" in ''|*[!0-9]*) ;; *)
+        for d in "$sdir"/*/; do dn=$(basename "$d"); case "$dn" in ''|*[!0-9]*) continue ;; esac; [ -s "${d}manifest.json" ] && [ "$dn" -gt "$last" ] && last="$dn"; done
+        if [ "$last" -lt "$sn" ]; then
+            mkdir -p "$sdir/$sn" && cp "$MOTHER_RESUME_CHECKPOINT" "$sdir/$sn/manifest.json" 2>/dev/null || true
+        fi ;;
+    esac
     _resume_restore_json=$(printf '%s\n' "$out" | tail -n 1)
     _resume_info_json='{}'
     [ -r "$info" ] && _resume_info_json=$(jq -c . "$info" 2>/dev/null || echo '{}')

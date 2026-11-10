@@ -264,7 +264,15 @@ Validation (`ValidateManifest`) runs on receipt and refuses, before any `WipRef(
   together (a ref cannot be both a file and a directory; the second push is rejected with a refname conflict).
   `WipRef`/`SalvageRef` return `""` for a job id that is not a valid git ref component (`JobRefOK`: an id, no leading `.`, no trailing `.`
   or `.lock`), and `ValidateManifest` refuses such a job.
-- Follow-up (not built): delete `refs/mother/wip/<job>` and `refs/mother/wip-salvage/<job>/*` when the job is archived.
+- **Per-checkpoint refs (round 2).** Each take pushes `refs/mother/wip-ckpt/<job>/<epoch>-<n>` (the same wip commit; force-pushed, since the name
+  is unique to the lease and take number) BEFORE it moves the rolling ref, and the manifest then travels the async outbox. So the rolling
+  ref is routinely ahead of the newest manifest the coordinator holds, and a worker that dies in between must not fail the job. The runner
+  restores from the immutable ref its own `latest.json` names (epoch and n are vetted: the frame's epoch is the coordinator's lease epoch
+  and `coord_apply.sh` checks it against `runner/leases/<job>.history.jsonl`), accepts the rolling ref only when it equals `wip_sha`, and
+  refuses any other sha. `wip-ckpt` is a separate directory for the same D/F reason as `wip-salvage`. The newest
+  `MOTHER_CHECKPOINT_KEEP_REFS` (20) of each epoch are kept; older ones are deleted best effort, so a coordinator that is more than 20
+  checkpoints behind its worker falls back to the rolling ref (which then must equal `wip_sha`) or fails `no_checkpoint_restorable`.
+- Follow-up (not built): delete `refs/mother/wip/<job>`, `refs/mother/wip-ckpt/<job>/*` and `refs/mother/wip-salvage/<job>/*` when the job is archived.
 - **Interval 120 s** (refused above **240 s**), **final-on-exit timeout 30 s**, **per-checkpoint watchdog 60 s**.
 - **MC-14 mapping:** worst-case loss = interval + watchdog = 120 + 60 = **180 s**, under the 300 s bound (at the 240 s maximum it
   is 300 s, which is why the maximum is not raised).
@@ -363,7 +371,11 @@ Everything here is additive inside `data` (section 5: additive data fields are a
   ordered outbox: `artifact.put` for `checkpoints/<job>/<n>/transcript.delta` and `manifest.json`, then `checkpoint.taken{manifest}`.
   The coordinator applies it (`lib/coord_apply.sh`): the delta is appended to `checkpoints/<job>/transcript/<session>.jsonl`
   (replaced when `reset` or when the delta is the whole file), verified against the manifest's sha256, every manifest is appended to
-  `checkpoints/<job>/index.jsonl`, and `latest.json` advances only for a checkpoint that is `pushed:true` with a verified transcript.
+  `checkpoints/<job>/index.jsonl` (de-duplicated by epoch, n and wip_sha), and `latest.json` advances only for a checkpoint that is
+  `pushed:true` with a verified transcript and is newer in `(epoch, n)` order: a failover starts a new epoch whose worker continues
+  numbering from the manifest it was offered, but even a worker that restarts at 1 outranks every earlier epoch. The epoch must be
+  one in the coordinator's lease history for the job (`runner/leases/<job>.history.jsonl`, written at offer time; bounded: past 256
+  lines it is cut to the newest 128; a repeated epoch resolves to its latest grant).
   The supervisor takes the same checkpoint at phase boundaries and before every exit or awaiting/terminal state write
   (`_ckpt_final`); takes serialise on the checkpoint lock and number themselves under it.
 - **`salvage` control frame** (worker to coordinator, not seq-numbered, envelope job/lease/epoch of the fenced lease):
@@ -383,5 +395,9 @@ Everything here is additive inside `data` (section 5: additive data fields are a
   start). After `MOTHER_WORKER_RESUME_MAX` resumes: `worker_resume_exhausted`.
 - **A restarted worker** that still holds an active lease whose supervisor is gone fences it (salvage under that lease's own epoch)
   when the coordinator offers the job again.
+- **Trust limit of resuming at all.** A hostile worker authors the transcript the next session resumes (`--resume`), so a failover
+  inherits any prompt injection already present in that transcript. This is inherent to continuing a session and is not filtered. The
+  mitigation is that nothing the resumed session can do exceeds what the first one could: same job, same branch, same worktree class,
+  same permissions, and no new credentials; the coordinator still derives success itself.
 - Limitations: the checkpoint paths in `resume_from` are coordinator-side paths (local carrier only); the subagent transcript
   directory is not shipped; a main-dir job cannot be resumed (it fails `no_checkpoint_restorable`, `why: main_dir_job`).

@@ -180,27 +180,28 @@ func TestValidate(t *testing.T) {
 		f    Frame
 		code string
 	}{
-		"missing seq":        {noSeq, CodeInvalid},
-		"epoch 0":            {zeroEpoch, CodeInvalid},
-		"missing cmd_id":     {noCmd, CodeInvalid},
-		"command w/o lease":  {noLeaseCmd, CodeInvalid},
-		"empty event line":   {streamFrame(t, TypeEventAppend, EventAppend{}), CodeInvalid},
-		"newline in line":    {streamFrame(t, TypeEventAppend, EventAppend{Line: "a\nb"}), CodeInvalid},
-		"stream not allowed": {streamFrame(t, TypeRecordAppend, RecordAppend{Stream: "../x", Line: "{}"}), CodeInvalid},
-		"chunk too big":      {streamFrame(t, TypeLogAppend, LogAppend{B64: b64(MaxChunkBytes + 1)}), CodeTooLarge},
-		"bad b64":            {streamFrame(t, TypeLogAppend, LogAppend{B64: "!!"}), CodeInvalid},
-		"artifact dotdot":    {streamFrame(t, TypeArtifactPut, ArtifactPut{Path: "crew/job1/../job2/x", B64: ""}), CodeInvalid},
-		"artifact other job": {streamFrame(t, TypeArtifactPut, ArtifactPut{Path: "crew/job2/x", B64: ""}), CodeInvalid},
-		"artifact absolute":  {streamFrame(t, TypeArtifactPut, ArtifactPut{Path: "/etc/passwd", B64: ""}), CodeInvalid},
-		"artifact bad sha":   {streamFrame(t, TypeArtifactPut, ArtifactPut{Path: "crew/job1/x", SHA256: "zz"}), CodeInvalid},
-		"sync.file path":     {mustFrame(t, TypeSyncFile, SyncFile{CmdID: "c", Path: "jobs/x.json", Content: []byte(`"x"`)}), CodeInvalid},
-		"sync.file absent":   {mustFrame(t, TypeSyncFile, map[string]any{"cmd_id": "c", "path": "ratelimit-until"}), CodeInvalid},
-		"sync.job key":       {cmdFrame(t, TypeSyncJob, SyncJob{CmdID: "c", Set: map[string]json.RawMessage{"repo_path": []byte(`"x"`)}}), CodeOwnership},
-		"refuse bad code":    {mustFrame(t, TypeRefuse, Refuse{Code: "bogus"}), CodeInvalid},
-		"hello no auth":      {mustFrame(t, TypeHello, Hello{ProtoMin: 1, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local"}), CodeInvalid},
-		"hello bad range":    {mustFrame(t, TypeHello, Hello{ProtoMin: 2, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local", Auth: Auth{Method: "peercred"}}), CodeInvalid},
-		"manifest other job": {streamFrame(t, TypeCheckpointTaken, CheckpointTaken{Manifest: otherJobManifest()}), CodeInvalid},
-		"cmd.ack outcome":    {mustFrame(t, TypeCmdAck, CmdAck{CmdID: "c", Outcome: "maybe"}), CodeInvalid},
+		"missing seq":           {noSeq, CodeInvalid},
+		"epoch 0":               {zeroEpoch, CodeInvalid},
+		"missing cmd_id":        {noCmd, CodeInvalid},
+		"command w/o lease":     {noLeaseCmd, CodeInvalid},
+		"empty event line":      {streamFrame(t, TypeEventAppend, EventAppend{}), CodeInvalid},
+		"newline in line":       {streamFrame(t, TypeEventAppend, EventAppend{Line: "a\nb"}), CodeInvalid},
+		"stream not allowed":    {streamFrame(t, TypeRecordAppend, RecordAppend{Stream: "../x", Line: "{}"}), CodeInvalid},
+		"chunk too big":         {streamFrame(t, TypeLogAppend, LogAppend{B64: b64(MaxChunkBytes + 1)}), CodeTooLarge},
+		"bad b64":               {streamFrame(t, TypeLogAppend, LogAppend{B64: "!!"}), CodeInvalid},
+		"artifact dotdot":       {streamFrame(t, TypeArtifactPut, ArtifactPut{Path: "crew/job1/../job2/x", B64: ""}), CodeInvalid},
+		"artifact other job":    {streamFrame(t, TypeArtifactPut, ArtifactPut{Path: "crew/job2/x", B64: ""}), CodeInvalid},
+		"artifact absolute":     {streamFrame(t, TypeArtifactPut, ArtifactPut{Path: "/etc/passwd", B64: ""}), CodeInvalid},
+		"artifact bad sha":      {streamFrame(t, TypeArtifactPut, ArtifactPut{Path: "crew/job1/x", SHA256: "zz"}), CodeInvalid},
+		"sync.file path":        {mustFrame(t, TypeSyncFile, SyncFile{CmdID: "c", Path: "jobs/x.json", Content: []byte(`"x"`)}), CodeInvalid},
+		"sync.file absent":      {mustFrame(t, TypeSyncFile, map[string]any{"cmd_id": "c", "path": "ratelimit-until"}), CodeInvalid},
+		"sync.job key":          {cmdFrame(t, TypeSyncJob, SyncJob{CmdID: "c", Set: map[string]json.RawMessage{"repo_path": []byte(`"x"`)}}), CodeOwnership},
+		"refuse bad code":       {mustFrame(t, TypeRefuse, Refuse{Code: "bogus"}), CodeInvalid},
+		"hello no auth":         {mustFrame(t, TypeHello, Hello{ProtoMin: 1, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local"}), CodeInvalid},
+		"hello bad range":       {mustFrame(t, TypeHello, Hello{ProtoMin: 2, ProtoMax: 1, WorkerID: "w", InstanceID: "i", Kind: "local", Auth: Auth{Method: "peercred"}}), CodeInvalid},
+		"manifest other job":    {streamFrame(t, TypeCheckpointTaken, CheckpointTaken{Manifest: otherJobManifest()}), CodeInvalid},
+		"manifest future epoch": {streamFrame(t, TypeCheckpointTaken, CheckpointTaken{Manifest: epochManifest("job1", 99)}), CodeInvalid},
+		"cmd.ack outcome":       {mustFrame(t, TypeCmdAck, CmdAck{CmdID: "c", Outcome: "maybe"}), CodeInvalid},
 	}
 	for n, c := range bad {
 		if err := Validate(c.f); ErrorCode(err) != c.code {
@@ -233,6 +234,13 @@ func TestFixturesRoundTripByteIdentical(t *testing.T) {
 
 func otherJobManifest() Manifest {
 	return goodManifest("job2")
+}
+
+// A manifest whose epoch is not the stream's (the frame's) epoch: a worker cannot order its checkpoint ahead of a lease it does not hold.
+func epochManifest(job string, epoch int64) Manifest {
+	m := goodManifest(job)
+	m.Epoch = epoch
+	return m
 }
 
 func goodManifest(job string) Manifest {

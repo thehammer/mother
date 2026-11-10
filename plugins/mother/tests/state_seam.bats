@@ -1592,3 +1592,48 @@ _ss_manifest_op() { # <job> <branch> <wip-ref> — a checkpoint.taken op line (n
     [ "$status" -eq 4 ]
     [ "$(printf '%s\n' "$output" | tail -n 1 | jq -r .why)" = "job_mismatch" ]
 }
+
+# ===========================================================================
+# Restore points are ordered by (epoch, n), and the epoch is the coordinator's (P1-6 round 2)
+#
+# A failover to another machine starts a new epoch whose worker may number from 1: ordering by n alone froze latest.json at the
+# first lease's last checkpoint. The epoch must also be one the coordinator granted for the job (runner/leases/<job>.history.jsonl).
+
+_ss_en_op() { # <seq> <job> <epoch> <n> — a well-formed pushed manifest op whose delta ("hello") is put in place
+    local hello_sha="2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" sha
+    sha=$(printf '%040x' $(( $3 * 1000 + $4 )))
+    mkdir -p "$SS_C/checkpoints/$2/$4"; printf 'hello' > "$SS_C/checkpoints/$2/$4/transcript.delta"
+    _ss_op "$1" checkpoint.taken "$(jq -nc --arg j "$2" --argjson e "$3" --argjson n "$4" --arg sha "$sha" --arg t "$hello_sha" '
+        {manifest: {v: 1, job: $j, lease: ("L-" + ($e|tostring)), epoch: $e, n: $n, at: "2026-11-08T12:00:00.000Z", head_sha: $sha,
+                    branch: "feature/test", base_sha: $sha, wip_sha: $sha, wip_ref: ("refs/mother/wip/" + $j), pushed: true, session_id: "s1",
+                    transcript: {path_rel: ("checkpoints/" + $j + "/" + ($n|tostring) + "/transcript.delta"), bytes: 5, sha256: $t, reset: true},
+                    untracked_skipped: []}}')"
+}
+
+_ss_history() { # <job> <epoch>... — the coordinator's lease history
+    local job="$1" e; shift
+    mkdir -p "$SS_C/runner/leases"
+    for e in "$@"; do jq -nc --arg j "$job" --argjson e "$e" '{job: $j, epoch: $e, id: ("L-" + ($e|tostring)), worker: "w"}' >> "$SS_C/runner/leases/$job.history.jsonl"; done
+}
+
+@test "checkpoint order: epoch 1 n=1..3 then epoch 2 n=1 leaves latest.json at epoch 2 (a new lease numbering from 1 is newer)" {
+    local id="ck-ord" ops="$BATS_TEST_TMPDIR/ck.ndjson"
+    _ss_seed_hand "$id"; _ss_history "$id" 1 2
+    { _ss_en_op 1 "$id" 1 1; _ss_en_op 2 "$id" 1 2; _ss_en_op 3 "$id" 1 3; _ss_en_op 4 "$id" 2 1; } > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '[.epoch, .n] | @tsv' "$SS_C/checkpoints/$id/latest.json")" = "$(printf '2\t1')" ]
+    # the index keeps all four (epoch is part of the de-dupe key: epoch 1 n=1 and epoch 2 n=1 are different checkpoints)
+    [ "$(wc -l < "$SS_C/checkpoints/$id/index.jsonl" | tr -d ' ')" = 4 ]
+}
+
+@test "checkpoint order: a late older-epoch manifest with a huge n, or an epoch the coordinator never granted, cannot replace or freeze latest.json" {
+    local id="ck-freeze" ops="$BATS_TEST_TMPDIR/ck.ndjson"
+    _ss_seed_hand "$id"; _ss_history "$id" 1 2
+    { _ss_en_op 1 "$id" 2 1; _ss_en_op 2 "$id" 1 999; _ss_en_op 3 "$id" 7 999; _ss_en_op 4 "$id" 2 2; } > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    # epoch 1 n=999 ranks below epoch 2; epoch 7 was never granted (refused, audited); epoch 2 n=2 still advances
+    [ "$(jq -r '[.epoch, .n] | @tsv' "$SS_C/checkpoints/$id/latest.json")" = "$(printf '2\t2')" ]
+    [ "$(jq -r 'select(.code == "manifest_refused") | .keys[0]' "$SS_C/runner/leases/audit.jsonl" | head -n 1)" = "epoch" ]
+    ! jq -e 'select(.epoch == 7)' "$SS_C/checkpoints/$id/index.jsonl" >/dev/null 2>&1
+}
