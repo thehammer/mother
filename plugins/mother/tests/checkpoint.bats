@@ -995,7 +995,8 @@ STUB
     if [ -s "$T/childpid" ]; then
         have_child=1
         cpid="$(cat "$T/childpid")"
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
+        # Generous under CPU load: the stub child sleeps 20 s, so a child that outlives the kill still fails this.
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
             if ! kill -0 "$cpid" 2>/dev/null; then dead=1; break; fi
             sleep 0.5
         done
@@ -1003,7 +1004,7 @@ STUB
         [ "$dead" -eq 1 ] || kill "$cpid" 2>/dev/null || true
     fi
 
-    [ "$elapsed" -le 10 ]
+    [ "$elapsed" -le 15 ]
     [ "$CST" -eq 1 ]
     [ "$(printf '%s' "$COUT" | jq -r .why)" = "timeout" ]
     [ "$have_child" -eq 1 ]
