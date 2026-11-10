@@ -1541,7 +1541,7 @@ _ss_manifest_op() { # <job> <branch> <wip-ref> — a checkpoint.taken op line (n
 
 @test "checkpoint trust: a manifest that agrees with the job (branch feature/test, its own wip ref) is recorded" {
     local id="ck-ok" ops="$BATS_TEST_TMPDIR/ck.ndjson"
-    _ss_seed_hand "$id"
+    _ss_seed_hand "$id"; _ss_history "$id" 1
     _ss_manifest_op "$id" feature/test "refs/mother/wip/$id" > "$ops"
     _ss_replay_to "$SS_C" "$id" "$ops"
     [ "$status" -eq 0 ]
