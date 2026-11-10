@@ -17,8 +17,9 @@
 #                          Slots = children + leases in offered|active. dispatch-last.json gains leased and mode.
 #                          A released lease with end_reason succeeded is finalized by the runner through
 #                          `coord_apply.sh --finalize`: succeeded only when the final commit is on the remote branch
-#                          (else failed / unpushed_commit + needs_attention + audit line). A lost lease => failed
-#                          worker_lost. Draining the runner stops the coordinator, not the worker.
+#                          (else failed / unpushed_commit + needs_attention + audit line). A lost lease => a worker_lost event, then
+#                          a resume from its checkpoint (P1-6, failover_resume.bats) or, with none,
+#                          failed no_checkpoint_restorable (held, never re-run). Draining the runner stops the coordinator, not the worker.
 #
 # World. One test = one temp tree (setup_mother_env). The "current" world is $MOTHER_ROOT itself; the legacy
 # comparison world is $MOTHER_ROOT/worlds/legacy with its own runner. Every job has its own repo + bare origin
@@ -621,7 +622,7 @@ _rs_max() { sort -n "$1" | tail -n 1; }
 # ===========================================================================
 # 7. Lost lease
 
-@test "worker tree killed: the lease is lost, the canonical job fails worker_lost with usage recorded, and failure routing sees it" {
+@test "worker tree killed with no checkpoint: worker_lost is recorded, the job fails no_checkpoint_restorable (never re-run fresh) with usage recorded, and failure routing sees it" {
     local id="rs-lost" wpid wpgid sup supgid g
     echo 60 > "$RS_CLAUDE_DIR/default-sleep"
     _rs_job "$RS_C" "$id"
@@ -646,11 +647,14 @@ _rs_max() { sort -n "$1" | tail -n 1; }
     done
     kill -9 "$sup" 2>/dev/null || true
 
-    _rs_must 60 "a failed event with reason worker_lost" _rs_event_reason_has "$RS_C" "$id" worker_lost
+    # P1-6: the lost lease is a worker_lost event; with no checkpoint to resume from the job fails
+    # no_checkpoint_restorable with the reason in words (P1-5 failed it worker_lost).
+    _rs_must 60 "a worker_lost event" _rs_event_has "$RS_C" "$id" worker_lost
     _rs_must 20 "the job to be failed" _rs_state_is "$RS_C" "$id" failed
-    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
-    jq -e -s 'map(select(.kind == "failed" and .detail.reason == "worker_lost")) | length == 1' "$RS_C/events/$id.jsonl" >/dev/null
-    jq -e -s 'map(select(.detail.reason == "worker_lost" and (.detail.worker // "") != "" and (.detail.lease_epoch != null))) | length >= 1' \
+    _rs_must 30 "the failed event" _rs_event_reason_has "$RS_C" "$id" no_checkpoint_restorable
+    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "no_checkpoint_restorable" ]
+    jq -e -s 'map(select(.kind == "failed" and .detail.reason == "no_checkpoint_restorable" and (.detail.why // "") != "")) | length == 1' "$RS_C/events/$id.jsonl" >/dev/null
+    jq -e -s 'map(select(.kind == "worker_lost" and (.detail.worker // "") != "" and (.detail.lease_epoch != null) and (.detail.reason == "lost"))) | length == 1' \
         "$RS_C/events/$id.jsonl" >/dev/null
     grep -qF "\"job_id\":\"$id\"" "$RS_C/metrics/runs.jsonl"
     _rs_must 30 "a failure_routed event" _rs_event_has "$RS_C" "$id" failure_routed
@@ -1208,7 +1212,7 @@ LOG
     jq -nc '{id: "x", current_run: {log_offset: 0}}' > "$MOTHER_WORKER_ROOT/local/jobs/$id.json"
     ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
     [ "$(_rs_state "$RS_C" "$id")" = "failed" ]
-    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
+    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "no_checkpoint_restorable" ]
     grep -qF "\"job_id\":\"$id\"" "$RS_C/metrics/runs.jsonl"
 }
 
@@ -1222,7 +1226,7 @@ _rs_lost_lease_job() {
     : > "$RS_C/runner/leases/active/$id"
 }
 
-@test "orphan pass leaves a lost, unhandled lease to the lost-lease pass, which then records worker_lost" {
+@test "orphan pass leaves a lost, unhandled lease to the lost-lease pass, which then records worker_lost and holds the job (no checkpoint to resume)" {
     local id="rs-lost-race"
     _rs_lost_lease_job "$id"
     ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --recover-orphans-tick 0 ) >/dev/null 2>&1 || true
@@ -1230,11 +1234,11 @@ _rs_lost_lease_job() {
     ! _rs_event_reason_has "$RS_C" "$id" runner_died
     ( _rs_export_root "$RS_C"; export MOTHER_DISPATCH_MODE=legacy; mother-runner --worker-tick ) >/dev/null 2>&1 || true
     [ "$(_rs_state "$RS_C" "$id")" = "failed" ]
-    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
-    _rs_event_reason_has "$RS_C" "$id" worker_lost
+    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "no_checkpoint_restorable" ]
+    _rs_event_has "$RS_C" "$id" worker_lost
 }
 
-@test "runner startup handles a lost lease before the orphan pass: worker_lost, not runner_died" {
+@test "runner startup handles a lost lease before the orphan pass: worker_lost then no_checkpoint_restorable, not runner_died" {
     local id="rs-lost-start"
     _rs_lost_lease_job "$id"
     # Freeze the outcome at `failed` (no routing, no escalation): otherwise the live runner escalates the job on its
@@ -1243,9 +1247,9 @@ _rs_lost_lease_job() {
     _rs_must 40 "the job to fail" _rs_state_is "$RS_C" "$id" failed
     _rs_runner_stop "$RS_C"
     [ "$(_rs_state "$RS_C" "$id")" = "failed" ]
-    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "worker_lost" ]
-    _rs_event_reason_has "$RS_C" "$id" worker_lost
-    jq -e -s 'map(select(.kind == "failed" and .detail.reason == "worker_lost")) | length == 1' "$RS_C/events/$id.jsonl" >/dev/null
+    [ "$(_rs_field "$RS_C" "$id" failure_reason)" = "no_checkpoint_restorable" ]
+    _rs_event_has "$RS_C" "$id" worker_lost
+    jq -e -s 'map(select(.kind == "failed" and .detail.reason == "no_checkpoint_restorable")) | length == 1' "$RS_C/events/$id.jsonl" >/dev/null
 }
 
 # --- work_dir is never a path the worker can aim at ------------------------------------

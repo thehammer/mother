@@ -635,7 +635,16 @@ _write_dispatch_request() {
     mkdir -p "$DISPATCH_DIR"
     mkdir -p "$ACTIVE_DIR"
     : > "$ACTIVE_DIR/$1"
-    _atomic_write "$DISPATCH_DIR/$1.json" "$(jq -nc --arg j "$1" --arg at "$(_iso_now)" '{job: $j, requested_at: $at}')"
+    # A job resuming after a lost worker (runner/resume/<job>.json, written by _resume_lost_lease) carries its
+    # checkpoint in the request; the coordinator puts it in the next lease offer.
+    local rf="$RUNNER_DIR/resume/$1.json" resume='null'
+    if [ -f "$rf" ] && resume=$(jq -c '.' "$rf" 2>/dev/null) && [ -n "$resume" ]; then
+        mv -f "$rf" "$RUNNER_DIR/resume/$1.consumed.json" 2>/dev/null || true
+    else
+        resume='null'
+    fi
+    _atomic_write "$DISPATCH_DIR/$1.json" "$(jq -nc --arg j "$1" --arg at "$(_iso_now)" --argjson r "$resume" \
+        '{job: $j, requested_at: $at} + (if $r == null then {} else {resume_from: $r} end)')"
 }
 
 # _lease_state <job_id>: the lease file's state ("" when none).
@@ -648,16 +657,24 @@ _lease_awaits_finalize() {
     [ "$(jq -r '[.state // "", .end_reason // ""] | join("/")' "$LEASES_DIR/$1.json" 2>/dev/null)" = "released/succeeded" ]
 }
 
-# _lease_lost_unhandled <job_id>: the lease is `lost` (or carries a `.lost` marker and is not live) and
+# _lease_lost_unhandled <job_id>: the lease is `lost` (or carries a `.lost` marker and is not live, or was
+# released by a stopping worker with the job still running) and
 # _recover_lost_leases has not yet recorded it. The orphan reaper must leave such a job alone, otherwise it fails
 # it `runner_died` and the `worker_lost` event never appears. One stat for a non-indexed (legacy) job.
 _lease_lost_unhandled() {
     [ -e "$ACTIVE_DIR/$1" ] || return 1
     local lf="$LEASES_DIR/$1.json" st lease_id
     st=$(jq -r '.state // empty' "$lf" 2>/dev/null)
-    if [ "$st" != "lost" ]; then
+    if [ "$st" = "released" ]; then
+        # A worker that stopped itself (SIGTERM) releases the lease with the job still `running`: that release
+        # is a resume candidate for _recover_lost_leases, not an orphan (P1-6). A release that carries a
+        # terminal or awaiting state is the ordinary path.
+        case "$(jq -r '.end_reason // ""' "$lf" 2>/dev/null)" in
+            succeeded|failed|cancelled|awaiting) return 1 ;;
+        esac
+    elif [ "$st" != "lost" ]; then
         [ -f "$LEASES_DIR/$1.lost" ] || return 1
-        case "$st" in offered|active|released) return 1 ;; esac
+        case "$st" in offered|active) return 1 ;; esac
     fi
     lease_id=$(jq -r '.lease_id // empty' "$lf" 2>/dev/null)
     [ "$(cat "$LEASES_DIR/$1.lost-handled" 2>/dev/null)" != "$lease_id" ]
@@ -725,23 +742,31 @@ _finalize_released_leases() {
 # Interim behaviour until P1-6 resumes it: record the usage row of the dead run, fail the job `worker_lost`
 # and let failure routing take it from there. Handled once per lease (marker keyed by lease id).
 _recover_lost_leases() {
-    local f id lease_id st jf lost=0
+    local f id lease_id st jf lost=0 reason=lost
     for id in $(_active_ids); do
         f="$LEASES_DIR/$id.json"
         [ -f "$f" ] || continue
         jf="$JOBS_DIR/$id.json"
         [ -f "$jf" ] || continue
         st=$(jq -r '.state // empty' "$f" 2>/dev/null)
-        lost=0
+        lost=0; reason=lost
         [ "$st" = "lost" ] && lost=1
         if [ "$lost" -eq 0 ] && [ -f "$LEASES_DIR/$id.lost" ]; then
             case "$st" in offered|active|released) ;; *) lost=1 ;; esac
+        fi
+        if [ "$lost" -eq 0 ] && [ "$st" = "released" ]; then
+            # Released with the job still `running` and no success to derive: the worker stopped (SIGTERM)
+            # after its final checkpoint. A release as succeeded is the finalizer's.
+            case "$(jq -r '.end_reason // ""' "$f" 2>/dev/null)" in
+                succeeded|failed|cancelled|awaiting) ;;
+                *) lost=1; reason=released_running ;;
+            esac
         fi
         [ "$lost" -eq 1 ] || continue
         [ "$(jq -r '.state // empty' "$jf" 2>/dev/null)" = "running" ] || continue
         lease_id=$(jq -r '.lease_id // empty' "$f" 2>/dev/null)
         [ "$(cat "$LEASES_DIR/$id.lost-handled" 2>/dev/null)" = "$lease_id" ] && continue
-        _orphan_lost_lease "$id" "$jf" "$f" "$lease_id"
+        _orphan_lost_lease "$id" "$jf" "$f" "$lease_id" "$reason"
     done
 }
 
@@ -766,16 +791,17 @@ _lost_run_log_offset() {
 }
 
 _orphan_lost_lease() {
-    local id="$1" jf="$2" lf="$3" lease_id="$4" terminal detail offset ophase ostage outcome=failed
+    local id="$1" jf="$2" lf="$3" lease_id="$4" reason="${5:-lost}" terminal detail offset ophase ostage outcome=failed
+    local worker epoch hb
+    worker=$(jq -r '.worker_id // empty' "$lf"); epoch=$(jq -c '.epoch // null' "$lf"); hb=$(jq -r '.last_hb // empty' "$lf")
     if [ "$(jq -r '.cancel_requested // false' "$jf" 2>/dev/null)" = "true" ]; then
         terminal=cancelled; outcome=cancelled; detail='{"reason":"user"}'
     else
-        terminal=failed
-        detail=$(jq -nc --arg w "$(jq -r '.worker_id // empty' "$lf")" \
-            --argjson e "$(jq -c '.epoch // null' "$lf")" --arg hb "$(jq -r '.last_hb // empty' "$lf")" \
-            '{reason: "worker_lost", worker: $w, lease_epoch: $e, last_heartbeat_at: $hb}')
+        terminal=resume
+        _append_event "$id" worker_lost "$(jq -nc --arg w "$worker" --argjson e "$epoch" --arg hb "$hb" --arg r "$reason" \
+            '{worker: $w, lease_epoch: $e, last_heartbeat_at: $hb, reason: $r}')"
     fi
-    _log "marking $id $terminal (lease $lease_id lost)"
+    _log "worker lost for $id (lease $lease_id, $reason)"
     if type mother_record_run_usage >/dev/null 2>&1; then
         if offset=$(_lost_run_log_offset "$id" "$jf" "$lf"); then
             ophase=$(jq -r '.pipeline.phase // empty' "$jf" 2>/dev/null)
@@ -786,9 +812,117 @@ _orphan_lost_lease() {
             _log "$id: no log offset for the lost run; its usage row could not be recorded"
         fi
     fi
-    _job_transition "$id" "$terminal" "$detail"
+    if [ "$terminal" = "resume" ]; then
+        _resume_lost_lease "$id" "$jf" "$worker" "$epoch" "$hb" "$reason"
+    else
+        _job_transition "$id" "$terminal" "$detail"
+    fi
     _job_update "$id" 'if .activity == "gating" or .activity == "gate_fix" then .activity = null else . end'
     printf '%s\n' "$lease_id" > "$LEASES_DIR/$id.lost-handled"
+}
+
+# _hold_resume_failed <job> <why> <worker> <epoch> <hb> [reason]: the lost job has nothing to resume from. It
+# fails `no_checkpoint_restorable` with the reason in words (failure routing HOLDS it; it is never
+# re-dispatched fresh). `worker_resume_exhausted` for a job that keeps losing its worker.
+_resume_fail() {
+    local id="$1" why="$2" reason="${3:-no_checkpoint_restorable}"
+    _log "$id: $reason ($why)"
+    _job_transition "$id" failed "$(jq -nc --arg r "$reason" --arg w "$why" '{reason: $r, why: $w}')"
+}
+
+# _resume_lost_lease <job> <job-file> <worker> <epoch-json> <last-hb> <reason>: the P1-6 replacement for failing a
+# lost job. Resume from the newest checkpoint the coordinator holds (checkpoints/<job>/latest.json: pushed and with
+# a verified transcript) provided its wip ref is really on the remote; the job goes back to `ready` and the next
+# dispatch request carries the checkpoint (runner/resume/<job>.json, see _write_dispatch_request). Never a fresh start.
+_resume_lost_lease() {
+    local id="$1" jf="$2" worker="$3" epoch="$4" hb="$5" reason="$6"
+    local root ck latest n max count repo wipref wipsha rsha at bytes tsha tfile staged hb_e at_e lost_s tmp
+    root="${MOTHER_ROOT:-${MOTHER_LIVE_ROOT:-$HOME/.mother}}"
+    ck="$root/checkpoints/$id"; latest="$ck/latest.json"
+    max="${MOTHER_WORKER_RESUME_MAX:-3}"; case "$max" in ''|*[!0-9]*) max=3 ;; esac
+    count=$(jq -r '.worker_resume_count // 0' "$jf" 2>/dev/null); case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    if [ "$count" -ge "$max" ]; then
+        _resume_fail "$id" "the worker was lost $count times (MOTHER_WORKER_RESUME_MAX=$max)" worker_resume_exhausted
+        return 0
+    fi
+    if [ ! -s "$latest" ] || ! jq -e '.pushed == true' "$latest" >/dev/null 2>&1; then
+        _resume_fail "$id" "no pushed checkpoint"
+        return 0
+    fi
+    # latest.json is the worker's word: the ref is rebuilt from the job id, never read from it, and the
+    # manifest must name this job's branch and a real sha.
+    n=$(jq -r '.n' "$latest"); wipref="refs/mother/wip/$id"; wipsha=$(jq -r '.wip_sha // empty' "$latest")
+    if [ "$(jq -r '.wip_ref // empty' "$latest")" != "$wipref" ]; then
+        _resume_fail "$id" "checkpoint manifest names wip ref '$(jq -r '.wip_ref // empty' "$latest" | head -c 120)', not $wipref"; return 0
+    fi
+    if [ "$(jq -r '.branch // empty' "$latest")" != "$(jq -r '.branch // empty' "$jf")" ]; then
+        _resume_fail "$id" "checkpoint manifest names branch '$(jq -r '.branch // empty' "$latest" | head -c 120)', not the job's branch"; return 0
+    fi
+    case "$wipsha" in
+        *[!0-9a-f]*|'') _resume_fail "$id" "checkpoint manifest has a malformed wip_sha"; return 0 ;;
+    esac
+    at=$(jq -r '.at // empty' "$latest"); bytes=$(jq -r '.transcript.bytes // empty' "$latest"); tsha=$(jq -r '.transcript.sha256 // empty' "$latest")
+    repo=$(jq -r '.repo_path // empty' "$jf" 2>/dev/null)
+    if [ -z "$repo" ] || [ ! -d "$repo" ]; then _resume_fail "$id" "repository missing: ${repo:-unknown}"; return 0; fi
+    tmp=$(mktemp "${TMPDIR:-/tmp}/mother-lsr.XXXXXX") || { _resume_fail "$id" "no scratch space"; return 0; }
+    # The checkpoint's own immutable ref (named from the manifest's epoch and n, which the coordinator vetted against its lease
+    # history) is what proves the point. The rolling ref is only a
+    # fallback (a pruned or older checkpoint) and counts only when it equals wip_sha: it runs ahead of the manifest the coordinator
+    # holds whenever a worker dies between its push and the manifest landing, so a different sha there is expected and not an
+    # error by itself. No ref at wip_sha (unrelated sha, gone) means the point is refused.
+    local mep ckref="" ckrsha=""
+    mep=$(jq -r '.epoch // empty' "$latest")
+    case "$mep$n" in ''|*[!0-9]*) ;; *) ckref="refs/mother/wip-ckpt/$id/$mep-$n" ;; esac
+    local lsrc=0 lsstart=$SECONDS
+    _bounded_run "${MOTHER_GIT_REMOTE_TIMEOUT:-60}" "$tmp" git -C "$repo" ls-remote origin -- "$wipref" ${ckref:+"$ckref"} || lsrc=$?
+    if [ "$lsrc" -ne 0 ]; then
+        rm -f "$tmp"; _resume_fail "$id" "remote unreachable: could not verify the wip ref (git ls-remote exit $lsrc after $((SECONDS - lsstart))s)"; return 0
+    fi
+    rsha=$(awk -v r="$wipref" '$2 == r {print $1; exit}' "$tmp")
+    [ -z "$ckref" ] || ckrsha=$(awk -v r="$ckref" '$2 == r {print $1; exit}' "$tmp")
+    rm -f "$tmp"
+    if [ "$ckrsha" != "$wipsha" ] && [ "$rsha" != "$wipsha" ]; then
+        if [ -z "$rsha" ] && [ -z "$ckrsha" ]; then _resume_fail "$id" "wip ref missing on remote"; return 0; fi
+        _resume_fail "$id" "wip ref on the remote is at ${ckrsha:0:12}${ckrsha:+ (checkpoint ref)}${ckrsha:+, }${rsha:0:12}${rsha:+ (rolling ref)}, not the checkpoint's wip_sha ${wipsha:0:12}"; return 0
+    fi
+    # The transcript the new session continues: the first <bytes> bytes of the reassembled file, verified.
+    tfile="$root/$(jq -r '.transcript_file // empty' "$latest")"
+    mkdir -p "$ck/resume"; staged="$ck/resume/$n.jsonl"
+    if [ ! -f "$tfile" ]; then
+        _resume_fail "$id" "transcript missing or unverifiable (no reassembled file at ${tfile#"$root"/})"; return 0
+    fi
+    # BSD head rejects `-c 0` (a checkpoint taken before the session wrote anything has 0 transcript bytes).
+    if { [ "$bytes" = 0 ] && : > "$staged"; } || { [ "$bytes" != 0 ] && head -c "$bytes" "$tfile" > "$staged" 2>/dev/null; }; then :; else
+        rm -f "$staged"; _resume_fail "$id" "transcript missing or unverifiable (could not read the first ${bytes:-?} bytes of ${tfile#"$root"/})"; return 0
+    fi
+    if [ "$(shasum -a 256 "$staged" | cut -d' ' -f1)" != "$tsha" ]; then
+        _resume_fail "$id" "transcript missing or unverifiable (sha mismatch over the first ${bytes:-?} bytes of ${tfile#"$root"/}: have $(shasum -a 256 "$staged" 2>/dev/null | cut -c1-12), manifest ${tsha:0:12}, file $(wc -c < "$tfile" | tr -d ' ') bytes)"; return 0
+    fi
+    hb_e=$(_iso_to_epoch "$hb"); at_e=$(_iso_to_epoch "$at")
+    case "$hb_e" in ''|*[!0-9]*) hb_e=0 ;; esac; case "$at_e" in ''|*[!0-9]*) at_e=0 ;; esac
+    lost_s=$(( hb_e - at_e )); [ "$lost_s" -lt 0 ] && lost_s=0; [ "$hb_e" -gt 0 ] || lost_s=0
+    # A worker that stopped itself (SIGTERM) took its final checkpoint on the way out: nothing is re-done.
+    [ "$reason" != "released_running" ] || lost_s=0
+    mkdir -p "$RUNNER_DIR/resume"
+    _atomic_write "$RUNNER_DIR/resume/$id.json" "$(jq -nc --arg m "$latest" --arg t "$staged" --arg fw "$worker" \
+        --argjson le "$epoch" --argjson ls "$lost_s" --arg at "$at" --argjson n "$n" --arg ws "$wipsha" --arg r "$reason" \
+        '{manifest: $m, transcript: $t, from_worker: $fw, lease_epoch: $le, lost_work_s: $ls, checkpoint_at: $at,
+          checkpoint_n: $n, wip_sha: $ws, reason: $r}')"
+    _job_update "$id" ".worker_resume_count = $((count + 1)) | .worker_pid = null | .cancel_requested = null"
+    _job_transition "$id" ready "$(jq -nc --argjson n "$n" --argjson ls "$lost_s" '{reason: "worker_lost_resume", checkpoint_n: $n, lost_work_s: $ls}')"
+}
+
+# _emit_salvage_events: the coordinator records a fenced worker's salvage push as a marker
+# (runner/leases/<job>.salvage.<epoch>.json); the runner turns it into the job event worker_salvaged.
+_emit_salvage_events() {
+    local f id rec
+    for f in "$LEASES_DIR"/*.salvage.*.json; do
+        [ -f "$f" ] || continue
+        id="${f##*/}"; id="${id%%.salvage.*}"
+        [ -f "$JOBS_DIR/$id.json" ] || { rm -f "$f"; continue; }
+        rec=$(jq -c '{epoch, ref, wip_sha, worker}' "$f" 2>/dev/null) || continue
+        _append_event "$id" worker_salvaged "$rec" && rm -f "$f"
+    done
 }
 
 # _worker_path_tick: the per-tick worker-path work. Legacy default (no leases/dispatch dir): one stat and out.
@@ -800,6 +934,7 @@ _worker_path_tick() {
         _finalize_released_leases
         _prune_active
     fi
+    _emit_salvage_events
     _reap_coord
     _reap_local_worker
 }
@@ -2788,6 +2923,13 @@ _RATELIMIT_ANNOUNCED=0
 # nothing in dispatch reads it.
 _write_dispatch_last() {
     local running; running=$(_count_running_children)
+    # Worker path only (cluster P1-5): additive `leased` and `mode`; legacy output is unchanged. They go in
+    # the SAME write as the rest: a second rewrite let a reader see the file between the two (no `.leased`).
+    local wf='{}'
+    if _worker_path_possible; then
+        wf=$(jq -nc --argjson leased "$(_leased_job_ids | wc -l | tr -d ' ')" --arg mode "$MOTHER_DISPATCH_MODE" \
+            '{leased: $leased, mode: $mode}')
+    fi
     jq -nc --argjson ts "$(date +%s)" --argjson running "${running:-0}" --argjson ceiling "$MOTHER_CONCURRENCY" \
         --argjson paused "$([ "$1" = 1 ] && echo true || echo false)" \
         --argjson over "$([ "$2" = 1 ] && echo true || echo false)" \
@@ -2795,21 +2937,13 @@ _write_dispatch_last() {
         --arg spawned "$4" --arg skipped "$5" \
         --argjson enforcing "$([ "${6:-0}" = 1 ] && echo true || echo false)" \
         --argjson drained "$([ "${7:-0}" = 1 ] && echo true || echo false)" \
+        --argjson wf "$wf" \
         '{ts: $ts, running: $running, ceiling: $ceiling, ratelimit_paused: $paused, quota_over_cap: $over,
           low_disk: $low, enforcing: $enforcing, drained: $drained, spawned: ($spawned | split(" ") | map(select(length > 0))),
-          skipped: ($skipped | split(" ") | map(select(length > 0)))}' \
+          skipped: ($skipped | split(" ") | map(select(length > 0)))} + $wf' \
         > "$RUNNER_DIR/dispatch-last.json.tmp.$$" 2>/dev/null \
         && mv "$RUNNER_DIR/dispatch-last.json.tmp.$$" "$RUNNER_DIR/dispatch-last.json" \
         || rm -f "$RUNNER_DIR/dispatch-last.json.tmp.$$"
-    # Worker path only (cluster P1-5): additive `leased` and `mode`; legacy output is unchanged.
-    ! _worker_path_possible || _dispatch_last_worker_fields
-}
-
-_dispatch_last_worker_fields() {
-    local f="$RUNNER_DIR/dispatch-last.json"
-    [ -f "$f" ] || return 0
-    jq -c --argjson leased "$(_leased_job_ids | wc -l | tr -d ' ')" --arg mode "$MOTHER_DISPATCH_MODE" \
-        '. + {leased: $leased, mode: $mode}' "$f" > "$f.tmp.$$" 2>/dev/null && mv "$f.tmp.$$" "$f" || rm -f "$f.tmp.$$"
 }
 
 # _dispatch_drained: maintenance mode (`mother drain`). True while $RUNNER_DIR/drain.json exists; the

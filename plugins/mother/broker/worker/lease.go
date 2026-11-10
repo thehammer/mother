@@ -49,6 +49,9 @@ type lease struct {
 	adoptedDead bool
 
 	ship *shipState // nil until the current connection's welcome rebases it
+
+	ckptBusy bool     // a cadence checkpoint of this lease is running
+	extraEnv []string // resume environment (MOTHER_RESUME_*) for the supervisor spawn
 }
 
 type childEntry struct {
@@ -172,7 +175,9 @@ func (d *Daemon) spawn(l *lease) error {
 		name, args = d.cfg.SpawnCmd(l.loc.Job)
 	}
 	cmd := exec.Command(name, args...)
-	cmd.Env = d.scrubbedEnv("MOTHER_LEASE_ID="+l.loc.LeaseID, "MOTHER_LEASE_EPOCH="+itoa(l.loc.Epoch))
+	cmd.Env = d.scrubbedEnv(append([]string{"MOTHER_LEASE_ID=" + l.loc.LeaseID, "MOTHER_LEASE_EPOCH=" + itoa(l.loc.Epoch),
+		"MOTHER_WORKER_ID=" + d.cfg.ID, "MOTHER_CHECKPOINT_FINAL_TIMEOUT_S=" + strconv.Itoa(int(d.cfg.CkptFinalWait/time.Second))},
+		l.extraEnv...)...)
 	cmd.Dir = d.cfg.Root
 	// Own process group: fencing signals the whole group, so a hung claude does not outlive its supervisor.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -307,18 +312,29 @@ func (d *Daemon) fence(l *lease, why string) {
 	l.loc.State, l.loc.EndReason = stateFenced, why
 	l.ship = nil
 	d.persistLease(l)
-	pid, done := l.pid, l.done
-	if pid > 0 && !l.exited {
-		go d.terminate(pid, l.pidStart, done)
-	}
-	d.onFenced(l.loc.Job)
+	pid, done, start, exited := l.pid, l.done, l.pidStart, l.exited
+	d.onFenced(l, func() {
+		if pid > 0 && !exited {
+			d.terminate(pid, start, done)
+		}
+	})
 }
 
-// onFenced is the hook for the salvage push (P1-6): the lease is gone, the supervisor is being stopped and
-// the work tree may hold unpushed commits that should land on refs/mother/wip-salvage/<job>/lease-<epoch>.
-// This slice does nothing here.
-func (d *Daemon) onFenced(job string) {
-	d.logf("onFenced(%s): salvage push not implemented in this slice", job)
+// onFenced is the salvage hook (P1-6): the lease is gone. After stop has stopped the supervisor (and its
+// group), the work tree is pushed, final and fenced out of the job's main wip ref, to
+// refs/mother/wip-salvage/<job>/lease-<epoch> and reported with a salvage control frame. The frame cannot
+// ride the lease's stream (it is refused). The mirror document is snapshotted first: a later lease for the
+// same job rewrites the mirror, and the salvage must keep pointing at this lease's work tree.
+func (d *Daemon) onFenced(l *lease, stop func()) {
+	root, ok := d.salvageSnapshot(l)
+	d.bg.Add(1)
+	go func() {
+		defer d.bg.Done()
+		stop()
+		if ok && d.cfg.MotherCLI != "" {
+			d.salvage(l, root)
+		}
+	}()
 }
 
 func (d *Daemon) markReleased(l *lease, reason string) {

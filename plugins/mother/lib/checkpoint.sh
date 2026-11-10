@@ -10,7 +10,8 @@
 # Every git call goes through _ckpt_git: hardened against repo-controlled config (hooks, fsmonitor,
 # filter/textconv drivers, signing, credential helpers, upload/receive-pack overrides), bounded by the
 # take's deadline, and killed as a process group when it hangs.
-# No runtime path calls this library yet (P1-6 wires it). Sourced under `set -u`, bash 3.2: no
+# Callers: `mother checkpoint take|restore` (bin/mother), driven by the worker daemon's cadence and
+# bin/mother-run-job's boundaries and exits (cluster P1-6). Sourced under `set -u`, bash 3.2: no
 # `declare -A`, no `mapfile`. Needs lib/state.sh (_bounded_run, _switch_with_lock, _iso_now,
 # safe_rm_tree) and jq.
 
@@ -38,6 +39,14 @@ _ckpt_mktemp() {
 # watchdog <= 300 s). Anything not an integer in 30..240 falls back to 120 with one stderr line.
 mother_checkpoint_interval_s() {
     local v="${MOTHER_CHECKPOINT_INTERVAL_S:-}"
+    # Test-only: seconds below the 30 s floor so failover tests run in seconds. Never honoured outside the
+    # test harness (MOTHER_TEST_ROOT=1), whatever the environment says.
+    if [ "${MOTHER_TEST_ROOT:-}" = "1" ]; then
+        case "${MOTHER_TEST_CHECKPOINT_INTERVAL_S:-}" in
+            ''|*[!0-9]*|0) ;;
+            *) echo "$MOTHER_TEST_CHECKPOINT_INTERVAL_S"; return 0 ;;
+        esac
+    fi
     if [ -z "$v" ] && type mother_config_get >/dev/null 2>&1; then
         v=$(mother_config_get MOTHER_CHECKPOINT_INTERVAL_S 2>/dev/null) || v=""
     fi
@@ -261,6 +270,46 @@ _ckpt_push() {
     return "$rc"
 }
 
+# _ckpt_ref_pushed <porcelain-file> <ref>: the push updated <ref> (a porcelain line whose flag is not "!" or "-" and whose
+# destination is <ref>).
+_ckpt_ref_pushed() {
+    awk -F'\t' -v r="$2" 'index($2, ":" r) && $2 ~ (":" r "$") && $1 != "!" && $1 != "-" {ok=1} END {exit ok ? 0 : 1}' "$1" 2>/dev/null
+}
+
+# _ckpt_prune_refspecs <wd> <parent> <job> <epoch> <n> <array-name>: the delete refspecs that ride along the take's one push.
+# Bound on origin: this epoch keeps its newest MOTHER_CHECKPOINT_KEEP_REFS (default 20) immutable refs (n-keep goes now; one that
+# was never pushed is a harmless refused delete). Earlier epochs keep exactly ONE ref each: the restore point this lease was
+# restored from (<parent>/.restore-point = "<epoch>-<n>", written by the restore); the rest of their refs are removed, once
+# per epoch (<parent>/.pruned-epoch), after one bounded ls-remote. Salvage refs (wip-salvage/*) are never touched. Sets
+# _CKPT_PRUNED_OLD_EPOCHS=1 when the old-epoch sweep is part of this push.
+_ckpt_prune_refspecs() {
+    local wd="$1" parent="$2" job="$3" epoch="$4" n="$5" out="$6" keep="${MOTHER_CHECKPOINT_KEEP_REFS:-20}"
+    local pfx="refs/mother/wip-ckpt/$job/" line ref name e keepref="" done_epoch=""
+    _CKPT_PRUNED_OLD_EPOCHS=0
+    case "$keep" in ''|*[!0-9]*|0) keep=20 ;; esac
+    if [ "$n" -gt "$keep" ]; then eval "$out+=(\":\$pfx\$epoch-\$((n - keep))\")"; fi
+    [ -s "$parent/.pruned-epoch" ] && done_epoch=$(cat "$parent/.pruned-epoch" 2>/dev/null)
+    [ "$done_epoch" = "$epoch" ] && return 0
+    [ -s "$parent/.restore-point" ] && keepref=$(cat "$parent/.restore-point" 2>/dev/null)
+    # Without a well-formed restore point, never delete an earlier epoch's refs: one of them may be the only restorable checkpoint.
+    case "$keepref" in ''|*[!0-9-]*|-*|*-|*-*-*) return 0 ;; esac
+    # A failed ls-remote means the sweep did not happen: it is retried on the next take, never marked done.
+    local listing
+    listing=$(_ckpt_git "$wd" ls-remote --upload-pack=git-upload-pack origin "${pfx}*" 2>/dev/null) || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        ref="${line#*[[:space:]]}"
+        case "$ref" in "$pfx"*) name="${ref#"$pfx"}" ;; *) continue ;; esac
+        e="${name%%-*}"
+        case "$e" in ''|*[!0-9]*) continue ;; esac
+        [ "$e" -lt "$epoch" ] || continue
+        [ "$name" = "$keepref" ] && continue
+        eval "$out+=(\":\$ref\")"
+    done <<<"$listing"
+    _CKPT_PRUNED_OLD_EPOCHS=1
+    return 0
+}
+
 # --- take ----------------------------------------------------------------------------------------
 
 # mother_checkpoint_take <job-file> <out-dir> [--salvage-epoch N] [--final] [--expect-sha SHA]
@@ -332,6 +381,22 @@ _ckpt_take_fail() {
 _ckpt_take_locked() {
     local job_file="$1" out_dir="$2" parent="$3" salvage="$4" final="$5" expect_flag="$6"
     local job wd branch base_sha session
+    # Auto numbering (`mother checkpoint take` without --out): the next n and the previous manifest are decided
+    # HERE, under the checkpoint lock, so two takers (the worker's cadence and the supervisor's boundary or
+    # final take) can never share a number or diff against a stale previous manifest.
+    if [ "${MOTHER_CHECKPOINT_AUTO_N:-0}" = "1" ]; then
+        local _last=0 _d _n
+        for _d in "$parent"/*/; do
+            [ -s "${_d}manifest.json" ] || continue
+            _n=$(basename "$_d")
+            case "$_n" in ''|*[!0-9]*) continue ;; esac
+            [ "$_n" -gt "$_last" ] && _last="$_n"
+        done
+        MOTHER_CHECKPOINT_PREV_MANIFEST=""
+        [ "$_last" -gt 0 ] && MOTHER_CHECKPOINT_PREV_MANIFEST="$parent/$_last/manifest.json"
+        out_dir="$parent/$((_last + 1))"
+        mkdir -p "$out_dir" || return 1
+    fi
     job=$(jq -r '.id // ""' "$job_file") || return 1
     wd=$(jq -r '.work_dir // ""' "$job_file")
     branch=$(jq -r '.branch // ""' "$job_file")
@@ -350,6 +415,9 @@ _ckpt_take_locked() {
     local head
     head=$(_ckpt_git "$wd" rev-parse --verify -q HEAD) || { _ckpt_take_fail unborn_head "no commit at HEAD in $wd (an unborn HEAD cannot be checkpointed)"; return 1; }
     _ckpt_sha_ok "$head" || { _ckpt_take_fail unborn_head "HEAD did not resolve in $wd"; return 1; }
+    # A job whose base did not resolve at `mother add` has no base_sha; the wire manifest requires one, and a
+    # refused frame would stall the job's stream. The head stands in (informational for the restore).
+    _ckpt_sha_ok "$base_sha" || base_sha="$head"
 
     # 1. Transcript: copied ONCE; size, sha256 and the delta all come from this copy.
     local tdir tfile="" tcopy tsize=0 tsha t_trunc=false tcap_mb="${MOTHER_CHECKPOINT_MAX_TRANSCRIPT_MB:-256}" tcap
@@ -371,13 +439,26 @@ _ckpt_take_locked() {
     fi
 
     # 2. WIP tree from a temp copy of the index; the worktree and its index are never written.
-    local idx tmpidx skipfile tree
+    local idx tmpidx skipfile tree head_after attempt=0
     idx=$(_ckpt_git_path "$wd" index) || { _ckpt_take_fail snapshot_failed "could not locate the index"; return 1; }
     tmpidx=$(_ckpt_mktemp) || return 1
     skipfile=$(_ckpt_mktemp) || return 1
-    if [ -f "$idx" ]; then cp "$idx" "$tmpidx" || return 1; else rm -f "$tmpidx"; fi
-    tree=$(_ckpt_tree_of "$wd" "$tmpidx" "$skipfile") || { rm -f "$skipfile.paths"; _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
-    [ -n "$tree" ] || { _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
+    # The snapshot is not atomic: the agent keeps working while the tree is built. HEAD is read before it and
+    # again after; if a commit landed in between, the manifest would pair the OLD head with a tree that already
+    # contains that commit's content (restorable, but the commit would come back as an unstaged change). So a
+    # moved HEAD means: read HEAD again and redo the snapshot (three tries; after that the content is still all
+    # in the tree, and the next checkpoint is consistent).
+    while :; do
+        attempt=$((attempt + 1))
+        if [ -f "$idx" ]; then cp "$idx" "$tmpidx" || return 1; else rm -f "$tmpidx"; fi
+        tree=$(_ckpt_tree_of "$wd" "$tmpidx" "$skipfile") || { rm -f "$skipfile.paths"; _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
+        [ -n "$tree" ] || { _ckpt_take_fail snapshot_failed "could not snapshot $wd"; return 1; }
+        head_after=$(_ckpt_git "$wd" rev-parse --verify -q HEAD) || head_after=""
+        [ -z "$head_after" ] || [ "$head_after" = "$head" ] && break
+        _ckpt_sha_ok "$head_after" || break
+        head="$head_after"
+        [ "$attempt" -lt 3 ] || break
+    done
 
     local prev="${MOTHER_CHECKPOINT_PREV_MANIFEST:-$out_dir/manifest.json}"
     local prev_n=0 prev_head="" prev_wip="" prev_tbytes=0 prev_tsha="" prev_pushed=false
@@ -405,7 +486,7 @@ _ckpt_take_locked() {
         || { _ckpt_take_fail commit_failed "could not create the wip commit"; return 1; }
 
     # 4. Push with fencing.
-    local pushed=false push_error="" branch_push="" rc=0 pout wip_ref="refs/mother/wip/$job" target expect="" state_file marker
+    local pushed=false push_error="" branch_push="" rc=0 rolling_landed=0 pout wip_ref="refs/mother/wip/$job" ckpt_ref="" target expect="" state_file marker
     state_file="$parent/.last-pushed"
     marker=$(_ckpt_git_path "$wd" mother-wip-expect) || marker=""
     pout=$(_ckpt_mktemp) || return 1
@@ -419,9 +500,27 @@ _ckpt_take_locked() {
         elif [ -n "$marker" ] && [ -s "$marker" ]; then expect=$(cat "$marker")
         else expect=$(_ckpt_ls_remote_ref "$wd" "$target" || true)
         fi
-        # No "+" on the refspec: a "+" overrides the lease check, so a moved ref would be overwritten.
-        # The explicit lease alone allows the non-fast-forward update when the ref is where we left it.
-        _ckpt_push "$wd" "$pout" origin "$wip:$target" "--force-with-lease=$target:$expect" || rc=$?
+        # ONE push carries the per-checkpoint ref, the rolling ref and the prune deletions. Git decides the order refs are
+        # written (refs that already exist on the remote go first whatever the refspec order), so NO ordering is relied on.
+        # The guarantee is the manifest's: pushed:true only when BOTH refs landed at wip_sha, and the coordinator restores
+        # only from the immutable ref its own manifest names. The per-checkpoint name is unique to this lease (epoch) and
+        # take number, so only this worker writes it; "+" lets a take that died after the push and before its manifest
+        # (same n, new commit) be redone. No "+" on the rolling refspec: it would override the lease check, so a moved ref
+        # would be overwritten. No --atomic: a delete of a ref already gone must not sink the checkpoint. Success and
+        # fencing are judged per ref from the porcelain output: a refused delete is ignored; "fenced" comes only from the
+        # ROLLING ref's own refusal plus the remote no longer being where the lease left it; a refused per-checkpoint ref
+        # alone is pushed:false (the rolling ref still moved, so committed work is safe and the expectation advances).
+        ckpt_ref="refs/mother/wip-ckpt/$job/$epoch-$n"
+        local -a prune=()
+        _ckpt_prune_refspecs "$wd" "$parent" "$job" "$epoch" "$n" prune
+        _ckpt_push "$wd" "$pout" origin "+$wip:$ckpt_ref" "$wip:$target" "--force-with-lease=$target:$expect" "${prune[@]+"${prune[@]}"}" || rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 137 ]; then
+            if _ckpt_ref_pushed "$pout" "$target"; then
+                rolling_landed=1
+                if _ckpt_ref_pushed "$pout" "$ckpt_ref"; then rc=0; fi
+            fi
+        fi
+        if [ "$rc" -eq 0 ] && [ "$_CKPT_PRUNED_OLD_EPOCHS" = 1 ]; then printf '%s' "$epoch" >"$parent/.pruned-epoch"; fi
     fi
     local exit_code=0 cur
     if [ "$rc" -eq 0 ]; then
@@ -432,10 +531,16 @@ _ckpt_take_locked() {
         fi
     elif [ "$rc" -eq 137 ]; then
         push_error="push timed out"
-    elif [ -z "$salvage" ] && grep -q '^!' "$pout" 2>/dev/null \
+    elif [ "$rolling_landed" -eq 1 ]; then
+        # The rolling ref moved but the per-checkpoint ref was refused: no restore point for this take (pushed:false), yet the
+        # work is on the remote and the lease's expectation is now this wip.
+        push_error="checkpoint ref refused"
+        printf '%s' "$wip" >"$state_file"
+        [ -n "$marker" ] && printf '%s' "$wip" >"$marker" 2>/dev/null
+    elif [ -z "$salvage" ] && awk -F'\t' -v r="$target" '$1 == "!" && $2 ~ (":" r "$") {f=1} END {exit f ? 0 : 1}' "$pout" 2>/dev/null \
         && cur=$(_ckpt_ls_remote_ref "$wd" "$target") && [ "$cur" != "$expect" ]; then
-        # The remote refused the update (a "!" porcelain flag) AND the ref is no longer where our lease
-        # said it was: the lease is lost. Language-independent: no message text is matched.
+        # The remote refused the ROLLING ref (a "!" porcelain line for it) AND it is no longer where our lease said it was:
+        # the lease is lost. Language-independent: no message text is matched.
         push_error="fenced"; exit_code=3
     else
         push_error="push failed (exit $rc)"
@@ -523,6 +628,22 @@ _ckpt_push_branch() {
     fi
 }
 
+# mother_checkpoint_ship <job> <manifest-json>: worker mode only (a no-op elsewhere). Puts one finished take
+# into the job's ordered outbox: the transcript delta and the manifest as artifact.put (checkpoints/<job>/<n>/),
+# then the checkpoint.taken op, so the coordinator has every earlier op, the delta and the manifest before it
+# hears of the checkpoint. The subagent transcript directory is not shipped.
+mother_checkpoint_ship() {
+    local job="$1" manifest="$2" n data f
+    mother_outbox_enabled || return 0
+    n=$(printf '%s' "$manifest" | jq -r '.n // empty') || return 1
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    for f in transcript.delta manifest.json; do
+        mother_outbox_artifact "$job" "checkpoints/$job/$n/$f" || return 1
+    done
+    data=$(jq -nc --argjson m "$manifest" '{manifest: $m}') || return 1
+    _OUTBOX_TRUSTED=1 mother_outbox_emit "$job" checkpoint.taken "$data"
+}
+
 # --- restore -------------------------------------------------------------------------------------
 
 _ckpt_restore_fail() {
@@ -530,7 +651,9 @@ _ckpt_restore_fail() {
     return 4
 }
 
-# mother_checkpoint_restore <manifest> <transcript-file> <repo_path> <new_work_dir>
+# mother_checkpoint_restore <manifest> <transcript-file> <repo_path> <new_work_dir> [<expect-job> [<expect-branch>]]
+# With expect-job / expect-branch the manifest must name exactly that job and branch (not_restorable:
+# job_mismatch, branch_mismatch): a manifest is the worker's word, never what picks the branch to touch.
 # Exit 0 restored, 4 not restorable (why: wip_missing, head_missing, chain_mismatch,
 # transcript_mismatch, tree_mismatch), 1 usage/other. Never falls back to a fresh start; a failure after
 # the worktree was added removes it again. <new_work_dir> must be absolute, without "..", and
@@ -540,7 +663,7 @@ _ckpt_restore_fail() {
 # Output: restored, head_sha, wip_sha, transcript_sha, source, branch_state, detached, base_sha,
 # base_moved, incomplete (embedded repos were not captured), skipped.
 mother_checkpoint_restore() {
-    local manifest="${1:-}" tfile="${2:-}" repo="${3:-}" newwd="${4:-}"
+    local manifest="${1:-}" tfile="${2:-}" repo="${3:-}" newwd="${4:-}" want_job="${5:-}" want_branch="${6:-}"
     [ -r "$manifest" ] && [ -n "$repo" ] && [ -n "$newwd" ] \
         || { echo "mother: checkpoint restore: usage: <manifest> <transcript-file> <repo_path> <new_work_dir>" >&2; return 1; }
     local job branch head wip session tsha_want base_sha
@@ -554,6 +677,12 @@ mother_checkpoint_restore() {
     _ckpt_job_ok "$job" && _ckpt_branch_ok "$branch" && _ckpt_sha_ok "$head" && _ckpt_sha_ok "$wip" \
         || { echo "mother: checkpoint restore: manifest has a malformed job, branch or sha" >&2; return 1; }
     _ckpt_session_ok "$session" || { echo "mother: checkpoint restore: bad session_id" >&2; return 1; }
+    if [ -n "$want_job" ] && [ "$job" != "$want_job" ]; then
+        echo "mother: checkpoint restore: manifest names job '$job', not '$want_job'" >&2; _ckpt_restore_fail job_mismatch; return $?
+    fi
+    if [ -n "$want_branch" ] && [ "$branch" != "$want_branch" ]; then
+        echo "mother: checkpoint restore: manifest names branch '$branch', the job's branch is '$want_branch'" >&2; _ckpt_restore_fail branch_mismatch; return $?
+    fi
 
     newwd="${newwd%/}"
     case "$newwd" in
@@ -582,8 +711,17 @@ mother_checkpoint_restore() {
     [ -z "$_CKPT_REFUSE" ] || { echo "mother: checkpoint restore: refusing $repo: $_CKPT_REFUSE" >&2; return 1; }
 
     # 1. The wip commit: fetch it, or use the object already in a shared store.
-    local ref="refs/mother/wip/$job" source=origin
-    _ckpt_git "$repo" fetch --no-tags --no-recurse-submodules --upload-pack=git-upload-pack origin "+$ref:$ref" >/dev/null || source=local_object
+    # The immutable ref of this very checkpoint first (the manifest's own epoch and n), the rolling ref as the fallback
+    # (older workers; a pruned immutable ref). Whichever ref supplies the object, the sha must be the manifest's wip_sha.
+    local ref="refs/mother/wip/$job" source=origin mep mn ckref=""
+    mep=$(jq -r '.epoch // empty' "$manifest" 2>/dev/null); mn=$(jq -r '.n // empty' "$manifest" 2>/dev/null)
+    case "$mep$mn" in ''|*[!0-9]*) ;; *) ckref="refs/mother/wip-ckpt/$job/$mep-$mn" ;; esac
+    if [ -n "$ckref" ] && _ckpt_git "$repo" fetch --no-tags --no-recurse-submodules --upload-pack=git-upload-pack origin "+$ckref:$ckref" >/dev/null 2>&1 \
+        && [ "$(_ckpt_git "$repo" rev-parse --verify -q "$ckref^{commit}" 2>/dev/null)" = "$wip" ]; then
+        :
+    else
+        _ckpt_git "$repo" fetch --no-tags --no-recurse-submodules --upload-pack=git-upload-pack origin "+$ref:$ref" >/dev/null || source=local_object
+    fi
     _ckpt_git "$repo" cat-file -e "$wip^{commit}" >/dev/null 2>&1 || { _ckpt_restore_fail wip_missing; return $?; }
     _ckpt_git "$repo" cat-file -e "$head^{commit}" >/dev/null 2>&1 || { _ckpt_restore_fail head_missing; return $?; }
     local wip_tree parents
@@ -632,7 +770,14 @@ mother_checkpoint_restore() {
         && _ckpt_git "$repo" merge-base --is-ancestor "$base_sha" "$head" >/dev/null 2>&1; then
         base_moved=false
     fi
-    local mk; mk=$(_ckpt_git_path "$newwd" mother-wip-expect) && printf '%s' "$wip" >"$mk" 2>/dev/null
+    # The new lease's first push may replace whatever the rolling ref holds NOW: the dead worker can have pushed after the
+    # checkpoint this restore used (a take that died before its manifest landed), and expecting the manifest's wip_sha would
+    # fence the legitimate new lease on its very first take. The remote's current value is what the lease replaces; an
+    # unreadable remote falls back to the checkpoint's own wip_sha.
+    local mk cur_remote; mk=$(_ckpt_git_path "$newwd" mother-wip-expect) || mk=""
+    cur_remote=$(_ckpt_ls_remote_ref "$newwd" "refs/mother/wip/$job" 2>/dev/null) || cur_remote=""
+    _ckpt_sha_ok "$cur_remote" || cur_remote="$wip"
+    [ -z "$mk" ] || printf '%s' "$cur_remote" >"$mk" 2>/dev/null
     jq -n -c --arg head "$head" --arg wip "$wip" --arg tsha "$tsha_want" --arg src "$source" \
         --arg bs "$branch_state" --argjson det "$detached" --arg base "$base_sha" --argjson bm "$base_moved" \
         --slurpfile m "$manifest" '

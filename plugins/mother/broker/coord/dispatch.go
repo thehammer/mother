@@ -178,12 +178,14 @@ func (s *Server) offer(job string, req dispatchReq, w *workerConn) error {
 	offer := workerproto.LeaseOffer{
 		CmdID: newID("c-"), JobDoc: jobDoc, Plan: string(plan), CrewBundle: crew, Checkpoint: ckpt,
 		Repo: repoName(repoPath, jsonString(doc["repo"])), RepoPath: repoPath, Attempt: attempt,
+		AppliedSeq: s.truthApplied(&jobLease{job: job}),
 	}
 	now := s.now()
 	l, err := s.leases.Offer(job, newID("L-"), w.id, now)
 	if err != nil {
 		return err
 	}
+	s.leaseHistoryAppend(l)
 	jl := &jobLease{job: job, pending: map[int64]workerproto.Frame{}, rec: LeaseRec{
 		Job: job, LeaseID: l.ID, Epoch: l.Epoch, WorkerID: w.id, State: string(workerproto.LeaseOffered),
 		OfferedAt: fmtTime(now), LastHB: fmtTime(now), Synced: map[string]json.RawMessage{},

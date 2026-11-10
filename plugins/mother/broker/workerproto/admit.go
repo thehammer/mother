@@ -124,7 +124,7 @@ func (a *Admitter) Admit(worker string, line []byte, now time.Time) (Admission, 
 		if h.WorkerID != worker {
 			return adm, protoErr(CodeAuthFailed, "hello worker_id is not the authenticated worker")
 		}
-	case TypeBye:
+	case TypeBye, TypeSalvage:
 	case TypeHb:
 		h, _ := parseData[Hb](f)
 		for _, j := range h.Jobs {

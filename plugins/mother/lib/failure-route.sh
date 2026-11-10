@@ -31,7 +31,9 @@ mother_failure_class() {
             fi ;;
         no_pr_no_push)
             echo "reconcile_then_hold" ;;
-        rework_no_new_commit|unpushed_commit|branch_create_failed|checkout_failed)
+        rework_no_new_commit|unpushed_commit|branch_create_failed|checkout_failed|no_checkpoint_restorable|worker_resume_exhausted)
+            # A job whose worker was lost and whose work cannot be restored (or keeps being lost) must never
+            # be re-run from scratch by an escalation: the operator decides.
             echo "hold" ;;
         worktree_create_failed|runner_died_early|unspecified|"")
             echo "retry_once" ;;

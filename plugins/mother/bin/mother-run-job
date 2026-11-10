@@ -1281,6 +1281,7 @@ _gates_hold() {
         "  mother resume $id --option override_open  open the PR for review anyway (override recorded)" \
         "  mother resume $id --option cancel         cancel the job; the branch is left in place")
 
+    _ckpt_final gate_hold
     local merged
     merged=$(jq --arg q "$q" --arg ts "$(iso_now)" '
         .state = "awaiting" | .activity = "gate_hold" | .paused_reason = "gate_hold"
@@ -1816,6 +1817,7 @@ _wave_hold() {
         "  mother resume $id --option override_open  present the PR with the open findings listed as advisories" \
         "  mother resume $id --option cancel         cancel the job; the branch is left in place")
 
+    _ckpt_final review_hold
     local merged
     merged=$(jq --arg q "$q" --arg ts "$(iso_now)" '
         .state = "awaiting" | .activity = "review_hold" | .paused_reason = "review_hold"
@@ -1913,6 +1915,7 @@ _run_review_wave() {
 # _run_post_run_checks — gates (enforce loop or observe), then the review wave
 # when one applies. Runs before the sandbox stop and the main-dir restore.
 _run_post_run_checks() {
+    _ckpt_final post_run_checks
     _pr_ready_reason=""
     _run_gates
     case "$_gates_outcome" in held|stopped) return 0 ;; esac
@@ -1942,6 +1945,9 @@ _verify_run_advanced_or_fail() {
     # Without a pre-existing artifact the ordinary no_pr_no_push logic below
     # already catches a run that shipped nothing.
     [ "${run_had_artifact_at_start:-false}" = "true" ] || return 0
+    # A run resumed from a checkpoint (worker lost) starts on top of its own earlier work: that is not a
+    # rework of someone else's PR, and finishing without a further commit is legitimate.
+    [ "${_resumed_from_ckpt:-0}" != "1" ] || return 0
     # Operator guidance on a gate hold may need no new commit (e.g. "re-run,
     # it was flaky"): green gates on the pushed head are the proof of work.
     if [ "${gates_budget_reset_by:-}" = "resume" ] \
@@ -2477,6 +2483,9 @@ _install_core_job_helpers() {
     _transition() {
         local new="$1" detail="${2:-}"
         [ -z "$detail" ] && detail='{}'
+        # Worker mode: the work reaches the remote (and the coordinator hears of the checkpoint) before the
+        # coordinator can see a terminal state. A no-op elsewhere.
+        case "$new" in succeeded|failed|cancelled) _ckpt_final "$new" ;; esac
         # Worker mode with a broken outbox: never claim a state the coordinator cannot see; hold instead.
         case "$new" in
             running|succeeded|failed)
@@ -2532,6 +2541,56 @@ _install_core_job_helpers
 # with lib/state.sh's version if that normalization rule ever changes.
 type _failure_reason_literal >/dev/null 2>&1 || _failure_reason_literal() {
     printf '%s' "$1" | jq -c '(.reason // "") | tostring | if . == "" then "unspecified" else . end' 2>/dev/null || echo '"unspecified"'
+}
+
+# ---- worker-mode checkpoints (cluster P1-6) ----
+#
+# _ckpt_final <reason>: take a checkpoint of the work tree and ship it (lib/checkpoint.sh via
+# `mother checkpoint take --ship`): wip commit pushed to refs/mother/wip/<job>, committed work fast-forwarded
+# to the job branch, transcript delta and manifest into the outbox. It is called before every exit and every
+# awaiting/terminal state write (so the coordinator sees the checkpoint before the state), and at phase
+# boundaries. Idempotent: `take` skips when nothing changed since a checkpoint that reached the remote.
+# Bounded by MOTHER_CHECKPOINT_FINAL_TIMEOUT_S (30 s: one deadline for the whole take, git killed as a
+# process group). Never fails the caller. Legacy mode (no MOTHER_WORKER_MODE): does nothing at all.
+_ckpt_enabled() {
+    type mother_worker_mode_active >/dev/null 2>&1 && mother_worker_mode_active \
+        && [ -n "${MOTHER_LEASE_ID:-}" ] && [ -n "${work_dir:-}" ] && [ -d "${work_dir:-/nonexistent}" ] \
+        && [ "${_ckpt_busy:-0}" != 1 ]
+}
+_ckpt_final() {
+    _ckpt_enabled || return 0
+    _ckpt_busy=1
+    local reason="${1:-exit}" out rc=0 t="${MOTHER_CHECKPOINT_FINAL_TIMEOUT_S:-30}" detail
+    case "$t" in ''|*[!0-9]*|0) t=30 ;; esac
+    out=$(MOTHER_CHECKPOINT_TIMEOUT_S="$t" "${mother_cli:-$MOTHER_BIN_DIR/mother}" checkpoint take "$id" --ship 2>/dev/null) || rc=$?
+    detail=$(printf '%s\n' "$out" | tail -n 1 | jq -c --arg r "$reason" --argjson rc "$rc" '
+        {reason: $r, exit: $rc}
+        + (if type == "object" then
+              (if has("skipped") then {skipped: .skipped}
+               elif has("n") then {n: .n, pushed: .pushed, wip_sha: .wip_sha}
+               else {why: (.why // "unknown")} end)
+           else {} end)' 2>/dev/null) || detail=$(jq -nc --arg r "$reason" --argjson rc "$rc" '{reason: $r, exit: $rc}')
+    # Not an event: a worker-mode run must leave the same event stream as a legacy run (coord_worker.bats parity).
+    # The runner-local log is for the operator's `tail` and for tests; it is not mirrored.
+    printf '%s %s\n' "$(iso_now)" "$detail" >> "$RUNNER_DIR/$id.ckpt.log" 2>/dev/null || true
+    _ckpt_busy=0
+    return 0
+}
+
+# SIGTERM (the worker daemon is stopping, or the platform is): stop claude, take the final checkpoint, and
+# exit with the job still `running` in the mirror. The daemon then releases the lease and the coordinator
+# resumes the job from this checkpoint. Worker mode only; legacy keeps the default TERM behaviour.
+_sigterm_exit=0
+_sigterm_stop() {
+    trap '' TERM INT
+    _sigterm_exit=1
+    if [ "${worker_pid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$worker_pid" 2>/dev/null; then
+        _terminate_worker
+    fi
+    _ckpt_final sigterm
+    # The wrapper's exit marker would make the resumed lease believe its own run already ended.
+    [ -z "${marker_file:-}" ] || rm -f "$marker_file"
+    exit 143
 }
 
 # _terminate_worker: SIGTERM the wrapper + its direct children, wait up to
@@ -2698,6 +2757,7 @@ _hold_park() {
     # take it); the lock is released before any event or other write, so it is never nested. _with_lock
     # fails after its 200 tries (~27 s under load; and for good with a stale .lockdir), so the result is not trusted: re-read the job
     # and require this park's own awaiting state before anything is recorded or the caller stops the worker.
+    _ckpt_final limiter_park
     park_ts=$(iso_now)
     if ! _with_lock "$job_file" _hold_park_write "$q" "$preason" "$park_ts" \
        || [ "$(jq -r --arg p "$preason" --arg ts "$park_ts" \
@@ -3144,6 +3204,9 @@ _spawn_and_wait() {
     [ "$spawn_seq" -gt 1 ] && spawn_sfx=".$spawn_seq"
 
     marker_file="$RUNNER_DIR/$id.exit$spawn_sfx"
+    # Worker mode: a supervisor that stopped on SIGTERM (or died) leaves its wrapper's exit marker behind, and a
+    # resumed lease reuses this root: a stale marker would read as "this run already finished".
+    ! mother_worker_mode_active || rm -f "$marker_file"
     wrapper="$RUNNER_DIR/$id.wrap$spawn_sfx"
     # Job-scoped Docker Compose project name (see mother_compose_project in
     # state.sh). Computed here, not inside the heredoc, so it interpolates at
@@ -3358,6 +3421,7 @@ WRAP
         if [ "$(jq -r '.pause_requested // false' "$job_file" 2>/dev/null)" = "true" ]; then
             _pause_reason=$(jq -r '.paused_reason // "system"' "$job_file" 2>/dev/null)
             _pause_resume_at=$(jq -r '.auto_resume_at // 0'    "$job_file" 2>/dev/null)
+            _ckpt_final quota_pause
             _job_update_n 40 '.state = "awaiting"
                 | .question = "Mother paused this job because the quota cap was reached. Auto-resumes when the blocking window resets."
                 | .pause_requested = null'
@@ -3493,6 +3557,7 @@ USAGE_EOF
                 _grace="${MOTHER_COST_CAP_GRACE_SECONDS:-300}"
                 if [ $((_now_epoch - cost_cap_breach_epoch)) -ge "$_grace" ]; then
                     _cap_summary=$(cat "$cost_cap_flag" 2>/dev/null || echo "Mother cost cap reached on job $id.")
+                    _ckpt_final cost_cap
                     _cc_merged=$(jq --arg q "$_cap_summary" --arg ts "$(iso_now)" \
                         '.state = "awaiting" | .question = $q | .paused_at = $ts | .paused_reason = "cost_cap"' \
                         "$job_file") && _job_write_doc "$_cc_merged"
@@ -3551,6 +3616,8 @@ USAGE_EOF
 
     exit_code=0
     [ -f "$marker_file" ] && exit_code=$(cat "$marker_file")
+    # Phase boundary (worker mode): checkpoint what this run produced before gates, review or the next turn.
+    _ckpt_final spawn_end
     return 0
 }
 
@@ -3685,6 +3752,8 @@ mother_cli="$MOTHER_BIN_DIR/mother"
 _runner_died_trap() {
     local rc=$?
     local cur; cur=$(jq -r '.state // empty' "$job_file" 2>/dev/null)
+    # A SIGTERM stop (worker mode) deliberately leaves the job running: the coordinator resumes it.
+    if [ "${_sigterm_exit:-0}" = 1 ]; then cur="sigterm"; fi
     if [ "$cur" = "running" ]; then
         _transition failed "$(jq -nc --argjson rc "$rc" \
             '{reason: "runner_died_early", exit_code: $rc}')" 2>/dev/null || true
@@ -3701,6 +3770,7 @@ _runner_died_trap() {
     _exit_cleanup_workspace
 }
 trap _runner_died_trap EXIT
+mother_worker_mode_active && trap _sigterm_stop TERM
 
 # Accept ready (invoked by `mother run --once`) or running (daemon already
 # pre-transitioned before forking us).
@@ -3800,6 +3870,93 @@ _tm_exclude_path() {
     return 0
 }
 
+# _restore_from_checkpoint <new-work-dir> (worker mode, resumed lease): `mother checkpoint restore` of the
+# checkpoint the lease was offered (MOTHER_RESUME_CHECKPOINT / MOTHER_RESUME_TRANSCRIPT, staged by the worker
+# daemon). Exit 4 / any failure: `failed {reason: no_checkpoint_restorable, why}`, return 1.
+_restore_from_checkpoint() {
+    local new="$1" out rc=0 why info="${MOTHER_RESUME_INFO:-}"
+    # The dead lease's worktree (same host, local carrier) still has the branch checked out, which git refuses
+    # to share. The canonical job has no work_dir for a worktree job, so ask git: detach the HEAD of every other
+    # worktree on the job branch (files untouched; teardown removes the directories later), never the main checkout.
+    local line wt=""
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*) wt="${line#worktree }" ;;
+            "branch refs/heads/$branch")
+                if [ -n "$wt" ] && [ "$wt" != "$new" ] && [ "$wt" != "$repo_path" ]; then
+                    git -C "$wt" checkout -q --detach >/dev/null 2>&1 || true
+                fi ;;
+        esac
+    done < <(git -C "$repo_path" worktree list --porcelain 2>/dev/null)
+    if [ -d "$new" ]; then
+        # A previous start of this same lease already restored it.
+        [ -e "$new/.git" ] && return 0
+    fi
+    local errf msg=""
+    errf=$(mktemp "${TMPDIR:-/tmp}/mother-restore.XXXXXX") || errf=/dev/null
+    out=$("$mother_cli" checkpoint restore "$id" --manifest "$MOTHER_RESUME_CHECKPOINT" \
+        --transcript "${MOTHER_RESUME_TRANSCRIPT:-/nonexistent}" --work-dir "$new" --branch "$branch" 2>"$errf") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        why=$(printf '%s\n' "$out" | tail -n 1 | jq -r '.why // empty' 2>/dev/null)
+        [ -n "$why" ] || why="restore_error"
+        # Mother-written text only (the library's own stderr), so the operator can see what git refused.
+        msg=$(head -c 400 "$errf" 2>/dev/null | tr '\n\r\t' '   ')
+        rm -f "$errf"
+        _transition failed "$(jq -nc --arg w "$why" --arg m "$msg" --argjson rc "$rc" '{reason: "no_checkpoint_restorable", why: $w, message: $m, exit_code: $rc}')"
+        return 1
+    fi
+    rm -f "$errf"
+    _tm_exclude_path "$new"
+    # Continue numbering from the offered manifest: this worker's own checkpoints dir is empty after a failover to another machine, and a
+    # take numbers itself from the newest manifest it finds there (and diffs the transcript against it). Seed it, unless a newer one exists.
+    local sn sdir="$MOTHER_ROOT/checkpoints/$id" last=0 d dn
+    # An earlier lease on this machine left its last-pushed value here; the restore just wrote the new lease's own expectation.
+    rm -f "$sdir/.last-pushed" "$sdir/.pruned-epoch"
+    # The restore point stays on origin when older epochs are pruned (see _ckpt_prune_refspecs).
+    mkdir -p "$sdir" 2>/dev/null
+    rm -f "$sdir/.restore-point"
+    local rp_e rp_n
+    rp_e=$(jq -r '.epoch // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null); rp_n=$(jq -r '.n // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)
+    # A missing or malformed value leaves no file: the take then keeps every earlier epoch's refs (no sweep).
+    case "$rp_e$rp_n" in ''|*[!0-9]*) ;; *) [ -n "$rp_e" ] && [ -n "$rp_n" ] && printf '%s-%s' "$rp_e" "$rp_n" >"$sdir/.restore-point" 2>/dev/null ;; esac
+    sn=$(jq -r '.n // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)
+    case "$sn" in ''|*[!0-9]*) ;; *)
+        for d in "$sdir"/*/; do dn=$(basename "$d"); case "$dn" in ''|*[!0-9]*) continue ;; esac; [ -s "${d}manifest.json" ] && [ "$dn" -gt "$last" ] && last="$dn"; done
+        if [ "$last" -lt "$sn" ]; then
+            # Numbering only (epoch, n): NOT the transcript bytes/sha. The coordinator's rebuilt transcript can be longer than
+            # latest.json's byte count (pushed:false checkpoints append deltas without advancing latest.json), so a delta
+            # starting at latest.transcript.bytes would never line up and latest.json would freeze for the whole lease. With
+            # bytes 0 and pushed:false the first take ships the full transcript, which the coordinator accepts as a replacement.
+            local se; se=$(jq -r '.epoch // 0' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null); case "$se" in ''|*[!0-9]*) se=0 ;; esac
+            mkdir -p "$sdir/$sn" && jq -nc --argjson n "$sn" --argjson e "$se" \
+                '{v:1, n:$n, epoch:$e, pushed:false, transcript:{bytes:0, sha256:""}}' >"$sdir/$sn/manifest.json" 2>/dev/null || true
+        fi ;;
+    esac
+    _resume_restore_json=$(printf '%s\n' "$out" | tail -n 1)
+    _resume_info_json='{}'
+    [ -r "$info" ] && _resume_info_json=$(jq -c . "$info" 2>/dev/null || echo '{}')
+    return 0
+}
+
+# _resume_prompt_file <manifest> <restore-json>: the same-session prompt (templates/resume-elsewhere.md).
+_resume_prompt_file() {
+    local manifest="$1" restore="$2" f="$RUNNER_DIR/$id.resume-elsewhere.md" body at head notes=""
+    body=$(cat "$MOTHER_LIB_DIR/../templates/resume-elsewhere.md" 2>/dev/null) || return 1
+    at=$(jq -r '.at // "an earlier time"' "$manifest" 2>/dev/null)
+    head=$(jq -r '.head_sha // ""' "$manifest" 2>/dev/null)
+    [ "$(printf '%s' "$restore" | jq -r '.incomplete // false' 2>/dev/null)" != "true" ] \
+        || notes="
+Note: nested repositories or submodules were not captured; check them by hand."
+    [ "$(printf '%s' "$restore" | jq -r '.detached // false' 2>/dev/null)" != "true" ] \
+        || notes="$notes
+Note: the branch moved on after this checkpoint, so the worktree is detached at the checkpoint's head."
+    body="${body//\{\{AT\}\}/$at}"
+    body="${body//\{\{BRANCH\}\}/$branch}"
+    body="${body//\{\{HEAD_SHA\}\}/$head}"
+    body="${body//\{\{NOTES\}\}/$notes}"
+    printf '%s\n' "$body" > "$f" && printf '%s' "$f"
+}
+
 # Resolve working directory.
 work_dir=""
 _workspace_lock_held=0
@@ -3807,7 +3964,14 @@ if [ "$isolation" = "worktree" ]; then
     (cd "$repo_path" && git fetch --quiet origin "${base_ref#origin/}" 2>/dev/null || true)
     # Create the branch + worktree from base_ref.
     wt_path=$(source "$MOTHER_LIB_DIR/worktree.sh" && worktree_path_for_repo "$repo_path" "$branch")
-    if [ ! -d "$wt_path" ]; then
+    _resumed_from_ckpt=0
+    if mother_worker_mode_active && [ -n "${MOTHER_RESUME_CHECKPOINT:-}" ]; then
+        # Resumed on a new lease (cluster P1-6): a lease-scoped path, restored from the checkpoint. Never a
+        # fresh worktree, never a fresh start: a checkpoint that cannot be restored fails the job.
+        wt_path="${wt_path}-e${MOTHER_LEASE_EPOCH:-0}"
+        _restore_from_checkpoint "$wt_path" || exit 1
+        _resumed_from_ckpt=1
+    elif [ ! -d "$wt_path" ]; then
         # If the branch already exists (e.g. adherence rework re-run), add the
         # worktree pointing at it rather than trying to create a new branch with
         # -b, which would fail with "branch already exists".
@@ -3824,6 +3988,11 @@ if [ "$isolation" = "worktree" ]; then
     work_dir="$wt_path"
 else
     # main-dir: acquire workspace lock so concurrent main-dir jobs serialize.
+    if mother_worker_mode_active && [ -n "${MOTHER_RESUME_CHECKPOINT:-}" ]; then
+        # A main-dir job works in the operator's own checkout: there is no second path to restore into.
+        _transition failed '{"reason":"no_checkpoint_restorable","why":"main_dir_job"}'
+        exit 1
+    fi
     lock_name="${repo}:workspace"
     if ! lock_acquire "$lock_name" 0 >/dev/null 2>&1; then
         echo "mother-run-job: could not acquire lock $lock_name (another main-dir job is running)" >&2
@@ -4113,13 +4282,44 @@ detection work and operator confusion.
 # its next turn. If that session can't be resumed, fall back to a fresh spawn
 # that carries the answer the usual way.
 run_activity_at_start=$(jq -r '.activity // ""' "$job_file" 2>/dev/null)
+_boundary_resume=0
+[ -n "${_resume_info_json:-}" ] || _resume_info_json='{}'
+[ -n "${_resume_restore_json:-}" ] || _resume_restore_json='{}'
 gates_budget_reset_by=""
 if [ "$(jq -r '(.gates.attempt // -1) == 0 and (.gates.budget_reset_by // "") == "escalate"' "$job_file" 2>/dev/null)" = "true" ]; then
     gates_budget_reset_by="escalate"
 fi
 resume_sid=$(jq -r '.resume_session_id // empty' "$job_file" 2>/dev/null)
 resume_answer=$(jq -r '.pending_answer // empty' "$job_file" 2>/dev/null)
-if [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ]; then
+if [ "${_resumed_from_ckpt:-0}" = "1" ]; then
+    # Resumed on a new machine from a checkpoint (worker lost): re-enter the SAME Claude session. If the loss
+    # happened while no session was live (gates, the review wave) restart that boundary step instead: both
+    # are re-runnable. Never a fresh session.
+    _ck_session=$(jq -r '.session_id // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)
+    _job_update ".session_id = \"$_ck_session\" | .resume_kind = \"worker_lost\""
+    _ck_mode="session"
+    case "$run_activity_at_start" in gating|review_wave) _ck_mode="boundary:$run_activity_at_start" ;; esac
+    _append_event "resumed_from_checkpoint" "$(jq -nc --argjson i "$_resume_info_json" --argjson r "$_resume_restore_json" \
+        --arg to "${MOTHER_WORKER_ID:-}" --arg m "$_ck_mode" --arg wd "$work_dir" --arg sid "$_ck_session" \
+        '{from_worker: ($i.from_worker // null), to_worker: $to, checkpoint_at: ($i.checkpoint_at // null),
+          checkpoint_n: ($i.checkpoint_n // null), lost_work_s: ($i.lost_work_s // null), wip_sha: ($i.wip_sha // null),
+          lease_epoch: ($i.lease_epoch // null), reason: ($i.reason // null), mode: $m, session_id: $sid, work_dir: $wd,
+          branch_state: ($r.branch_state // null), incomplete: ($r.incomplete // false)}')"
+    case "$_ck_mode" in
+        boundary:*)
+            _append_event "resume_boundary_restart" "$(jq -nc --arg a "$run_activity_at_start" '{activity: $a, note: "no live session at the loss; the step is re-run"}')"
+            # No claude run: stand in for one that ended cleanly, then the post-run checks redo the step.
+            exit_code=0; reaped_reason=""; cancel_requested=0; final_result_epoch=0; worker_pid=0
+            log_offset_at_spawn=$(stat -f %z "$log_path" 2>/dev/null || stat -c %s "$log_path" 2>/dev/null || echo 0)
+            : "${usage_main_actor:=${phase_agent:-cody}-main}" "${marker_file:=}" "${wrapper:=}" "${usage_state_file:=}"
+            _job_update '.worker_pid = null' ;;
+        *)
+            _ck_prompt=$(_resume_prompt_file "$MOTHER_RESUME_CHECKPOINT" "$_resume_restore_json") \
+                || { _transition failed '{"reason":"no_checkpoint_restorable","why":"resume_prompt_missing"}'; exit 1; }
+            _spawn_and_wait resume "$_ck_prompt" || true
+            rm -f "$_ck_prompt" ;;
+    esac
+elif [ -n "$resume_sid" ] && [ -n "$resume_answer" ] && [ "$kind" != "pipeline" ]; then
     resume_kind=$(jq -r '.resume_kind // empty' "$job_file" 2>/dev/null)
     # A limiter release is a continuation, not an operator answer: the gate budget keeps counting.
     [ "$resume_kind" = "limiter_hold" ] || gates_budget_reset_by="resume"

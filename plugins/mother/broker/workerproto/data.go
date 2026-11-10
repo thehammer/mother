@@ -107,6 +107,13 @@ type Bye struct {
 	Reason string `json:"reason"`
 }
 
+// Salvage is the data of a salvage frame (job, lease and epoch ride in the envelope): the fenced
+// lease's work was pushed to Ref (always SalvageRef(job, epoch)) at WipSHA.
+type Salvage struct {
+	Ref    string `json:"ref"`
+	WipSHA string `json:"wip_sha"`
+}
+
 type JobSet struct {
 	Set map[string]json.RawMessage `json:"set"`
 	Del []string                   `json:"del"`
@@ -154,6 +161,10 @@ type LeaseOffer struct {
 	Repo       string          `json:"repo"`
 	RepoPath   string          `json:"repo_path,omitempty"`
 	Attempt    int             `json:"attempt"`
+	// AppliedSeq (additive, P1-6) is the outbox op seq the coordinator has already applied for the job: a
+	// worker that held an earlier lease of the job drops its own unshipped ops from that lease and numbers its
+	// new ops after this one (an old lease's ops cannot be applied under the new lease).
+	AppliedSeq int64 `json:"applied_seq,omitempty"`
 }
 
 type LeaseRevoke struct {
@@ -354,7 +365,7 @@ const (
 // acks, bye and the seq-numbered stream frames. Everything else (lease.offer, lease.revoke, cancel,
 // hold, release, sync.job, sync.file, welcome, refuse, ack) is coordinator-only.
 func AllowedFromWorker(t string) bool {
-	return streamTypes[t] || t == TypeHello || t == TypeHb || t == TypeCmdAck || t == TypeBye
+	return streamTypes[t] || t == TypeHello || t == TypeHb || t == TypeCmdAck || t == TypeBye || t == TypeSalvage
 }
 
 // AllowedFromCoordinator reports whether the coordinator may send t: welcome, refuse, ack, bye and the
@@ -475,6 +486,17 @@ func Validate(f Frame) error {
 		}
 		if !IDOK(a.Job) || !IDOK(a.Lease) || a.Epoch < 1 || a.Seq < 0 {
 			return protoErr(CodeInvalid, "ack: job, lease, epoch and seq are required")
+		}
+	case TypeSalvage:
+		if err := needEnvelope(f, true, true, true, false); err != nil {
+			return err
+		}
+		sv, err := parseData[Salvage](f)
+		if err != nil {
+			return err
+		}
+		if sv.Ref != SalvageRef(*f.Job, *f.Epoch) || !shaOK(sv.WipSHA) {
+			return protoErr(CodeInvalid, "salvage: ref must be %s and wip_sha a git sha", SalvageRef(*f.Job, *f.Epoch))
 		}
 	case TypeBye:
 		b, err := parseData[Bye](f)

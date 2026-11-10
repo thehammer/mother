@@ -39,6 +39,12 @@ type Config struct {
 	// BackoffBase/BackoffMax bound the reconnect delay: base doubling to max, plus up to 20% jitter.
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
+	// CkptInterval is the checkpoint cadence (0 disables it; main reads it from `mother checkpoint interval`).
+	// CkptFinalWait bounds a supervisor's final checkpoint (MOTHER_CHECKPOINT_FINAL_TIMEOUT_S, default 30 s).
+	CkptInterval  time.Duration
+	CkptFinalWait time.Duration
+	// MotherCLI is the `mother` executable the cadence and the salvage push run (default BinDir/mother).
+	MotherCLI string
 	// SpawnCmd, when set, replaces the mother-run-job command line (tests run a `sleep`).
 	SpawnCmd func(job string) (name string, args []string)
 	Logf     func(format string, args ...any)
@@ -49,10 +55,13 @@ type Daemon struct {
 	cfg      Config
 	instance string
 
-	mu     sync.Mutex
-	leases map[string]*lease
-	dedupe *workerproto.DedupeSet
-	sess   *session
+	mu       sync.Mutex
+	leases   map[string]*lease
+	dedupe   *workerproto.DedupeSet
+	sess     *session
+	stopping bool // GracefulStop in progress: no new offers, no cadence, stopped supervisors are released
+
+	bg sync.WaitGroup // fence/salvage goroutines; tests wait for it so nothing logs after they end
 }
 
 func New(cfg Config) (*Daemon, error) {
@@ -67,6 +76,12 @@ func New(cfg Config) (*Daemon, error) {
 	}
 	if cfg.Slots < 1 {
 		cfg.Slots = 1
+	}
+	if cfg.CkptFinalWait <= 0 {
+		cfg.CkptFinalWait = 30 * time.Second
+	}
+	if cfg.MotherCLI == "" {
+		cfg.MotherCLI = filepath.Join(cfg.BinDir, "mother")
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
@@ -91,7 +106,7 @@ func (d *Daemon) p(parts ...string) string {
 
 // initRoot creates the worker root skeleton (idempotent: an existing root is kept as is).
 func (d *Daemon) initRoot() error {
-	for _, sub := range []string{"jobs", "events", "logs", "runner", "outbox", "metrics", "crew", "leases", "children"} {
+	for _, sub := range []string{"jobs", "events", "logs", "runner", "outbox", "metrics", "crew", "leases", "children", "checkpoints", "resume", "salvage"} {
 		if err := os.MkdirAll(d.p(sub), 0o700); err != nil {
 			return err
 		}
@@ -139,6 +154,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.loadLeases()
 	d.adopt()
 	go d.watchLoop(ctx)
+	go d.ckptLoop(ctx)
 	delay := d.cfg.BackoffBase
 	for ctx.Err() == nil {
 		welcomed, err := d.runSession(ctx)

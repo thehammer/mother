@@ -1302,6 +1302,39 @@ _status_worker_lines() {
     fi
 }
 
+# _status_clock <epoch>: "2:14 pm CST" in local time, as the rest of the CLI prints it.
+_status_clock() {
+    local e="$1" c
+    c=$(date -r "$e" '+%-I:%M %p %Z' 2>/dev/null || date -d "@$e" '+%-I:%M %p %Z' 2>/dev/null) || c="$e"
+    printf '%s' "$c" | sed -e 's/AM/am/' -e 's/PM/pm/'
+}
+
+# _status_worker_timeline <id> (cluster P1-6): one line per lost worker, built from the job's events
+# (worker_lost, then the resumed_from_checkpoint that answered it, or worker_salvaged for a fenced one):
+#   worker local lost at 2:14 pm CST; resumed on local from the checkpoint at 2:11 pm CST; about 3 minutes of work re-done
+_status_worker_timeline() {
+    local id="$1" ev="$EVENTS_DIR/$1.jsonl" lost_ts from to ck_ts lost_s mins resumed row
+    [ -f "$ev" ] && grep -q '"kind":"worker_lost"' "$ev" 2>/dev/null || return 0
+    while IFS=$'\t' read -r lost_ts from to ck_ts lost_s resumed; do
+        [ -n "$lost_ts" ] || continue
+        row="worker ${from:-?} lost at $(_status_clock "$(_iso_to_epoch "$lost_ts")")"
+        if [ "$resumed" = "yes" ]; then
+            row="$row; resumed on ${to:-?} from the checkpoint at $(_status_clock "$(_iso_to_epoch "$ck_ts")")"
+            if [ "${lost_s:-0}" -lt 60 ] 2>/dev/null; then row="$row; under a minute of work re-done"
+            else mins=$(( (lost_s + 30) / 60 )); row="$row; about $mins minute$([ "$mins" -eq 1 ] || echo s) of work re-done"; fi
+        else
+            row="$row; not resumed (no resume event)"
+        fi
+        echo "$row"
+    done < <(jq -rs '
+        [ .[] | select(.kind == "worker_lost" or .kind == "resumed_from_checkpoint") ] as $e
+        | [ range(0; $e | length) | select($e[.].kind == "worker_lost") ] as $idx
+        | $idx[] | . as $i | $e[$i] as $l
+        | ([ $e[$i+1:][] | select(.kind == "resumed_from_checkpoint") ][0]) as $r
+        | [ $l.ts, ($l.detail.worker // "?"), ($r.detail.to_worker // "?"), ($r.detail.checkpoint_at // ""),
+            (($r.detail.lost_work_s // 0) | tostring), (if $r == null then "no" else "yes" end) ] | @tsv' "$ev" 2>/dev/null)
+}
+
 # "Rust build dirs: ..." status line from the cargo-targets.json cache (only
 # when it lists any dirs).
 _status_rust_dirs_line() {
@@ -1554,6 +1587,7 @@ cmd_status() {
         local _lw; _lw=$(jq -r 'if (.state == "ready" or .state == "queued") and (.limiter.wait.reason // "") != "" then .limiter.wait.reason else empty end' "$job_file" 2>/dev/null) || _lw=""
         [ -z "$_lw" ] || echo "Waiting: $_lw"
         _status_worker_lines "$id" "$job_file"
+        _status_worker_timeline "$id"
         _status_limiter_hold "$job_file"
         if [ "$activity" = "adherence_blocked" ]; then
             echo ""
@@ -4133,6 +4167,14 @@ cmd_await() {
 $(cat "$cost_cap_flag" 2>/dev/null)"
     fi
 
+    # Worker mode (cluster P1-6): the work reaches the remote, and the coordinator hears of the checkpoint,
+    # before it can see the job awaiting. The supervisor takes another (cheap when nothing changed) once the
+    # session has exited.
+    if type mother_worker_mode_active >/dev/null 2>&1 && mother_worker_mode_active && [ -n "${MOTHER_LEASE_ID:-}" ]; then
+        MOTHER_CHECKPOINT_TIMEOUT_S="${MOTHER_CHECKPOINT_FINAL_TIMEOUT_S:-30}" \
+            "$MOTHER_BIN_DIR/mother" checkpoint take "$id" --ship >/dev/null 2>&1 || true
+    fi
+
     # Single atomic write: set question/paused_at/paused_reason/state and
     # clear any stale pending_answer or auto_resume_at (so a resume after
     # this pause must come from a fresh `mother resume` call, not a
@@ -5333,18 +5375,20 @@ cmd_checkpoint() {
     case "$sub" in
         take)    _checkpoint_cmd_take "$@" ;;
         restore) _checkpoint_cmd_restore "$@" ;;
-        *)       _die "checkpoint: usage: mother checkpoint take ID [--out DIR] [--final] [--salvage-epoch N] [--expect-sha SHA] | mother checkpoint restore ID --manifest F --transcript F --work-dir D" ;;
+        interval) mother_checkpoint_interval_s ;;
+        *)       _die "checkpoint: usage: mother checkpoint take ID [--out DIR] [--final] [--ship] [--salvage-epoch N] [--expect-sha SHA] | mother checkpoint restore ID --manifest F --transcript F --work-dir D | mother checkpoint interval" ;;
     esac
 }
 
 _checkpoint_cmd_take() {
-    local id="${1:-}" out="" final=() salvage=() expect=()
+    local id="${1:-}" out="" final=() salvage=() expect=() ship=0
     [ -n "$id" ] || _die "checkpoint take: <id> required"
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
             --out)           out="${2:-}"; shift 2 ;;
             --final)         final=(--final); shift ;;
+            --ship)          ship=1; shift ;;
             --salvage-epoch) salvage=(--salvage-epoch "${2:-}"); shift 2 ;;
             --expect-sha)    expect=(--expect-sha "${2:-}"); shift 2 ;;
             *) _die "unknown flag for checkpoint take: $1" ;;
@@ -5354,23 +5398,25 @@ _checkpoint_cmd_take() {
     local job_file; job_file=$(_job_path "$id")
     local ckdir="$MOTHER_ROOT/checkpoints/$id"
     if [ -z "$out" ]; then
-        # Default: checkpoints/<id>/<n>/ with n = the newest manifest's n + 1; that manifest is the
-        # "previous" one for the skip check and the transcript delta.
-        local last=0 d n
-        for d in "$ckdir"/*/; do
-            [ -s "${d}manifest.json" ] || continue
-            n=$(basename "$d")
-            case "$n" in ''|*[!0-9]*) continue ;; esac
-            [ "$n" -gt "$last" ] && last="$n"
-        done
-        [ "$last" -gt 0 ] && export MOTHER_CHECKPOINT_PREV_MANIFEST="$ckdir/$last/manifest.json"
-        out="$ckdir/$((last + 1))"
+        # Default: checkpoints/<id>/<n>/, n = the newest manifest's n + 1, decided under the checkpoint lock
+        # (mother_checkpoint_take, MOTHER_CHECKPOINT_AUTO_N) with that manifest as the "previous" one.
+        export MOTHER_CHECKPOINT_AUTO_N=1
+        out="$ckdir/pending"
     fi
-    mother_checkpoint_take "$job_file" "$out" ${salvage[@]+"${salvage[@]}"} ${final[@]+"${final[@]}"} ${expect[@]+"${expect[@]}"}
+    local result rc=0
+    result=$(mother_checkpoint_take "$job_file" "$out" ${salvage[@]+"${salvage[@]}"} ${final[@]+"${final[@]}"} ${expect[@]+"${expect[@]}"}) || rc=$?
+    [ -z "$result" ] || printf '%s\n' "$result"
+    # --ship (worker mode): the finished take enters the job's ordered outbox. Not for a fenced (exit 3) or
+    # failed take, nor for a skip (nothing new), nor a salvage (the fenced stream would be refused).
+    if [ "$ship" = 1 ] && [ "$rc" -eq 0 ] && [ -z "${salvage[*]-}" ] && mother_outbox_enabled \
+        && printf '%s' "$result" | jq -e 'has("n")' >/dev/null 2>&1; then
+        mother_checkpoint_ship "$id" "$(printf '%s\n' "$result" | tail -n 1)" || rc=1
+    fi
+    return "$rc"
 }
 
 _checkpoint_cmd_restore() {
-    local id="${1:-}" manifest="" transcript="" workdir=""
+    local id="${1:-}" manifest="" transcript="" workdir="" want_branch=""
     [ -n "$id" ] || _die "checkpoint restore: <id> required"
     shift
     while [ $# -gt 0 ]; do
@@ -5378,6 +5424,7 @@ _checkpoint_cmd_restore() {
             --manifest)   manifest="${2:-}"; shift 2 ;;
             --transcript) transcript="${2:-}"; shift 2 ;;
             --work-dir)   workdir="${2:-}"; shift 2 ;;
+            --branch)     want_branch="${2:-}"; shift 2 ;;
             *) _die "unknown flag for checkpoint restore: $1" ;;
         esac
     done
@@ -5385,7 +5432,12 @@ _checkpoint_cmd_restore() {
     _job_exists "$id" || _die "no such job: $id"
     local repo; repo=$(jq -r '.repo_path // .work_dir // ""' "$(_job_path "$id")")
     [ -n "$repo" ] || _die "checkpoint restore: no repo path on job $id"
-    mother_checkpoint_restore "$manifest" "$transcript" "$repo" "$workdir"
+    # The manifest must agree with the job document (and --branch, when the caller has one).
+    local job_branch; job_branch=$(jq -r '.branch // ""' "$(_job_path "$id")")
+    if [ -n "$want_branch" ] && [ -n "$job_branch" ] && [ "$want_branch" != "$job_branch" ]; then
+        _die "checkpoint restore: --branch '$want_branch' is not the job's branch '$job_branch'"
+    fi
+    mother_checkpoint_restore "$manifest" "$transcript" "$repo" "$workdir" "$id" "${want_branch:-$job_branch}"
 }
 
 _gates_cmd_check() {

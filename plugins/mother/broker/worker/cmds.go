@@ -182,22 +182,43 @@ func (d *Daemon) acceptOffer(s *session, f workerproto.Frame, existing *lease) (
 		return workerproto.OutcomeRejected, "invalid", nil
 	}
 	job := *f.Job
+	if d.stopping {
+		return workerproto.OutcomeRejected, "no_slot", nil
+	}
 	if existing != nil && existing.loc.State == stateActive {
 		if sameLease(existing, f) {
 			return workerproto.OutcomeApplied, "", nil
 		}
-		return workerproto.OutcomeRejected, "busy_local", nil
+		// The coordinator offers a job only once its previous lease is over (lost or released). An older
+		// active lease of ours whose supervisor is gone is a zombie (a restarted worker that re-adopted a
+		// dead supervisor): fence it, so its work is salvaged under its own epoch, then this lease takes
+		// over. A lease whose supervisor is still running is never displaced by an offer.
+		if *f.Epoch <= existing.loc.Epoch || !existing.exited {
+			return workerproto.OutcomeRejected, "busy_local", nil
+		}
+		d.fence(existing, "superseded")
 	}
 	if d.activeCount() >= d.cfg.Slots {
 		return workerproto.OutcomeRejected, "no_slot", nil
+	}
+	resumeEnv, err := d.stageResume(job, *f.Epoch, o.Checkpoint)
+	if err != nil {
+		d.logf("offer %s: resume checkpoint: %v", job, err)
+		return workerproto.OutcomeRejected, "resume_unavailable", nil
+	}
+	if err := d.resetOutbox(job, o.AppliedSeq); err != nil {
+		d.logf("offer %s: outbox: %v", job, err)
+		return workerproto.OutcomeRejected, "mirror_failed", nil
 	}
 	if err := d.writeMirror(job, o); err != nil {
 		d.logf("offer %s: mirror: %v", job, err)
 		return workerproto.OutcomeRejected, "mirror_failed", nil
 	}
 	l := &lease{loc: localLease{Job: job, LeaseID: *f.Lease, Epoch: *f.Epoch, Attempt: o.Attempt, State: stateActive, OfferedAt: workerproto.Timestamp(time.Now())}}
-	// A fresh lease's stream starts at seq 1 with nothing applied; the welcome rebases it on a reconnect.
-	l.ship = &shipState{out: workerproto.NewOutStream(), meta: map[int64]frameMeta{}, nextOseq: 1}
+	// A fresh lease's stream starts at wire seq 1; its ops continue after what the coordinator already applied
+	// (o.AppliedSeq). The welcome rebases it on a reconnect.
+	l.ship = &shipState{out: workerproto.NewOutStream(), meta: map[int64]frameMeta{}, nextOseq: o.AppliedSeq + 1}
+	l.extraEnv = resumeEnv
 	d.leases[job] = l
 	d.persistLease(l)
 	return workerproto.OutcomeApplied, "", func() {
@@ -272,4 +293,90 @@ func (d *Daemon) extractCrew(job string, raw []byte) error {
 			return err
 		}
 	}
+}
+
+// stageResume copies the checkpoint a resumed lease was offered (manifest and transcript, named by path in
+// lease.offer.checkpoint, local carrier) into <root>/resume/<job>/e<epoch>/ and returns the environment the
+// supervisor restores from: MOTHER_RESUME_CHECKPOINT (manifest), MOTHER_RESUME_TRANSCRIPT and
+// MOTHER_RESUME_INFO (what the timeline event needs). nil when the offer carries no checkpoint.
+func (d *Daemon) stageResume(job string, epoch int64, raw json.RawMessage) ([]string, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return nil, nil
+	}
+	var ck map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &ck); err != nil {
+		return nil, err
+	}
+	str := func(k string) string { var v string; _ = json.Unmarshal(ck[k], &v); return v }
+	manifest, transcript := str("manifest"), str("transcript")
+	if !filepath.IsAbs(manifest) || !filepath.IsAbs(transcript) {
+		return nil, fmt.Errorf("checkpoint manifest and transcript must be absolute paths")
+	}
+	dir := d.p("resume", job, fmt.Sprintf("e%d", epoch))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	copyFile := func(src, dst string) error {
+		fi, err := os.Lstat(src)
+		if err != nil || !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", src)
+		}
+		in, err := os.Open(src)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		tmp := dst + ".tmp"
+		out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			out.Close()
+			return err
+		}
+		if err := out.Close(); err != nil {
+			return err
+		}
+		return os.Rename(tmp, dst)
+	}
+	m, t, info := filepath.Join(dir, "manifest.json"), filepath.Join(dir, "transcript.jsonl"), filepath.Join(dir, "info.json")
+	if err := copyFile(manifest, m); err != nil {
+		return nil, err
+	}
+	if err := copyFile(transcript, t); err != nil {
+		return nil, err
+	}
+	delete(ck, "manifest")
+	delete(ck, "transcript")
+	b, _ := json.Marshal(ck)
+	if err := writeFileAtomic(info, append(b, '\n')); err != nil {
+		return nil, err
+	}
+	return []string{"MOTHER_RESUME_CHECKPOINT=" + m, "MOTHER_RESUME_TRANSCRIPT=" + t, "MOTHER_RESUME_INFO=" + info}, nil
+}
+
+// resetOutbox: a new lease of a job that has applied ops (an earlier lease, here or on another worker, was lost,
+// stopped or released) must not re-ship that lease's ops: anything the coordinator applied is done, and the rest
+// belongs to a lease that no longer exists (a checkpoint.taken names its own lease and epoch, so it could
+// never be applied under the new one). The file is replaced by one anchor line carrying the applied seq, so
+// the supervisor's next op is numbered after it (lib/outbox.sh derives seq from the last line) and the
+// shipper skips the anchor.
+func (d *Daemon) resetOutbox(job string, applied int64) error {
+	path := d.p("outbox", job+".ndjson")
+	if applied < 1 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		_ = os.Remove(d.p("outbox", job+".seq"))
+		return nil
+	}
+	// Applied ops exist on the coordinator even when this worker has never seen the job (it resumes a job that
+	// ran elsewhere): the anchor is what makes this worker's first op come after them.
+	anchor := fmt.Sprintf("{\"seq\":%d,\"t\":\"job.set\",\"ts\":%q,\"data\":{\"set\":{},\"del\":[]}}\n", applied, workerproto.Timestamp(time.Now()))
+	if err := writeFileAtomic(path, []byte(anchor)); err != nil {
+		return err
+	}
+	_ = writeFileAtomic(d.p("outbox", job+".seq"), []byte(itoa(applied)))
+	return nil
 }

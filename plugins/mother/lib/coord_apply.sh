@@ -23,6 +23,12 @@
 #                  canonical cost recompute (the canonical side owns cost).
 #   event.append   one event object on one line, size-capped.
 #   record.append  one usage row for this job, size-capped; followed by the canonical cost recompute.
+#   checkpoint.taken  (P1-6) a worker checkpoint. Its manifest and transcript delta arrived as artifact.put
+#                  ops just before (checkpoints/<job>/<n>/); the delta is appended to the reassembled transcript
+#                  checkpoints/<job>/transcript/<session>.jsonl (replacing it when `reset`, or when the delta is
+#                  the whole file), the transcript is verified against the manifest's sha256, every manifest is
+#                  appended to checkpoints/<job>/index.jsonl, and checkpoints/<job>/latest.json is advanced only
+#                  for a checkpoint that is pushed:true AND whose transcript verified.
 #   artifact.put   offset-addressed into crew/<job>/ or checkpoints/<job>/ only; `final` needs a
 #                  sha256 and is verified; per-file and per-job byte caps.
 #
@@ -435,6 +441,108 @@ _ca_apply_artifact() {
     return "$rc"
 }
 
+# --- checkpoint.taken ---------------------------------------------------------------------------
+
+# _ca_epoch_granted <job> <epoch>: the coordinator's lease history (runner/leases/<job>.history.jsonl) lists the epoch.
+_ca_epoch_granted() {
+    local hist="$MOTHER_ROOT/runner/leases/$1.history.jsonl"
+    case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+    # No history file = no epoch was ever granted here: refuse (the caller audits manifest_refused/epoch) rather than trust the worker.
+    [ -f "$hist" ] || { _ca_log "checkpoint.taken: no lease history for $1 (epoch $2 cannot be verified)"; return 1; }
+    jq -e -s --argjson e "$2" --arg j "$1" 'any(.[]; .job == $j and .epoch == $e)' "$hist" >/dev/null 2>&1
+}
+
+# $1 job, $2 op line. Idempotent: replaying the same op changes nothing (the delta is only appended when the
+# reassembled file is exactly where the manifest says it was before this delta).
+_ca_apply_checkpoint() {
+    local job="$1" line="$2" ck n sess pushed bytes sha reset dsz cur tfile okflag=true
+    ck="$MOTHER_ROOT/checkpoints/$job"
+    n=$(printf '%s' "$line" | jq -r '.data.manifest.n // empty')
+    sess=$(printf '%s' "$line" | jq -r '.data.manifest.session_id // empty')
+    case "$n" in ''|*[!0-9]*) _ca_log "checkpoint.taken: bad n"; return 1 ;; esac
+    [ "$(printf '%s' "$line" | jq -r '.data.manifest.job // empty')" = "$job" ] \
+        || { _ca_log "checkpoint.taken: manifest names another job"; return 1; }
+    printf '%s' "$sess" | grep -Eq '^[A-Za-z0-9._:-]{1,128}$' && [ "${sess#*..}" = "$sess" ] \
+        || { _ca_log "checkpoint.taken: bad session_id"; return 1; }
+    # The manifest is the worker's word and later picks the branch and ref a restore touches: it must agree
+    # with the job document and the one wip ref this job owns.
+    local jbranch mbranch mref
+    jbranch=$(jq -r '.branch // empty' "$MOTHER_ROOT/jobs/$job.json" 2>/dev/null)
+    mbranch=$(printf '%s' "$line" | jq -r '.data.manifest.branch // empty')
+    mref=$(printf '%s' "$line" | jq -r '.data.manifest.wip_ref // empty')
+    [ -n "$jbranch" ] && [ "$mbranch" = "$jbranch" ] \
+        || { _ca_audit "$job" manifest_refused '["branch"]'; _ca_log "checkpoint.taken: manifest branch '$mbranch' is not the job's branch '$jbranch'"; return 1; }
+    [ "$mref" = "refs/mother/wip/$job" ] \
+        || { _ca_audit "$job" manifest_refused '["wip_ref"]'; _ca_log "checkpoint.taken: manifest wip_ref '$mref' is not refs/mother/wip/$job"; return 1; }
+    # The epoch orders restore points, so it must be one the coordinator granted for this job (its lease history, written at
+    # offer time and never by a worker). The Go coordinator already refuses a manifest whose (epoch, lease) it did not grant
+    # to the sending worker; this is the replay's own check. No history file = refused and audited.
+    _ca_epoch_granted "$job" "$(printf '%s' "$line" | jq -r '.data.manifest.epoch // empty')" \
+        || { _ca_audit "$job" manifest_refused '["epoch"]'; _ca_log "checkpoint.taken: epoch was not granted for this job"; return 1; }
+    pushed=$(printf '%s' "$line" | jq -r '.data.manifest.pushed == true')
+    bytes=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.bytes // empty')
+    sha=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.sha256 // empty')
+    reset=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.reset == true')
+    case "$bytes" in ''|*[!0-9]*) _ca_log "checkpoint.taken: bad transcript bytes"; return 1 ;; esac
+    mkdir -p "$ck/transcript" || return 2
+    tfile="$ck/transcript/$sess.jsonl"
+    if [ -f "$ck/$n/transcript.delta" ]; then
+        dsz=$(wc -c < "$ck/$n/transcript.delta" | tr -d ' ')
+        cur=$(wc -c < "$tfile" 2>/dev/null | tr -d ' '); : "${cur:=0}"
+        if [ "$reset" = true ] || [ "$dsz" -eq "$bytes" ]; then
+            # The delta is the whole transcript: replace (idempotent).
+            cp "$ck/$n/transcript.delta" "$tfile.tmp.$$" && mv "$tfile.tmp.$$" "$tfile" || return 2
+        elif [ "$cur" -eq $((bytes - dsz)) ]; then
+            cat "$ck/$n/transcript.delta" >> "$tfile" || return 2
+        elif [ "$cur" -lt "$bytes" ]; then
+            _ca_log "checkpoint.taken: transcript is at $cur bytes, expected $((bytes - dsz)) before checkpoint $n"
+            okflag=false
+        fi
+    else
+        _ca_log "checkpoint.taken: no transcript delta for checkpoint $n"
+        okflag=false
+    fi
+    # The first $bytes of the reassembled file must hash to the manifest's value.
+    if [ "$okflag" = true ]; then
+        [ "$(head -c "$bytes" "$tfile" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)" = "$sha" ] || okflag=false
+    fi
+    _with_lock "$ck/.index" _ca_checkpoint_record "$ck" "$n" "$pushed" "$okflag" "$sess" "$line" || return 2
+}
+
+# Under the lock on checkpoints/<job>/.index.
+_ca_checkpoint_record() {
+    local ck="$1" n="$2" pushed="$3" okflag="$4" sess="$5" line="$6" entry now
+    now=$(_iso_now)
+    entry=$(printf '%s' "$line" | jq -c --arg now "$now" --argjson ok "$okflag" '
+        .data.manifest as $m
+        | {n: $m.n, at: $m.at, received_at: $now, lease: $m.lease, epoch: $m.epoch, head_sha: $m.head_sha,
+           wip_sha: $m.wip_sha, wip_ref: $m.wip_ref, pushed: $m.pushed, session_id: $m.session_id,
+           transcript_bytes: $m.transcript.bytes, transcript_ok: $ok}
+          + (if $m.push_error then {push_error: $m.push_error} else {} end)') || return 1
+    local m_epoch m_wip
+    m_epoch=$(printf '%s' "$line" | jq -r '.data.manifest.epoch // empty'); m_wip=$(printf '%s' "$line" | jq -r '.data.manifest.wip_sha // empty')
+    case "$m_epoch" in ''|*[!0-9]*) _ca_log "checkpoint.taken: bad epoch"; return 1 ;; esac
+    # The index is ordered by (epoch, n): a replay of the same (epoch, n, wip_sha) is the only duplicate.
+    if ! { [ -f "$ck/index.jsonl" ] && jq -e -s --argjson n "$n" --argjson e "$m_epoch" --arg w "$m_wip" \
+            'any(.[]; .n == $n and .epoch == $e and .wip_sha == $w)' "$ck/index.jsonl" >/dev/null 2>&1; }; then
+        printf '%s\n' "$entry" >> "$ck/index.jsonl" || return 1
+    fi
+    if [ "$pushed" = true ] && [ "$okflag" = true ]; then
+        # Only ever forward in (epoch, n): a later lease (a failover to another machine) numbers from its own start, so n alone
+        # would freeze latest.json at the first lease's last checkpoint. The epoch was vetted against the coordinator's lease
+        # history (_ca_epoch_granted), never taken on the worker's word alone.
+        local cur_n cur_e
+        cur_n=$(jq -r '.n // 0' "$ck/latest.json" 2>/dev/null); : "${cur_n:=0}"
+        cur_e=$(jq -r '.epoch // 0' "$ck/latest.json" 2>/dev/null); : "${cur_e:=0}"
+        if [ "$m_epoch" -gt "$cur_e" ] || { [ "$m_epoch" -eq "$cur_e" ] && [ "$n" -ge "$cur_n" ]; }; then
+            printf '%s' "$line" | jq -c --arg now "$now" --arg tf "checkpoints/$(basename "$ck")/transcript/$sess.jsonl" '
+                .data.manifest + {received_at: $now, transcript_file: $tf, transcript_ok: true}' \
+                > "$ck/latest.json.tmp.$$" && mv "$ck/latest.json.tmp.$$" "$ck/latest.json" || return 1
+        fi
+    fi
+    return 0
+}
+
 # Unfinished .part files nobody has resumed for MOTHER_APPLY_PART_MAX_AGE_MIN (1440) minutes.
 _ca_sweep_parts() {
     local job="$1" d
@@ -457,6 +565,7 @@ _ca_apply_op() {
         event.append)  _ca_apply_event "$job" "$line" ;;
         record.append) _ca_apply_record "$job" "$line" ;;
         artifact.put)  _ca_apply_artifact "$job" "$line" ;;
+        checkpoint.taken) _ca_apply_checkpoint "$job" "$line" ;;
         *) _ca_log "cannot apply op type '$t'"; return 1 ;;
     esac
 }

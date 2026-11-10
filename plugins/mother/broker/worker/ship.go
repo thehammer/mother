@@ -123,7 +123,13 @@ func (d *Daemon) shipLease(s *session, l *lease) {
 		return
 	}
 	state := d.mirrorState(l.loc.Job)
-	if !releasableState(state) {
+	stopReason := ""
+	if d.stopping && state == "running" {
+		// The daemon is stopping and the supervisor stopped itself with the job still running (SIGTERM,
+		// final checkpoint taken): release the lease so the coordinator resumes the job from that checkpoint.
+		stopReason = "worker_stopping"
+	}
+	if !releasableState(state) && stopReason == "" {
 		if !l.noHB {
 			d.logf("%s: supervisor exited with the job in state %q; the coordinator decides on loss", l.loc.Job, state)
 			l.noHB = true
@@ -133,6 +139,9 @@ func (d *Daemon) shipLease(s *session, l *lease) {
 	reason := state
 	if l.adoptedDead {
 		reason = "supervisor_exited"
+	}
+	if stopReason != "" {
+		reason = stopReason
 	}
 	data, _ := json.Marshal(workerproto.LeaseRelease{Reason: reason})
 	seq := sh.base + sh.out.Last() + 1

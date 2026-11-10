@@ -12,3 +12,4 @@ awaiting_notify.bats
 dependencies.bats
 orphan_recovery.bats
 contract.bats
+failover_resume.bats
