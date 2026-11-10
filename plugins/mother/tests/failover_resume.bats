@@ -413,6 +413,18 @@ _fr_latest() { jq -r "$1" "$(_fr_ckpt_dir)/latest.json" 2>/dev/null; }
 _fr_latest_pushed() { [ -f "$(_fr_ckpt_dir)/latest.json" ] && [ "$(_fr_latest .pushed)" = "true" ]; }
 _fr_index_count() { wc -l < "$(_fr_ckpt_dir)/index.jsonl" 2>/dev/null | tr -d ' ' || echo 0; }
 _fr_origin_ref() { git --git-dir="$FR_ORIGIN" rev-parse --verify -q "$1" 2>/dev/null; }
+# The manifest of the highest-numbered worker-side checkpoint of this job (what the dead worker had taken, delivered or not).
+_fr_worker_newest_manifest() {
+    local d best=0 k
+    for d in "$FR_W/checkpoints/$FR_ID"/*/; do
+        [ -s "${d}manifest.json" ] || continue
+        k=$(basename "$d")
+        case "$k" in ''|*[!0-9]*) continue ;; esac
+        [ "$k" -gt "$best" ] && best="$k"
+    done
+    [ "$best" -gt 0 ] || return 1
+    printf '%s/checkpoints/%s/%s/manifest.json' "$FR_W" "$FR_ID" "$best"
+}
 _fr_ref_tree() { git --git-dir="$FR_ORIGIN" rev-parse --verify -q "$1^{tree}" 2>/dev/null; }
 _fr_origin_has_file() { git --git-dir="$FR_ORIGIN" cat-file -e "$1:$2" 2>/dev/null; }
 # The newest pushed checkpoint's wip commit holds <file>.
@@ -739,11 +751,15 @@ _fr_origin_wip_refs_to_other_sha() { # BOTH the rolling ref and the latest check
     _fr_must 60 "the first run's work steps" _fr_step_done 1 4
     _fr_must 40 "a pushed checkpoint" _fr_ckpt_has_file scratch/untracked.txt
     _fr_kill9_worker "$FR_W"
-    sleep 1
-    n=$(_fr_latest .n); epoch=$(_fr_latest .epoch); head=$(_fr_latest .head_sha)
+    # Take n from the NEWEST worker-side checkpoint, not from latest.json: a manifest still in the dead worker's outbox is
+    # delivered by the restarted worker, and fabricating n+1 from the coordinator's (older) n would overwrite that
+    # checkpoint's immutable ref (this was the flake under load).
+    local wm
+    wm=$(_fr_worker_newest_manifest) || _fr_fail "no worker-side checkpoint manifest"
+    n=$(jq -r .n "$wm"); epoch=$(jq -r .epoch "$wm"); head=$(jq -r .head_sha "$wm")
     # What a take that got as far as the push and no further leaves: a newer wip commit under the rolling ref and under the
     # checkpoint's own immutable ref, and no manifest for it at the coordinator.
-    tree=$(_fr_ref_tree "$(_fr_latest .wip_sha)")
+    tree=$(_fr_ref_tree "$(jq -r .wip_sha "$wm")")
     ahead=$(git --git-dir="$FR_ORIGIN" commit-tree "$tree" -p "$head" -m "ahead of the manifest")
     git --git-dir="$FR_ORIGIN" update-ref "$(_fr_wip_ref)" "$ahead"
     git --git-dir="$FR_ORIGIN" update-ref "refs/mother/wip-ckpt/$id/$epoch-$((n + 1))" "$ahead"

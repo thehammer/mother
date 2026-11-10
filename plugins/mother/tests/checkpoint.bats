@@ -1337,3 +1337,154 @@ HOOK
     [ "$(printf '%s' "$COUT" | jq -r .push_error)" = "fenced" ]
     [ "$(remote_sha "$WIPREF")" = "$MOVED" ]
 }
+
+# --- a timed-out push the remote applied; pruning never costs the newest restore point (PR #124 round 5) -------------------
+
+# A `git push` that the remote applies (or not) and that then hangs until the take's deadline kills it. $T/push-mode holds
+# "apply" (run the real push first, so origin has it, then hang) or "drop" (hang without pushing); no file = pass through.
+_install_hanging_push_stub() {
+    _install_git_stub <<STUB
+case " \$* " in
+    *" push "*)
+        mode=\$(cat "$T/push-mode" 2>/dev/null || true)
+        case "\$mode" in
+            apply) "\$REAL_GIT" "\$@" >/dev/null 2>&1; sleep 120 ;;
+            drop) sleep 120 ;;
+        esac ;;
+esac
+exec "\$REAL_GIT" "\$@"
+STUB
+}
+
+@test "C: a push that timed out after the remote applied it is reconciled, so the next take is not fenced" {
+    _install_hanging_push_stub
+    make_dirty
+    PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+
+    echo apply > "$T/push-mode"
+    printf 'timed-out\n' >> "$WT/b.txt"
+    MOTHER_CHECKPOINT_TIMEOUT_S=8 PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "false" ]
+    [ "$(m .push_error)" = "push timed out" ]
+    # precondition: the remote really did apply the timed-out push
+    [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
+
+    rm -f "$T/push-mode"
+    printf 'after-timeout\n' >> "$WT/b.txt"
+    PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    [ "$(m '.push_error // ""')" != "fenced" ]
+    [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
+}
+
+@test "C: a push that timed out before the remote applied it leaves the next take unfenced" {
+    _install_hanging_push_stub
+    make_dirty
+    PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+    wip1="$(m .wip_sha)"
+
+    echo drop > "$T/push-mode"
+    printf 'timed-out\n' >> "$WT/b.txt"
+    MOTHER_CHECKPOINT_TIMEOUT_S=8 PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "false" ]
+    [ "$(m .push_error)" = "push timed out" ]
+    [ "$(remote_sha "$WIPREF")" = "$wip1" ]
+
+    rm -f "$T/push-mode"
+    printf 'after-timeout\n' >> "$WT/b.txt"
+    PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
+}
+
+@test "C: after a timed-out push, a rolling ref that ANOTHER writer moved is still fenced" {
+    _install_hanging_push_stub
+    make_dirty
+    PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+
+    echo apply > "$T/push-mode"
+    printf 'timed-out\n' >> "$WT/b.txt"
+    MOTHER_CHECKPOINT_TIMEOUT_S=8 PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+    [ "$(m .push_error)" = "push timed out" ]
+    rm -f "$T/push-mode"
+
+    # another lease force-moves the rolling ref to a commit unrelated to anything this worker made
+    local other
+    other="$(git -C "$REPO" commit-tree "$(git -C "$REPO" rev-parse 'main^{tree}')" -m other-lease)"
+    git -C "$REPO" push -q --force origin "$other:$WIPREF"
+    [ "$(remote_sha "$WIPREF")" = "$other" ]
+
+    printf 'after-fence\n' >> "$WT/b.txt"
+    PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 3 ]
+    [ "$(printf '%s' "$COUT" | jq -r .push_error)" = "fenced" ]
+    [ "$(remote_sha "$WIPREF")" = "$other" ]
+}
+
+# Like _install_update_hook, but refuses only the CREATION of wip-ckpt refs: deletes are allowed (a remote whose policy
+# forbids new checkpoint refs still lets the worker prune).
+_install_create_refusing_hook() {
+    mkdir -p "$ORIGIN/hooks"
+    cat > "$ORIGIN/hooks/update" <<HOOK
+#!/bin/sh
+case "\$1" in refs/mother/wip-ckpt/*)
+    case "\$3" in 0000000000000000000000000000000000000000|0000000000000000000000000000000000000000000000000000000000000000) ;;
+        *) [ -e "$T/refuse-ckpt" ] && { echo "refused by test hook" >&2; exit 1; } ;; esac ;; esac
+exit 0
+HOOK
+    chmod +x "$ORIGIN/hooks/update"
+}
+
+@test "D: a remote that refuses new wip-ckpt/* refs for more than KEEP_REFS takes never loses the newest pushed restore point" {
+    _install_create_refusing_hook
+    export MOTHER_CHECKPOINT_KEEP_REFS=3
+    make_dirty
+    take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    [ -n "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-1")" ]
+
+    touch "$T/refuse-ckpt"
+    local i
+    for i in 1 2 3 4 5 6; do
+        printf 'r%s\n' "$i" >> "$WT/b.txt"
+        take
+        [ "$CST" -eq 0 ]
+        [ "$(m .pushed)" = "false" ]
+        [ "$(m .push_error)" != "fenced" ]
+        # the only pushed restore point survives every refused take
+        [ -n "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-1")" ]
+    done
+
+    rm -f "$T/refuse-ckpt"
+    printf 'back\n' >> "$WT/b.txt"
+    take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    [ "$(remote_sha "refs/mother/wip-ckpt/$JOB/$MOTHER_LEASE_EPOCH-$(m .n)")" = "$(m .wip_sha)" ]
+}
+
+@test "D: the restore point on record is never deleted by this epoch's keep-newest prune" {
+    export MOTHER_CHECKPOINT_KEEP_REFS=3
+    make_dirty
+    take
+    [ "$(m .pushed)" = "true" ]
+    printf '1-1' > "$OUT/../.restore-point"
+    local i
+    for i in 1 2 3 4 5; do
+        printf 'x%s\n' "$i" >> "$WT/b.txt"
+        take
+        [ "$(m .pushed)" = "true" ]
+    done
+    [ -n "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-1")" ]
+    [ -n "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-6")" ]
+}

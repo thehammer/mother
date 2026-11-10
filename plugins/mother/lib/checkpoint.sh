@@ -277,20 +277,28 @@ _ckpt_ref_pushed() {
 }
 
 # _ckpt_prune_refspecs <wd> <parent> <job> <epoch> <n> <array-name>: the delete refspecs that ride along the take's one push.
-# Bound on origin: this epoch keeps its newest MOTHER_CHECKPOINT_KEEP_REFS (default 20) immutable refs (n-keep goes now; one that
-# was never pushed is a harmless refused delete). Earlier epochs keep exactly ONE ref each: the restore point this lease was
-# restored from (<parent>/.restore-point = "<epoch>-<n>", written by the restore); the rest of their refs are removed, once
-# per epoch (<parent>/.pruned-epoch), after one bounded ls-remote. Salvage refs (wip-salvage/*) are never touched. Sets
-# _CKPT_PRUNED_OLD_EPOCHS=1 when the old-epoch sweep is part of this push.
+# Bound on origin: this epoch keeps its newest MOTHER_CHECKPOINT_KEEP_REFS (default 20) immutable refs: the take deletes n-keep, once,
+# in its own push (one that was never pushed is a harmless refused delete). That is NOT a strict bound: a take that fails before
+# its push never sends its n-keep delete, so that ref stays behind. The delete skips two refs: the newest pushed checkpoint of this
+# epoch (<parent>/.last-ckpt-ref = "<epoch>-<n>") and the restore point on record (<parent>/.restore-point), because either may be
+# the coordinator's ONLY restore point (a remote that refuses wip-ckpt/* for more than keep takes would otherwise lose it).
+# Earlier epochs keep at most ONE ref IN TOTAL (not one each): the restore point this lease was restored from
+# (<parent>/.restore-point = "<epoch>-<n>", written by the restore); every other earlier-epoch ref is removed, once per epoch
+# (<parent>/.pruned-epoch), after one bounded ls-remote (epoch 3 deletes all epoch-1 refs and keeps only the 2-x restore point).
+# Salvage refs (wip-salvage/*) are never touched. Sets _CKPT_PRUNED_OLD_EPOCHS=1 when the old-epoch sweep is part of this push.
 _ckpt_prune_refspecs() {
     local wd="$1" parent="$2" job="$3" epoch="$4" n="$5" out="$6" keep="${MOTHER_CHECKPOINT_KEEP_REFS:-20}"
-    local pfx="refs/mother/wip-ckpt/$job/" line ref name e keepref="" done_epoch=""
+    local pfx="refs/mother/wip-ckpt/$job/" line ref name e keepref="" lastref="" done_epoch="" victim
     _CKPT_PRUNED_OLD_EPOCHS=0
     case "$keep" in ''|*[!0-9]*|0) keep=20 ;; esac
-    if [ "$n" -gt "$keep" ]; then eval "$out+=(\":\$pfx\$epoch-\$((n - keep))\")"; fi
+    [ -s "$parent/.restore-point" ] && keepref=$(cat "$parent/.restore-point" 2>/dev/null)
+    [ -s "$parent/.last-ckpt-ref" ] && lastref=$(cat "$parent/.last-ckpt-ref" 2>/dev/null)
+    if [ "$n" -gt "$keep" ]; then
+        victim="$epoch-$((n - keep))"
+        if [ "$victim" != "$keepref" ] && [ "$victim" != "$lastref" ]; then eval "$out+=(\":\$pfx\$victim\")"; fi
+    fi
     [ -s "$parent/.pruned-epoch" ] && done_epoch=$(cat "$parent/.pruned-epoch" 2>/dev/null)
     [ "$done_epoch" = "$epoch" ] && return 0
-    [ -s "$parent/.restore-point" ] && keepref=$(cat "$parent/.restore-point" 2>/dev/null)
     # Without a well-formed restore point, never delete an earlier epoch's refs: one of them may be the only restorable checkpoint.
     case "$keepref" in ''|*[!0-9-]*|-*|*-|*-*-*) return 0 ;; esac
     # A failed ls-remote means the sweep did not happen: it is retried on the next take, never marked done.
@@ -307,6 +315,24 @@ _ckpt_prune_refspecs() {
         eval "$out+=(\":\$ref\")"
     done <<<"$listing"
     _CKPT_PRUNED_OLD_EPOCHS=1
+    return 0
+}
+
+# _ckpt_reconcile_pending <wd> <parent> <target> <state_file> <marker>: the previous take's push timed out (137), so it may have been
+# applied by the remote after we gave up (<parent>/.push-pending holds the wip sha it pushed). One bounded ls-remote of the rolling
+# ref: equal to the pending sha means the remote applied it, so it is the lease's expectation now (recorded like a successful push,
+# NOT fenced); any other value leaves the expectation as it was (still fenced if another writer moved the ref). A failed ls-remote
+# leaves the marker for the next take.
+_ckpt_reconcile_pending() {
+    local wd="$1" parent="$2" target="$3" state_file="$4" marker="$5" pending cur
+    [ -s "$parent/.push-pending" ] || return 0
+    pending=$(cat "$parent/.push-pending" 2>/dev/null)
+    cur=$(_ckpt_ls_remote_ref "$wd" "$target") || return 0
+    if [ -n "$pending" ] && [ "$cur" = "$pending" ]; then
+        printf '%s' "$pending" >"$state_file"
+        [ -n "$marker" ] && printf '%s' "$pending" >"$marker" 2>/dev/null
+    fi
+    rm -f "$parent/.push-pending"
     return 0
 }
 
@@ -495,6 +521,7 @@ _ckpt_take_locked() {
         _ckpt_push "$wd" "$pout" origin "+$wip:$target" || rc=$?
     else
         target="$wip_ref"
+        _ckpt_reconcile_pending "$wd" "$parent" "$target" "$state_file" "$marker"
         if [ -n "$expect_flag" ]; then expect="$expect_flag"
         elif [ -s "$state_file" ]; then expect=$(cat "$state_file")
         elif [ -n "$marker" ] && [ -s "$marker" ]; then expect=$(cat "$marker")
@@ -521,6 +548,9 @@ _ckpt_take_locked() {
             fi
         fi
         if [ "$rc" -eq 0 ] && [ "$_CKPT_PRUNED_OLD_EPOCHS" = 1 ]; then printf '%s' "$epoch" >"$parent/.pruned-epoch"; fi
+        if [ "$rc" -eq 0 ]; then printf '%s' "$epoch-$n" >"$parent/.last-ckpt-ref"; fi
+        # A timed-out push may still be applied by the remote: remember what it carried; the next take reconciles.
+        if [ "$rc" -eq 137 ]; then printf '%s' "$wip" >"$parent/.push-pending"; fi
     fi
     local exit_code=0 cur
     if [ "$rc" -eq 0 ]; then

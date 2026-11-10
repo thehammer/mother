@@ -288,11 +288,18 @@ _epoch2_entries_ok() { # every epoch-2 index entry has transcript_ok true, and t
     printf 'XYZ' >> "$TR2"
     _take_ship "$W2" 2
     [ "$TAKE_PUSHED" = true ]
+    # The origin refuses the per-checkpoint ref for one take: pushed:false, yet its transcript delta still ships.
+    mkdir -p "$ORIGIN/hooks"
+    printf '#!/bin/sh\ncase "$1" in refs/mother/wip-ckpt/*) [ -e "%s/refuse-ckpt" ] && exit 1 ;; esac\nexit 0\n' "$T" > "$ORIGIN/hooks/update"
+    chmod +x "$ORIGIN/hooks/update"
+    touch "$T/refuse-ckpt"
     printf '!!' >> "$TR2"
     _take_ship "$W2" 2
-    [ "$TAKE_PUSHED" = true ]
+    [ "$TAKE_PUSHED" = false ]
+    rm -f "$T/refuse-ckpt"
     _apply
-    [ "$(_latest '[.epoch, .n] | @tsv')" = "$(printf '2\t3')" ]
+    # latest.json stays at the last PUSHED checkpoint while the coordinator's transcript is already longer.
+    [ "$(_latest '[.epoch, .n] | @tsv')" = "$(printf '2\t2')" ]
     printf 'epoch2-file\n' > "$T/wt2-e2/e2.txt"
     printf '??' >> "$TR2"
     _take_ship "$W2" 2
