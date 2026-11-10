@@ -3911,7 +3911,9 @@ _restore_from_checkpoint() {
     # take numbers itself from the newest manifest it finds there (and diffs the transcript against it). Seed it, unless a newer one exists.
     local sn sdir="$MOTHER_ROOT/checkpoints/$id" last=0 d dn
     # An earlier lease on this machine left its last-pushed value here; the restore just wrote the new lease's own expectation.
-    rm -f "$sdir/.last-pushed"
+    rm -f "$sdir/.last-pushed" "$sdir/.pruned-epoch"
+    # The restore point stays on origin when older epochs are pruned (see _ckpt_prune_refspecs).
+    printf '%s-%s' "$(jq -r '.epoch // 0' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)" "$(jq -r '.n // 0' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)" >"$sdir/.restore-point" 2>/dev/null || true
     sn=$(jq -r '.n // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)
     case "$sn" in ''|*[!0-9]*) ;; *)
         for d in "$sdir"/*/; do dn=$(basename "$d"); case "$dn" in ''|*[!0-9]*) continue ;; esac; [ -s "${d}manifest.json" ] && [ "$dn" -gt "$last" ] && last="$dn"; done

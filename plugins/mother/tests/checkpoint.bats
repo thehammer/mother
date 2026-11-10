@@ -977,14 +977,17 @@ STUB
 @test "a hung local git is killed with its children at the deadline and take reports why timeout" {
     make_dirty
     _install_git_stub <<STUB
-for a in "\$@"; do
-    if [ "\$a" = write-tree ]; then
-        sleep 20 &
-        echo \$! > "$T/childpid"
-        wait
-        exit 0
-    fi
-done
+# Block in the FIRST deadline-bounded git call (the unbounded safety pre-checks, config --list and check-ref-format, are let through): the
+# deadline then always runs out while a child exists, however slow the machine is. Waiting for a particular later call
+# (write-tree) raced the 2 s deadline under CPU load.
+case " \$* " in *" config "*|*" check-ref-format "*) exec "\$REAL_GIT" "\$@" ;; esac
+if [ ! -e "$T/blocked-once" ]; then
+    : > "$T/blocked-once"
+    sleep 20 &
+    echo \$! > "$T/childpid"
+    wait
+    exit 0
+fi
 exec "\$REAL_GIT" "\$@"
 STUB
     start=$SECONDS
@@ -1185,4 +1188,72 @@ STUB
     [ "$CST" -eq 1 ]
     [ "$(printf '%s' "$COUT" | jq -r .why)" = "unsafe_config" ]
     [ -z "$(remote_sha "$WIPREF")" ]
+}
+
+# ---------------------------------------------------------------------------
+# One push per take, and a bounded ref history on origin (P1-6 round 3)
+# ---------------------------------------------------------------------------
+
+_ckpt_refs() { git -C "$ORIGIN" for-each-ref --format='%(refname)' "refs/mother/wip-ckpt/$JOB/" | sed "s|refs/mother/wip-ckpt/$JOB/||" | sort | tr '\n' ' '; }
+
+@test "a take makes exactly ONE push, carrying the per-checkpoint ref and the rolling ref" {
+    make_dirty
+    _install_git_stub <<STUB
+case " \$* " in *" push "*) echo "\$*" >> "$T/pushlog" ;; esac
+exec "\$REAL_GIT" "\$@"
+STUB
+    PATH="$T/stubbin:$PATH" take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    [ "$(grep -c . "$T/pushlog")" -eq 1 ]
+    grep -q "refs/mother/wip-ckpt/$JOB/1-1" "$T/pushlog"
+    grep -q "refs/mother/wip/$JOB" "$T/pushlog"
+    [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
+    [ "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-1")" = "$(m .wip_sha)" ]
+}
+
+@test "this epoch keeps only the newest MOTHER_CHECKPOINT_KEEP_REFS refs on origin" {
+    export MOTHER_CHECKPOINT_KEEP_REFS=2
+    local i
+    for i in 1 2 3 4; do
+        printf 'x%s\n' "$i" >> "$WT/b.txt"
+        take
+        [ "$CST" -eq 0 ]
+        [ "$(m .pushed)" = "true" ]
+    done
+    [ "$(_ckpt_refs)" = "1-3 1-4 " ]
+}
+
+@test "a later epoch removes the earlier epochs' refs except the restore point it was restored from, once, and never a salvage ref" {
+    local seed
+    seed="$(git -C "$WT" rev-parse HEAD)"
+    git -C "$WT" push -q origin "$seed:refs/mother/wip-ckpt/$JOB/1-1" "$seed:refs/mother/wip-ckpt/$JOB/1-2" "$seed:refs/mother/wip-ckpt/$JOB/1-3" \
+        "$seed:refs/mother/wip-salvage/$JOB/lease-1"
+    printf '1-2' > "$OUT/../.restore-point"
+    export MOTHER_LEASE_EPOCH=2
+    make_dirty
+    take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    [ "$(_ckpt_refs)" = "1-2 2-1 " ]
+    [ -n "$(remote_sha "refs/mother/wip-salvage/$JOB/lease-1")" ]
+    [ "$(cat "$OUT/../.pruned-epoch")" = "2" ]
+    # The sweep runs once per epoch: a ref that appears afterwards is not looked for (no extra ls-remote).
+    git -C "$WT" push -q origin "$seed:refs/mother/wip-ckpt/$JOB/1-9"
+    printf 'y\n' >> "$WT/b.txt"
+    take
+    [ "$(m .pushed)" = "true" ]
+    [ -n "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-9")" ]
+}
+
+@test "a refused delete (a ref already gone) never sinks the checkpoint" {
+    export MOTHER_CHECKPOINT_KEEP_REFS=1
+    make_dirty
+    take                      # n=1
+    git -C "$ORIGIN" update-ref -d "refs/mother/wip-ckpt/$JOB/1-1"
+    printf 'z\n' >> "$WT/b.txt"
+    take                      # n=2 deletes 1-1, which is already gone
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
 }

@@ -271,3 +271,13 @@ _epoch2_entries_ok() { # every epoch-2 index entry has transcript_ok true, and t
     [ "$(_latest '[.epoch, .n] | @tsv')" = "$(printf '2\t3')" ]
     cmp "$(_ctranscript)" "$TR2"
 }
+
+@test "a checkpoint for a job with no lease history is refused and audited, never trusted on the worker's word" {
+    rm -f "$CROOT/runner/leases/$JOB.history.jsonl"
+    printf 'hello' > "$TR1"
+    _take_ship "$W1" 1
+    run _apply
+    [ ! -e "$CROOT/checkpoints/$JOB/latest.json" ]
+    grep -q manifest_refused "$CROOT/runner/leases/audit.jsonl"
+    grep -q epoch "$CROOT/runner/leases/audit.jsonl"
+}

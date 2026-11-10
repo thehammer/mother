@@ -270,6 +270,40 @@ _ckpt_push() {
     return "$rc"
 }
 
+# _ckpt_ref_pushed <porcelain-file> <ref>: the push updated <ref> (a porcelain line whose flag is not "!" or "-" and whose
+# destination is <ref>).
+_ckpt_ref_pushed() {
+    awk -F'\t' -v r="$2" 'index($2, ":" r) && $2 ~ (":" r "$") && $1 != "!" && $1 != "-" {ok=1} END {exit ok ? 0 : 1}' "$1" 2>/dev/null
+}
+
+# _ckpt_prune_refspecs <wd> <parent> <job> <epoch> <n> <array-name>: the delete refspecs that ride along the take's one push.
+# Bound on origin: this epoch keeps its newest MOTHER_CHECKPOINT_KEEP_REFS (default 20) immutable refs (n-keep goes now; one that
+# was never pushed is a harmless refused delete). Earlier epochs keep exactly ONE ref each: the restore point this lease was
+# restored from (<parent>/.restore-point = "<epoch>-<n>", written by the restore); the rest of their refs are removed, once
+# per epoch (<parent>/.pruned-epoch), after one bounded ls-remote. Salvage refs (wip-salvage/*) are never touched. Sets
+# _CKPT_PRUNED_OLD_EPOCHS=1 when the old-epoch sweep is part of this push.
+_ckpt_prune_refspecs() {
+    local wd="$1" parent="$2" job="$3" epoch="$4" n="$5" out="$6" keep="${MOTHER_CHECKPOINT_KEEP_REFS:-20}"
+    local pfx="refs/mother/wip-ckpt/$job/" line ref name e keepref="" done_epoch=""
+    _CKPT_PRUNED_OLD_EPOCHS=0
+    case "$keep" in ''|*[!0-9]*|0) keep=20 ;; esac
+    if [ "$n" -gt "$keep" ]; then eval "$out+=(\":\$pfx\$epoch-\$((n - keep))\")"; fi
+    [ -s "$parent/.pruned-epoch" ] && done_epoch=$(cat "$parent/.pruned-epoch" 2>/dev/null)
+    [ "$done_epoch" = "$epoch" ] && return 0
+    [ -s "$parent/.restore-point" ] && keepref=$(cat "$parent/.restore-point" 2>/dev/null)
+    while IFS= read -r line; do
+        ref="${line#*[[:space:]]}"
+        case "$ref" in "$pfx"*) name="${ref#"$pfx"}" ;; *) continue ;; esac
+        e="${name%%-*}"
+        case "$e" in ''|*[!0-9]*) continue ;; esac
+        [ "$e" -lt "$epoch" ] || continue
+        [ "$name" = "$keepref" ] && continue
+        eval "$out+=(\":\$ref\")"
+    done < <(_ckpt_git "$wd" ls-remote --upload-pack=git-upload-pack origin "${pfx}*" 2>/dev/null)
+    _CKPT_PRUNED_OLD_EPOCHS=1
+    return 0
+}
+
 # --- take ----------------------------------------------------------------------------------------
 
 # mother_checkpoint_take <job-file> <out-dir> [--salvage-epoch N] [--final] [--expect-sha SHA]
@@ -468,12 +502,16 @@ _ckpt_take_locked() {
         # rolling ref to equal anything. Namespace refs/mother/wip-ckpt/<job>/<epoch>-<n> has no D/F conflict with
         # refs/mother/wip/<job>.
         ckpt_ref="refs/mother/wip-ckpt/$job/$epoch-$n"
-        _ckpt_push "$wd" "$pout" origin "+$wip:$ckpt_ref" || rc=$?
-        if [ "$rc" -eq 0 ]; then
-            # No "+" on the refspec: a "+" overrides the lease check, so a moved ref would be overwritten.
-            # The explicit lease alone allows the non-fast-forward update when the ref is where we left it.
-            _ckpt_push "$wd" "$pout" origin "$wip:$target" "--force-with-lease=$target:$expect" || rc=$?
-        fi
+        # ONE push carries everything: the per-checkpoint ref (first, so it is never later than the rolling ref), the rolling
+        # ref and the prune deletions. No "+" on the rolling refspec: a "+" overrides the lease check, so a moved ref would be
+        # overwritten; the explicit lease alone allows the non-fast-forward update when the ref is where we left it. No --atomic:
+        # a delete of a ref that is already gone must not sink the checkpoint, so success is judged per ref from the porcelain
+        # output (a refused delete is ignored, a refused checkpoint or rolling ref is not).
+        local -a prune=()
+        _ckpt_prune_refspecs "$wd" "$parent" "$job" "$epoch" "$n" prune
+        _ckpt_push "$wd" "$pout" origin "+$wip:$ckpt_ref" "$wip:$target" "--force-with-lease=$target:$expect" "${prune[@]+"${prune[@]}"}" || rc=$?
+        if [ "$rc" -ne 0 ] && _ckpt_ref_pushed "$pout" "$ckpt_ref" && _ckpt_ref_pushed "$pout" "$target"; then rc=0; fi
+        if [ "$rc" -eq 0 ] && [ "$_CKPT_PRUNED_OLD_EPOCHS" = 1 ]; then printf '%s' "$epoch" >"$parent/.pruned-epoch"; fi
     fi
     local exit_code=0 cur
     if [ "$rc" -eq 0 ]; then
@@ -491,15 +529,6 @@ _ckpt_take_locked() {
         push_error="fenced"; exit_code=3
     else
         push_error="push failed (exit $rc)"
-    fi
-
-    # Bounded history of immutable refs: keep the newest MOTHER_CHECKPOINT_KEEP_REFS (default 20) of this epoch; best effort.
-    if [ "$pushed" = true ] && [ -z "$salvage" ] && [ -n "$ckpt_ref" ]; then
-        local keep="${MOTHER_CHECKPOINT_KEEP_REFS:-20}"
-        case "$keep" in ''|*[!0-9]*|0) keep=20 ;; esac
-        if [ "$n" -gt "$keep" ]; then
-            _ckpt_push "$wd" "$pout" origin ":refs/mother/wip-ckpt/$job/$epoch-$((n - keep))" >/dev/null 2>&1 || true
-        fi
     fi
 
     # Committed work also goes to the job branch (fast-forward only, never forced), unless this worker

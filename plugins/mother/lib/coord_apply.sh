@@ -447,7 +447,8 @@ _ca_apply_artifact() {
 _ca_epoch_granted() {
     local hist="$MOTHER_ROOT/runner/leases/$1.history.jsonl"
     case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
-    [ -f "$hist" ] || return 0
+    # No history file = no epoch was ever granted here: refuse (the caller audits manifest_refused/epoch) rather than trust the worker.
+    [ -f "$hist" ] || { _ca_log "checkpoint.taken: no lease history for $1 (epoch $2 cannot be verified)"; return 1; }
     jq -e -s --argjson e "$2" --arg j "$1" 'any(.[]; .job == $j and .epoch == $e)' "$hist" >/dev/null 2>&1
 }
 
@@ -475,7 +476,7 @@ _ca_apply_checkpoint() {
         || { _ca_audit "$job" manifest_refused '["wip_ref"]'; _ca_log "checkpoint.taken: manifest wip_ref '$mref' is not refs/mother/wip/$job"; return 1; }
     # The epoch orders restore points, so it must be one the coordinator granted for this job (its lease history, written at
     # offer time and never by a worker). The Go coordinator already refuses a manifest whose (epoch, lease) it did not grant
-    # to the sending worker; this is the replay's own check. No history file (a root the coordinator never ran in) = skipped.
+    # to the sending worker; this is the replay's own check. No history file = refused and audited.
     _ca_epoch_granted "$job" "$(printf '%s' "$line" | jq -r '.data.manifest.epoch // empty')" \
         || { _ca_audit "$job" manifest_refused '["epoch"]'; _ca_log "checkpoint.taken: epoch was not granted for this job"; return 1; }
     pushed=$(printf '%s' "$line" | jq -r '.data.manifest.pushed == true')
