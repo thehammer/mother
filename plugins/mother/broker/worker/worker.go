@@ -60,6 +60,8 @@ type Daemon struct {
 	dedupe   *workerproto.DedupeSet
 	sess     *session
 	stopping bool // GracefulStop in progress: no new offers, no cadence, stopped supervisors are released
+
+	bg sync.WaitGroup // fence/salvage goroutines; tests wait for it so nothing logs after they end
 }
 
 func New(cfg Config) (*Daemon, error) {

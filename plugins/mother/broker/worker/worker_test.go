@@ -44,6 +44,7 @@ func newDaemon(t *testing.T) (*Daemon, *session, *capture) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(d.bg.Wait) // runs last: the fence/salvage goroutine must not log through t after the test ends
 	a, b := net.Pipe()
 	t.Cleanup(func() { a.Close(); b.Close() })
 	c := &capture{}

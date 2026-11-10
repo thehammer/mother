@@ -327,7 +327,9 @@ func (d *Daemon) fence(l *lease, why string) {
 // same job rewrites the mirror, and the salvage must keep pointing at this lease's work tree.
 func (d *Daemon) onFenced(l *lease, stop func()) {
 	root, ok := d.salvageSnapshot(l)
+	d.bg.Add(1)
 	go func() {
+		defer d.bg.Done()
 		stop()
 		if ok && d.cfg.MotherCLI != "" {
 			d.salvage(l, root)

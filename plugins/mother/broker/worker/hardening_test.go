@@ -44,6 +44,7 @@ func newDaemonWith(t *testing.T, mut func(*Config)) (*Daemon, *session, *capture
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(d.bg.Wait)
 	a, b := net.Pipe()
 	c := &capture{}
 	go func() {
