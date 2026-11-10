@@ -212,6 +212,7 @@ _fr_wait_for() {
 
 _fr_dump() {
     local f
+    set +e   # a diagnostic dump must never stop at the first missing file (bats runs with -e)
     {
         echo "--- runner.out";    tail -n 25 "$FR_C/runner.out" 2>/dev/null
         echo "--- runner.log";    tail -n 25 "$FR_C/logs/runner.log" 2>/dev/null

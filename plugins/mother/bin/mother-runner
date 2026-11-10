@@ -867,8 +867,11 @@ _resume_lost_lease() {
     if [ ! -f "$tfile" ]; then
         _resume_fail "$id" "transcript missing or unverifiable (no reassembled file at ${tfile#"$root"/})"; return 0
     fi
-    if ! head -c "$bytes" "$tfile" > "$staged" 2>/dev/null \
-       || [ "$(shasum -a 256 "$staged" | cut -d' ' -f1)" != "$tsha" ]; then
+    # BSD head rejects `-c 0` (a checkpoint taken before the session wrote anything has 0 transcript bytes).
+    if { [ "$bytes" = 0 ] && : > "$staged"; } || { [ "$bytes" != 0 ] && head -c "$bytes" "$tfile" > "$staged" 2>/dev/null; }; then :; else
+        rm -f "$staged"; _resume_fail "$id" "transcript missing or unverifiable (could not read the first ${bytes:-?} bytes of ${tfile#"$root"/})"; return 0
+    fi
+    if [ "$(shasum -a 256 "$staged" | cut -d' ' -f1)" != "$tsha" ]; then
         _resume_fail "$id" "transcript missing or unverifiable (sha mismatch over the first ${bytes:-?} bytes of ${tfile#"$root"/}: have $(shasum -a 256 "$staged" 2>/dev/null | cut -c1-12), manifest ${tsha:0:12}, file $(wc -c < "$tfile" | tr -d ' ') bytes)"; return 0
     fi
     hb_e=$(_iso_to_epoch "$hb"); at_e=$(_iso_to_epoch "$at")
