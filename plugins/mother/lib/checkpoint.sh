@@ -291,6 +291,8 @@ _ckpt_prune_refspecs() {
     [ -s "$parent/.pruned-epoch" ] && done_epoch=$(cat "$parent/.pruned-epoch" 2>/dev/null)
     [ "$done_epoch" = "$epoch" ] && return 0
     [ -s "$parent/.restore-point" ] && keepref=$(cat "$parent/.restore-point" 2>/dev/null)
+    # Without a well-formed restore point, never delete an earlier epoch's refs: one of them may be the only restorable checkpoint.
+    case "$keepref" in ''|*[!0-9-]*|-*|*-|*-*-*) return 0 ;; esac
     while IFS= read -r line; do
         ref="${line#*[[:space:]]}"
         case "$ref" in "$pfx"*) name="${ref#"$pfx"}" ;; *) continue ;; esac

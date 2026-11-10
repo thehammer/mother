@@ -1101,6 +1101,14 @@ Worker mode never loses a job's work when its worker stops. Details: `docs/worke
   refused); restore sets the new lease's push expectation to the remote's current rolling ref. `latest.json` orders by `(epoch, n)`,
   the epoch checked against `runner/leases/<job>.history.jsonl`; a new worker numbers on from the offered manifest. Details:
   `docs/worker-protocol.md` section 9 and 15.
+- **One push, bounded refs, seeded numbering only.** A take is ONE `git push` (per-checkpoint ref, rolling ref under
+  `--force-with-lease`, prune deletes; success is judged per ref, a refused delete never sinks a checkpoint). Origin keeps this
+  epoch's newest `MOTHER_CHECKPOINT_KEEP_REFS` (20) `wip-ckpt` refs plus ONE ref per earlier epoch: the restore point the lease
+  was restored from (`<checkpoints>/.restore-point`); no sweep without it. Salvage refs are never pruned. A restore seeds the new
+  worker's checkpoints dir with `epoch`/`n` only (transcript bytes 0, `pushed:false`), so its first take ships the whole
+  transcript: the coordinator's transcript can be longer than `latest.json` (unpushed checkpoints append deltas), and a delta
+  from `latest.json`'s byte count would never line up. `coord_apply.sh` refuses (and audits) a checkpoint when the job has no lease
+  history file.
 - **Fenced worker.** A worker that learns its lease is gone stops its supervisor and pushes
   `refs/mother/wip-salvage/<job>/lease-<epoch>` from a snapshot of its mirror, then sends the `salvage` control frame;
   the coordinator audits it and the runner emits `worker_salvaged`. It never writes the job's state or the main wip ref.

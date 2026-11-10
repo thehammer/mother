@@ -1257,3 +1257,14 @@ STUB
     [ "$(m .pushed)" = "true" ]
     [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
 }
+
+@test "a later epoch with no restore point on record deletes none of the earlier epochs' refs" {
+    local seed
+    seed="$(git -C "$WT" rev-parse HEAD)"
+    git -C "$WT" push -q origin "$seed:refs/mother/wip-ckpt/$JOB/1-1" "$seed:refs/mother/wip-ckpt/$JOB/1-2"
+    export MOTHER_LEASE_EPOCH=2
+    make_dirty
+    take
+    [ "$(m .pushed)" = "true" ]
+    [ "$(_ckpt_refs)" = "1-1 1-2 2-1 " ]
+}

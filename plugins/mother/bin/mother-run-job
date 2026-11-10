@@ -3913,7 +3913,12 @@ _restore_from_checkpoint() {
     # An earlier lease on this machine left its last-pushed value here; the restore just wrote the new lease's own expectation.
     rm -f "$sdir/.last-pushed" "$sdir/.pruned-epoch"
     # The restore point stays on origin when older epochs are pruned (see _ckpt_prune_refspecs).
-    printf '%s-%s' "$(jq -r '.epoch // 0' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)" "$(jq -r '.n // 0' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)" >"$sdir/.restore-point" 2>/dev/null || true
+    mkdir -p "$sdir" 2>/dev/null
+    rm -f "$sdir/.restore-point"
+    local rp_e rp_n
+    rp_e=$(jq -r '.epoch // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null); rp_n=$(jq -r '.n // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)
+    # A missing or malformed value leaves no file: the take then keeps every earlier epoch's refs (no sweep).
+    case "$rp_e$rp_n" in ''|*[!0-9]*) ;; *) [ -n "$rp_e" ] && [ -n "$rp_n" ] && printf '%s-%s' "$rp_e" "$rp_n" >"$sdir/.restore-point" 2>/dev/null ;; esac
     sn=$(jq -r '.n // empty' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null)
     case "$sn" in ''|*[!0-9]*) ;; *)
         for d in "$sdir"/*/; do dn=$(basename "$d"); case "$dn" in ''|*[!0-9]*) continue ;; esac; [ -s "${d}manifest.json" ] && [ "$dn" -gt "$last" ] && last="$dn"; done
