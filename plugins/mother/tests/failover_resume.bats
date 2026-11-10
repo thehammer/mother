@@ -414,6 +414,8 @@ _fr_ref_tree() { git --git-dir="$FR_ORIGIN" rev-parse --verify -q "$1^{tree}" 2>
 _fr_origin_has_file() { git --git-dir="$FR_ORIGIN" cat-file -e "$1:$2" 2>/dev/null; }
 # The newest pushed checkpoint's wip commit holds <file>.
 _fr_ckpt_has_file() { _fr_latest_pushed && _fr_origin_has_file "$(_fr_latest .wip_sha)" "$1"; }
+# The reassembled transcript on the canonical side (everything up to latest.json) contains <fixed string>.
+_fr_canonical_transcript_has() { grep -qF -- "$1" "$FR_C/$(_fr_latest .transcript_file)" 2>/dev/null; }
 _fr_wip_ref() { printf 'refs/mother/wip/%s' "$FR_ID"; }
 
 # _fr_tree_of <worktree> — the tree of the working directory as the checkpoint sees it (tracked edits, untracked files that are
@@ -514,6 +516,9 @@ pr")
 
     _fr_must 60 "the first run's four work steps" _fr_step_done 1 4
     _fr_must 40 "a pushed checkpoint holding the untracked file on the canonical side" _fr_ckpt_has_file scratch/untracked.txt
+    # The file exists a moment before the mock appends its step-4 line to the transcript: a checkpoint can land in between, and the
+    # transcript the resumed session continues would then lack that line. Kill only once the canonical transcript has it.
+    _fr_must 40 "the canonical reassembled transcript to hold the first run's step 4" _fr_canonical_transcript_has '"n":4,'
     _fr_must 10 "the lease to be active" bash -c '[ "$(jq -r .state "$1/runner/leases/$2.json")" = active ]' _ "$FR_C" "$id"
     old_epoch=$(_fr_lease epoch)
     old_wd=$(_fr_inv_field 1 cwd)
@@ -655,7 +660,9 @@ sleep 600")
     _fr_kill9_worker "$FR_W"
     # With the daemon dead nothing can push the ref back before the runner looks.
     git --git-dir="$FR_ORIGIN" update-ref -d "$(_fr_wip_ref)"
+    git --git-dir="$FR_ORIGIN" for-each-ref --format='%(refname)' "refs/mother/wip-ckpt/$id" | while read -r r; do git --git-dir="$FR_ORIGIN" update-ref -d "$r"; done
     [ -z "$(_fr_origin_ref "$(_fr_wip_ref)")" ]
+    [ -z "$(git --git-dir="$FR_ORIGIN" for-each-ref "refs/mother/wip-ckpt/$id")" ]
 
     _fr_must 90 "the job to fail" _fr_state_is failed
     _fr_must 60 "the failed event (the last write of the transition)" _fr_ev_has failed
