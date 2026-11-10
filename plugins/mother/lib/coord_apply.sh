@@ -455,6 +455,16 @@ _ca_apply_checkpoint() {
         || { _ca_log "checkpoint.taken: manifest names another job"; return 1; }
     printf '%s' "$sess" | grep -Eq '^[A-Za-z0-9._:-]{1,128}$' && [ "${sess#*..}" = "$sess" ] \
         || { _ca_log "checkpoint.taken: bad session_id"; return 1; }
+    # The manifest is the worker's word and later picks the branch and ref a restore touches: it must agree
+    # with the job document and the one wip ref this job owns.
+    local jbranch mbranch mref
+    jbranch=$(jq -r '.branch // empty' "$MOTHER_ROOT/jobs/$job.json" 2>/dev/null)
+    mbranch=$(printf '%s' "$line" | jq -r '.data.manifest.branch // empty')
+    mref=$(printf '%s' "$line" | jq -r '.data.manifest.wip_ref // empty')
+    [ -n "$jbranch" ] && [ "$mbranch" = "$jbranch" ] \
+        || { _ca_audit "$job" manifest_refused '["branch"]'; _ca_log "checkpoint.taken: manifest branch '$mbranch' is not the job's branch '$jbranch'"; return 1; }
+    [ "$mref" = "refs/mother/wip/$job" ] \
+        || { _ca_audit "$job" manifest_refused '["wip_ref"]'; _ca_log "checkpoint.taken: manifest wip_ref '$mref' is not refs/mother/wip/$job"; return 1; }
     pushed=$(printf '%s' "$line" | jq -r '.data.manifest.pushed == true')
     bytes=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.bytes // empty')
     sha=$(printf '%s' "$line" | jq -r '.data.manifest.transcript.sha256 // empty')

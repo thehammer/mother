@@ -3895,7 +3895,7 @@ _restore_from_checkpoint() {
     local errf msg=""
     errf=$(mktemp "${TMPDIR:-/tmp}/mother-restore.XXXXXX") || errf=/dev/null
     out=$("$mother_cli" checkpoint restore "$id" --manifest "$MOTHER_RESUME_CHECKPOINT" \
-        --transcript "${MOTHER_RESUME_TRANSCRIPT:-/nonexistent}" --work-dir "$new" 2>"$errf") || rc=$?
+        --transcript "${MOTHER_RESUME_TRANSCRIPT:-/nonexistent}" --work-dir "$new" --branch "$branch" 2>"$errf") || rc=$?
     if [ "$rc" -ne 0 ]; then
         why=$(printf '%s\n' "$out" | tail -n 1 | jq -r '.why // empty' 2>/dev/null)
         [ -n "$why" ] || why="restore_error"

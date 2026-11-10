@@ -1523,3 +1523,72 @@ _ss_emit() {
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
+
+# ===========================================================================
+# The checkpoint manifest is the worker's word (P1-6 review fix-ups)
+#
+# It later picks the branch and ref a restore touches, so coord_apply only records a manifest that agrees
+# with the job document (branch) and the one wip ref this job owns.
+
+_ss_manifest_op() { # <job> <branch> <wip-ref> — a checkpoint.taken op line (no transcript delta shipped)
+    local sha="0123456789abcdef0123456789abcdef01234567"
+    _ss_op 1 checkpoint.taken "$(jq -nc --arg j "$1" --arg b "$2" --arg r "$3" --arg sha "$sha" --arg t "$(printf 'x%.0s' {1..64})" '
+        {manifest: {v: 1, job: $j, lease: "L-1", epoch: 1, n: 1, at: "2026-11-08T12:00:00.000Z", head_sha: $sha,
+                    branch: $b, base_sha: $sha, wip_sha: $sha, wip_ref: $r, pushed: true, session_id: "s1",
+                    transcript: {path_rel: ("checkpoints/" + $j + "/1/transcript.delta"), bytes: 0, sha256: $t},
+                    untracked_skipped: []}}')"
+}
+
+@test "checkpoint trust: a manifest that agrees with the job (branch feature/test, its own wip ref) is recorded" {
+    local id="ck-ok" ops="$BATS_TEST_TMPDIR/ck.ndjson"
+    _ss_seed_hand "$id"
+    _ss_manifest_op "$id" feature/test "refs/mother/wip/$id" > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ "$status" -eq 0 ]
+    [ "$(wc -l < "$SS_C/checkpoints/$id/index.jsonl" | tr -d ' ')" = 1 ]
+}
+
+@test "checkpoint trust: a manifest naming another branch than the job's is refused and audited, nothing recorded" {
+    local id="ck-branch" ops="$BATS_TEST_TMPDIR/ck.ndjson"
+    _ss_seed_hand "$id"
+    _ss_manifest_op "$id" feature/someone-elses "refs/mother/wip/$id" > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ ! -e "$SS_C/checkpoints/$id/index.jsonl" ]
+    [ ! -e "$SS_C/checkpoints/$id/latest.json" ]
+    [ "$(jq -r 'select(.code == "manifest_refused") | .keys[0]' "$SS_C/runner/leases/audit.jsonl")" = "branch" ]
+}
+
+@test "checkpoint trust: a manifest naming another job's wip ref is refused and audited, nothing recorded" {
+    local id="ck-ref" ops="$BATS_TEST_TMPDIR/ck.ndjson"
+    _ss_seed_hand "$id"
+    _ss_manifest_op "$id" feature/test "refs/mother/wip/another-job" > "$ops"
+    _ss_replay_to "$SS_C" "$id" "$ops"
+    [ ! -e "$SS_C/checkpoints/$id/index.jsonl" ]
+    [ ! -e "$SS_C/checkpoints/$id/latest.json" ]
+    [ "$(jq -r 'select(.code == "manifest_refused") | .keys[0]' "$SS_C/runner/leases/audit.jsonl")" = "wip_ref" ]
+}
+
+# `mother checkpoint restore` (what mother-run-job calls) must itself refuse a manifest that names another
+# job or another branch than the one it is restoring for.
+@test "checkpoint trust: restore refuses a manifest whose branch is not the job's (branch_mismatch), before touching git" {
+    local id="ck-rbranch" m="$BATS_TEST_TMPDIR/m.json"
+    _ss_seed_hand "$id"
+    _ss_manifest_op "$id" feature/someone-elses "refs/mother/wip/$id" | jq -c '.data.manifest' > "$m"
+    : > "$BATS_TEST_TMPDIR/t.jsonl"
+    run --separate-stderr _ss_in_world "$SS_C" 0 mother checkpoint restore "$id" --manifest "$m" \
+        --transcript "$BATS_TEST_TMPDIR/t.jsonl" --work-dir "$BATS_TEST_TMPDIR/wd"
+    [ "$status" -eq 4 ]
+    [ "$(printf '%s\n' "$output" | tail -n 1 | jq -r .why)" = "branch_mismatch" ]
+    [ ! -e "$BATS_TEST_TMPDIR/wd" ]
+}
+
+@test "checkpoint trust: restore refuses a manifest for another job (job_mismatch)" {
+    local id="ck-rjob" m="$BATS_TEST_TMPDIR/m.json"
+    _ss_seed_hand "$id"
+    _ss_manifest_op other-job feature/test "refs/mother/wip/other-job" | jq -c '.data.manifest' > "$m"
+    : > "$BATS_TEST_TMPDIR/t.jsonl"
+    run --separate-stderr _ss_in_world "$SS_C" 0 mother checkpoint restore "$id" --manifest "$m" \
+        --transcript "$BATS_TEST_TMPDIR/t.jsonl" --work-dir "$BATS_TEST_TMPDIR/wd"
+    [ "$status" -eq 4 ]
+    [ "$(printf '%s\n' "$output" | tail -n 1 | jq -r .why)" = "job_mismatch" ]
+}

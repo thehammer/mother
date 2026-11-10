@@ -573,14 +573,26 @@ _record_run_usage_for_last_spawn failed gate_fix
 # (HC-08 added the callers: gate-fix turns and gate-hold guidance resumes.)
 # ---------------------------------------------------------------------------
 
-@test "every _spawn_and_wait resume call in mother-run-job is followed by a fresh-fallback check" {
+@test "every _spawn_and_wait resume call in mother-run-job is followed by a fresh-fallback check, except the failover resume entry, which must never fall back to fresh" {
     # Executable lines only (comments dropped); function definitions excluded.
     local calls resumes checks
     calls=$(grep -vE '^[[:space:]]*#' "$MOTHER_RUN_JOB" \
         | grep -E '(^|[^_[:alnum:]])_spawn_and_wait[[:space:]]' \
         | grep -vE '_spawn_and_wait[[:space:]]*\(\)|function[[:space:]]+_spawn_and_wait' || true)
     printf '%s\n' "$calls" | grep -Eq '_spawn_and_wait[[:space:]]+fresh([[:space:]]|$|;|&)'
-    resumes=$(printf '%s\n' "$calls" | grep -c '_spawn_and_wait[[:space:]]\+resume' || true)
+    # The one exemption (cluster P1-6): the resume entry of a job whose worker was lost re-enters the SAME session
+    # on a restored checkout ("resume, never restart"). A fresh session there would silently redo, or contradict,
+    # the checkpointed work, so a failed resume must fail the job instead. It is identified by its prompt variable,
+    # and this test pins that it exists once and has no fresh fallback.
+    local exempt='_spawn_and_wait[[:space:]]+resume[[:space:]]+"\$_ck_prompt"'
+    [ "$(printf '%s\n' "$calls" | grep -cE "$exempt" || true)" = 1 ]
+    local entry
+    entry=$(awk '/_spawn_and_wait resume "\$_ck_prompt"/ {on = 1} on {print} on && /esac/ {exit}' "$MOTHER_RUN_JOB")
+    [ -n "$entry" ]
+    if printf '%s\n' "$entry" | grep -qE '_spawn_and_wait[[:space:]]+fresh|_gates_spawn_failed_immediately'; then
+        echo "the failover resume entry must not fall back to a fresh spawn" >&2; return 1
+    fi
+    resumes=$(printf '%s\n' "$calls" | grep -E '_spawn_and_wait[[:space:]]+resume' | grep -vcE "$exempt" || true)
     checks=$(grep -vE '^[[:space:]]*#' "$MOTHER_RUN_JOB" \
         | grep -E '_gates_spawn_failed_immediately[[:space:]]+"' | grep -vc '()' || true)
     [ "$resumes" -ge 1 ]

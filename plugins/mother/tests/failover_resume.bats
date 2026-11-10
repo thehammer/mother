@@ -652,6 +652,53 @@ sleep 600")
     [ "$(_fr_ev_count resumed_from_checkpoint)" = "0" ]
 }
 
+# The checkpoint on the coordinator is the worker's word. Each case below kills the worker (so nothing can
+# rewrite the checkpoint), tampers one thing a hostile or buggy worker could have caused, and expects the job to
+# fail no_checkpoint_restorable with a why naming the disagreement, never a resume and never a fresh run.
+
+_fr_tamper_failure() { # <jq-edit-of-latest.json | ""> <origin-edit-cmd...> — kill, tamper, expect the hold
+    local id="$1" edit="$2" want="$3"
+    shift 3
+    _fr_world "$id"
+    export MOCK_CLAUDE_SCRIPT=$(_fr_first_run_script) MOCK_CLAUDE_RESUME_SCRIPT=$(_fr_resume_script)
+    _fr_runner worker
+    _fr_must 60 "the first run's work steps" _fr_step_done 1 4
+    _fr_must 40 "a pushed checkpoint" _fr_ckpt_has_file scratch/untracked.txt
+    _fr_kill9_worker "$FR_W"
+    if [ -n "$edit" ]; then
+        jq -c "$edit" "$(_fr_ckpt_dir)/latest.json" > "$(_fr_ckpt_dir)/latest.json.tamper" \
+            && mv "$(_fr_ckpt_dir)/latest.json.tamper" "$(_fr_ckpt_dir)/latest.json"
+    fi
+    if [ $# -gt 0 ]; then "$@"; fi
+    _fr_must 90 "the job to fail" _fr_state_is failed
+    _fr_must 60 "the failed event (the last write of the transition)" _fr_ev_has failed
+    [ "$(_fr_field failure_reason)" = "no_checkpoint_restorable" ]
+    _fr_ev_detail failed .why | grep -qF -- "$want" || _fr_fail "why does not say '$want': $(_fr_ev_detail failed .why)"
+    sleep 5
+    [ "$(_fr_mock_runs)" = "1" ]
+    [ "$(_fr_ev_count resumed_from_checkpoint)" = "0" ]
+}
+
+_fr_origin_wip_to_other_sha() { # point the wip ref at a different, valid commit (the repo's base commit)
+    git --git-dir="$FR_ORIGIN" update-ref "$(_fr_wip_ref)" "$(git --git-dir="$FR_ORIGIN" rev-parse "$(git --git-dir="$FR_ORIGIN" for-each-ref --format='%(refname)' refs/heads | head -1)")"
+}
+
+@test "kill -9, then the wip ref on origin points at another sha than the checkpoint's wip_sha: the job fails no_checkpoint_restorable (a ref that moved is not the checkpoint)" {
+    _fr_tamper_failure fr-wrongsha "" "not the checkpoint's wip_sha" _fr_origin_wip_to_other_sha
+}
+
+@test "kill -9, then the canonical checkpoint says pushed:false (an unpushed wip ref): the job fails no_checkpoint_restorable" {
+    _fr_tamper_failure fr-unpushed '.pushed = false' "no pushed checkpoint"
+}
+
+@test "kill -9, then the canonical manifest names another job's wip_ref: the job fails no_checkpoint_restorable, the ref is rebuilt from the job id and never read from the manifest" {
+    _fr_tamper_failure fr-otherref '.wip_ref = "refs/mother/wip/some-other-job"' "not refs/mother/wip/fr-otherref"
+}
+
+@test "kill -9, then the canonical manifest names another branch than the job's: the job fails no_checkpoint_restorable" {
+    _fr_tamper_failure fr-otherbranch '.branch = "feature/someone-elses"' "not the job's branch"
+}
+
 # ===========================================================================
 # 3. SIGTERM: the final checkpoint carries everything up to the termination
 

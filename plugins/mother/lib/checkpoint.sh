@@ -587,7 +587,9 @@ _ckpt_restore_fail() {
     return 4
 }
 
-# mother_checkpoint_restore <manifest> <transcript-file> <repo_path> <new_work_dir>
+# mother_checkpoint_restore <manifest> <transcript-file> <repo_path> <new_work_dir> [<expect-job> [<expect-branch>]]
+# With expect-job / expect-branch the manifest must name exactly that job and branch (not_restorable:
+# job_mismatch, branch_mismatch): a manifest is the worker's word, never what picks the branch to touch.
 # Exit 0 restored, 4 not restorable (why: wip_missing, head_missing, chain_mismatch,
 # transcript_mismatch, tree_mismatch), 1 usage/other. Never falls back to a fresh start; a failure after
 # the worktree was added removes it again. <new_work_dir> must be absolute, without "..", and
@@ -597,7 +599,7 @@ _ckpt_restore_fail() {
 # Output: restored, head_sha, wip_sha, transcript_sha, source, branch_state, detached, base_sha,
 # base_moved, incomplete (embedded repos were not captured), skipped.
 mother_checkpoint_restore() {
-    local manifest="${1:-}" tfile="${2:-}" repo="${3:-}" newwd="${4:-}"
+    local manifest="${1:-}" tfile="${2:-}" repo="${3:-}" newwd="${4:-}" want_job="${5:-}" want_branch="${6:-}"
     [ -r "$manifest" ] && [ -n "$repo" ] && [ -n "$newwd" ] \
         || { echo "mother: checkpoint restore: usage: <manifest> <transcript-file> <repo_path> <new_work_dir>" >&2; return 1; }
     local job branch head wip session tsha_want base_sha
@@ -611,6 +613,12 @@ mother_checkpoint_restore() {
     _ckpt_job_ok "$job" && _ckpt_branch_ok "$branch" && _ckpt_sha_ok "$head" && _ckpt_sha_ok "$wip" \
         || { echo "mother: checkpoint restore: manifest has a malformed job, branch or sha" >&2; return 1; }
     _ckpt_session_ok "$session" || { echo "mother: checkpoint restore: bad session_id" >&2; return 1; }
+    if [ -n "$want_job" ] && [ "$job" != "$want_job" ]; then
+        echo "mother: checkpoint restore: manifest names job '$job', not '$want_job'" >&2; _ckpt_restore_fail job_mismatch; return $?
+    fi
+    if [ -n "$want_branch" ] && [ "$branch" != "$want_branch" ]; then
+        echo "mother: checkpoint restore: manifest names branch '$branch', the job's branch is '$want_branch'" >&2; _ckpt_restore_fail branch_mismatch; return $?
+    fi
 
     newwd="${newwd%/}"
     case "$newwd" in

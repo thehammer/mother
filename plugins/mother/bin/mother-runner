@@ -849,18 +849,32 @@ _resume_lost_lease() {
         _resume_fail "$id" "no pushed checkpoint"
         return 0
     fi
-    n=$(jq -r '.n' "$latest"); wipref=$(jq -r '.wip_ref // empty' "$latest"); wipsha=$(jq -r '.wip_sha // empty' "$latest")
+    # latest.json is the worker's word: the ref is rebuilt from the job id, never read from it, and the
+    # manifest must name this job's branch and a real sha.
+    n=$(jq -r '.n' "$latest"); wipref="refs/mother/wip/$id"; wipsha=$(jq -r '.wip_sha // empty' "$latest")
+    if [ "$(jq -r '.wip_ref // empty' "$latest")" != "$wipref" ]; then
+        _resume_fail "$id" "checkpoint manifest names wip ref '$(jq -r '.wip_ref // empty' "$latest" | head -c 120)', not $wipref"; return 0
+    fi
+    if [ "$(jq -r '.branch // empty' "$latest")" != "$(jq -r '.branch // empty' "$jf")" ]; then
+        _resume_fail "$id" "checkpoint manifest names branch '$(jq -r '.branch // empty' "$latest" | head -c 120)', not the job's branch"; return 0
+    fi
+    case "$wipsha" in
+        *[!0-9a-f]*|'') _resume_fail "$id" "checkpoint manifest has a malformed wip_sha"; return 0 ;;
+    esac
     at=$(jq -r '.at // empty' "$latest"); bytes=$(jq -r '.transcript.bytes // empty' "$latest"); tsha=$(jq -r '.transcript.sha256 // empty' "$latest")
     repo=$(jq -r '.repo_path // empty' "$jf" 2>/dev/null)
     if [ -z "$repo" ] || [ ! -d "$repo" ]; then _resume_fail "$id" "repository missing: ${repo:-unknown}"; return 0; fi
     tmp=$(mktemp "${TMPDIR:-/tmp}/mother-lsr.XXXXXX") || { _resume_fail "$id" "no scratch space"; return 0; }
     local lsrc=0 lsstart=$SECONDS
-    _bounded_run "${MOTHER_GIT_REMOTE_TIMEOUT:-60}" "$tmp" git -C "$repo" ls-remote origin "$wipref" || lsrc=$?
+    _bounded_run "${MOTHER_GIT_REMOTE_TIMEOUT:-60}" "$tmp" git -C "$repo" ls-remote origin -- "$wipref" || lsrc=$?
     if [ "$lsrc" -ne 0 ]; then
         rm -f "$tmp"; _resume_fail "$id" "remote unreachable: could not verify the wip ref (git ls-remote exit $lsrc after $((SECONDS - lsstart))s)"; return 0
     fi
-    rsha=$(awk 'NR==1{print $1}' "$tmp"); rm -f "$tmp"
+    rsha=$(awk -v r="$wipref" '$2 == r {print $1; exit}' "$tmp"); rm -f "$tmp"
     if [ -z "$rsha" ]; then _resume_fail "$id" "wip ref missing on remote"; return 0; fi
+    if [ "$rsha" != "$wipsha" ]; then
+        _resume_fail "$id" "wip ref on the remote is at ${rsha:0:12}, not the checkpoint's wip_sha ${wipsha:0:12}"; return 0
+    fi
     # The transcript the new session continues: the first <bytes> bytes of the reassembled file, verified.
     tfile="$root/$(jq -r '.transcript_file // empty' "$latest")"
     mkdir -p "$ck/resume"; staged="$ck/resume/$n.jsonl"
@@ -2899,6 +2913,13 @@ _RATELIMIT_ANNOUNCED=0
 # nothing in dispatch reads it.
 _write_dispatch_last() {
     local running; running=$(_count_running_children)
+    # Worker path only (cluster P1-5): additive `leased` and `mode`; legacy output is unchanged. They go in
+    # the SAME write as the rest: a second rewrite let a reader see the file between the two (no `.leased`).
+    local wf='{}'
+    if _worker_path_possible; then
+        wf=$(jq -nc --argjson leased "$(_leased_job_ids | wc -l | tr -d ' ')" --arg mode "$MOTHER_DISPATCH_MODE" \
+            '{leased: $leased, mode: $mode}')
+    fi
     jq -nc --argjson ts "$(date +%s)" --argjson running "${running:-0}" --argjson ceiling "$MOTHER_CONCURRENCY" \
         --argjson paused "$([ "$1" = 1 ] && echo true || echo false)" \
         --argjson over "$([ "$2" = 1 ] && echo true || echo false)" \
@@ -2906,21 +2927,13 @@ _write_dispatch_last() {
         --arg spawned "$4" --arg skipped "$5" \
         --argjson enforcing "$([ "${6:-0}" = 1 ] && echo true || echo false)" \
         --argjson drained "$([ "${7:-0}" = 1 ] && echo true || echo false)" \
+        --argjson wf "$wf" \
         '{ts: $ts, running: $running, ceiling: $ceiling, ratelimit_paused: $paused, quota_over_cap: $over,
           low_disk: $low, enforcing: $enforcing, drained: $drained, spawned: ($spawned | split(" ") | map(select(length > 0))),
-          skipped: ($skipped | split(" ") | map(select(length > 0)))}' \
+          skipped: ($skipped | split(" ") | map(select(length > 0)))} + $wf' \
         > "$RUNNER_DIR/dispatch-last.json.tmp.$$" 2>/dev/null \
         && mv "$RUNNER_DIR/dispatch-last.json.tmp.$$" "$RUNNER_DIR/dispatch-last.json" \
         || rm -f "$RUNNER_DIR/dispatch-last.json.tmp.$$"
-    # Worker path only (cluster P1-5): additive `leased` and `mode`; legacy output is unchanged.
-    ! _worker_path_possible || _dispatch_last_worker_fields
-}
-
-_dispatch_last_worker_fields() {
-    local f="$RUNNER_DIR/dispatch-last.json"
-    [ -f "$f" ] || return 0
-    jq -c --argjson leased "$(_leased_job_ids | wc -l | tr -d ' ')" --arg mode "$MOTHER_DISPATCH_MODE" \
-        '. + {leased: $leased, mode: $mode}' "$f" > "$f.tmp.$$" 2>/dev/null && mv "$f.tmp.$$" "$f" || rm -f "$f.tmp.$$"
 }
 
 # _dispatch_drained: maintenance mode (`mother drain`). True while $RUNNER_DIR/drain.json exists; the

@@ -5416,7 +5416,7 @@ _checkpoint_cmd_take() {
 }
 
 _checkpoint_cmd_restore() {
-    local id="${1:-}" manifest="" transcript="" workdir=""
+    local id="${1:-}" manifest="" transcript="" workdir="" want_branch=""
     [ -n "$id" ] || _die "checkpoint restore: <id> required"
     shift
     while [ $# -gt 0 ]; do
@@ -5424,6 +5424,7 @@ _checkpoint_cmd_restore() {
             --manifest)   manifest="${2:-}"; shift 2 ;;
             --transcript) transcript="${2:-}"; shift 2 ;;
             --work-dir)   workdir="${2:-}"; shift 2 ;;
+            --branch)     want_branch="${2:-}"; shift 2 ;;
             *) _die "unknown flag for checkpoint restore: $1" ;;
         esac
     done
@@ -5431,7 +5432,12 @@ _checkpoint_cmd_restore() {
     _job_exists "$id" || _die "no such job: $id"
     local repo; repo=$(jq -r '.repo_path // .work_dir // ""' "$(_job_path "$id")")
     [ -n "$repo" ] || _die "checkpoint restore: no repo path on job $id"
-    mother_checkpoint_restore "$manifest" "$transcript" "$repo" "$workdir"
+    # The manifest must agree with the job document (and --branch, when the caller has one).
+    local job_branch; job_branch=$(jq -r '.branch // ""' "$(_job_path "$id")")
+    if [ -n "$want_branch" ] && [ -n "$job_branch" ] && [ "$want_branch" != "$job_branch" ]; then
+        _die "checkpoint restore: --branch '$want_branch' is not the job's branch '$job_branch'"
+    fi
+    mother_checkpoint_restore "$manifest" "$transcript" "$repo" "$workdir" "$id" "${want_branch:-$job_branch}"
 }
 
 _gates_cmd_check() {
