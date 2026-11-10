@@ -20,6 +20,7 @@ type fakeApplier struct {
 	mu      sync.Mutex
 	applied int64
 	batches [][]int64
+	ops     [][]byte
 	fail    bool
 }
 
@@ -33,6 +34,7 @@ func (f *fakeApplier) Apply(job string, ops [][]byte) (int64, error) {
 		}
 		_ = json.Unmarshal(o, &op)
 		seqs = append(seqs, op.Seq)
+		f.ops = append(f.ops, append([]byte(nil), o...))
 	}
 	f.batches = append(f.batches, seqs)
 	if f.fail {

@@ -1016,6 +1016,18 @@ func (s *Server) flushJob(jl *jobLease) {
 			continue
 		}
 		items[i].oseq = oseq
+		if f.T == workerproto.TypeCheckpointTaken {
+			// The manifest drives restores. Go validated it; jq and bash must never see the worker's own
+			// bytes (duplicate or case-variant keys parse differently in each), so hand them Go's
+			// re-serialisation of the validated struct.
+			var ct workerproto.CheckpointTaken
+			if err := json.Unmarshal(data, &ct); err != nil {
+				s.audit(jl.rec.WorkerID, jl.job, jl.rec.LeaseID, jl.rec.Epoch, "invalid_op")
+				items[i].valid = false
+				continue
+			}
+			data, _ = json.Marshal(ct)
+		}
 		// Outbox ops the worker consumed without sending (every key refused by the ownership table) are
 		// filled with empty job.set ops, which coord_apply accepts as no-ops, so its seq stays contiguous.
 		for n := skip[0]; skip[1] >= skip[0] && n <= skip[1]; n++ {
