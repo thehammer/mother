@@ -380,6 +380,9 @@ _fr_lease_active_epoch() { [ "$(_fr_lease state)" = "active" ] && [ "$(_fr_lease
 _fr_events() { printf '%s/events/%s.jsonl' "$FR_C" "$FR_ID"; }
 _fr_ev_count() { jq -s --arg k "$1" 'map(select(.kind == $k)) | length' "$(_fr_events)" 2>/dev/null || echo 0; }
 _fr_ev_has() { [ "$(_fr_ev_count "$1")" -ge 1 ]; }
+# _fr_ev_count_ge <kind> <n> — events reach the coordinator through the async outbox, so a mock marker (inv<N>.started) does
+# not mean the event of that run is here yet: wait for the count before reading "the last" one.
+_fr_ev_count_ge() { [ "$(_fr_ev_count "$1")" -ge "$2" ]; }
 # _fr_ev_where <jq-select-body> — some event matches.
 _fr_ev_where() { jq -e -s "map(select($1)) | length > 0" "$(_fr_events)" >/dev/null 2>&1; }
 _fr_ev_reason_has() { _fr_ev_where "(.detail.reason // \"\") == \"$1\""; }
@@ -658,9 +661,22 @@ sleep 600")
     _fr_must 60 "the first run's work steps" _fr_step_done 1 4
     _fr_must 40 "a pushed checkpoint" _fr_ckpt_has_file scratch/untracked.txt
     _fr_kill9_worker "$FR_W"
-    # With the daemon dead nothing can push the ref back before the runner looks.
-    git --git-dir="$FR_ORIGIN" update-ref -d "$(_fr_wip_ref)"
-    git --git-dir="$FR_ORIGIN" for-each-ref --format='%(refname)' "refs/mother/wip-ckpt/$id" | while read -r r; do git --git-dir="$FR_ORIGIN" update-ref -d "$r"; done
+    # A push already in flight at the kill (or a restarted daemon) can still land after the first delete, so under load the
+    # refs can come back: delete until a full second passes with nothing on origin.
+    local quiet=0 tries=0 r
+    while [ "$quiet" -lt 2 ] && [ "$tries" -lt 30 ]; do
+        tries=$((tries + 1))
+        if [ -n "$(_fr_origin_ref "$(_fr_wip_ref)")" ] || [ -n "$(git --git-dir="$FR_ORIGIN" for-each-ref "refs/mother/wip-ckpt/$id")" ]; then
+            quiet=0
+            git --git-dir="$FR_ORIGIN" update-ref -d "$(_fr_wip_ref)" 2>/dev/null || true
+            for r in $(git --git-dir="$FR_ORIGIN" for-each-ref --format='%(refname)' "refs/mother/wip-ckpt/$id"); do
+                git --git-dir="$FR_ORIGIN" update-ref -d "$r" 2>/dev/null || true
+            done
+        else
+            quiet=$((quiet + 1))
+        fi
+        sleep 0.5
+    done
     [ -z "$(_fr_origin_ref "$(_fr_wip_ref)")" ]
     [ -z "$(git --git-dir="$FR_ORIGIN" for-each-ref "refs/mother/wip-ckpt/$id")" ]
 
@@ -1175,6 +1191,7 @@ pr")
     _fr_must 60 "the third run to start" _fr_inv_started 3
     [ "$(_fr_field worker_resume_count)" = "2" ]
     [ "$(_fr_ev_count failed)" = "0" ]
+    _fr_must 60 "the third run's resumed_from_checkpoint event (the second one)" _fr_ev_count_ge resumed_from_checkpoint 2
     # It resumed from the SECOND lease's checkpoint: that line's file is in its worktree.
     jq -e -s --arg s "$(_fr_ev_detail resumed_from_checkpoint .wip_sha)" --argjson e "$((old_epoch + 1))" \
         'map(select(.epoch == $e and .wip_sha == $s)) | length > 0' "$(_fr_ckpt_dir)/index.jsonl" >/dev/null \

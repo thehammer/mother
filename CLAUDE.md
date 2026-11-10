@@ -1102,9 +1102,13 @@ Worker mode never loses a job's work when its worker stops. Details: `docs/worke
   the epoch checked against `runner/leases/<job>.history.jsonl`; a new worker numbers on from the offered manifest. Details:
   `docs/worker-protocol.md` section 9 and 15.
 - **One push, bounded refs, seeded numbering only.** A take is ONE `git push` (per-checkpoint ref, rolling ref under
-  `--force-with-lease`, prune deletes; success is judged per ref, a refused delete never sinks a checkpoint). Origin keeps this
-  epoch's newest `MOTHER_CHECKPOINT_KEEP_REFS` (20) `wip-ckpt` refs plus ONE ref per earlier epoch: the restore point the lease
-  was restored from (`<checkpoints>/.restore-point`); no sweep without it. Salvage refs are never pruned. A restore seeds the new
+  `--force-with-lease`, prune deletes; success is judged per ref, a refused delete never sinks a checkpoint). Git decides the
+  write order, so none is relied on: `pushed:true` means both refs landed at `wip_sha`; a remote that refuses only the
+  per-checkpoint ref gives `pushed:false` (`checkpoint ref refused`) with the rolling ref moved and the expectation advanced, and
+  "fenced" (exit 3) needs the ROLLING ref's own refusal plus a moved remote. Origin keeps this epoch's newest
+  `MOTHER_CHECKPOINT_KEEP_REFS` (20) `wip-ckpt` refs; once per epoch (after a SUCCESSFUL `ls-remote`) every earlier-epoch ref
+  except the restore point the lease was restored from (`<checkpoints>/.restore-point`) is deleted, so at most one earlier ref
+  remains in total; with no well-formed restore point nothing earlier is deleted (unbounded then). Salvage refs are never pruned. A restore seeds the new
   worker's checkpoints dir with `epoch`/`n` only (transcript bytes 0, `pushed:false`), so its first take ships the whole
   transcript: the coordinator's transcript can be longer than `latest.json` (unpushed checkpoints append deltas), and a delta
   from `latest.json`'s byte count would never line up. `coord_apply.sh` refuses (and audits) a checkpoint when the job has no lease

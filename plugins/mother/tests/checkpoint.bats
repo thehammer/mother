@@ -1268,3 +1268,72 @@ STUB
     [ "$(m .pushed)" = "true" ]
     [ "$(_ckpt_refs)" = "1-1 1-2 2-1 " ]
 }
+
+# --- one push, partial rejection (PR #124 round 4, B) ----------------------------------------------------------------
+
+# An update hook on the bare origin: refuses refs/mother/wip-ckpt/* while $T/refuse-ckpt exists; logs every ref it sees.
+_install_update_hook() {
+    mkdir -p "$ORIGIN/hooks"
+    cat > "$ORIGIN/hooks/update" <<HOOK
+#!/bin/sh
+echo "\$1" >> "$T/hooklog"
+case "\$1" in refs/mother/wip-ckpt/*) [ -e "$T/refuse-ckpt" ] && { echo "refused by test hook" >&2; exit 1; } ;; esac
+exit 0
+HOOK
+    chmod +x "$ORIGIN/hooks/update"
+}
+
+@test "B: a remote that refuses only the per-checkpoint ref is pushed:false, never fenced, and the next take is pushed:true" {
+    _install_update_hook
+    make_dirty
+    take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    touch "$T/refuse-ckpt"
+    printf 'r1\n' >> "$WT/b.txt"
+    take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "false" ]
+    [ "$(m .push_error)" != "fenced" ]
+    # committed work still reached the remote: the rolling ref is at this take's wip
+    [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
+    [ -z "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-2")" ]
+    # still refused: still not fenced, and the expectation follows the rolling ref
+    printf 'r2\n' >> "$WT/b.txt"
+    take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "false" ]
+    [ "$(m .push_error)" != "fenced" ]
+    # cause removed: back to normal
+    rm -f "$T/refuse-ckpt"
+    printf 'r3\n' >> "$WT/b.txt"
+    take
+    [ "$CST" -eq 0 ]
+    [ "$(m .pushed)" = "true" ]
+    [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
+    [ "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-4")" = "$(m .wip_sha)" ]
+}
+
+@test "B: pushed:true means the per-checkpoint ref and the rolling ref both sit at the manifest's wip_sha, on every take" {
+    _install_update_hook
+    make_dirty
+    local i
+    for i in 1 2 3; do
+        printf 'x%s\n' "$i" >> "$WT/b.txt"
+        take
+        [ "$(m .pushed)" = "true" ]
+        [ "$(remote_sha "$WIPREF")" = "$(m .wip_sha)" ]
+        [ "$(remote_sha "refs/mother/wip-ckpt/$JOB/1-$i")" = "$(m .wip_sha)" ]
+    done
+    [ "$(grep -c "^refs/mother/wip-ckpt/$JOB/" "$T/hooklog")" -eq 3 ]
+    [ "$(grep -c "^$WIPREF\$" "$T/hooklog")" -eq 3 ]
+}
+
+@test "B: a rolling ref another writer moved is still fenced even when a hook is installed" {
+    _install_update_hook
+    _make_fenced
+    take
+    [ "$CST" -eq 3 ]
+    [ "$(printf '%s' "$COUT" | jq -r .push_error)" = "fenced" ]
+    [ "$(remote_sha "$WIPREF")" = "$MOVED" ]
+}

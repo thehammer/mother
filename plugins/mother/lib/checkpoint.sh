@@ -293,7 +293,11 @@ _ckpt_prune_refspecs() {
     [ -s "$parent/.restore-point" ] && keepref=$(cat "$parent/.restore-point" 2>/dev/null)
     # Without a well-formed restore point, never delete an earlier epoch's refs: one of them may be the only restorable checkpoint.
     case "$keepref" in ''|*[!0-9-]*|-*|*-|*-*-*) return 0 ;; esac
+    # A failed ls-remote means the sweep did not happen: it is retried on the next take, never marked done.
+    local listing
+    listing=$(_ckpt_git "$wd" ls-remote --upload-pack=git-upload-pack origin "${pfx}*" 2>/dev/null) || return 0
     while IFS= read -r line; do
+        [ -n "$line" ] || continue
         ref="${line#*[[:space:]]}"
         case "$ref" in "$pfx"*) name="${ref#"$pfx"}" ;; *) continue ;; esac
         e="${name%%-*}"
@@ -301,7 +305,7 @@ _ckpt_prune_refspecs() {
         [ "$e" -lt "$epoch" ] || continue
         [ "$name" = "$keepref" ] && continue
         eval "$out+=(\":\$ref\")"
-    done < <(_ckpt_git "$wd" ls-remote --upload-pack=git-upload-pack origin "${pfx}*" 2>/dev/null)
+    done <<<"$listing"
     _CKPT_PRUNED_OLD_EPOCHS=1
     return 0
 }
@@ -482,7 +486,7 @@ _ckpt_take_locked() {
         || { _ckpt_take_fail commit_failed "could not create the wip commit"; return 1; }
 
     # 4. Push with fencing.
-    local pushed=false push_error="" branch_push="" rc=0 pout wip_ref="refs/mother/wip/$job" ckpt_ref="" target expect="" state_file marker
+    local pushed=false push_error="" branch_push="" rc=0 rolling_landed=0 pout wip_ref="refs/mother/wip/$job" ckpt_ref="" target expect="" state_file marker
     state_file="$parent/.last-pushed"
     marker=$(_ckpt_git_path "$wd" mother-wip-expect) || marker=""
     pout=$(_ckpt_mktemp) || return 1
@@ -496,23 +500,26 @@ _ckpt_take_locked() {
         elif [ -n "$marker" ] && [ -s "$marker" ]; then expect=$(cat "$marker")
         else expect=$(_ckpt_ls_remote_ref "$wd" "$target" || true)
         fi
-        # The per-checkpoint ref goes FIRST. The name is unique to this lease (epoch) and take number, so only this lease's
-        # worker ever writes it; "+" lets a take that died after the push and before its manifest (same n, new commit)
-        # be redone. The coordinator trusts a ref only when its sha equals its own manifest's wip_sha. The rolling ref moves before the coordinator hears of the manifest
-        # (the manifest travels the async outbox), so after a kill the rolling ref can be ahead of the newest manifest the
-        # coordinator holds; the coordinator restores from the immutable ref its own manifest names and never needs the
-        # rolling ref to equal anything. Namespace refs/mother/wip-ckpt/<job>/<epoch>-<n> has no D/F conflict with
-        # refs/mother/wip/<job>.
+        # ONE push carries the per-checkpoint ref, the rolling ref and the prune deletions. Git decides the order refs are
+        # written (refs that already exist on the remote go first whatever the refspec order), so NO ordering is relied on.
+        # The guarantee is the manifest's: pushed:true only when BOTH refs landed at wip_sha, and the coordinator restores
+        # only from the immutable ref its own manifest names. The per-checkpoint name is unique to this lease (epoch) and
+        # take number, so only this worker writes it; "+" lets a take that died after the push and before its manifest
+        # (same n, new commit) be redone. No "+" on the rolling refspec: it would override the lease check, so a moved ref
+        # would be overwritten. No --atomic: a delete of a ref already gone must not sink the checkpoint. Success and
+        # fencing are judged per ref from the porcelain output: a refused delete is ignored; "fenced" comes only from the
+        # ROLLING ref's own refusal plus the remote no longer being where the lease left it; a refused per-checkpoint ref
+        # alone is pushed:false (the rolling ref still moved, so committed work is safe and the expectation advances).
         ckpt_ref="refs/mother/wip-ckpt/$job/$epoch-$n"
-        # ONE push carries everything: the per-checkpoint ref (first, so it is never later than the rolling ref), the rolling
-        # ref and the prune deletions. No "+" on the rolling refspec: a "+" overrides the lease check, so a moved ref would be
-        # overwritten; the explicit lease alone allows the non-fast-forward update when the ref is where we left it. No --atomic:
-        # a delete of a ref that is already gone must not sink the checkpoint, so success is judged per ref from the porcelain
-        # output (a refused delete is ignored, a refused checkpoint or rolling ref is not).
         local -a prune=()
         _ckpt_prune_refspecs "$wd" "$parent" "$job" "$epoch" "$n" prune
         _ckpt_push "$wd" "$pout" origin "+$wip:$ckpt_ref" "$wip:$target" "--force-with-lease=$target:$expect" "${prune[@]+"${prune[@]}"}" || rc=$?
-        if [ "$rc" -ne 0 ] && _ckpt_ref_pushed "$pout" "$ckpt_ref" && _ckpt_ref_pushed "$pout" "$target"; then rc=0; fi
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 137 ]; then
+            if _ckpt_ref_pushed "$pout" "$target"; then
+                rolling_landed=1
+                if _ckpt_ref_pushed "$pout" "$ckpt_ref"; then rc=0; fi
+            fi
+        fi
         if [ "$rc" -eq 0 ] && [ "$_CKPT_PRUNED_OLD_EPOCHS" = 1 ]; then printf '%s' "$epoch" >"$parent/.pruned-epoch"; fi
     fi
     local exit_code=0 cur
@@ -524,10 +531,16 @@ _ckpt_take_locked() {
         fi
     elif [ "$rc" -eq 137 ]; then
         push_error="push timed out"
-    elif [ -z "$salvage" ] && grep -q '^!' "$pout" 2>/dev/null \
+    elif [ "$rolling_landed" -eq 1 ]; then
+        # The rolling ref moved but the per-checkpoint ref was refused: no restore point for this take (pushed:false), yet the
+        # work is on the remote and the lease's expectation is now this wip.
+        push_error="checkpoint ref refused"
+        printf '%s' "$wip" >"$state_file"
+        [ -n "$marker" ] && printf '%s' "$wip" >"$marker" 2>/dev/null
+    elif [ -z "$salvage" ] && awk -F'\t' -v r="$target" '$1 == "!" && $2 ~ (":" r "$") {f=1} END {exit f ? 0 : 1}' "$pout" 2>/dev/null \
         && cur=$(_ckpt_ls_remote_ref "$wd" "$target") && [ "$cur" != "$expect" ]; then
-        # The remote refused the update (a "!" porcelain flag) AND the ref is no longer where our lease
-        # said it was: the lease is lost. Language-independent: no message text is matched.
+        # The remote refused the ROLLING ref (a "!" porcelain line for it) AND it is no longer where our lease said it was:
+        # the lease is lost. Language-independent: no message text is matched.
         push_error="fenced"; exit_code=3
     else
         push_error="push failed (exit $rc)"

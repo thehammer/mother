@@ -265,12 +265,19 @@ Validation (`ValidateManifest`) runs on receipt and refuses, before any `WipRef(
   `WipRef`/`SalvageRef` return `""` for a job id that is not a valid git ref component (`JobRefOK`: an id, no leading `.`, no trailing `.`
   or `.lock`), and `ValidateManifest` refuses such a job.
 - **Per-checkpoint refs (round 2).** Each take pushes `refs/mother/wip-ckpt/<job>/<epoch>-<n>` (the same wip commit; force-pushed, since the name
-  is unique to the lease and take number) BEFORE it moves the rolling ref, and the manifest then travels the async outbox. So the rolling
-  ref is routinely ahead of the newest manifest the coordinator holds, and a worker that dies in between must not fail the job. The runner
+  is unique to the lease and take number) in the SAME push as the rolling ref; git, not the refspec order, decides which is written first, so
+  no ordering is relied on. A manifest says `pushed: true` only when both refs landed at `wip_sha`; if the remote refuses only the
+  per-checkpoint ref the rolling ref still moved (committed work is safe, the lease's expectation advances) and the manifest says
+  `pushed:false, push_error:"checkpoint ref refused"` (never "fenced": that needs the ROLLING ref refused and moved). The manifest travels
+  the async outbox, so the rolling ref is routinely ahead of the newest manifest the coordinator holds, and a worker that dies in between must not fail the job. The runner
   restores from the immutable ref its own `latest.json` names (epoch and n are vetted: the frame's epoch is the coordinator's lease epoch
   and `coord_apply.sh` checks it against `runner/leases/<job>.history.jsonl`), accepts the rolling ref only when it equals `wip_sha`, and
   refuses any other sha. `wip-ckpt` is a separate directory for the same D/F reason as `wip-salvage`. The newest
-  `MOTHER_CHECKPOINT_KEEP_REFS` (20) of each epoch are kept; older ones are deleted best effort, so a coordinator that is more than 20
+  `MOTHER_CHECKPOINT_KEEP_REFS` (20) of the CURRENT epoch are kept (older ones deleted in the same push, best effort). Earlier epochs: once
+  per epoch, after one successful bounded `ls-remote` (a failed one is retried on the next take), a take deletes every earlier-epoch
+  `wip-ckpt` ref except the restore point the lease was restored from (`<checkpoints>/.restore-point`, "<epoch>-<n>"). So at most ONE
+  earlier-epoch ref remains in total (the newest restore point), and with no well-formed restore point on record nothing earlier is
+  deleted (unbounded in that case). Salvage refs are never pruned. A coordinator that is more than 20
   checkpoints behind its worker falls back to the rolling ref (which then must equal `wip_sha`) or fails `no_checkpoint_restorable`.
 - Follow-up (not built): delete `refs/mother/wip/<job>`, `refs/mother/wip-ckpt/<job>/*` and `refs/mother/wip-salvage/<job>/*` when the job is archived.
 - **Interval 120 s** (refused above **240 s**), **final-on-exit timeout 30 s**, **per-checkpoint watchdog 60 s**.

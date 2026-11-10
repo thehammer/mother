@@ -162,7 +162,7 @@ _epoch1() {
 # _failover <dest-worker-root> <dest-repo> <new-work-dir> <expected-restored-transcript>: the new lease restores from latest.json exactly as the runner and
 # mother-run-job do. Leaves the job document of <dest-worker-root> pointing at the new work dir and sets TR2 (its transcript).
 _failover() {
-    local wroot="$1" repo="$2" newwd="$3" want="$4" stage="$T/resume-e2" bytes
+    local wroot="$1" repo="$2" newwd="$3" want="$4" epoch="${5:-2}" stage="$T/resume-e${5:-2}" bytes
     mkdir -p "$stage"
     cp "$CROOT/checkpoints/$JOB/latest.json" "$stage/manifest.json"
     bytes=$(jq -r '.transcript.bytes' "$stage/manifest.json")
@@ -193,7 +193,7 @@ export MOTHER_RESUME_CHECKPOINT="$stage/manifest.json" MOTHER_RESUME_TRANSCRIPT=
 _restore_from_checkpoint "$newwd"
 DRV
     local rc=0
-    _w "$wroot" env MOTHER_LEASE_EPOCH=2 bash "$T/restore-driver.sh" >"$T/restore.out" 2>"$T/restore.err" || rc=$?
+    _w "$wroot" env MOTHER_LEASE_EPOCH="$epoch" bash "$T/restore-driver.sh" >"$T/restore.out" 2>"$T/restore.err" || rc=$?
     if [ "$rc" -ne 0 ]; then echo "restore failed (rc=$rc): $(cat "$T/restore.err") $(tail -n 3 "$T/restore.out")" >&2; return 1; fi
     TR2="$MOTHER_CLAUDE_PROJECTS_DIR/$(_enc "$newwd")/$SID.jsonl"
     [ "$(cat "$TR2")" = "$want" ] || { echo "restored transcript is '$(cat "$TR2")', expected '$want'" >&2; return 1; }
@@ -280,4 +280,47 @@ _epoch2_entries_ok() { # every epoch-2 index entry has transcript_ok true, and t
     [ ! -e "$CROOT/checkpoints/$JOB/latest.json" ]
     grep -q manifest_refused "$CROOT/runner/leases/audit.jsonl"
     grep -q epoch "$CROOT/runner/leases/audit.jsonl"
+}
+
+@test "a second loss after a pushed:false epoch: epoch 3 on a third machine restores the epoch-2 files and transcript, then advances latest.json (epoch 3, numbering continued) with matching bytes" {
+    _epoch1
+    _failover "$W2" "$REPO2" "$T/wt2-e2" hello
+    printf 'XYZ' >> "$TR2"
+    _take_ship "$W2" 2
+    [ "$TAKE_PUSHED" = true ]
+    printf '!!' >> "$TR2"
+    _take_ship "$W2" 2
+    [ "$TAKE_PUSHED" = true ]
+    _apply
+    [ "$(_latest '[.epoch, .n] | @tsv')" = "$(printf '2\t3')" ]
+    printf 'epoch2-file\n' > "$T/wt2-e2/e2.txt"
+    printf '??' >> "$TR2"
+    _take_ship "$W2" 2
+    _apply
+    [ "$(_latest '[.epoch, .n] | @tsv')" = "$(printf '2\t4')" ]
+    [ "$(_latest .transcript.bytes)" = "$(wc -c < "$TR2" | tr -d ' ')" ]
+
+    # Machine 2 dies; epoch 3 starts on a third machine.
+    local W3="$T/w3" REPO3="$T/repo3" r
+    mkdir -p "$W3/jobs" "$W3/events" "$W3/logs" "$W3/drafts" "$W3/cursors" "$W3/runner" "$W3/archive" "$W3/teardown-pending"
+    git clone -q "$ORIGIN" "$REPO3" 2>/dev/null
+    git -C "$REPO3" config user.name tester
+    git -C "$REPO3" config user.email tester@example.com
+    jq -nc --arg j "$JOB" '{job:$j, epoch:3, id:"L-3", worker:"w3"}' >> "$CROOT/runner/leases/$JOB.history.jsonl"
+    _failover "$W3" "$REPO3" "$T/wt3-e3" "helloXYZ!!??" 3
+    # (the restore pulled the epoch-2 work along with the transcript)
+    [ "$(cat "$T/wt3-e3/e2.txt")" = "epoch2-file" ]
+
+    printf 'third' >> "$TR2"
+    printf 'third' >> "$TR2"
+    local tr3="$TR2"
+    _take_ship "$W3" 3
+    [ "$TAKE_PUSHED" = true ]
+    printf '+' >> "$tr3"
+    _take_ship "$W3" 3
+    [ "$TAKE_PUSHED" = true ]
+    _apply
+    [ "$(_latest '[.epoch, .n] | @tsv')" = "$(printf '3\t6')" ] || { cat "$CROOT/checkpoints/$JOB/latest.json" >&2; cat "$T/apply.err" >&2; false; }
+    [ "$(_latest .transcript.bytes)" = "$(wc -c < "$tr3" | tr -d ' ')" ]
+    cmp "$(_ctranscript)" "$tr3"
 }
