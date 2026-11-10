@@ -61,10 +61,13 @@ func (s *Server) recPath(job string) string  { return filepath.Join(s.leasesDir(
 func (s *Server) cmdsPath(job string) string { return filepath.Join(s.leasesDir(), job+".cmds.jsonl") }
 func (s *Server) lostPath(job string) string { return filepath.Join(s.leasesDir(), job+".lost") }
 func (s *Server) auditPath() string          { return filepath.Join(s.leasesDir(), "audit.jsonl") }
-func (s *Server) tablePath() string          { return filepath.Join(s.leasesDir(), "table.json") }
-func (s *Server) dispatchDir() string        { return s.path("runner", "dispatch") }
-func (s *Server) jobPath(job string) string  { return s.path("jobs", job+".json") }
-func (s *Server) logPath(job string) string  { return s.path("logs", job+".log") }
+func (s *Server) historyPath(job string) string {
+	return filepath.Join(s.leasesDir(), job+".history.jsonl")
+}
+func (s *Server) tablePath() string         { return filepath.Join(s.leasesDir(), "table.json") }
+func (s *Server) dispatchDir() string       { return s.path("runner", "dispatch") }
+func (s *Server) jobPath(job string) string { return s.path("jobs", job+".json") }
+func (s *Server) logPath(job string) string { return s.path("logs", job+".log") }
 
 // appliedSeqFile is where lib/coord_apply.sh persists a job's applied op seq.
 func (s *Server) appliedSeqFile(job string) string {
@@ -197,3 +200,33 @@ func (s *Server) jobState(job string) workerproto.JobState {
 func fmtTime(t time.Time) string { return workerproto.Timestamp(t) }
 
 func parseTime(v string) (time.Time, error) { return time.Parse("2006-01-02T15:04:05.000Z", v) }
+
+// leaseHistoryAppend records a granted lease (job, epoch, id, worker) in runner/leases/<job>.history.jsonl.
+// The lease table keeps only each job's latest lease, so this is the coordinator's own record of who
+// held which epoch: salvage frames are checked against it, never against what the worker claims.
+func (s *Server) leaseHistoryAppend(l workerproto.Lease) {
+	line, _ := json.Marshal(map[string]any{"job": l.Job, "epoch": l.Epoch, "id": l.ID, "worker": l.Worker})
+	if err := appendLine(s.historyPath(l.Job), line); err != nil {
+		s.logf("lease history %s: %v", l.Job, err)
+	}
+}
+
+// leaseHistoryLookup returns the lease the coordinator granted for (job, epoch).
+func (s *Server) leaseHistoryLookup(job string, epoch int64) (workerproto.Lease, bool) {
+	b, err := os.ReadFile(s.historyPath(job))
+	if err != nil {
+		return workerproto.Lease{}, false
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		var r struct {
+			Job    string `json:"job"`
+			Epoch  int64  `json:"epoch"`
+			ID     string `json:"id"`
+			Worker string `json:"worker"`
+		}
+		if json.Unmarshal([]byte(ln), &r) == nil && r.Job == job && r.Epoch == epoch && r.ID != "" {
+			return workerproto.Lease{Job: job, Epoch: epoch, ID: r.ID, Worker: r.Worker}, true
+		}
+	}
+	return workerproto.Lease{}, false
+}

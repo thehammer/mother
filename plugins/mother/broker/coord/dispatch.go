@@ -185,6 +185,7 @@ func (s *Server) offer(job string, req dispatchReq, w *workerConn) error {
 	if err != nil {
 		return err
 	}
+	s.leaseHistoryAppend(l)
 	jl := &jobLease{job: job, pending: map[int64]workerproto.Frame{}, rec: LeaseRec{
 		Job: job, LeaseID: l.ID, Epoch: l.Epoch, WorkerID: w.id, State: string(workerproto.LeaseOffered),
 		OfferedAt: fmtTime(now), LastHB: fmtTime(now), Synced: map[string]json.RawMessage{},

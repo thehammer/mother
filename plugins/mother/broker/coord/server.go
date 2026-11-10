@@ -1575,7 +1575,18 @@ func (s *Server) onSalvage(w *workerConn, f workerproto.Frame) {
 	var sv workerproto.Salvage
 	_ = json.Unmarshal(f.Data, &sv)
 	job, lease, epoch := *f.Job, *f.Lease, *f.Epoch
-	if l, ok := s.leases.Get(job); ok && l.Epoch == epoch && (l.State == workerproto.LeaseActive || l.State == workerproto.LeaseOffered) {
+	// The worker is untrusted: the (job, epoch, lease) it names must be a lease the coordinator itself
+	// granted to THIS worker (lease history, written at offer time), and no longer live.
+	granted, known := s.leaseHistoryLookup(job, epoch)
+	switch {
+	case !known:
+		s.auditRefusal(w.id, job, lease, epoch, "salvage_unknown_lease")
+		return
+	case granted.Worker != w.id || granted.ID != lease:
+		s.auditRefusal(w.id, job, lease, epoch, "salvage_not_owner")
+		return
+	}
+	if l, ok := s.leases.Get(job); ok && l.Epoch == epoch && (l.ID != lease || l.State == workerproto.LeaseActive || l.State == workerproto.LeaseOffered) {
 		s.auditRefusal(w.id, job, lease, epoch, "salvage_of_live_lease")
 		return
 	}
