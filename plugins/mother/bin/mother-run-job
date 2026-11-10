@@ -3916,7 +3916,13 @@ _restore_from_checkpoint() {
     case "$sn" in ''|*[!0-9]*) ;; *)
         for d in "$sdir"/*/; do dn=$(basename "$d"); case "$dn" in ''|*[!0-9]*) continue ;; esac; [ -s "${d}manifest.json" ] && [ "$dn" -gt "$last" ] && last="$dn"; done
         if [ "$last" -lt "$sn" ]; then
-            mkdir -p "$sdir/$sn" && cp "$MOTHER_RESUME_CHECKPOINT" "$sdir/$sn/manifest.json" 2>/dev/null || true
+            # Numbering only (epoch, n): NOT the transcript bytes/sha. The coordinator's rebuilt transcript can be longer than
+            # latest.json's byte count (pushed:false checkpoints append deltas without advancing latest.json), so a delta
+            # starting at latest.transcript.bytes would never line up and latest.json would freeze for the whole lease. With
+            # bytes 0 and pushed:false the first take ships the full transcript, which the coordinator accepts as a replacement.
+            local se; se=$(jq -r '.epoch // 0' "$MOTHER_RESUME_CHECKPOINT" 2>/dev/null); case "$se" in ''|*[!0-9]*) se=0 ;; esac
+            mkdir -p "$sdir/$sn" && jq -nc --argjson n "$sn" --argjson e "$se" \
+                '{v:1, n:$n, epoch:$e, pushed:false, transcript:{bytes:0, sha256:""}}' >"$sdir/$sn/manifest.json" 2>/dev/null || true
         fi ;;
     esac
     _resume_restore_json=$(printf '%s\n' "$out" | tail -n 1)
