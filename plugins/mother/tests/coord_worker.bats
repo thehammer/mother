@@ -158,12 +158,12 @@ _cw_wait_for() {
 # _cw_dump — everything useful for triage, to stderr.
 _cw_dump() {
     local f
-    # The known open bug (not hidden, not skipped): under CPU load the coordinator can drop the worker's
-    # connection ("send queue full") and the lease then never reaches released.
+    # The stuck-lease-after-a-dropped-connection bug (ack flood -> "send queue full" -> drop -> redeliver -> drop) is
+    # fixed (acks coalesced and, under back-pressure, shed; a recovered lease is logged). If this line shows up
+    # again the fix is incomplete: the coordinator log's "leases recovered" line says what resumed where.
     if grep -qs "send queue full; dropping the connection" "$CW_C/coord.out" "$CW_C/worker.out" "$CW_W/worker.out" 2>/dev/null; then
-        echo "*** KNOWN BUG: 'send queue full; dropping the connection' was logged: this failure is the open" >&2
-        echo "*** stuck-lease bug, see .claude/bugs/open/2026-11-09-stuck-lease-after-send-queue-full-under-cpu-load.md" >&2
-        echo "*** (local bug inbox of the main mother checkout). The test is NOT skipped; it fails on purpose." >&2
+        echo "*** 'send queue full; dropping the connection' was logged: a coordinator send queue overflowed (see" >&2
+        echo "*** docs/worker-protocol.md section 14, back-pressure); this is not a plain timing failure." >&2
     fi
     echo "--- coord.out" >&2;   tail -n 40 "$CW_C/coord.out" >&2 2>/dev/null || true
     echo "--- worker.out" >&2;  tail -n 40 "$CW_C/worker.out" >&2 2>/dev/null || true
@@ -567,7 +567,7 @@ _cw_same() {
     sleep 5
     _cw_start_coord
     _cw_must 25 "a heartbeat to reach the restarted coordinator" _cw_hb_moved "$id" "$hb"
-    _cw_lease_is "$id" active
+    _cw_must 1 "the lease to be active after the first outage" _cw_lease_is "$id" active
 
     # Second crash: down for 9 s, longer than the 6 s TTL. Downtime must never expire a lease (MC-16).
     hb=$(_cw_lease_field "$id" last_hb)
@@ -577,7 +577,7 @@ _cw_same() {
     _cw_must 25 "a heartbeat to reach the coordinator after the long outage" _cw_hb_moved "$id" "$hb"
 
     # Both outages are over and the lease was active throughout: now let the job finish.
-    _cw_lease_is "$id" active
+    _cw_must 1 "the lease to be active after the long outage" _cw_lease_is "$id" active
     : > "$CW_CLAUDE_DIR/release"
     _cw_must 90 "the lease to be released" _cw_lease_is "$id" released
     _cw_mirror_state_is "$id" succeeded
@@ -590,7 +590,11 @@ _cw_same() {
     if [ -f "$CW_C/runner/leases/audit.jsonl" ]; then
         run jq -s "map(select(.job == \"$id\" and ((.code // \"\") | test(\"lost\")))) | length" \
             "$CW_C/runner/leases/audit.jsonl"
-        [ "$output" = "0" ]
+        if [ "$output" != "0" ]; then
+            echo "the lease was declared lost (audit lines with a 'lost' code: $output)" >&2
+            _cw_dump
+            return 1
+        fi
     fi
     [ "$(_cw_lease_field "$id" end_reason)" = "succeeded" ]
 }

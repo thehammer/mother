@@ -371,6 +371,13 @@ Everything here is additive inside `data` (section 5: additive data fields are a
 - Files: `runner/dispatch/<job>.json` (request, gains `wait_reason`), `runner/leases/<job>.json`, `<job>.cmds.jsonl` (unacked commands), `<job>.lost`,
   `table.json` (the durable lease table snapshot, written before each offer leaves), `audit.jsonl`, `runner/coord/coord.pid`, `runner/coord-status.json`.
   Worker root: `leases/<job>.json`, `children/<pid>.json`, `applied-cmds.json`, `worker.pid` (`<pid> <pgid>`).
+- Back-pressure on the coordinator's send queue (4096 frames per connection, `Config.SendQueue`). Commands, the welcome, `sync.*` frames and
+  fencing refusals (`fenced`, `not_leased`, `unknown_job`) are never shed: a queue that cannot take one drops the connection (log line
+  `send queue full (<frame counts>); dropping the connection`), the lease stays live, and the worker's reconnect resumes it from the welcome. Acks (cumulative)
+  and advisory refusals (`too_large`, `invalid`, `ownership`) are redundant: while the queue is more than half full they are **shed**, not queued (the ack stays
+  owed and goes out on a later flush tick), so a slow reader is never dropped, redelivered everything and dropped again. Duplicate and out-of-order frames
+  share one owed ack per job per flush tick. When a dropped worker comes back the coordinator logs `worker <id>: reconnected <after> after its connection was
+  dropped (<why>); leases recovered: <job>@e<epoch>(wire <n>, applied <m>) ...`.
 - Release rule: a worker sends `lease.release` only after its supervisor exited, the outbox and log are fully acked, and the mirror's state is terminal or
   `awaiting` (reason = that state, or `supervisor_exited` for a supervisor found dead at start). A supervisor that died with the job still `running` is not
   released and no longer heartbeated, so the coordinator's TTL decides. The wire (and hence P1-5) still refuses `succeeded` from a worker.
