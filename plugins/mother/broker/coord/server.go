@@ -66,8 +66,11 @@ type Config struct {
 	IdleTimeout    time.Duration // post-hello read deadline; default 3 heartbeat intervals
 	AuditMaxBytes  int64         // audit.jsonl rotates past this (default 4 MiB)
 	AcceptMinSleep time.Duration // first retry delay after a temporary Accept error (default 5ms)
-	SendQueue      int           // frames queued per worker connection before it is dropped (default 4096)
+	SendQueue      int           // frames queued per worker connection before it is dropped (default 4096; below MinSendQueue is raised to it)
 }
+
+// MinSendQueue is the smallest per-connection send queue the coordinator will run with.
+const MinSendQueue = 64
 
 type workerConn struct {
 	id       string
@@ -182,6 +185,12 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
+	}
+	// A queue this small cannot hold a welcome and its redelivered commands, and the shedding threshold (half
+	// the capacity) would be zero or one frame: the connection would drop and reconnect forever.
+	if cfg.SendQueue > 0 && cfg.SendQueue < MinSendQueue {
+		cfg.Logf("coordinator: SendQueue %d is below the minimum; using %d", cfg.SendQueue, MinSendQueue)
+		cfg.SendQueue = MinSendQueue
 	}
 	if cfg.Applier == nil {
 		cfg.Applier = ExecApplier{Root: cfg.Root, LibDir: cfg.LibDir}

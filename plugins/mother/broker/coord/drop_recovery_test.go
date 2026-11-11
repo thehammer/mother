@@ -11,8 +11,8 @@ import (
 )
 
 // A connection the coordinator drops for a full send queue leaves the lease live; when the worker is back
-// the welcome resumes it at the committed positions, a stale frame of the dropped session is not applied, and
-// one coordinator log line says which leases recovered.
+// the welcome resumes it at the committed positions, the new session's next frame is applied, and one
+// coordinator log line says which leases recovered.
 func TestLeaseResumesAfterTheCoordinatorDropsAFullQueueAndLogsTheRecovery(t *testing.T) {
 	h := newHarness(t)
 	var mu sync.Mutex

@@ -158,12 +158,16 @@ _cw_wait_for() {
 # _cw_dump — everything useful for triage, to stderr.
 _cw_dump() {
     local f
-    # The stuck-lease-after-a-dropped-connection bug (ack flood -> "send queue full" -> drop -> redeliver -> drop) is
-    # fixed (acks coalesced and, under back-pressure, shed; a recovered lease is logged). If this line shows up
-    # again the fix is incomplete: the coordinator log's "leases recovered" line says what resumed where.
-    if grep -qs "send queue full; dropping the connection" "$CW_C/coord.out" "$CW_C/worker.out" "$CW_W/worker.out" 2>/dev/null; then
-        echo "*** 'send queue full; dropping the connection' was logged: a coordinator send queue overflowed (see" >&2
-        echo "*** docs/worker-protocol.md section 14, back-pressure); this is not a plain timing failure." >&2
+    # The stuck-lease bug is STILL OPEN (cause unknown): under CPU load the coordinator was seen to drop the worker's
+    # connection ("send queue full (<profile>); dropping the connection") and the lease then never reached released. The
+    # coordinator now sheds redundant acks/refusals under back-pressure (hardening against an unbounded queue, not a proven
+    # fix) and logs "leases recovered" when a dropped worker returns. See
+    # .claude/bugs/open/2026-11-09-stuck-lease-after-send-queue-full-under-cpu-load.md (local bug inbox of the main mother checkout).
+    # The real log line carries the queue profile in parentheses, so match "send queue full (".
+    if grep -qs "send queue full (" "$CW_C/coord.out" "$CW_C/worker.out" "$CW_W/worker.out" 2>/dev/null; then
+        echo "*** 'send queue full (...); dropping the connection' was logged: this failure may be the open stuck-lease bug," >&2
+        echo "*** not a plain timing failure. The test is NOT skipped; it fails on purpose. The coordinator log's" >&2
+        echo "*** 'leases recovered' line says what resumed where (docs/worker-protocol.md, back-pressure)." >&2
     fi
     echo "--- coord.out" >&2;   tail -n 40 "$CW_C/coord.out" >&2 2>/dev/null || true
     echo "--- worker.out" >&2;  tail -n 40 "$CW_C/worker.out" >&2 2>/dev/null || true

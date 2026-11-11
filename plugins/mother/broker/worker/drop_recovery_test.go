@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -27,6 +28,7 @@ type strictApplier struct {
 	applied int64
 	gaps    atomic.Int64
 	ops     []int64
+	drops   atomic.Int64  // "send queue full (...)" lines the coordinator logged: real queue-overflow drops
 	delay   time.Duration // each apply takes this long (a script exec on a loaded host)
 	failN   int           // every failN-th apply lands only a prefix and fails (a transient stop)
 	calls   int
@@ -60,6 +62,21 @@ func (a *strictApplier) Apply(job string, ops [][]byte) (int64, error) {
 	return a.applied, nil
 }
 
+// checkExactlyOnce fails unless every seq 1..total was applied once, in order, with no repeat and no skip.
+func (a *strictApplier) checkExactlyOnce(t *testing.T, total int64) {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if int64(len(a.ops)) != total {
+		t.Fatalf("%d ops applied, want exactly %d", len(a.ops), total)
+	}
+	for i, seq := range a.ops {
+		if seq != int64(i)+1 {
+			t.Fatalf("op #%d applied as seq %d: not exactly-once and in order (%v)", i+1, seq, a.ops)
+		}
+	}
+}
+
 func (a *strictApplier) appliedSeq() int64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -70,12 +87,15 @@ func (a *strictApplier) appliedSeq() int64 {
 func startStrictPair(t *testing.T, queueLen int) (*pair, *strictApplier) {
 	t.Helper()
 	var finished atomic.Bool
+	app := &strictApplier{}
 	logf := func(f string, a ...any) {
+		if strings.Contains(f, "send queue full (") {
+			app.drops.Add(1)
+		}
 		if !finished.Load() {
 			t.Logf(f, a...)
 		}
 	}
-	app := &strictApplier{}
 	p := &pair{root: shortTemp(t), wroot: shortTemp(t), secret: coord.NewSecret()}
 	release, err := coord.Lock(p.root)
 	if err != nil {
@@ -212,6 +232,7 @@ func TestLeaseRecoversWhenTheConnectionIsDroppedRepeatedly(t *testing.T) {
 	if g := app.gaps.Load(); g != 0 {
 		t.Fatalf("%d applies stopped at a gap in the outbox", g)
 	}
+	app.checkExactlyOnce(t, total)
 	// The supervisor finishes: the mirror says succeeded and the supervisor exits.
 	if err := os.WriteFile(filepath.Join(p.wroot, "jobs", "j1.json"), []byte(`{"id":"j1","state":"succeeded"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -232,8 +253,10 @@ func syscallKillGroup(pid int) error {
 	return syscall.Kill(pid, syscall.SIGKILL)
 }
 
-// A coordinator whose per-connection send queue is tiny drops the connection itself ("send queue full"):
-// the lease must still recover, whatever the cause of the drops.
+// A coordinator whose per-connection send queue is tiny may drop the connection itself ("send queue full"): the
+// lease must still recover and every op be applied exactly once. Whether the queue really overflows depends on
+// timing and was never seen to in this test (not on main, not on the shedding branch), so a run that logged no
+// drop proves nothing about drops: it checks everything below and then reports itself skipped, never passed.
 func TestLeaseRecoversWhenTheCoordinatorDropsTheConnectionForAFullSendQueue(t *testing.T) {
 	p, app := startStrictPair(t, 64)
 	app.delay = 150 * time.Millisecond
@@ -249,6 +272,7 @@ func TestLeaseRecoversWhenTheCoordinatorDropsTheConnectionForAFullSendQueue(t *t
 	if g := app.gaps.Load(); g != 0 {
 		t.Fatalf("%d applies stopped at a gap in the outbox", g)
 	}
+	app.checkExactlyOnce(t, total)
 	if err := os.WriteFile(filepath.Join(p.wroot, "jobs", "j1.json"), []byte(`{"id":"j1","state":"succeeded"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -257,4 +281,7 @@ func TestLeaseRecoversWhenTheCoordinatorDropsTheConnectionForAFullSendQueue(t *t
 	p.d.mu.Unlock()
 	_ = syscallKillGroup(pid)
 	eventually(t, "the lease to be released", 60*time.Second, func() bool { return p.leaseRecState("j1") == "released" })
+	if n := app.drops.Load(); n == 0 {
+		t.Skip("the coordinator never dropped a connection for a full send queue in this run: the lease and ops are intact, but the drop path was not exercised")
+	}
 }
