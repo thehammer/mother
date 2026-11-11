@@ -1108,7 +1108,13 @@ Worker mode never loses a job's work when its worker stops. Details: `docs/worke
   "fenced" (exit 3) needs the ROLLING ref's own refusal plus a moved remote. Origin keeps this epoch's newest
   `MOTHER_CHECKPOINT_KEEP_REFS` (20) `wip-ckpt` refs; once per epoch (after a SUCCESSFUL `ls-remote`) every earlier-epoch ref
   except the restore point the lease was restored from (`<checkpoints>/.restore-point`) is deleted, so at most one earlier ref
-  remains in total; with no well-formed restore point nothing earlier is deleted (unbounded then). Salvage refs are never pruned. A restore seeds the new
+  remains in total; with no well-formed restore point nothing earlier is deleted (unbounded then). The current epoch's `n-20` delete
+  runs once, in that take's push, so a take that fails before its push leaves its `n-20` ref behind (the bound is 20 plus a few, not
+  strict), and it never deletes the newest pushed checkpoint of the epoch (`<checkpoints>/.last-ckpt-ref`) or the ref named by
+  `.restore-point`: a remote that keeps refusing `wip-ckpt/*` cannot take the coordinator's only restore point. A push that times
+  out (137) leaves `<checkpoints>/.push-pending` (the wip sha attempted); the next take reads the rolling ref with one bounded
+  `ls-remote` first: equal to the pending sha means the remote applied it (recorded as `.last-pushed`, not fenced), anything else
+  leaves the expectation as it was (still fenced if another writer moved it). Salvage refs are never pruned. A restore seeds the new
   worker's checkpoints dir with `epoch`/`n` only (transcript bytes 0, `pushed:false`), so its first take ships the whole
   transcript: the coordinator's transcript can be longer than `latest.json` (unpushed checkpoints append deltas), and a delta
   from `latest.json`'s byte count would never line up. `coord_apply.sh` refuses (and audits) a checkpoint when the job has no lease

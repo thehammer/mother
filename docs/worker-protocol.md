@@ -277,7 +277,13 @@ Validation (`ValidateManifest`) runs on receipt and refuses, before any `WipRef(
   per epoch, after one successful bounded `ls-remote` (a failed one is retried on the next take), a take deletes every earlier-epoch
   `wip-ckpt` ref except the restore point the lease was restored from (`<checkpoints>/.restore-point`, "<epoch>-<n>"). So at most ONE
   earlier-epoch ref remains in total (the newest restore point), and with no well-formed restore point on record nothing earlier is
-  deleted (unbounded in that case). Salvage refs are never pruned. A coordinator that is more than 20
+  deleted (unbounded in that case). The `n-20` delete of the current epoch happens once, in that take's push, so a take that fails
+  before its push leaves its `n-20` ref behind (the bound is 20 plus a few, not strict). The delete never removes the newest pushed
+  checkpoint of the epoch (`<checkpoints>/.last-ckpt-ref`) nor the ref named by `.restore-point`, so a remote that keeps refusing
+  `wip-ckpt/*` for more than 20 takes cannot delete the coordinator's only restore point. A push that timed out (exit 137) may still
+  have been applied: the take records `<checkpoints>/.push-pending` (the wip sha) and the NEXT take reads the rolling ref with a
+  bounded `ls-remote` before judging fencing; a ref equal to the pending sha is recorded as the lease's expectation (not fenced), any
+  other value leaves the expectation alone (still fenced if another writer moved the ref). Salvage refs are never pruned. A coordinator that is more than 20
   checkpoints behind its worker falls back to the rolling ref (which then must equal `wip_sha`) or fails `no_checkpoint_restorable`.
 - Follow-up (not built): delete `refs/mother/wip/<job>`, `refs/mother/wip-ckpt/<job>/*` and `refs/mother/wip-salvage/<job>/*` when the job is archived.
 - **Interval 120 s** (refused above **240 s**), **final-on-exit timeout 30 s**, **per-checkpoint watchdog 60 s**.
