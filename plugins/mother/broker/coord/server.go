@@ -66,7 +66,11 @@ type Config struct {
 	IdleTimeout    time.Duration // post-hello read deadline; default 3 heartbeat intervals
 	AuditMaxBytes  int64         // audit.jsonl rotates past this (default 4 MiB)
 	AcceptMinSleep time.Duration // first retry delay after a temporary Accept error (default 5ms)
+	SendQueue      int           // frames queued per worker connection before it is dropped (default 4096; below MinSendQueue is raised to it)
 }
+
+// MinSendQueue is the smallest per-connection send queue the coordinator will run with.
+const MinSendQueue = 64
 
 type workerConn struct {
 	id       string
@@ -127,12 +131,20 @@ type Server struct {
 	kick     chan struct{}
 	ln       net.Listener
 	auditAt  map[string]auditEntry
+	dropped  map[string]dropNote // worker id -> why its last connection was dropped, until it reconnects
 
 	wg      sync.WaitGroup
 	connMu  sync.Mutex
 	pidSet  map[int]struct{} // registered worker pids; guarded by connMu (exempt from pre-hello eviction)
 	conns   map[*connState]struct{}
 	preConn int
+}
+
+// dropNote remembers that the coordinator itself dropped a worker's connection (a full send queue), so the
+// reconnect can say which leases came back (see register).
+type dropNote struct {
+	at  time.Time
+	why string
 }
 
 type auditEntry struct {
@@ -174,11 +186,17 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
+	// A queue this small cannot hold a welcome and its redelivered commands, and the shedding threshold (half
+	// the capacity) would be zero or one frame: the connection would drop and reconnect forever.
+	if cfg.SendQueue > 0 && cfg.SendQueue < MinSendQueue {
+		cfg.Logf("coordinator: SendQueue %d is below the minimum; using %d", cfg.SendQueue, MinSendQueue)
+		cfg.SendQueue = MinSendQueue
+	}
 	if cfg.Applier == nil {
 		cfg.Applier = ExecApplier{Root: cfg.Root, LibDir: cfg.LibDir}
 	}
 	s := &Server{cfg: cfg, jobs: map[string]*jobLease{}, workers: map[string]*workerConn{}, creds: map[string]*workerCred{},
-		fileSent: map[string]string{}, kick: make(chan struct{}, 1), auditAt: map[string]auditEntry{}, conns: map[*connState]struct{}{}}
+		fileSent: map[string]string{}, kick: make(chan struct{}, 1), auditAt: map[string]auditEntry{}, dropped: map[string]dropNote{}, conns: map[*connState]struct{}{}}
 	s.upSince = cfg.Now()
 	if err := os.MkdirAll(s.leasesDir(), 0o700); err != nil {
 		return nil, err
@@ -534,6 +552,9 @@ func (s *Server) handleConn(c *net.UnixConn, cs *connState) {
 		return
 	}
 	w := newWorkerConn(h.WorkerID, h.InstanceID, slots, welcome.Caps, c, s.now())
+	if s.cfg.SendQueue > 0 {
+		w.out = make(chan []byte, s.cfg.SendQueue)
+	}
 	s.mu.Lock()
 	if why := s.authenticate(h, peerPID); why != "" {
 		s.auditRefusal(h.WorkerID, "", "", 0, "auth_failed:"+why)
@@ -647,6 +668,10 @@ func (s *Server) register(w *workerConn, welcome *workerproto.Welcome) {
 			AppliedSeq: s.truthApplied(jl), WireSeq: jl.rec.WireSeq, LogOffset: s.logSize(jl.job),
 		})
 	}
+	if note, ok := s.dropped[w.id]; ok {
+		delete(s.dropped, w.id)
+		s.logRecovery(w, note)
+	}
 	s.sendFrame(w, workerproto.TypeWelcome, nil, welcome)
 	for _, jl := range s.sortedJobs() {
 		if jl.rec.WorkerID != w.id {
@@ -673,6 +698,23 @@ func (s *Server) register(w *workerConn, welcome *workerproto.Welcome) {
 	}
 }
 
+// logRecovery says, once, that a worker whose connection the coordinator dropped is back and which of its
+// leases resume where. It makes a stuck lease after a drop diagnosable from the coordinator log alone: the
+// line names each lease with the wire and applied seq the worker was told to resume from.
+func (s *Server) logRecovery(w *workerConn, note dropNote) {
+	var parts []string
+	for _, jl := range s.sortedJobs() {
+		if jl.rec.WorkerID == w.id && live(jl.rec.State) {
+			parts = append(parts, fmt.Sprintf("%s@e%d(wire %d, applied %d)", jl.job, jl.rec.Epoch, jl.rec.WireSeq, s.truthApplied(jl)))
+		}
+	}
+	if len(parts) == 0 {
+		parts = []string{"none"}
+	}
+	s.logf("worker %s: reconnected %s after its connection was dropped (%s); leases recovered: %s",
+		w.id, s.now().Sub(note.at).Round(time.Millisecond), note.why, strings.Join(parts, " "))
+}
+
 func live(state string) bool {
 	return state == string(workerproto.LeaseActive) || state == string(workerproto.LeaseOffered)
 }
@@ -690,7 +732,9 @@ func (s *Server) enqueue(w *workerConn, b []byte) {
 	select {
 	case w.out <- b:
 	default:
-		s.logf("worker %s: send queue full (%s); dropping the connection", w.id, queueProfile(w.out))
+		profile := queueProfile(w.out)
+		s.logf("worker %s: send queue full (%s); dropping the connection", w.id, profile)
+		s.dropped[w.id] = dropNote{at: s.now(), why: "send queue full (" + profile + ")"}
 		w.close()
 	}
 }
@@ -751,8 +795,15 @@ func (s *Server) sendRefuse(w *workerConn, f *workerproto.Frame, code string) {
 	if f != nil {
 		fr.Job, fr.Lease, fr.Epoch = f.Job, f.Lease, f.Epoch
 	}
-	if b, err := workerproto.Encode(fr); err == nil {
-		s.enqueue(w, b)
+	b, err := workerproto.Encode(fr)
+	if err != nil {
+		return
+	}
+	switch code {
+	case workerproto.CodeFenced, workerproto.CodeNotLeased, workerproto.CodeUnknownJob:
+		s.enqueue(w, b) // the worker acts on these (it stops its supervisor): never shed
+	default:
+		s.enqueueRedundant(w, b)
 	}
 }
 
@@ -941,12 +992,34 @@ func (s *Server) sendOwedAcks() {
 	}
 }
 
+// sendAck queues an ack of the stream's committed position. An ack is cumulative and idempotent, so it is
+// never worth dropping the worker's connection for: when the worker's send queue is more than half full the
+// ack stays owed (oweAck) and goes out on a later flush tick, once the worker has read what is ahead of it.
 func (s *Server) sendAck(w *workerConn, jl *jobLease, f workerproto.Frame) {
 	d, err := s.adm.AckFor(f)
 	if err != nil {
 		return
 	}
-	s.sendFrame(w, workerproto.TypeAck, jl, d)
+	b, err := s.buildFrame(workerproto.TypeAck, jl, d)
+	if err != nil {
+		s.logf("build %s: %v", workerproto.TypeAck, err)
+		return
+	}
+	if !s.enqueueRedundant(w, b) {
+		s.oweAck(jl, f)
+	}
+}
+
+// enqueueRedundant queues a frame the worker can do without (an ack that will be repeated, an advisory
+// refusal) unless its send queue is more than half full, and reports whether it did. Commands, the welcome
+// and fencing refusals use enqueue: those are never shed. This is the back-pressure that keeps a slow reader
+// from being dropped, reconnecting, being redelivered everything and being dropped again.
+func (s *Server) enqueueRedundant(w *workerConn, b []byte) bool {
+	if len(w.out) >= cap(w.out)/2 {
+		return false
+	}
+	s.enqueue(w, b)
+	return true
 }
 
 func (s *Server) flushAll() {
